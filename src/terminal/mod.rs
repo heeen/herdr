@@ -8,5 +8,5 @@ pub use runtime::TerminalRuntime;
 pub(crate) use runtime_registry::TerminalRuntimeRegistry;
 pub use state::{
     AgentMetadataReport, EffectivePresentation, EffectiveStateChange, TerminalState,
-    TerminalStateMutation,
+    TerminalStateMutation, WorkingDuration,
 };

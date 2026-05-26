@@ -244,6 +244,22 @@ impl App {
                     SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                         self.save_switch_ascii_input_source_in_prefix(enabled)
                     }
+                    SettingsAction::SaveSidebarSpace {
+                        previous,
+                        preferences,
+                    } => {
+                        if !self.save_sidebar_space_preferences(preferences) {
+                            self.state.sidebar_space = previous;
+                        }
+                    }
+                    SettingsAction::SaveSidebarAgent {
+                        previous,
+                        preferences,
+                    } => {
+                        if !self.save_sidebar_agent_preferences(preferences) {
+                            self.state.sidebar_agent = previous;
+                        }
+                    }
                     SettingsAction::InstallRecommendedIntegrations => {
                         self.install_recommended_integrations()
                     }
