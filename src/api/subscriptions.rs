@@ -212,6 +212,12 @@ impl ActiveSubscription {
                 pane_id,
                 agent_status,
             } => {
+                let Some(pane_id) = pane_id else {
+                    return Ok(Self::Event(ActiveEventSubscription {
+                        event_kind: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        last_sequence: 0,
+                    }));
+                };
                 let last_sequence = event_hub.current_sequence();
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
                 let last_status = probe.agent_status;

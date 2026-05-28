@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -139,6 +139,58 @@ fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) 
     }
 }
 
+fn spawn_named_server(config_home: &Path, runtime_dir: &Path, session_name: &str) -> SpawnedHerdr {
+    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(runtime_dir).unwrap();
+    register_runtime_dir(runtime_dir);
+    fs::write(
+        config_home.join("herdr/config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("server");
+    cmd.arg("--session");
+    cmd.arg(session_name);
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env_remove("HERDR_SOCKET_PATH");
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("HERDR_ENV");
+
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    drop(pair.slave);
+
+    SpawnedHerdr {
+        _master: pair.master,
+        child,
+    }
+}
+
+fn session_socket_dir(config_home: &Path, session_name: &str) -> PathBuf {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home
+        .join(app_dir)
+        .join("sessions")
+        .join(session_name)
+}
+
 fn spawn_client_process(
     config_home: &Path,
     runtime_dir: &Path,
@@ -229,6 +281,150 @@ fn send_json_request(socket_path: &Path, request: &str) -> Value {
     reader.read_line(&mut response).unwrap();
 
     serde_json::from_str(&response).expect("response should be valid JSON")
+}
+
+fn workspace_list(socket_path: &Path) -> Value {
+    send_json_request(
+        socket_path,
+        r#"{"id":"workspace_list","method":"workspace.list","params":{}}"#,
+    )
+}
+
+fn workspace_count(socket_path: &Path) -> usize {
+    workspace_list(socket_path)
+        .pointer("/result/workspaces")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .expect("workspace.list should return a workspace array")
+}
+
+fn wait_for_workspace_count(socket_path: &Path, expected: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if workspace_count(socket_path) == expected {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn spawn_pty_output_collector(master: &dyn MasterPty) -> mpsc::Receiver<String> {
+    let mut reader = master.try_clone_reader().expect("clone PTY reader");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if tx
+                        .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(_) => return,
+                Err(_) => return,
+            }
+        }
+    });
+    rx
+}
+
+fn wait_for_output_containing(
+    rx: &mpsc::Receiver<String>,
+    needles: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut raw_output = String::new();
+    let mut output = String::new();
+    while Instant::now() < deadline {
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        match rx.recv_timeout(slice) {
+            Ok(chunk) => {
+                raw_output.push_str(&chunk);
+                output = strip_ansi_for_test(&raw_output);
+                if needles.iter().all(|needle| output.contains(needle)) {
+                    return true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    eprintln!(
+        "client PTY output did not contain {needles:?}. Captured output: {}",
+        output.escape_debug()
+    );
+    false
+}
+
+fn strip_ansi_for_test(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            let ch = input[i..].chars().next().expect("valid UTF-8 char");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() {
+                    let byte = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            b']' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'P' | b'_' | b'^' | b'X' | b'G' => {
+                i += 1;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == 0x1b && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn write_sgr_mouse_click(writer: &mut dyn Write, column: u16, row: u16) {
+    write!(writer, "\x1b[<0;{column};{row}M").expect("write SGR mouse click");
+    writer.flush().expect("flush SGR mouse click");
 }
 
 fn create_workspace_and_root_pane(socket_path: &Path, label: &str) -> (String, String) {
@@ -499,6 +695,7 @@ fn client_handshake(
             &encode_varint_u32(8),  // cell_width_px
             &encode_varint_u32(16), // cell_height_px
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),  // ClientSurfaceMode::FullApp
             &encode_varint_u32(0),  // ClientKeybindings::Server
         ],
     );
@@ -999,6 +1196,267 @@ fn multi_client_client_crash_sigkill_does_not_affect_server() {
     );
 
     cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn mixed_local_remote_client_connects_main_and_secondary_streams() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let dev_socket_dir = session_socket_dir(&config_home, "dev");
+    let dev_api_socket = dev_socket_dir.join("herdr.sock");
+    let dev_client_socket = dev_socket_dir.join("herdr-client.sock");
+
+    let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let dev_server = spawn_named_server(&config_home, &runtime_dir, "dev");
+    wait_for_socket(&dev_api_socket, Duration::from_secs(10));
+    wait_for_file(&dev_client_socket, Duration::from_secs(10));
+
+    let add_remote = send_json_request(
+        &api_socket,
+        r#"{"id":"remote_add","method":"remote.add","params":{"name":"dev","target":"local:dev"}}"#,
+    );
+    if add_remote.get("error").is_some() {
+        panic!("remote.add failed: {add_remote}");
+    }
+
+    let main_log_path = server_log_path(&config_home);
+    let dev_log_path = dev_socket_dir.join("herdr-server.log");
+    let main_connected_before = count_log_occurrences(&main_log_path, "client connected");
+    let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
+
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(
+        wait_for_log_occurrence_count(
+            &main_log_path,
+            "client connected",
+            main_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the main client stream"
+    );
+    assert!(
+        wait_for_log_occurrence_count(
+            &dev_log_path,
+            "client connected",
+            dev_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the local:dev client stream"
+    );
+
+    drop(client);
+    drop(dev_server);
+    cleanup_spawned_herdr(main_server, base);
+}
+
+#[test]
+fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survives_secondary_stop()
+{
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let dev_socket_dir = session_socket_dir(&config_home, "dev");
+    let dev_api_socket = dev_socket_dir.join("herdr.sock");
+    let dev_client_socket = dev_socket_dir.join("herdr-client.sock");
+
+    let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    create_workspace_and_root_pane(&api_socket, "main-visible");
+
+    let dev_server = spawn_named_server(&config_home, &runtime_dir, "dev");
+    wait_for_socket(&dev_api_socket, Duration::from_secs(10));
+    wait_for_file(&dev_client_socket, Duration::from_secs(10));
+    create_workspace_and_root_pane(&dev_api_socket, "dev-visible");
+
+    let add_remote = send_json_request(
+        &api_socket,
+        r#"{"id":"remote_add","method":"remote.add","params":{"name":"dev","target":"local:dev"}}"#,
+    );
+    if add_remote.get("error").is_some() {
+        panic!("remote.add failed: {add_remote}");
+    }
+
+    let main_count_before = workspace_count(&api_socket);
+    let dev_count_before = workspace_count(&dev_api_socket);
+
+    let main_log_path = server_log_path(&config_home);
+    let dev_log_path = dev_socket_dir.join("herdr-server.log");
+    let main_connected_before = count_log_occurrences(&main_log_path, "client connected");
+    let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
+
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let client_output = spawn_pty_output_collector(client._master.as_ref());
+    assert!(
+        wait_for_log_occurrence_count(
+            &main_log_path,
+            "client connected",
+            main_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the main client stream"
+    );
+    assert!(
+        wait_for_log_occurrence_count(
+            &dev_log_path,
+            "client connected",
+            dev_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the local:dev client stream"
+    );
+    assert!(
+        wait_for_output_containing(
+            &client_output,
+            &["main-visible", "dev-visible"],
+            Duration::from_secs(10),
+        ),
+        "mixed client sidebar should show workspace labels from main and local:dev"
+    );
+
+    // 80x24 host: footer row is y=23 (SGR row 24), and the second
+    // picker destination is y=22 (SGR row 23).
+    let mut client_writer = client._master.take_writer().expect("open PTY writer");
+    write_sgr_mouse_click(client_writer.as_mut(), 2, 24);
+    assert!(
+        wait_for_output_containing(
+            &client_output,
+            &["create on", "+ dev"],
+            Duration::from_secs(5)
+        ),
+        "clicking new in all-server mode should open the destination picker"
+    );
+    write_sgr_mouse_click(client_writer.as_mut(), 2, 23);
+
+    assert!(
+        wait_for_workspace_count(
+            &dev_api_socket,
+            dev_count_before + 1,
+            Duration::from_secs(10)
+        ),
+        "choosing dev in the destination picker should create a workspace on local:dev"
+    );
+    assert_eq!(
+        workspace_count(&api_socket),
+        main_count_before,
+        "choosing dev must not create the new workspace on main"
+    );
+
+    drop(dev_server);
+
+    let main_after_dev_stop = send_json_request(
+        &api_socket,
+        r#"{"id":"main_after_dev_stop","method":"workspace.create","params":{"label":"main-after-dev-stop"}}"#,
+    );
+    assert!(
+        main_after_dev_stop.get("error").is_none(),
+        "main API should stay usable after stopping secondary: {main_after_dev_stop}"
+    );
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "main server should keep responding after stopping secondary"
+    );
+
+    drop(client);
+    cleanup_spawned_herdr(main_server, base);
+}
+
+#[test]
+fn mixed_local_remote_client_menu_adds_first_secondary_remote() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let dev_socket_dir = session_socket_dir(&config_home, "dev");
+    let dev_api_socket = dev_socket_dir.join("herdr.sock");
+    let dev_client_socket = dev_socket_dir.join("herdr-client.sock");
+
+    let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let dev_server = spawn_named_server(&config_home, &runtime_dir, "dev");
+    wait_for_socket(&dev_api_socket, Duration::from_secs(10));
+    wait_for_file(&dev_client_socket, Duration::from_secs(10));
+
+    let main_log_path = server_log_path(&config_home);
+    let dev_log_path = dev_socket_dir.join("herdr-server.log");
+    let main_connected_before = count_log_occurrences(&main_log_path, "client connected");
+    let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
+
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let client_output = spawn_pty_output_collector(client._master.as_ref());
+    let mut client_writer = client._master.take_writer().expect("open PTY writer");
+
+    assert!(
+        wait_for_log_occurrence_count(
+            &main_log_path,
+            "client connected",
+            main_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the main client stream"
+    );
+    assert!(
+        wait_for_output_containing(&client_output, &["new", "menu"], Duration::from_secs(10)),
+        "client-owned footer should render before any secondary remote exists"
+    );
+
+    // Footer menu is right-aligned inside the 26-column sidebar.
+    write_sgr_mouse_click(client_writer.as_mut(), 24, 24);
+    assert!(
+        wait_for_output_containing(&client_output, &["> add remote"], Duration::from_secs(5)),
+        "clicking menu should open the client global menu"
+    );
+
+    // The single menu item is on zero-based row 22 in an 80x24 host.
+    write_sgr_mouse_click(client_writer.as_mut(), 2, 23);
+    assert!(
+        wait_for_output_containing(
+            &client_output,
+            &["add remote", "target:"],
+            Duration::from_secs(5)
+        ),
+        "clicking add remote should open the client add-remote form"
+    );
+
+    client_writer
+        .write_all(b"local:dev\r")
+        .expect("type local remote target");
+    client_writer.flush().expect("flush local remote target");
+
+    assert!(
+        wait_for_log_occurrence_count(
+            &dev_log_path,
+            "client connected",
+            dev_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "client add-remote submission should connect to local:dev"
+    );
+
+    let list = send_json_request(
+        &api_socket,
+        r#"{"id":"remote_list","method":"remote.list","params":{}}"#,
+    );
+    assert_eq!(list["result"]["remotes"].as_array().unwrap().len(), 1);
+    assert_eq!(list["result"]["remotes"][0]["name"], "dev");
+    assert_eq!(list["result"]["remotes"][0]["target"]["type"], "local");
+    assert_eq!(list["result"]["remotes"][0]["target"]["session"], "dev");
+
+    drop(client);
+    drop(dev_server);
+    cleanup_spawned_herdr(main_server, base);
 }
 
 #[test]

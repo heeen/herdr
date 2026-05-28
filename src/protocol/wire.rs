@@ -43,6 +43,15 @@ pub enum RenderEncoding {
     TerminalAnsi,
 }
 
+/// App surface requested by an attached app client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientSurfaceMode {
+    /// Existing behavior: the server renders the full Herdr UI.
+    FullApp,
+    /// The server renders only active workspace content for a client-owned shell.
+    EmbeddedContent,
+}
+
 /// Keybinding profile requested by an attached app client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientKeybindings {
@@ -69,6 +78,8 @@ pub enum ClientMessage {
         cell_height_px: u32,
         /// Render encoding requested by the client.
         requested_encoding: RenderEncoding,
+        /// Surface mode requested by the client.
+        surface_mode: ClientSurfaceMode,
         /// Keybinding profile requested by the client.
         keybindings: ClientKeybindings,
     },
@@ -650,11 +661,32 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_hello_embedded_content_surface_mode_roundtrip() {
+        let msg = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::EmbeddedContent,
+            keybindings: ClientKeybindings::Server,
+        };
+
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
         assert_eq!(msg, decoded);
     }
 
@@ -951,6 +983,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
         };
         let mut buf = Vec::new();
@@ -1024,6 +1057,7 @@ mod tests {
                     cell_width_px: 8,
                     cell_height_px: 16,
                     requested_encoding: RenderEncoding::SemanticFrame,
+                    surface_mode: ClientSurfaceMode::FullApp,
                     keybindings: ClientKeybindings::Server,
                 },
                 1 => ClientMessage::Input {
@@ -1459,6 +1493,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
         };
         let mut buf = Vec::new();
@@ -1493,6 +1528,7 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
             },
             ClientMessage::Input {

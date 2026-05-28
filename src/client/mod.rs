@@ -12,32 +12,35 @@
 //! - Forwards OSC 52 clipboard writes from server to its own stdout
 //! - Displays sound/toast notifications forwarded from server
 
+mod compositor;
 mod input;
+mod supervisor;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableFocusChange, EnableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use tracing::{debug, info, warn};
 
 use crate::protocol::render_ansi;
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientMessage, NotifyKind,
-    RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientMessage,
+    ClientSurfaceMode, NotifyKind, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+const CLIENT_SUPERVISOR_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -51,6 +54,10 @@ struct ClientState {
     mouse_capture_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
     reported_size: (u16, u16),
+    /// The outer terminal size owned by the client compositor.
+    host_size: (u16, u16),
+    /// Last known host cell size in pixels, used for secondary handshakes.
+    cell_size_px: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
@@ -61,6 +68,34 @@ struct ClientState {
     mouse_scroll_lines: usize,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
+    /// Client-owned sidebar/frame compositor used for mixed-server sessions.
+    compositor: Option<compositor::ClientCompositor>,
+    /// Runtime multi-server summary state used by the client-owned sidebar.
+    supervisor_model: Option<supervisor::ClientSupervisorModel>,
+    /// Last time the client refreshed sidebar summaries through API polling.
+    last_supervisor_summary_refresh: Instant,
+    /// Last semantic frame received from each connected server stream.
+    frame_cache: HashMap<supervisor::ServerId, protocol::FrameData>,
+    /// Servers with active summary-event subscription workers.
+    summary_subscription_server_ids: HashSet<supervisor::ServerId>,
+    /// SSH bridges owned by this client for secondary servers.
+    ssh_bridges: HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    /// Backoff state for secondary servers that should be reconnected.
+    secondary_retries: HashMap<supervisor::ServerId, SecondaryRetryState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SecondaryRetryState {
+    attempt: usize,
+    next_retry_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientRenderPlan {
+    surface_mode: ClientSurfaceMode,
+    requested_encoding: RenderEncoding,
+    server_size: (u16, u16),
+    use_client_compositor: bool,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +116,18 @@ enum AttachInputAction {
     },
     Detach,
     None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientInputDispatch {
+    Forward(Vec<u8>),
+    ApiRequest {
+        server_id: supervisor::ServerId,
+        request: Box<crate::api::schema::Request>,
+    },
+    AddRemote(supervisor::AddRemoteDraft),
+    Redraw,
+    Consumed,
 }
 
 impl AttachEscapeState {
@@ -183,9 +230,257 @@ fn attach_scroll_action(
     }
 }
 
+fn dispatch_composited_input(
+    data: Vec<u8>,
+    compositor: &compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    host_size: (u16, u16),
+) -> ClientInputDispatch {
+    if model.add_remote_form().is_some() || model.client_global_menu_highlighted().is_some() {
+        return dispatch_client_overlay_input(data, compositor, model, host_size);
+    }
+
+    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+    let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() else {
+        return ClientInputDispatch::Forward(data);
+    };
+
+    dispatch_composited_mouse_input(data, compositor, model, host_size, mouse)
+}
+
+fn dispatch_client_overlay_input(
+    data: Vec<u8>,
+    compositor: &compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    host_size: (u16, u16),
+) -> ClientInputDispatch {
+    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+    if events.is_empty() {
+        return ClientInputDispatch::Consumed;
+    }
+
+    let mut dispatch = ClientInputDispatch::Consumed;
+    for event in events {
+        let next = match event {
+            crate::raw_input::RawInputEvent::Key(key) if model.add_remote_form().is_some() => {
+                match model.handle_add_remote_key(key) {
+                    supervisor::AddRemoteFormOutcome::Redraw => ClientInputDispatch::Redraw,
+                    supervisor::AddRemoteFormOutcome::Submit(draft) => {
+                        ClientInputDispatch::AddRemote(draft)
+                    }
+                }
+            }
+            crate::raw_input::RawInputEvent::Paste(text) if model.add_remote_form().is_some() => {
+                match model.append_add_remote_paste(&text) {
+                    supervisor::AddRemoteFormOutcome::Redraw => ClientInputDispatch::Redraw,
+                    supervisor::AddRemoteFormOutcome::Submit(draft) => {
+                        ClientInputDispatch::AddRemote(draft)
+                    }
+                }
+            }
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.client_global_menu_highlighted().is_some() =>
+            {
+                dispatch_client_global_menu_key(model, key)
+            }
+            crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                dispatch_composited_mouse_input(data.clone(), compositor, model, host_size, &mouse)
+            }
+            _ => ClientInputDispatch::Consumed,
+        };
+
+        if matches!(next, ClientInputDispatch::AddRemote(_)) {
+            dispatch = next;
+            break;
+        }
+        if matches!(next, ClientInputDispatch::Redraw) {
+            dispatch = ClientInputDispatch::Redraw;
+        }
+    }
+    dispatch
+}
+
+fn dispatch_client_global_menu_key(
+    model: &mut supervisor::ClientSupervisorModel,
+    key: crate::input::TerminalKey,
+) -> ClientInputDispatch {
+    if !matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) {
+        return ClientInputDispatch::Consumed;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.move_client_global_menu_prev();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.move_client_global_menu_next();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Enter => {
+            model.accept_client_global_menu_item();
+            ClientInputDispatch::Redraw
+        }
+        _ => ClientInputDispatch::Consumed,
+    }
+}
+
+fn dispatch_composited_mouse_input(
+    data: Vec<u8>,
+    compositor: &compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    host_size: (u16, u16),
+    mouse: &MouseEvent,
+) -> ClientInputDispatch {
+    if let Some(target) =
+        compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
+    {
+        return dispatch_sidebar_hit_target(target, model, mouse);
+    }
+
+    let sidebar_width = compositor.sidebar_width().min(host_size.0);
+    if mouse.column < sidebar_width {
+        return ClientInputDispatch::Consumed;
+    }
+
+    translate_content_mouse_input(data, mouse, sidebar_width)
+}
+
+fn dispatch_sidebar_hit_target(
+    target: compositor::SidebarHitTarget,
+    model: &mut supervisor::ClientSupervisorModel,
+    mouse: &MouseEvent,
+) -> ClientInputDispatch {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return ClientInputDispatch::Consumed;
+    }
+
+    match target {
+        compositor::SidebarHitTarget::Filter => {
+            model.cycle_filter();
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::Workspace {
+            server_id,
+            workspace_id,
+        } => model
+            .focus_workspace_route(&server_id, &workspace_id)
+            .api_request("client:workspace-focus")
+            .map(|request| ClientInputDispatch::ApiRequest {
+                server_id,
+                request: Box::new(request),
+            })
+            .unwrap_or(ClientInputDispatch::Consumed),
+        compositor::SidebarHitTarget::Agent {
+            server_id,
+            agent_id,
+        } => model
+            .focus_agent_route(&server_id, &agent_id)
+            .api_request("client:agent-focus")
+            .map(|request| ClientInputDispatch::ApiRequest {
+                server_id,
+                request: Box::new(request),
+            })
+            .unwrap_or(ClientInputDispatch::Consumed),
+        compositor::SidebarHitTarget::New => match model.open_new_workspace_picker() {
+            route @ supervisor::NewWorkspaceRoute::CreateOn(_) => route
+                .api_request("client:workspace-create")
+                .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Consumed),
+            supervisor::NewWorkspaceRoute::PickDestination(_) => ClientInputDispatch::Redraw,
+            supervisor::NewWorkspaceRoute::Unavailable { .. } => ClientInputDispatch::Consumed,
+        },
+        compositor::SidebarHitTarget::NewWorkspaceDestination { server_id } => model
+            .choose_new_workspace_destination(&server_id)
+            .api_request("client:workspace-create")
+            .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                server_id,
+                request: Box::new(request),
+            })
+            .unwrap_or(ClientInputDispatch::Consumed),
+        compositor::SidebarHitTarget::ClientGlobalMenuItem { index } => {
+            model.select_client_global_menu_item(index);
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::Menu => {
+            model.open_client_global_menu();
+            ClientInputDispatch::Redraw
+        }
+    }
+}
+
+fn translate_content_mouse_input(
+    original: Vec<u8>,
+    mouse: &MouseEvent,
+    sidebar_width: u16,
+) -> ClientInputDispatch {
+    let Some(column) = mouse.column.checked_sub(sidebar_width) else {
+        return ClientInputDispatch::Consumed;
+    };
+
+    let encoded = match mouse.kind {
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => crate::input::encode_mouse_scroll(
+            mouse.kind,
+            column,
+            mouse.row,
+            mouse.modifiers,
+            crate::input::MouseProtocolEncoding::Sgr,
+        ),
+        MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+            crate::input::encode_mouse_button(
+                mouse.kind,
+                column,
+                mouse.row,
+                mouse.modifiers,
+                crate::input::MouseProtocolEncoding::Sgr,
+            )
+        }
+        MouseEventKind::Moved => None,
+    };
+
+    ClientInputDispatch::Forward(encoded.unwrap_or(original))
+}
+
 impl ClientState {
     fn request_full_redraw(&mut self) {
         self.blit_encoder = render_ansi::BlitEncoder::new();
+    }
+}
+
+fn client_render_plan(
+    supervisor_model: Option<&supervisor::ClientSupervisorModel>,
+    requested_encoding: RenderEncoding,
+    host_size: (u16, u16),
+) -> ClientRenderPlan {
+    let use_client_compositor = supervisor_model.is_some();
+    if use_client_compositor {
+        let compositor = compositor::ClientCompositor::default();
+        return ClientRenderPlan {
+            surface_mode: ClientSurfaceMode::EmbeddedContent,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            server_size: compositor.content_size(host_size.0, host_size.1),
+            use_client_compositor,
+        };
+    }
+
+    ClientRenderPlan {
+        surface_mode: ClientSurfaceMode::FullApp,
+        requested_encoding,
+        server_size: host_size,
+        use_client_compositor: false,
     }
 }
 
@@ -420,21 +715,23 @@ fn do_handshake(
     cell_width_px: u32,
     cell_height_px: u32,
     requested_encoding: RenderEncoding,
+    surface_mode: ClientSurfaceMode,
+    keybindings: ClientKeybindings,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
     // Send Hello.
-    let hello = ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
+    let hello = build_hello_message(
         cols,
         rows,
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        keybindings: requested_keybindings(),
-    };
+        surface_mode,
+        keybindings,
+    );
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
@@ -465,6 +762,27 @@ fn do_handshake(
     }
 }
 
+fn build_hello_message(
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    surface_mode: ClientSurfaceMode,
+    keybindings: ClientKeybindings,
+) -> ClientMessage {
+    ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        surface_mode,
+        keybindings,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client event loop
 // ---------------------------------------------------------------------------
@@ -476,11 +794,33 @@ enum ClientLoopEvent {
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received.
-    ServerMessage(ServerMessage),
+    ServerMessage {
+        server_id: supervisor::ServerId,
+        message: ServerMessage,
+    },
+    /// A subscribed sidebar-summary event arrived from one managed server.
+    SupervisorSummaryChanged(supervisor::ServerId),
     /// Server reader thread exited (connection lost).
-    ServerDisconnected,
+    ServerDisconnected(supervisor::ServerId),
     /// Timer tick.
     Timer,
+}
+
+struct ClientLoopOptions {
+    host_size: (u16, u16),
+    reported_size: (u16, u16),
+    cell_size_px: (u32, u32),
+    sound_config: crate::config::SoundConfig,
+    mouse_scroll_lines: usize,
+    redraw_on_focus_gained: bool,
+    kitty_graphics_enabled: bool,
+    mouse_capture_active: bool,
+    negotiated_encoding: RenderEncoding,
+    attach_escape: Option<AttachEscapeState>,
+    compositor: Option<compositor::ClientCompositor>,
+    supervisor_model: Option<supervisor::ClientSupervisorModel>,
+    secondary_streams: Vec<(supervisor::ServerId, UnixStream)>,
+    ssh_bridges: HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
 }
 
 /// Runs the thin client: connects to the server, performs the handshake,
@@ -526,6 +866,37 @@ fn run_client_with_mode(
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
+    // Get the terminal geometry before handshake (before raw mode).
+    let (cols, rows, cell_width_px, cell_height_px) =
+        current_terminal_geometry(kitty_graphics_enabled);
+
+    let mut supervisor_model = if direct_attach_requested {
+        None
+    } else {
+        let mut api = crate::api::client::ApiClient::local();
+        match bootstrap_supervisor_for_client(false, &mut api) {
+            Ok(Some(mut model)) => {
+                model.refresh_local_secondary_summaries_from_api();
+                Some(model)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                warn!(err = %err, "failed to bootstrap client supervisor from main API");
+                None
+            }
+        }
+    };
+    if let Some(model) = &supervisor_model {
+        debug!(
+            secondary_servers = model.secondary_connection_plans().len(),
+            workspace_rows = model.workspace_rows().len(),
+            "client supervisor bootstrapped"
+        );
+    }
+
+    let render_plan =
+        client_render_plan(supervisor_model.as_ref(), requested_encoding, (cols, rows));
+
     // Try to connect to the server.
     let mut stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
@@ -537,24 +908,40 @@ fn run_client_with_mode(
         }
     };
 
-    // Get the terminal geometry before handshake (before raw mode).
-    let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
-
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
         &mut stream,
-        cols,
-        rows,
+        render_plan.server_size.0,
+        render_plan.server_size.1,
         cell_width_px,
         cell_height_px,
-        requested_encoding,
+        render_plan.requested_encoding,
+        render_plan.surface_mode,
+        requested_keybindings(),
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
             eprintln!("herdr: {err}");
             std::process::exit(1);
         }
+    };
+
+    let mut ssh_bridges = HashMap::new();
+    let secondary_streams = if render_plan.use_client_compositor {
+        supervisor_model
+            .as_mut()
+            .map(|model| {
+                connect_secondary_client_streams(
+                    model,
+                    render_plan.server_size,
+                    cell_width_px,
+                    cell_height_px,
+                    &mut ssh_bridges,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
     };
 
     if let Some((terminal_id, takeover)) = attach_request {
@@ -604,18 +991,28 @@ fn run_client_with_mode(
     });
 
     let result = rt.block_on(async {
+        let client_compositor = render_plan
+            .use_client_compositor
+            .then(compositor::ClientCompositor::default);
         run_client_loop(
             stream,
-            cols,
-            rows,
             should_quit,
-            sound_config,
-            mouse_scroll_lines,
-            redraw_on_focus_gained,
-            kitty_graphics_enabled,
-            false,
-            negotiated_encoding,
-            attach_escape,
+            ClientLoopOptions {
+                host_size: (cols, rows),
+                reported_size: render_plan.server_size,
+                cell_size_px: (cell_width_px, cell_height_px),
+                sound_config,
+                mouse_scroll_lines,
+                redraw_on_focus_gained,
+                kitty_graphics_enabled,
+                mouse_capture_active: false,
+                negotiated_encoding,
+                attach_escape,
+                compositor: client_compositor,
+                supervisor_model: supervisor_model.take(),
+                secondary_streams,
+                ssh_bridges,
+            },
         )
         .await
     });
@@ -645,6 +1042,728 @@ fn run_client_with_mode(
     Ok(())
 }
 
+fn bootstrap_supervisor_for_client(
+    direct_attach_requested: bool,
+    api: &mut impl supervisor::SupervisorApi,
+) -> Result<Option<supervisor::ClientSupervisorModel>, String> {
+    if direct_attach_requested {
+        return Ok(None);
+    }
+
+    supervisor::bootstrap_from_main_api(api, main_display_name_for_client()).map(Some)
+}
+
+fn main_display_name_for_client() -> String {
+    std::env::var(crate::remote::MAIN_DISPLAY_NAME_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+fn api_target_for_supervisor_server(
+    model: &supervisor::ClientSupervisorModel,
+    server_id: &supervisor::ServerId,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Option<crate::api::client::ConnectionTarget> {
+    let target = model.server_connection_target(server_id)?;
+    api_target_for_supervisor_target(server_id, &target, ssh_bridges)
+}
+
+fn api_target_for_supervisor_target(
+    server_id: &supervisor::ServerId,
+    target: &supervisor::ServerConnectionTarget,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Option<crate::api::client::ConnectionTarget> {
+    match target {
+        supervisor::ServerConnectionTarget::Ssh(_) => ssh_bridges.get(server_id).map(|bridge| {
+            crate::api::client::ConnectionTarget::SocketPath(bridge.api_socket_path().to_path_buf())
+        }),
+        _ => api_target_for_connection_target(target),
+    }
+}
+
+fn api_target_for_connection_target(
+    target: &supervisor::ServerConnectionTarget,
+) -> Option<crate::api::client::ConnectionTarget> {
+    match target {
+        supervisor::ServerConnectionTarget::Main => {
+            Some(crate::api::client::ConnectionTarget::LocalSession(None))
+        }
+        supervisor::ServerConnectionTarget::LocalSession(session) => Some(
+            crate::api::client::ConnectionTarget::LocalSession(session.clone()),
+        ),
+        supervisor::ServerConnectionTarget::Ssh(_) => None,
+    }
+}
+
+fn client_socket_path_for_connection_target(
+    target: &supervisor::ServerConnectionTarget,
+) -> Option<std::path::PathBuf> {
+    match target {
+        supervisor::ServerConnectionTarget::Main => Some(client_socket_path()),
+        supervisor::ServerConnectionTarget::LocalSession(session) => {
+            Some(crate::session::client_socket_path_for(session.as_deref()))
+        }
+        supervisor::ServerConnectionTarget::Ssh(_) => None,
+    }
+}
+
+#[cfg(test)]
+fn client_socket_path_for_supervisor_server(
+    model: &supervisor::ClientSupervisorModel,
+    server_id: &supervisor::ServerId,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Option<std::path::PathBuf> {
+    let target = model.server_connection_target(server_id)?;
+    match target {
+        supervisor::ServerConnectionTarget::Ssh(_) => ssh_bridges
+            .get(server_id)
+            .map(|bridge| bridge.client_socket_path().to_path_buf()),
+        _ => client_socket_path_for_connection_target(&target),
+    }
+}
+
+fn connect_secondary_client_streams(
+    model: &mut supervisor::ClientSupervisorModel,
+    server_size: (u16, u16),
+    cell_width_px: u32,
+    cell_height_px: u32,
+    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Vec<(supervisor::ServerId, UnixStream)> {
+    let mut streams = Vec::new();
+    for plan in model.secondary_connection_plans() {
+        match connect_secondary_client_stream_for_plan(
+            &plan,
+            server_size,
+            cell_width_px,
+            cell_height_px,
+            ssh_bridges,
+        ) {
+            Ok(stream) => {
+                let _ = model
+                    .set_connection_state(&plan.server_id, supervisor::ConnectionState::Connected);
+                streams.push((plan.server_id, stream));
+            }
+            Err(err) => {
+                let state = connection_state_from_client_error(&err);
+                let _ = model.set_connection_state(&plan.server_id, state);
+                ssh_bridges.remove(&plan.server_id);
+                warn!(
+                    server_id = ?plan.server_id,
+                    err = %err,
+                    "failed to connect secondary client stream"
+                );
+            }
+        }
+    }
+    streams
+}
+
+fn connect_secondary_client_stream_for_plan(
+    plan: &supervisor::SecondaryConnectionPlan,
+    server_size: (u16, u16),
+    cell_width_px: u32,
+    cell_height_px: u32,
+    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Result<UnixStream, ClientError> {
+    let socket_path = match &plan.target {
+        supervisor::ServerConnectionTarget::Ssh(target) => {
+            if !ssh_bridges.contains_key(&plan.server_id) {
+                let bridge = crate::remote::start_ssh_remote_bridge(target, None)
+                    .map_err(ClientError::ConnectionFailed)?;
+                ssh_bridges.insert(plan.server_id.clone(), bridge);
+            }
+            ssh_bridges
+                .get(&plan.server_id)
+                .map(|bridge| bridge.client_socket_path().to_path_buf())
+                .ok_or_else(|| {
+                    ClientError::ConnectionFailed(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "missing ssh bridge for secondary server",
+                    ))
+                })?
+        }
+        _ => client_socket_path_for_connection_target(&plan.target).ok_or_else(|| {
+            ClientError::ConnectionFailed(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secondary server has no client socket target",
+            ))
+        })?,
+    };
+
+    connect_secondary_client_stream(
+        &socket_path,
+        server_size,
+        cell_width_px,
+        cell_height_px,
+        plan.keybindings,
+    )
+}
+
+fn connect_secondary_client_stream(
+    socket_path: &std::path::Path,
+    server_size: (u16, u16),
+    cell_width_px: u32,
+    cell_height_px: u32,
+    keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
+) -> Result<UnixStream, ClientError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(ClientError::ConnectionFailed)?;
+    do_handshake(
+        &mut stream,
+        server_size.0,
+        server_size.1,
+        cell_width_px,
+        cell_height_px,
+        RenderEncoding::SemanticFrame,
+        ClientSurfaceMode::EmbeddedContent,
+        client_keybindings_from_snapshot(keybindings),
+    )?;
+    Ok(stream)
+}
+
+fn attach_secondary_client_stream(
+    server_id: supervisor::ServerId,
+    stream: UnixStream,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+) -> Result<(), ClientError> {
+    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+    let read_tx = event_tx.clone();
+    let read_quit = should_quit.clone();
+    let reader_server_id = server_id.clone();
+    std::thread::spawn(move || {
+        server_reader_thread(
+            reader_server_id,
+            read_stream,
+            read_tx,
+            &read_quit,
+            MAX_FRAME_SIZE,
+        );
+    });
+    stream
+        .set_nonblocking(false)
+        .map_err(ClientError::ConnectionFailed)?;
+    server_writes.insert(server_id, stream);
+    Ok(())
+}
+
+fn connection_state_from_client_error(err: &ClientError) -> supervisor::ConnectionState {
+    match err {
+        ClientError::HandshakeRejected { version, .. } => {
+            supervisor::ConnectionState::ProtocolMismatch {
+                server_protocol: Some(*version),
+                client_protocol: PROTOCOL_VERSION,
+            }
+        }
+        _ => supervisor::ConnectionState::Disconnected,
+    }
+}
+
+fn client_keybindings_from_snapshot(
+    keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
+) -> ClientKeybindings {
+    match keybindings {
+        crate::remote_registry::RemoteKeybindingsSnapshot::Server => ClientKeybindings::Server,
+        crate::remote_registry::RemoteKeybindingsSnapshot::Local => crate::config::Config::load()
+            .config
+            .local_keybindings_profile_toml()
+            .map(|keys_toml| ClientKeybindings::Local { keys_toml })
+            .unwrap_or(ClientKeybindings::Server),
+    }
+}
+
+fn send_client_supervisor_request(
+    model: &supervisor::ClientSupervisorModel,
+    server_id: &supervisor::ServerId,
+    request: crate::api::schema::Request,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Result<(), String> {
+    let target = api_target_for_supervisor_server(model, server_id, ssh_bridges)
+        .ok_or_else(|| format!("no API target for server {server_id:?}"))?;
+    let api = crate::api::client::ApiClient::for_target(target);
+    let value = api
+        .request_value_with_timeout(&request, Duration::from_millis(500))
+        .map_err(|err| err.to_string())?;
+    crate::api::client::parse_response_value(value)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn submit_remote_add_to_main_api(
+    api: &mut impl supervisor::SupervisorApi,
+    draft: supervisor::AddRemoteDraft,
+) -> Result<crate::remote_registry::RemoteDefinitionSnapshot, String> {
+    let response = api
+        .request(crate::api::schema::Request {
+            id: "client:remote-add".into(),
+            method: crate::api::schema::Method::RemoteAdd(crate::api::schema::RemoteAddParams {
+                name: draft.name,
+                target: draft.target,
+                keybindings: draft.keybindings,
+            }),
+        })
+        .map_err(|err| add_remote_error_message(&err))?;
+    match response.result {
+        crate::api::schema::ResponseResult::RemoteAdded { remote } => Ok(remote),
+        other => Err(format!("remote.add returned unexpected result: {other:?}")),
+    }
+}
+
+fn add_remote_error_message(error: &str) -> String {
+    match error {
+        "remote target already exists" => "remote already added".to_string(),
+        "remote name already exists" => "name already used".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn summary_refresh_subscription_request(id: impl Into<String>) -> crate::api::schema::Request {
+    use crate::api::schema::Subscription;
+
+    crate::api::schema::Request {
+        id: id.into(),
+        method: crate::api::schema::Method::EventsSubscribe(
+            crate::api::schema::EventsSubscribeParams {
+                subscriptions: vec![
+                    Subscription::WorkspaceCreated {},
+                    Subscription::WorkspaceUpdated {},
+                    Subscription::WorkspaceRenamed {},
+                    Subscription::WorkspaceClosed {},
+                    Subscription::WorkspaceFocused {},
+                    Subscription::TabCreated {},
+                    Subscription::TabClosed {},
+                    Subscription::TabFocused {},
+                    Subscription::TabRenamed {},
+                    Subscription::PaneCreated {},
+                    Subscription::PaneClosed {},
+                    Subscription::PaneFocused {},
+                    Subscription::PaneExited {},
+                    Subscription::PaneAgentDetected {},
+                    Subscription::PaneAgentStatusChanged {
+                        pane_id: None,
+                        agent_status: None,
+                    },
+                ],
+            },
+        ),
+    }
+}
+
+fn start_missing_supervisor_summary_subscriptions(
+    model: &supervisor::ClientSupervisorModel,
+    subscribed_server_ids: &mut HashSet<supervisor::ServerId>,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+) {
+    for plan in model.summary_subscription_plans() {
+        let Some(target) =
+            api_target_for_supervisor_target(&plan.server_id, &plan.target, ssh_bridges)
+        else {
+            continue;
+        };
+        if !subscribed_server_ids.insert(plan.server_id.clone()) {
+            continue;
+        }
+        spawn_supervisor_summary_subscription(plan.server_id, target, event_tx, should_quit);
+    }
+}
+
+fn spawn_supervisor_summary_subscription(
+    server_id: supervisor::ServerId,
+    target: crate::api::client::ConnectionTarget,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+) {
+    let event_tx = event_tx.clone();
+    let should_quit = should_quit.clone();
+    std::thread::spawn(move || {
+        let client = crate::api::client::ApiClient::for_target(target);
+        let request = summary_refresh_subscription_request(format!("client:summary:{server_id:?}"));
+        let (ack, mut stream) =
+            match client.subscribe_value(&request, Some(Duration::from_millis(500))) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        server_id = ?server_id,
+                        err = %err,
+                        "failed to subscribe to supervisor summary events"
+                    );
+                    return;
+                }
+            };
+        if let Err(err) = crate::api::client::parse_response_value(ack) {
+            warn!(
+                server_id = ?server_id,
+                err = %err,
+                "supervisor summary subscription was rejected"
+            );
+            return;
+        }
+
+        while !should_quit.load(Ordering::Acquire) {
+            match stream.next_value() {
+                Ok(Some(_event)) => {
+                    if event_tx
+                        .blocking_send(ClientLoopEvent::SupervisorSummaryChanged(server_id.clone()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(err) if api_client_error_is_timeout(&err) => continue,
+                Err(err) => {
+                    warn!(
+                        server_id = ?server_id,
+                        err = %err,
+                        "supervisor summary subscription ended"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn api_client_error_is_timeout(err: &crate::api::client::ApiClientError) -> bool {
+    matches!(
+        err,
+        crate::api::client::ApiClientError::Io(io_err)
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+    )
+}
+
+fn handle_client_add_remote_submission(
+    draft: supervisor::AddRemoteDraft,
+    model: &mut supervisor::ClientSupervisorModel,
+    server_size: (u16, u16),
+    cell_size_px: (u32, u32),
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) -> Result<(), String> {
+    let target = crate::remote_registry::RemoteTargetSnapshot::parse(&draft.target)
+        .map_err(|err| err.message().to_string())?;
+    reject_duplicate_main_target(&target)?;
+
+    let keybindings = draft.keybindings;
+    let (pending_stream, pending_bridge) = match &target {
+        crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
+            validate_add_remote_target(
+                crate::api::client::ConnectionTarget::LocalSession(session.clone()),
+                |connection_target| {
+                    let mut api = crate::api::client::ApiClient::for_target(connection_target);
+                    supervisor::request_runtime_status(&mut api)
+                },
+            )?;
+            let socket_path = crate::session::client_socket_path_for(session.as_deref());
+            let stream = connect_secondary_client_stream(
+                &socket_path,
+                server_size,
+                cell_size_px.0,
+                cell_size_px.1,
+                keybindings,
+            )
+            .map_err(|err| err.to_string())?;
+            (Some(stream), None)
+        }
+        crate::remote_registry::RemoteTargetSnapshot::Ssh { target } => {
+            let bridge = crate::remote::start_ssh_remote_bridge(target, None)
+                .map_err(|err| format!("failed to start ssh remote bridge: {err}"))?;
+            validate_add_remote_target(
+                crate::api::client::ConnectionTarget::SocketPath(
+                    bridge.api_socket_path().to_path_buf(),
+                ),
+                |connection_target| {
+                    let mut api = crate::api::client::ApiClient::for_target(connection_target);
+                    supervisor::request_runtime_status(&mut api)
+                },
+            )?;
+            let stream = connect_secondary_client_stream(
+                bridge.client_socket_path(),
+                server_size,
+                cell_size_px.0,
+                cell_size_px.1,
+                keybindings,
+            )
+            .map_err(|err| err.to_string())?;
+            (Some(stream), Some(bridge))
+        }
+    };
+
+    let mut main_api = crate::api::client::ApiClient::local();
+    let remote = submit_remote_add_to_main_api(&mut main_api, draft)?;
+    let server_id = model.add_secondary(remote);
+
+    if let Some(bridge) = pending_bridge {
+        ssh_bridges.insert(server_id.clone(), bridge);
+    }
+
+    if let Some(stream) = pending_stream {
+        attach_secondary_client_stream(
+            server_id.clone(),
+            stream,
+            event_tx,
+            should_quit,
+            server_writes,
+        )
+        .map_err(|err| err.to_string())?;
+        let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Connected);
+    }
+
+    model.finish_add_remote();
+    Ok(())
+}
+
+fn reject_duplicate_main_target(
+    target: &crate::remote_registry::RemoteTargetSnapshot,
+) -> Result<(), String> {
+    let Some(main_target) = main_server_target_snapshot() else {
+        return Ok(());
+    };
+    if main_target.canonical_key() == target.canonical_key() {
+        return Err("remote already added".to_string());
+    }
+    Ok(())
+}
+
+fn main_server_target_snapshot() -> Option<crate::remote_registry::RemoteTargetSnapshot> {
+    if let Ok(target) = std::env::var(crate::remote::MAIN_REMOTE_TARGET_ENV_VAR) {
+        return crate::remote_registry::RemoteTargetSnapshot::parse(&target).ok();
+    }
+
+    Some(crate::remote_registry::RemoteTargetSnapshot::Local {
+        session: crate::session::active_name(),
+    })
+}
+
+fn validate_add_remote_target(
+    target: crate::api::client::ConnectionTarget,
+    mut status_for_target: impl FnMut(
+        crate::api::client::ConnectionTarget,
+    ) -> Result<crate::api::RuntimeStatus, String>,
+) -> Result<(), String> {
+    let status = status_for_target(target)?;
+    if status.protocol != Some(PROTOCOL_VERSION) {
+        return Err(format!(
+            "protocol mismatch: server protocol {:?}, client protocol {}",
+            status.protocol, PROTOCOL_VERSION
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_client_supervisor_summaries(
+    model: &mut supervisor::ClientSupervisorModel,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+) {
+    let mut api = crate::api::client::ApiClient::local();
+    if let Err(err) = model.refresh_main_summary_from_api(&mut api) {
+        warn!(err = %err, "failed to refresh main server summary");
+    }
+    model.refresh_secondary_summaries(|plan| {
+        let Some(target) =
+            api_target_for_supervisor_target(&plan.server_id, &plan.target, ssh_bridges)
+        else {
+            return Err(supervisor::ConnectionState::Connecting);
+        };
+        supervisor::fetch_server_summary_from_api_target(target)
+    });
+}
+
+fn supervisor_summary_refresh_due(now: Instant, last_refresh: Instant) -> bool {
+    now.duration_since(last_refresh) >= CLIENT_SUPERVISOR_REFRESH_INTERVAL
+}
+
+fn secondary_retry_delay(attempt: usize) -> Duration {
+    match attempt {
+        0 => Duration::from_secs(1),
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(5),
+        _ => Duration::from_secs(15),
+    }
+}
+
+fn schedule_secondary_retry(
+    state: &mut ClientState,
+    server_id: supervisor::ServerId,
+    attempt: usize,
+    now: Instant,
+) {
+    state.secondary_retries.insert(
+        server_id,
+        SecondaryRetryState {
+            attempt,
+            next_retry_at: now + secondary_retry_delay(attempt),
+        },
+    );
+}
+
+fn schedule_disconnected_secondary_retries(state: &mut ClientState, now: Instant) {
+    let Some(model) = &state.supervisor_model else {
+        return;
+    };
+    for server_id in model.disconnected_secondary_server_ids() {
+        state
+            .secondary_retries
+            .entry(server_id.clone())
+            .or_insert_with(|| SecondaryRetryState {
+                attempt: 0,
+                next_retry_at: now + secondary_retry_delay(0),
+            });
+    }
+}
+
+fn retry_due_secondary_connections(
+    state: &mut ClientState,
+    now: Instant,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+) {
+    let due: Vec<(supervisor::ServerId, usize)> = state
+        .secondary_retries
+        .iter()
+        .filter(|(_, retry)| retry.next_retry_at <= now)
+        .map(|(server_id, retry)| (server_id.clone(), retry.attempt))
+        .collect();
+
+    for (server_id, attempt) in due {
+        if server_writes.contains_key(&server_id) {
+            state.secondary_retries.remove(&server_id);
+            continue;
+        }
+
+        let plan = state.supervisor_model.as_ref().and_then(|model| {
+            model
+                .secondary_connection_plans()
+                .into_iter()
+                .find(|plan| plan.server_id == server_id)
+        });
+        let Some(plan) = plan else {
+            state.secondary_retries.remove(&server_id);
+            continue;
+        };
+
+        match connect_secondary_client_stream_for_plan(
+            &plan,
+            state.reported_size,
+            state.cell_size_px.0,
+            state.cell_size_px.1,
+            &mut state.ssh_bridges,
+        ) {
+            Ok(stream) => {
+                if let Err(err) = attach_secondary_client_stream(
+                    server_id.clone(),
+                    stream,
+                    event_tx,
+                    should_quit,
+                    server_writes,
+                ) {
+                    let next_attempt = attempt.saturating_add(1);
+                    schedule_secondary_retry(state, server_id.clone(), next_attempt, now);
+                    if let Some(model) = &mut state.supervisor_model {
+                        let _ = model.set_connection_state(
+                            &server_id,
+                            connection_state_from_client_error(&err),
+                        );
+                    }
+                    warn!(
+                        server_id = ?server_id,
+                        err = %err,
+                        "failed to attach retried secondary client stream"
+                    );
+                    state.request_full_redraw();
+                    continue;
+                }
+
+                state.secondary_retries.remove(&server_id);
+                if let Some(model) = &mut state.supervisor_model {
+                    let _ = model
+                        .set_connection_state(&server_id, supervisor::ConnectionState::Connected);
+                    refresh_client_supervisor_summaries(model, &state.ssh_bridges);
+                    start_missing_supervisor_summary_subscriptions(
+                        model,
+                        &mut state.summary_subscription_server_ids,
+                        &state.ssh_bridges,
+                        event_tx,
+                        should_quit,
+                    );
+                    state.last_supervisor_summary_refresh = now;
+                }
+                state.request_full_redraw();
+            }
+            Err(err) => {
+                let connection_state = connection_state_from_client_error(&err);
+                if matches!(
+                    connection_state,
+                    supervisor::ConnectionState::ProtocolMismatch { .. }
+                ) {
+                    state.secondary_retries.remove(&server_id);
+                } else {
+                    let next_attempt = attempt.saturating_add(1);
+                    schedule_secondary_retry(state, server_id.clone(), next_attempt, now);
+                }
+                state.ssh_bridges.remove(&server_id);
+                if let Some(model) = &mut state.supervisor_model {
+                    let _ = model.set_connection_state(&server_id, connection_state);
+                }
+                warn!(
+                    server_id = ?server_id,
+                    err = %err,
+                    "failed to retry secondary client connection"
+                );
+                state.request_full_redraw();
+            }
+        }
+    }
+}
+
+fn select_composited_render_frame<'a>(
+    frames: &'a HashMap<supervisor::ServerId, protocol::FrameData>,
+    active_server_id: &supervisor::ServerId,
+    incoming_server_id: &supervisor::ServerId,
+) -> Option<&'a protocol::FrameData> {
+    frames
+        .get(active_server_id)
+        .or_else(|| frames.get(incoming_server_id))
+}
+
+fn render_cached_composited_frame(state: &mut ClientState) {
+    let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) else {
+        return;
+    };
+
+    let active_server_id = model.active_server_id().clone();
+    let Some(active_frame) = state
+        .frame_cache
+        .get(&active_server_id)
+        .or_else(|| state.frame_cache.values().next())
+        .cloned()
+    else {
+        return;
+    };
+
+    let frame_data =
+        compositor.compose_frame(model, &active_frame, state.host_size.0, state.host_size.1);
+    let encoded = state.blit_encoder.encode(&frame_data, false);
+    let graphics = if state.kitty_graphics_enabled {
+        frame_data.graphics.as_slice()
+    } else {
+        &[]
+    };
+    let mut stdout = io::stdout();
+    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+    let _ = stdout.flush();
+    state.blit_encoder.commit(frame_data, encoded);
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -654,27 +1773,45 @@ fn run_client_with_mode(
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
     stream: UnixStream,
-    cols: u16,
-    rows: u16,
     should_quit: Arc<AtomicBool>,
-    sound_config: crate::config::SoundConfig,
-    mouse_scroll_lines: usize,
-    redraw_on_focus_gained: bool,
-    kitty_graphics_enabled: bool,
-    mouse_capture_active: bool,
-    negotiated_encoding: RenderEncoding,
-    attach_escape: Option<AttachEscapeState>,
+    options: ClientLoopOptions,
 ) -> Result<(), ClientError> {
+    let ClientLoopOptions {
+        host_size,
+        reported_size,
+        cell_size_px,
+        sound_config,
+        mouse_scroll_lines,
+        redraw_on_focus_gained,
+        kitty_graphics_enabled,
+        mouse_capture_active,
+        negotiated_encoding,
+        attach_escape,
+        compositor,
+        supervisor_model,
+        secondary_streams,
+        ssh_bridges,
+    } = options;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active,
-        reported_size: (cols, rows),
+        reported_size,
+        host_size,
+        cell_size_px,
         sound_config,
         kitty_graphics_enabled,
         attach_escape,
         mouse_scroll_lines,
         redraw_on_focus_gained,
+        compositor,
+        supervisor_model,
+        last_supervisor_summary_refresh: Instant::now(),
+        frame_cache: HashMap::new(),
+        summary_subscription_server_ids: HashSet::new(),
+        ssh_bridges,
+        secondary_retries: HashMap::new(),
     };
+    schedule_disconnected_secondary_retries(&mut state, Instant::now());
     debug!(?negotiated_encoding, "client render encoding active");
 
     // Channel for events from the stdin, resize, and server reader threads.
@@ -695,13 +1832,20 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
+        resize_poll_loop(
+            resize_tx,
+            host_size.0,
+            host_size.1,
+            kitty_graphics_enabled,
+            &resize_quit,
+        );
     });
 
     // Spawn the server reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
     let server_read_quit = should_quit.clone();
     let server_read_tx = event_tx.clone();
+    let main_server_id = supervisor::ServerId::main();
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     std::thread::spawn(move || {
         let max_frame_size = if kitty_graphics_enabled {
@@ -710,6 +1854,7 @@ async fn run_client_loop(
             MAX_FRAME_SIZE
         };
         server_reader_thread(
+            main_server_id,
             read_stream,
             server_read_tx,
             &server_read_quit,
@@ -719,10 +1864,41 @@ async fn run_client_loop(
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
-    let mut write_stream = stream;
-    write_stream
+    let mut server_writes = HashMap::new();
+    stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
+    server_writes.insert(supervisor::ServerId::main(), stream);
+
+    for (server_id, stream) in secondary_streams {
+        let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+        let secondary_read_tx = event_tx.clone();
+        let secondary_read_quit = should_quit.clone();
+        let reader_server_id = server_id.clone();
+        std::thread::spawn(move || {
+            server_reader_thread(
+                reader_server_id,
+                read_stream,
+                secondary_read_tx,
+                &secondary_read_quit,
+                MAX_FRAME_SIZE,
+            );
+        });
+        stream
+            .set_nonblocking(false)
+            .map_err(ClientError::ConnectionFailed)?;
+        server_writes.insert(server_id, stream);
+    }
+
+    if let Some(model) = &state.supervisor_model {
+        start_missing_supervisor_summary_subscriptions(
+            model,
+            &mut state.summary_subscription_server_ids,
+            &state.ssh_bridges,
+            &event_tx,
+            &should_quit,
+        );
+    }
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
@@ -756,13 +1932,21 @@ async fn run_client_loop(
                                 row,
                                 modifiers,
                             };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                            if let Err(e) = write_to_server_id(
+                                &mut server_writes,
+                                &supervisor::ServerId::main(),
+                                &msg,
+                            ) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                            let _ = write_to_server_id(
+                                &mut server_writes,
+                                &supervisor::ServerId::main(),
+                                &ClientMessage::Detach,
+                            );
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
@@ -775,7 +1959,88 @@ async fn run_client_loop(
                     ) {
                         state.request_full_redraw();
                     }
-                    data
+                    if let (Some(compositor), Some(model)) =
+                        (&state.compositor, &mut state.supervisor_model)
+                    {
+                        match dispatch_composited_input(data, compositor, model, state.host_size) {
+                            ClientInputDispatch::Forward(data) => data,
+                            ClientInputDispatch::ApiRequest { server_id, request } => {
+                                match send_client_supervisor_request(
+                                    model,
+                                    &server_id,
+                                    *request,
+                                    &state.ssh_bridges,
+                                ) {
+                                    Ok(()) => {
+                                        refresh_client_supervisor_summaries(
+                                            model,
+                                            &state.ssh_bridges,
+                                        );
+                                        start_missing_supervisor_summary_subscriptions(
+                                            model,
+                                            &mut state.summary_subscription_server_ids,
+                                            &state.ssh_bridges,
+                                            &event_tx,
+                                            &should_quit,
+                                        );
+                                        state.last_supervisor_summary_refresh = Instant::now();
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            server_id = ?server_id,
+                                            err = %err,
+                                            "failed to route client sidebar request"
+                                        );
+                                    }
+                                }
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::AddRemote(draft) => {
+                                match handle_client_add_remote_submission(
+                                    draft,
+                                    model,
+                                    state.reported_size,
+                                    state.cell_size_px,
+                                    &event_tx,
+                                    &should_quit,
+                                    &mut server_writes,
+                                    &mut state.ssh_bridges,
+                                ) {
+                                    Ok(()) => {
+                                        refresh_client_supervisor_summaries(
+                                            model,
+                                            &state.ssh_bridges,
+                                        );
+                                        start_missing_supervisor_summary_subscriptions(
+                                            model,
+                                            &mut state.summary_subscription_server_ids,
+                                            &state.ssh_bridges,
+                                            &event_tx,
+                                            &should_quit,
+                                        );
+                                        state.last_supervisor_summary_refresh = Instant::now();
+                                    }
+                                    Err(err) => {
+                                        warn!(err = %err, "failed to add client remote");
+                                        model.set_add_remote_error(err);
+                                    }
+                                }
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::Redraw => {
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::Consumed => continue,
+                        }
+                    } else {
+                        data
+                    }
                 };
                 if should_bridge_clipboard_image_paste(&data) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
@@ -796,7 +2061,7 @@ async fn run_client_loop(
                             extension: image.extension.to_owned(),
                             data: image.bytes,
                         };
-                        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        if let Err(e) = write_to_active_server(&mut server_writes, &state, &msg) {
                             return Err(ClientError::ConnectionLost(e));
                         }
                         continue;
@@ -806,24 +2071,49 @@ async fn run_client_loop(
                     );
                 }
                 let msg = ClientMessage::Input { data };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = write_to_active_server(&mut server_writes, &state, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
-                state.reported_size = (new_cols, new_rows);
+                state.host_size = (new_cols, new_rows);
+                state.cell_size_px = (cell_width_px, cell_height_px);
+                state.reported_size = state
+                    .compositor
+                    .as_ref()
+                    .map(|compositor| compositor.content_size(new_cols, new_rows))
+                    .unwrap_or((new_cols, new_rows));
                 let msg = ClientMessage::Resize {
-                    cols: new_cols,
-                    rows: new_rows,
+                    cols: state.reported_size.0,
+                    rows: state.reported_size.1,
                     cell_width_px,
                     cell_height_px,
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = write_to_active_server(&mut server_writes, &state, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
+            ClientLoopEvent::ServerMessage { server_id, message } => match message {
+                ServerMessage::Frame(mut frame_data) => {
+                    if let (Some(compositor), Some(model)) =
+                        (&state.compositor, &state.supervisor_model)
+                    {
+                        state.frame_cache.insert(server_id.clone(), frame_data);
+                        let active_server_id = model.active_server_id().clone();
+                        let Some(active_frame) = select_composited_render_frame(
+                            &state.frame_cache,
+                            &active_server_id,
+                            &server_id,
+                        ) else {
+                            continue;
+                        };
+                        frame_data = compositor.compose_frame(
+                            model,
+                            active_frame,
+                            state.host_size.0,
+                            state.host_size.1,
+                        );
+                    }
                     let encoded = state.blit_encoder.encode(&frame_data, false);
                     let mut stdout = io::stdout();
                     let graphics = if state.kitty_graphics_enabled {
@@ -837,6 +2127,9 @@ async fn run_client_loop(
                     state.blit_encoder.commit(frame_data, encoded);
                 }
                 ServerMessage::Terminal(frame) => {
+                    if server_id != active_server_id(&state) {
+                        continue;
+                    }
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
                         record_received_kitty_graphics(&frame.bytes);
                     }
@@ -845,6 +2138,9 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
+                    if server_id != active_server_id(&state) {
+                        continue;
+                    }
                     if state.kitty_graphics_enabled {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
@@ -853,6 +2149,22 @@ async fn run_client_loop(
                     }
                 }
                 ServerMessage::ServerShutdown { reason } => {
+                    if server_id != supervisor::ServerId::main() {
+                        server_writes.remove(&server_id);
+                        state.frame_cache.remove(&server_id);
+                        state.summary_subscription_server_ids.remove(&server_id);
+                        state.ssh_bridges.remove(&server_id);
+                        if let Some(model) = &mut state.supervisor_model {
+                            let _ = model.set_connection_state(
+                                &server_id,
+                                supervisor::ConnectionState::Disconnected,
+                            );
+                            state.request_full_redraw();
+                        }
+                        schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
+                        render_cached_composited_frame(&mut state);
+                        continue;
+                    }
                     return Err(ClientError::ServerShutdown { reason });
                 }
                 ServerMessage::Notify { kind, message } => {
@@ -869,6 +2181,9 @@ async fn run_client_loop(
                     );
                 }
                 ServerMessage::MouseCapture { enabled } => {
+                    if server_id != active_server_id(&state) {
+                        continue;
+                    }
                     let desired = enabled;
                     if desired != state.mouse_capture_active {
                         set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
@@ -879,21 +2194,66 @@ async fn run_client_loop(
                     debug!("received unexpected Welcome in main loop");
                 }
             },
-            ClientLoopEvent::ServerDisconnected => {
-                return Err(ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                )));
+            ClientLoopEvent::SupervisorSummaryChanged(server_id) => {
+                debug!(
+                    server_id = ?server_id,
+                    "supervisor summary event requested refresh"
+                );
+                if let Some(model) = &mut state.supervisor_model {
+                    refresh_client_supervisor_summaries(model, &state.ssh_bridges);
+                    state.last_supervisor_summary_refresh = Instant::now();
+                    state.request_full_redraw();
+                }
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::ServerDisconnected(server_id) => {
+                if server_id == supervisor::ServerId::main() {
+                    return Err(ClientError::ConnectionLost(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "server closed connection",
+                    )));
+                }
+                server_writes.remove(&server_id);
+                state.frame_cache.remove(&server_id);
+                state.summary_subscription_server_ids.remove(&server_id);
+                state.ssh_bridges.remove(&server_id);
+                if let Some(model) = &mut state.supervisor_model {
+                    let _ = model.set_connection_state(
+                        &server_id,
+                        supervisor::ConnectionState::Disconnected,
+                    );
+                    state.request_full_redraw();
+                }
+                schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
+                render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
+                let now = Instant::now();
+                retry_due_secondary_connections(
+                    &mut state,
+                    now,
+                    &event_tx,
+                    &should_quit,
+                    &mut server_writes,
+                );
+                if supervisor_summary_refresh_due(now, state.last_supervisor_summary_refresh) {
+                    if let Some(model) = &mut state.supervisor_model {
+                        refresh_client_supervisor_summaries(model, &state.ssh_bridges);
+                        state.last_supervisor_summary_refresh = now;
+                        state.request_full_redraw();
+                    }
+                    render_cached_composited_frame(&mut state);
+                }
             }
         }
     }
 
     // Clean exit (Ctrl+C). Send Detach before closing.
     let detach = ClientMessage::Detach;
-    let _ = write_to_server(&mut write_stream, &detach);
+    for stream in server_writes.values_mut() {
+        let _ = write_to_server(stream, &detach);
+    }
     let _ = io::stdout().flush();
 
     Ok(())
@@ -906,6 +2266,7 @@ async fn run_client_loop(
 /// Blocking thread that reads ServerMessages from the server and sends them
 /// to the main event loop.
 fn server_reader_thread(
+    server_id: supervisor::ServerId,
     mut stream: UnixStream,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -916,7 +2277,7 @@ fn server_reader_thread(
     // blocking after handshake, but we enforce it here as a safety measure.
     if stream.set_nonblocking(false).is_err() {
         // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(server_id));
         return;
     }
 
@@ -928,7 +2289,10 @@ fn server_reader_thread(
         match protocol::read_message(&mut stream, max_frame_size) {
             Ok(msg) => {
                 if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(msg))
+                    .blocking_send(ClientLoopEvent::ServerMessage {
+                        server_id: server_id.clone(),
+                        message: msg,
+                    })
                     .is_err()
                 {
                     break; // Main loop gone.
@@ -936,7 +2300,7 @@ fn server_reader_thread(
             }
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(server_id));
                 break;
             }
             Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -947,7 +2311,7 @@ fn server_reader_thread(
             }
             Err(err) => {
                 warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(server_id));
                 break;
             }
         }
@@ -961,6 +2325,37 @@ fn server_reader_thread(
 /// Writes a message to the server stream (blocking).
 fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<()> {
     protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn active_server_id(state: &ClientState) -> supervisor::ServerId {
+    state
+        .supervisor_model
+        .as_ref()
+        .map(|model| model.active_server_id().clone())
+        .unwrap_or_else(supervisor::ServerId::main)
+}
+
+fn write_to_active_server(
+    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    state: &ClientState,
+    msg: &ClientMessage,
+) -> io::Result<()> {
+    let server_id = active_server_id(state);
+    write_to_server_id(server_writes, &server_id, msg)
+}
+
+fn write_to_server_id(
+    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    server_id: &supervisor::ServerId,
+    msg: &ClientMessage,
+) -> io::Result<()> {
+    let Some(stream) = server_writes.get_mut(server_id) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("server stream {server_id:?} is not connected"),
+        ));
+    };
+    write_to_server(stream, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,6 +3022,26 @@ mod tests {
     }
 
     #[test]
+    fn hello_message_uses_requested_surface_mode() {
+        let hello = build_hello_message(
+            80,
+            24,
+            0,
+            0,
+            RenderEncoding::SemanticFrame,
+            ClientSurfaceMode::EmbeddedContent,
+            ClientKeybindings::Server,
+        );
+
+        match hello {
+            ClientMessage::Hello { surface_mode, .. } => {
+                assert_eq!(surface_mode, ClientSurfaceMode::EmbeddedContent);
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sound_from_notify_message_maps_done() {
         assert_eq!(
             sound_from_notify_message("agent done"),
@@ -1668,6 +3083,674 @@ mod tests {
 
         assert!(!redraw_on_focus_gained);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[derive(Default)]
+    struct BootstrapApi {
+        requests: Vec<&'static str>,
+    }
+
+    impl supervisor::SupervisorApi for BootstrapApi {
+        fn request(
+            &mut self,
+            request: crate::api::schema::Request,
+        ) -> Result<crate::api::schema::SuccessResponse, String> {
+            let result = match request.method {
+                crate::api::schema::Method::RemoteList(_) => {
+                    self.requests.push("remote.list");
+                    crate::api::schema::ResponseResult::RemoteList {
+                        remotes: Vec::new(),
+                    }
+                }
+                crate::api::schema::Method::WorkspaceList(_) => {
+                    self.requests.push("workspace.list");
+                    crate::api::schema::ResponseResult::WorkspaceList {
+                        workspaces: Vec::new(),
+                    }
+                }
+                crate::api::schema::Method::AgentList(_) => {
+                    self.requests.push("agent.list");
+                    crate::api::schema::ResponseResult::AgentList { agents: Vec::new() }
+                }
+                other => return Err(format!("unexpected method: {other:?}")),
+            };
+
+            Ok(crate::api::schema::SuccessResponse {
+                id: request.id,
+                result,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RemoteAddApi {
+        captured: Option<crate::api::schema::RemoteAddParams>,
+    }
+
+    impl supervisor::SupervisorApi for RemoteAddApi {
+        fn request(
+            &mut self,
+            request: crate::api::schema::Request,
+        ) -> Result<crate::api::schema::SuccessResponse, String> {
+            match request.method {
+                crate::api::schema::Method::RemoteAdd(params) => {
+                    self.captured = Some(params);
+                    Ok(crate::api::schema::SuccessResponse {
+                        id: request.id,
+                        result: crate::api::schema::ResponseResult::RemoteAdded {
+                            remote: crate::remote_registry::RemoteDefinitionSnapshot {
+                                id: "remote-1".into(),
+                                name: "dev".into(),
+                                target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                                    session: Some("dev".into()),
+                                },
+                                session: None,
+                                keybindings:
+                                    crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                            },
+                        },
+                    })
+                }
+                other => Err(format!("unexpected method: {other:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn submit_remote_add_to_main_api_builds_remote_add_request() {
+        let mut api = RemoteAddApi::default();
+
+        let remote = submit_remote_add_to_main_api(
+            &mut api,
+            supervisor::AddRemoteDraft {
+                target: "local:dev".into(),
+                name: Some("dev".into()),
+                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(remote.id, "remote-1");
+        assert_eq!(
+            api.captured,
+            Some(crate::api::schema::RemoteAddParams {
+                name: Some("dev".into()),
+                target: "local:dev".into(),
+                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            })
+        );
+    }
+
+    #[test]
+    fn add_remote_error_message_maps_registry_duplicates_for_modal() {
+        assert_eq!(
+            add_remote_error_message("remote target already exists"),
+            "remote already added"
+        );
+        assert_eq!(
+            add_remote_error_message("remote name already exists"),
+            "name already used"
+        );
+        assert_eq!(
+            add_remote_error_message("connection refused"),
+            "connection refused"
+        );
+    }
+
+    #[test]
+    fn validate_add_remote_target_rejects_local_protocol_mismatch() {
+        let err = validate_add_remote_target(
+            crate::api::client::ConnectionTarget::LocalSession(Some("dev".into())),
+            |_| {
+                Ok(crate::api::RuntimeStatus {
+                    version: Some("0.6.0".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION - 1),
+                    capabilities: None,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("protocol mismatch"));
+        assert!(err.contains(&crate::protocol::PROTOCOL_VERSION.to_string()));
+    }
+
+    #[test]
+    fn validate_add_remote_target_accepts_ssh_bridge_api_socket() {
+        let err = validate_add_remote_target(
+            crate::api::client::ConnectionTarget::SocketPath(std::path::PathBuf::from(
+                "/tmp/herdr-prod-api.sock",
+            )),
+            |_| {
+                Ok(crate::api::RuntimeStatus {
+                    version: Some("0.6.0".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                    capabilities: None,
+                })
+            },
+        );
+
+        assert_eq!(err, Ok(()));
+    }
+
+    #[test]
+    fn add_remote_target_rejects_active_local_session_as_duplicate_main() {
+        let _guard = env_lock().lock().unwrap();
+        let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "dev");
+        let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::MAIN_REMOTE_TARGET_ENV_VAR]);
+
+        let target = crate::remote_registry::RemoteTargetSnapshot::Local {
+            session: Some("dev".into()),
+        };
+
+        assert_eq!(
+            reject_duplicate_main_target(&target),
+            Err("remote already added".to_string())
+        );
+    }
+
+    #[test]
+    fn add_remote_target_rejects_main_remote_target_from_launch_env() {
+        let _guard = env_lock().lock().unwrap();
+        let _remote_env = EnvVarGuard::set(crate::remote::MAIN_REMOTE_TARGET_ENV_VAR, "iq-64");
+
+        let target = crate::remote_registry::RemoteTargetSnapshot::Ssh {
+            target: "iq-64".into(),
+        };
+
+        assert_eq!(
+            reject_duplicate_main_target(&target),
+            Err("remote already added".to_string())
+        );
+    }
+
+    #[test]
+    fn summary_refresh_subscription_request_covers_sidebar_summary_events() {
+        let request = summary_refresh_subscription_request("client:summary-events");
+
+        assert_eq!(request.id, "client:summary-events");
+        let crate::api::schema::Method::EventsSubscribe(params) = request.method else {
+            panic!("expected events.subscribe request");
+        };
+        assert_eq!(
+            params.subscriptions,
+            vec![
+                crate::api::schema::Subscription::WorkspaceCreated {},
+                crate::api::schema::Subscription::WorkspaceUpdated {},
+                crate::api::schema::Subscription::WorkspaceRenamed {},
+                crate::api::schema::Subscription::WorkspaceClosed {},
+                crate::api::schema::Subscription::WorkspaceFocused {},
+                crate::api::schema::Subscription::TabCreated {},
+                crate::api::schema::Subscription::TabClosed {},
+                crate::api::schema::Subscription::TabFocused {},
+                crate::api::schema::Subscription::TabRenamed {},
+                crate::api::schema::Subscription::PaneCreated {},
+                crate::api::schema::Subscription::PaneClosed {},
+                crate::api::schema::Subscription::PaneFocused {},
+                crate::api::schema::Subscription::PaneExited {},
+                crate::api::schema::Subscription::PaneAgentDetected {},
+                crate::api::schema::Subscription::PaneAgentStatusChanged {
+                    pane_id: None,
+                    agent_status: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn full_app_client_bootstraps_supervisor_from_main_api() {
+        let mut api = BootstrapApi::default();
+
+        let model = bootstrap_supervisor_for_client(false, &mut api)
+            .unwrap()
+            .expect("full app client should bootstrap supervisor");
+
+        assert_eq!(
+            api.requests,
+            vec!["remote.list", "workspace.list", "agent.list"]
+        );
+        assert!(model.secondary_connection_plans().is_empty());
+    }
+
+    #[test]
+    fn remote_launch_display_name_labels_main_filter() {
+        let _guard = env_lock().lock().unwrap();
+        let _display_env = EnvVarGuard::set(crate::remote::MAIN_DISPLAY_NAME_ENV_VAR, "iq-64");
+        let mut api = BootstrapApi::default();
+
+        let mut model = bootstrap_supervisor_for_client(false, &mut api)
+            .unwrap()
+            .expect("remote client should bootstrap supervisor");
+        model.cycle_filter();
+
+        assert_eq!(model.filter_label(), "iq-64");
+    }
+
+    #[test]
+    fn direct_attach_client_skips_supervisor_bootstrap() {
+        let mut api = BootstrapApi::default();
+
+        let model = bootstrap_supervisor_for_client(true, &mut api).unwrap();
+
+        assert!(model.is_none());
+        assert!(api.requests.is_empty());
+    }
+
+    #[test]
+    fn client_render_plan_uses_embedded_content_when_supervisor_is_available() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+
+        let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
+
+        assert_eq!(plan.surface_mode, ClientSurfaceMode::EmbeddedContent);
+        assert_eq!(plan.requested_encoding, RenderEncoding::SemanticFrame);
+        assert_eq!(
+            plan.server_size,
+            (80 - compositor::DEFAULT_SIDEBAR_WIDTH, 24)
+        );
+        assert!(plan.use_client_compositor);
+    }
+
+    #[test]
+    fn client_render_plan_uses_full_app_when_supervisor_is_unavailable() {
+        let plan = client_render_plan(None, RenderEncoding::TerminalAnsi, (80, 24));
+
+        assert_eq!(plan.surface_mode, ClientSurfaceMode::FullApp);
+        assert_eq!(plan.requested_encoding, RenderEncoding::TerminalAnsi);
+        assert_eq!(plan.server_size, (80, 24));
+        assert!(!plan.use_client_compositor);
+    }
+
+    #[test]
+    fn client_render_plan_uses_embedded_content_with_secondary_servers() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+
+        let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
+
+        assert_eq!(plan.surface_mode, ClientSurfaceMode::EmbeddedContent);
+        assert_eq!(plan.requested_encoding, RenderEncoding::SemanticFrame);
+        assert_eq!(
+            plan.server_size,
+            (80 - compositor::DEFAULT_SIDEBAR_WIDTH, 24)
+        );
+        assert!(plan.use_client_compositor);
+    }
+
+    fn mixed_remote_model() -> (supervisor::ClientSupervisorModel, supervisor::ServerId) {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+        model
+            .set_summary(
+                &supervisor::ServerId::main(),
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        focused: false,
+                    }],
+                    agents: vec![supervisor::AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
+    }
+
+    #[test]
+    fn composited_input_clicking_filter_cycles_sidebar_filter_without_forwarding() {
+        let (mut model, _) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;11;1M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(dispatch, ClientInputDispatch::Redraw);
+        assert_eq!(
+            model.filter(),
+            &supervisor::ServerFilter::Server(supervisor::ServerId::main())
+        );
+    }
+
+    #[test]
+    fn composited_input_clicking_workspace_returns_owner_api_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;2;3M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: remote_id.clone(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-focus".into(),
+                    method: crate::api::schema::Method::WorkspaceFocus(
+                        crate::api::schema::WorkspaceTarget {
+                            workspace_id: "remote-api".into(),
+                        },
+                    ),
+                }),
+            }
+        );
+        assert_eq!(model.active_server_id(), &remote_id);
+    }
+
+    #[test]
+    fn composited_input_clicking_agent_returns_owner_api_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;2;7M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: remote_id.clone(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:agent-focus".into(),
+                    method: crate::api::schema::Method::AgentFocus(
+                        crate::api::schema::AgentTarget {
+                            target: "remote-agent".into(),
+                        },
+                    ),
+                }),
+            }
+        );
+        assert_eq!(model.active_server_id(), &remote_id);
+    }
+
+    #[test]
+    fn composited_input_translates_content_mouse_to_embedded_viewport() {
+        let (mut model, _) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;14;3M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::Forward(b"\x1b[<0;2;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn composited_input_clicking_new_with_single_destination_returns_create_request() {
+        let (mut model, _) = mixed_remote_model();
+        model.set_filter(supervisor::ServerFilter::Server(
+            supervisor::ServerId::main(),
+        ));
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;2;8M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: supervisor::ServerId::main(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-create".into(),
+                    method: crate::api::schema::Method::WorkspaceCreate(
+                        crate::api::schema::WorkspaceCreateParams {
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                        },
+                    ),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn composited_input_clicking_new_with_multiple_destinations_opens_picker() {
+        let (mut model, _) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;2;8M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(dispatch, ClientInputDispatch::Redraw);
+        assert_eq!(
+            model
+                .new_workspace_picker_destinations()
+                .map(|items| items.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn composited_input_clicking_picker_destination_returns_create_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        model.open_new_workspace_picker();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;2;7M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: remote_id.clone(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-create".into(),
+                    method: crate::api::schema::Method::WorkspaceCreate(
+                        crate::api::schema::WorkspaceCreateParams {
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                        },
+                    ),
+                }),
+            }
+        );
+        assert_eq!(model.active_server_id(), &remote_id);
+        assert_eq!(model.new_workspace_picker_destinations(), None);
+    }
+
+    #[test]
+    fn composited_input_clicking_menu_opens_client_global_menu() {
+        let (mut model, _) = mixed_remote_model();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b[<0;10;8M".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(dispatch, ClientInputDispatch::Redraw);
+        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+    }
+
+    #[test]
+    fn composited_input_add_remote_form_submits_draft() {
+        let (mut model, _) = mixed_remote_model();
+        model.open_add_remote_form();
+        let compositor = compositor::ClientCompositor::new(12);
+
+        assert_eq!(
+            dispatch_composited_input(b"local:dev".to_vec(), &compositor, &mut model, (24, 8)),
+            ClientInputDispatch::Redraw
+        );
+        assert_eq!(
+            dispatch_composited_input(b"\tdev".to_vec(), &compositor, &mut model, (24, 8)),
+            ClientInputDispatch::Redraw
+        );
+
+        let dispatch = dispatch_composited_input(b"\r".to_vec(), &compositor, &mut model, (24, 8));
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::AddRemote(supervisor::AddRemoteDraft {
+                target: "local:dev".into(),
+                name: Some("dev".into()),
+                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            })
+        );
+    }
+
+    #[test]
+    fn api_target_for_supervisor_server_maps_main_and_local_secondary() {
+        let (model, remote_id) = mixed_remote_model();
+
+        assert_eq!(
+            api_target_for_supervisor_server(
+                &model,
+                &supervisor::ServerId::main(),
+                &HashMap::new()
+            ),
+            Some(crate::api::client::ConnectionTarget::LocalSession(None))
+        );
+        assert_eq!(
+            api_target_for_supervisor_server(&model, &remote_id, &HashMap::new()),
+            Some(crate::api::client::ConnectionTarget::LocalSession(Some(
+                "x".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn supervisor_targets_map_ssh_secondary_through_bridge_sockets() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-prod".into(),
+            name: "prod".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "prod.example.com".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+        let api_socket = std::path::PathBuf::from("/tmp/herdr-prod-api.sock");
+        let client_socket = std::path::PathBuf::from("/tmp/herdr-prod-client.sock");
+        let bridge = crate::remote::RemoteBridge::from_socket_paths_for_test(
+            client_socket.clone(),
+            api_socket.clone(),
+        );
+        let ssh_bridges = HashMap::from([(remote_id.clone(), bridge)]);
+
+        assert_eq!(
+            api_target_for_supervisor_server(&model, &remote_id, &ssh_bridges),
+            Some(crate::api::client::ConnectionTarget::SocketPath(api_socket))
+        );
+        assert_eq!(
+            client_socket_path_for_supervisor_server(&model, &remote_id, &ssh_bridges),
+            Some(client_socket)
+        );
+    }
+
+    #[test]
+    fn supervisor_summary_refresh_due_uses_two_second_interval() {
+        let start = Instant::now();
+
+        assert!(!supervisor_summary_refresh_due(
+            start + Duration::from_millis(1999),
+            start
+        ));
+        assert!(supervisor_summary_refresh_due(
+            start + Duration::from_secs(2),
+            start
+        ));
+    }
+
+    #[test]
+    fn secondary_retry_delay_uses_conservative_backoff_schedule() {
+        assert_eq!(secondary_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(secondary_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(secondary_retry_delay(2), Duration::from_secs(5));
+        assert_eq!(secondary_retry_delay(3), Duration::from_secs(15));
+        assert_eq!(secondary_retry_delay(8), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn client_socket_path_for_connection_target_maps_local_sessions_only() {
+        let named = client_socket_path_for_connection_target(
+            &supervisor::ServerConnectionTarget::LocalSession(Some("work".into())),
+        )
+        .unwrap();
+        assert!(named.ends_with("sessions/work/herdr-client.sock"));
+
+        let default =
+            client_socket_path_for_connection_target(&supervisor::ServerConnectionTarget::Main)
+                .unwrap();
+        assert!(default.ends_with("herdr-client.sock"));
+
+        assert_eq!(
+            client_socket_path_for_connection_target(&supervisor::ServerConnectionTarget::Ssh(
+                "host".into()
+            )),
+            None
+        );
+    }
+
+    fn test_frame(width: u16) -> protocol::FrameData {
+        protocol::FrameData {
+            cells: Vec::new(),
+            width,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_composited_render_frame_prefers_active_server_cache() {
+        let main = supervisor::ServerId::main();
+        let remote = supervisor::ServerId::secondary("remote-x");
+        let mut frames = std::collections::HashMap::new();
+        frames.insert(main.clone(), test_frame(10));
+        frames.insert(remote.clone(), test_frame(20));
+
+        assert_eq!(
+            select_composited_render_frame(&frames, &remote, &main)
+                .unwrap()
+                .width,
+            20
+        );
+
+        let missing = supervisor::ServerId::secondary("missing");
+        assert_eq!(
+            select_composited_render_frame(&frames, &missing, &main)
+                .unwrap()
+                .width,
+            10
+        );
     }
 
     #[test]

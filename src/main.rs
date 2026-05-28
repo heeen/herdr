@@ -42,6 +42,7 @@ mod protocol;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod remote_registry;
 mod selection;
 mod server;
 mod session;
@@ -369,6 +370,9 @@ fn main() -> io::Result<()> {
     // Subcommands and flags (no TUI, no logging needed)
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
         return remote::run_remote_client_bridge();
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("remote-api-bridge") {
+        return remote::run_remote_api_bridge();
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {

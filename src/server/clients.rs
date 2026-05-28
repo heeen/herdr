@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::protocol::RenderEncoding;
+use crate::protocol::{ClientSurfaceMode, RenderEncoding};
 use crate::server::client_transport::ClientWriter;
 use crate::server::render_stream::ClientRenderState;
 
@@ -17,12 +17,15 @@ pub(crate) type RenderTarget = (
     crate::kitty_graphics::HostCellSize,
     bool,
     ClientConnectionMode,
+    ClientSurfaceMode,
 );
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
     /// Whether this connection is the full app client or a direct terminal attach.
     pub(crate) mode: ClientConnectionMode,
+    /// Surface mode requested by app clients. Terminal attach clients ignore this.
+    pub(crate) surface_mode: ClientSurfaceMode,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -88,6 +91,7 @@ impl ClientConnection {
     ) -> Self {
         Self {
             mode,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings,
             terminal_size,
             cell_size,
@@ -199,10 +203,11 @@ pub(crate) fn render_targets(
                 client.cell_size,
                 foreground_client_id == Some(client_id),
                 client.mode.clone(),
+                client.surface_mode,
             )
         })
         .collect();
 
-    targets.sort_by_key(|(client_id, _, _, is_foreground, _)| (*is_foreground, *client_id));
+    targets.sort_by_key(|(client_id, _, _, is_foreground, _, _)| (*is_foreground, *client_id));
     targets
 }

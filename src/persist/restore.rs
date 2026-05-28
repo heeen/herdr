@@ -1016,6 +1016,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1168,6 +1169,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot::default(),
         };
         (snapshot, history)
     }

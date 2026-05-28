@@ -629,6 +629,7 @@ impl HeadlessServer {
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            self.app.state.remote_registry.clone(),
         );
 
         let mut handoff_entries = Vec::new();
@@ -1652,6 +1653,7 @@ impl HeadlessServer {
                 cell_height_px,
                 keybindings,
                 writer,
+                surface_mode,
                 render_encoding,
             } => {
                 if self.handoff_in_progress {
@@ -1673,27 +1675,27 @@ impl HeadlessServer {
                     rows,
                     cell_width_px,
                     cell_height_px,
+                    ?surface_mode,
                     ?render_encoding,
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
-                self.clients.insert(
-                    client_id,
-                    ClientConnection::new_with_mode(
-                        ClientConnectionMode::App,
-                        keybindings,
-                        (cols, rows),
-                        crate::kitty_graphics::HostCellSize {
-                            width_px: cell_width_px,
-                            height_px: cell_height_px,
-                        },
-                        crate::terminal_theme::TerminalTheme::default(),
-                        None,
-                        last_activity,
-                        render_encoding,
-                        Some(writer),
-                    ),
+                let mut connection = ClientConnection::new_with_mode(
+                    ClientConnectionMode::App,
+                    keybindings,
+                    (cols, rows),
+                    crate::kitty_graphics::HostCellSize {
+                        width_px: cell_width_px,
+                        height_px: cell_height_px,
+                    },
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    last_activity,
+                    render_encoding,
+                    Some(writer),
                 );
+                connection.surface_mode = surface_mode;
+                self.clients.insert(client_id, connection);
                 self.foreground_client_id = Some(client_id);
                 self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
@@ -2223,29 +2225,39 @@ impl HeadlessServer {
         }
 
         let mut broken_clients: Vec<u64> = Vec::new();
-        for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, is_foreground, mode, surface_mode) in
+            render_targets
+        {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
                 ClientConnectionMode::App => {
-                    let (buffer, cursor) =
+                    let render_cell_size =
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                cell_size,
-                            )
+                            cell_size
                         } else {
+                            crate::kitty_graphics::HostCellSize::default()
+                        };
+                    let (buffer, cursor) = match surface_mode {
+                        crate::protocol::ClientSurfaceMode::FullApp => {
                             crate::server::render_stream::render_virtual_with_runtime_registry(
                                 &mut self.app.state,
                                 &self.app.terminal_runtimes,
                                 area,
                                 is_foreground,
-                                crate::kitty_graphics::HostCellSize::default(),
+                                render_cell_size,
                             )
-                        };
+                        }
+                        crate::protocol::ClientSurfaceMode::EmbeddedContent => {
+                            crate::server::render_stream::render_embedded_content_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                render_cell_size,
+                            )
+                        }
+                    };
                     let hyperlinks = crate::server::render_stream::visible_hyperlinks(
                         &self.app.state,
                         &self.app.terminal_runtimes,
@@ -2990,6 +3002,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             writer: writer_a,
@@ -3013,6 +3026,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             writer: writer_b,
@@ -3029,6 +3043,29 @@ new_tab = "prefix+t"
             .bindings
             .iter()
             .any(|binding| binding.label == "prefix+c"));
+    }
+
+    #[test]
+    fn connected_app_client_tracks_surface_mode() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::EmbeddedContent,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            writer,
+        }));
+
+        assert_eq!(
+            server.clients[&1].surface_mode,
+            crate::protocol::ClientSurfaceMode::EmbeddedContent
+        );
     }
 
     #[test]
@@ -3052,6 +3089,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             writer: writer_a,
@@ -3064,6 +3102,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             writer: writer_b,
@@ -3106,6 +3145,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             writer,
@@ -3179,6 +3219,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             writer: writer_a,
@@ -3198,6 +3239,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             writer: writer_b,
@@ -3230,6 +3272,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             writer,
@@ -3271,6 +3314,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             writer,
@@ -3565,6 +3609,26 @@ next_tab = ""
             crate::server::render_stream::render_virtual(&mut state, area, true);
         assert_eq!(buffer.area.width, 80);
         assert_eq!(buffer.area.height, 24);
+    }
+
+    #[test]
+    fn embedded_virtual_render_omits_sidebar_and_uses_full_width_content() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let (buffer, _cursor) =
+            crate::server::render_stream::render_embedded_content_virtual(&mut state, area, true);
+
+        assert_eq!(buffer.area.width, 80);
+        assert_eq!(buffer.area.height, 24);
+        assert_eq!(state.view.sidebar_rect, Rect::default());
+        assert!(state.view.workspace_card_areas.is_empty());
+        assert_eq!(state.view.tab_bar_rect, Rect::new(0, 0, 80, 1));
+        assert_eq!(state.view.terminal_area, Rect::new(0, 1, 80, 23));
     }
 
     #[test]
@@ -4117,6 +4181,39 @@ next_tab = ""
         assert_eq!((phone_frame.width, phone_frame.height), (80, 24));
     }
 
+    #[test]
+    fn render_and_stream_uses_embedded_app_surface_mode() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        let mut connection = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        connection.surface_mode = crate::protocol::ClientSurfaceMode::EmbeddedContent;
+        server.clients.insert(1, connection);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv().expect("embedded frame"));
+
+        assert_eq!((frame.width, frame.height), (80, 24));
+        assert_eq!(server.app.state.view.sidebar_rect, Rect::default());
+        assert_eq!(server.app.state.view.tab_bar_rect, Rect::new(0, 0, 80, 1));
+        assert_eq!(server.app.state.view.terminal_area, Rect::new(0, 1, 80, 23));
+    }
+
     #[tokio::test]
     async fn resize_shared_runtime_resizes_background_tabs() {
         let mut server = test_headless_server();
@@ -4226,6 +4323,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             writer,

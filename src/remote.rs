@@ -24,6 +24,8 @@ const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+pub(crate) const MAIN_DISPLAY_NAME_ENV_VAR: &str = "HERDR_MAIN_DISPLAY_NAME";
+pub(crate) const MAIN_REMOTE_TARGET_ENV_VAR: &str = "HERDR_MAIN_REMOTE_TARGET";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -55,6 +57,61 @@ pub(crate) struct RemoteLaunch {
     pub(crate) target: String,
     pub(crate) keybindings: RemoteKeybindings,
     pub(crate) live_handoff: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteBridgeKind {
+    Client,
+    Api,
+}
+
+impl RemoteBridgeKind {
+    fn subcommand(self) -> &'static str {
+        match self {
+            Self::Client => "remote-client-bridge",
+            Self::Api => "remote-api-bridge",
+        }
+    }
+
+    fn path_label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Api => "api",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteBridgePaths {
+    client_socket: PathBuf,
+    api_socket: PathBuf,
+}
+
+pub(crate) struct RemoteBridge {
+    client_socket: PathBuf,
+    api_socket: PathBuf,
+    _client_bridge: Option<SshStdioBridge>,
+    _api_bridge: Option<SshStdioBridge>,
+}
+
+impl RemoteBridge {
+    pub(crate) fn client_socket_path(&self) -> &Path {
+        &self.client_socket
+    }
+
+    pub(crate) fn api_socket_path(&self) -> &Path {
+        &self.api_socket
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_socket_paths_for_test(client_socket: PathBuf, api_socket: PathBuf) -> Self {
+        Self {
+            client_socket,
+            api_socket,
+            _client_bridge: None,
+            _api_bridge: None,
+        }
+    }
 }
 
 pub(crate) fn extract_remote_args(
@@ -150,7 +207,6 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    let local_socket = local_forward_socket_path(&remote.target, &session_name);
     let program = std::env::args()
         .next()
         .unwrap_or_else(|| "herdr".to_string());
@@ -169,25 +225,85 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
     )?;
 
-    let _bridge = SshStdioBridge::start(
-        remote.target,
+    let bridge = start_ssh_remote_bridge_with_prepared(
+        &remote.target,
+        &session_name,
         prepared_remote.remote_herdr,
-        local_socket.clone(),
-        session_name,
     )?;
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    run_client_process(
+        bridge.client_socket_path(),
+        bridge.api_socket_path(),
+        &reattach_command,
+        remote.keybindings,
+        &remote.target,
+    )
+}
+
+pub(crate) fn start_ssh_remote_bridge(
+    target: &str,
+    session_name: Option<&str>,
+) -> io::Result<RemoteBridge> {
+    let session_name = session_name.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
+    let prepared_remote = prepare_remote_herdr(target, false)?;
+    ensure_remote_server_ready(
+        target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        false,
+    )?;
+    start_ssh_remote_bridge_with_prepared(target, session_name, prepared_remote.remote_herdr)
+}
+
+fn start_ssh_remote_bridge_with_prepared(
+    target: &str,
+    session_name: &str,
+    remote_herdr: RemoteHerdr,
+) -> io::Result<RemoteBridge> {
+    let paths = remote_bridge_socket_paths(target, session_name);
+    let client_bridge = SshStdioBridge::start(
+        target.to_string(),
+        remote_herdr.clone(),
+        paths.client_socket.clone(),
+        session_name.to_string(),
+        RemoteBridgeKind::Client,
+    )?;
+    let api_bridge = SshStdioBridge::start(
+        target.to_string(),
+        remote_herdr,
+        paths.api_socket.clone(),
+        session_name.to_string(),
+        RemoteBridgeKind::Api,
+    )?;
+
+    Ok(RemoteBridge {
+        client_socket: paths.client_socket,
+        api_socket: paths.api_socket,
+        _client_bridge: Some(client_bridge),
+        _api_bridge: Some(api_bridge),
+    })
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
 
     let socket_path = crate::server::socket_paths::client_socket_path();
-    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+    bridge_stdio_to_socket(&socket_path, "client")
+}
+
+pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+    ensure_remote_server_running()?;
+
+    let socket_path = crate::api::socket_path();
+    bridge_stdio_to_socket(&socket_path, "API")
+}
+
+fn bridge_stdio_to_socket(socket_path: &Path, label: &str) -> io::Result<()> {
+    let stream = UnixStream::connect(socket_path).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
+                "failed to connect to remote Herdr {label} socket {}: {err}",
                 socket_path.display()
             ),
         )
@@ -1212,13 +1328,18 @@ fn ssh_output(target: &str, command: &str) -> io::Result<Output> {
         .output()
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+fn remote_bridge_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    kind: RemoteBridgeKind,
+) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
     }
-    command.push_str(" remote-client-bridge");
+    command.push(' ');
+    command.push_str(kind.subcommand());
     command
 }
 
@@ -1283,6 +1404,7 @@ impl SshStdioBridge {
         remote_herdr: RemoteHerdr,
         local_socket: PathBuf,
         session_name: String,
+        kind: RemoteBridgeKind,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
@@ -1302,7 +1424,7 @@ impl SshStdioBridge {
                             continue;
                         }
                         if let Err(err) =
-                            bridge_connection(stream, &target, &remote_herdr, &session_name)
+                            bridge_connection(stream, &target, &remote_herdr, &session_name, kind)
                         {
                             eprintln!("herdr: remote bridge failed: {err}");
                         }
@@ -1341,12 +1463,13 @@ fn bridge_connection(
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
+    kind: RemoteBridgeKind,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name));
+        .arg(remote_bridge_command(remote_herdr, session_name, kind));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1407,25 +1530,25 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
 }
 
 fn run_client_process(
-    local_socket: &Path,
+    local_client_socket: &Path,
+    local_api_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    main_remote_target: &str,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let status = Command::new(exe)
-        .arg("client")
-        .env(
-            crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
-            local_socket,
-        )
-        .env("HERDR_RENDER_ENCODING", "terminal-ansi")
-        .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
-        .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
-        .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+    let status = remote_client_command(
+        &exe,
+        local_client_socket,
+        local_api_socket,
+        reattach_command,
+        keybindings,
+        main_remote_target,
+    )
+    .stdin(Stdio::inherit())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .status()?;
 
     if status.success() {
         Ok(())
@@ -1437,14 +1560,39 @@ fn run_client_process(
     }
 }
 
-fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+fn remote_client_command(
+    exe: &Path,
+    local_client_socket: &Path,
+    local_api_socket: &Path,
+    reattach_command: &str,
+    keybindings: RemoteKeybindings,
+    main_remote_target: &str,
+) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .arg("client")
+        .env(
+            crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
+            local_client_socket,
+        )
+        .env(crate::api::SOCKET_PATH_ENV_VAR, local_api_socket)
+        .env("HERDR_RENDER_ENCODING", "terminal-ansi")
+        .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
+        .env(MAIN_DISPLAY_NAME_ENV_VAR, main_remote_target)
+        .env(MAIN_REMOTE_TARGET_ENV_VAR, main_remote_target)
+        .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str());
+    command
+}
+
+fn local_forward_socket_path(target: &str, session_name: &str, kind: RemoteBridgeKind) -> PathBuf {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
+    let kind_label = kind.path_label();
 
     let tmpdir = std::env::temp_dir();
     let readable = tmpdir.join(format!(
-        "herdr-remote-{pid}-{target_clean}-{session_clean}.sock"
+        "herdr-remote-{pid}-{target_clean}-{session_clean}-{kind_label}.sock"
     ));
     if fits_unix_socket_path(&readable) {
         return readable;
@@ -1457,13 +1605,20 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     // target/session so uniqueness does not depend on the prefix truncation;
     // the prefix is kept only for debuggability.
     let target_prefix: String = target_clean.chars().take(8).collect();
-    let hash = short_socket_hash(target, session_name);
-    let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
+    let hash = short_socket_hash(target, session_name, kind_label);
+    let short_name = format!("herdr-r-{pid}-{target_prefix}-{kind_label}.{hash}.sock");
     let short_in_tmp = tmpdir.join(&short_name);
     if fits_unix_socket_path(&short_in_tmp) {
         return short_in_tmp;
     }
     PathBuf::from("/tmp").join(short_name)
+}
+
+fn remote_bridge_socket_paths(target: &str, session_name: &str) -> RemoteBridgePaths {
+    RemoteBridgePaths {
+        client_socket: local_forward_socket_path(target, session_name, RemoteBridgeKind::Client),
+        api_socket: local_forward_socket_path(target, session_name, RemoteBridgeKind::Api),
+    }
 }
 
 fn fits_unix_socket_path(path: &Path) -> bool {
@@ -1474,13 +1629,15 @@ fn fits_unix_socket_path(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() <= MAX
 }
 
-fn short_socket_hash(target: &str, session: &str) -> String {
+fn short_socket_hash(target: &str, session: &str, kind: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     target.hash(&mut hasher);
     0u8.hash(&mut hasher);
     session.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    kind.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1520,6 +1677,7 @@ mod tests {
             remote_herdr,
             socket.clone(),
             "default".to_string(),
+            RemoteBridgeKind::Client,
         )
         .expect("start bridge listener");
 
@@ -1723,14 +1881,60 @@ mod tests {
     }
 
     #[test]
+    fn remote_client_command_sets_main_target_metadata_env() {
+        let command = remote_client_command(
+            Path::new("/tmp/herdr"),
+            Path::new("/tmp/herdr-client.sock"),
+            Path::new("/tmp/herdr-api.sock"),
+            "herdr --remote iq-64",
+            RemoteKeybindings::Local,
+            "iq-64",
+        );
+        let envs: BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get(MAIN_DISPLAY_NAME_ENV_VAR),
+            Some(&Some("iq-64".to_string()))
+        );
+        assert_eq!(
+            envs.get(MAIN_REMOTE_TARGET_ENV_VAR),
+            Some(&Some("iq-64".to_string()))
+        );
+        assert_eq!(
+            envs.get(crate::api::SOCKET_PATH_ENV_VAR),
+            Some(&Some("/tmp/herdr-api.sock".to_string()))
+        );
+    }
+
+    #[test]
     fn remote_bridge_command_uses_installed_binary() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Client,
+            ),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+        );
+        assert_eq!(
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Api,
+            ),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
         );
     }
 
@@ -1745,7 +1949,11 @@ mod tests {
             remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Client,
+            ),
             "exec /usr/bin/herdr remote-client-bridge"
         );
     }
@@ -1761,7 +1969,11 @@ mod tests {
             remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Client,
+            ),
             "exec '/opt/herdr bin/herdr' remote-client-bridge"
         );
     }
@@ -1777,7 +1989,11 @@ mod tests {
             remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Client,
+            ),
             "exec /opt/homebrew/bin/herdr remote-client-bridge"
         );
         assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
@@ -1794,7 +2010,11 @@ mod tests {
             remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Client,
+            ),
             "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
         );
     }
@@ -2106,7 +2326,7 @@ mod tests {
         let _guard = remote_env_lock().lock().unwrap();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
-        let path = local_forward_socket_path("dev", "default");
+        let path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Client);
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -2116,13 +2336,36 @@ mod tests {
             filename.starts_with("herdr-remote-"),
             "expected readable name, got {filename}"
         );
-        assert!(filename.contains("-dev-default."), "got {filename}");
+        assert!(filename.contains("-dev-default-client."), "got {filename}");
+        let api_path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Api);
+        assert_ne!(path, api_path);
         assert!(
             fits_unix_socket_path(&path),
             "socket path too long: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
         );
+    }
+
+    #[test]
+    fn remote_bridge_socket_paths_are_distinct_for_client_and_api() {
+        let paths = remote_bridge_socket_paths("prod.example.com", "default");
+
+        assert_ne!(paths.client_socket, paths.api_socket);
+        assert!(paths
+            .client_socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .contains("-client."));
+        assert!(paths
+            .api_socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .contains("-api."));
+        assert!(fits_unix_socket_path(&paths.client_socket));
+        assert!(fits_unix_socket_path(&paths.api_socket));
     }
 
     #[test]
@@ -2133,7 +2376,7 @@ mod tests {
         // short name, which fits under TMPDIR.
         let target = "longish-host.example.com";
         let session = "a-fairly-long-session-name-here";
-        let path = local_forward_socket_path(target, session);
+        let path = local_forward_socket_path(target, session, RemoteBridgeKind::Client);
         assert!(
             fits_unix_socket_path(&path),
             "socket path too long for sun_path: {} ({} bytes)",
@@ -2152,7 +2395,11 @@ mod tests {
         let _ = fs::create_dir_all(&long_dir);
         std::env::set_var("TMPDIR", &long_dir);
 
-        let path = local_forward_socket_path("longish-host.example.com", "default");
+        let path = local_forward_socket_path(
+            "longish-host.example.com",
+            "default",
+            RemoteBridgeKind::Client,
+        );
         let fits = fits_unix_socket_path(&path);
         let parent = path.parent().map(Path::to_path_buf);
         let filename = path

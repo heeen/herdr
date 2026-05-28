@@ -28,6 +28,8 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -174,6 +176,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -190,6 +194,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        remote_registry: raw.remote_registry,
     })
 }
 
@@ -253,6 +258,7 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -266,6 +272,7 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        remote_registry,
     }
 }
 
@@ -519,6 +526,7 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            state.remote_registry.clone(),
         )
     }
 
@@ -547,6 +555,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -554,6 +563,55 @@ mod tests {
         assert_eq!(restored.active, None);
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    #[test]
+    fn old_snapshot_defaults_remote_registry_to_empty() {
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [],
+            "active": null,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert!(restored.remote_registry.remotes.is_empty());
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_remote_registry_definitions_only() {
+        let snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: vec![],
+            active: None,
+            selected: 0,
+            agent_panel_scope: AgentPanelScope::CurrentWorkspace,
+            sidebar_width: Some(26),
+            sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot {
+                remotes: vec![crate::remote_registry::RemoteDefinitionSnapshot {
+                    id: "remote-x".into(),
+                    name: "x".into(),
+                    target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                        target: "user@x".into(),
+                    },
+                    session: None,
+                    keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                }],
+            },
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("connection_state"));
+        assert!(!json.contains("socket"));
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.remote_registry.remotes.len(), 1);
+        assert_eq!(restored.remote_registry.remotes[0].name, "x");
     }
 
     #[test]
@@ -630,6 +688,7 @@ mod tests {
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             version: SNAPSHOT_VERSION,
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot::default(),
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
@@ -1163,6 +1222,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            remote_registry: crate::remote_registry::RemoteRegistrySnapshot::default(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

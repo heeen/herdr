@@ -261,6 +261,60 @@ pub(crate) fn render_virtual_with_runtime_registry(
     (buffer, cursor)
 }
 
+// Kept as the no-runtime-registry companion to `render_virtual`; production
+// streaming uses the runtime-registry variant, while tests and future callers
+// can render embedded content without constructing pane runtimes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn render_embedded_content_virtual(
+    app_state: &mut AppState,
+    area: Rect,
+    resize_panes: bool,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let terminal_runtimes = TerminalRuntimeRegistry::new();
+    render_embedded_content_virtual_with_runtime_registry(
+        app_state,
+        &terminal_runtimes,
+        area,
+        resize_panes,
+        crate::kitty_graphics::HostCellSize::default(),
+    )
+}
+
+pub(crate) fn render_embedded_content_virtual_with_runtime_registry(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    crate::ui::compute_embedded_content_view_with_cell_size(
+        app_state,
+        terminal_runtimes,
+        area,
+        resize_panes,
+        cell_size,
+    );
+
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+
+    terminal
+        .draw(|frame| {
+            crate::ui::render_embedded_content_with_runtime_registry(
+                app_state,
+                terminal_runtimes,
+                frame,
+            );
+        })
+        .expect("render to TestBackend should never fail");
+
+    let buffer = terminal.backend().buffer().clone();
+    let cursor = focused_terminal_cursor(app_state, terminal_runtimes)
+        .or_else(|| terminal.backend().rendered_cursor());
+
+    (buffer, cursor)
+}
+
 /// Renders one server-owned terminal directly for `terminal attach` clients.
 pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added mixed remote headless server support: the thin client can manage secondary local or SSH-backed Herdr servers from the sidebar, persist the remote registry on the main server, show combined workspace and agent summaries, route workspace creation/focus to the selected server, and keep secondary disconnects isolated from the main session.
+
 ## [0.6.4] - 2026-05-27
 
 ### Fixed

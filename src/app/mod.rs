@@ -265,6 +265,7 @@ impl App {
             sidebar_width_source,
             sidebar_section_split,
             collapsed_space_keys,
+            remote_registry,
         ) = if no_session {
             (
                 Vec::new(),
@@ -275,6 +276,7 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                crate::remote_registry::RemoteRegistrySnapshot::default(),
             )
         } else if let Some(snap) = crate::persist::load() {
             let history = config
@@ -311,6 +313,7 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.remote_registry,
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -329,6 +332,7 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.remote_registry,
                 )
             }
         } else {
@@ -341,6 +345,7 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                crate::remote_registry::RemoteRegistrySnapshot::default(),
             )
         };
 
@@ -422,6 +427,7 @@ impl App {
             worktree_remove: None,
             worktree_directory,
             collapsed_space_keys,
+            remote_registry,
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -637,6 +643,7 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        app.state.remote_registry = snapshot.remote_registry.clone();
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {

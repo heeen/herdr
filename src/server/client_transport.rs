@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientMessage,
-    RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE,
+    ClientSurfaceMode, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE,
     MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
@@ -55,6 +55,7 @@ pub(crate) enum ServerEvent {
         rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
+        surface_mode: ClientSurfaceMode,
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         writer: ClientWriter,
@@ -159,68 +160,77 @@ pub(crate) fn handle_client_handshake(
         }
     };
 
-    let (client_cols, client_rows, cell_width_px, cell_height_px, render_encoding, keybindings) =
-        match hello {
-            ClientMessage::Hello {
-                version,
-                cols,
-                rows,
+    let (
+        client_cols,
+        client_rows,
+        cell_width_px,
+        cell_height_px,
+        render_encoding,
+        surface_mode,
+        keybindings,
+    ) = match hello {
+        ClientMessage::Hello {
+            version,
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+            requested_encoding,
+            surface_mode,
+            keybindings,
+        } => {
+            // Version check.
+            match protocol::check_client_version(version) {
+                protocol::VersionCheck::Compatible => {}
+                protocol::VersionCheck::Incompatible(reason) => {
+                    // Send rejection Welcome.
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(reason),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+            }
+
+            let keybindings = match parse_client_keybindings(keybindings) {
+                Ok(keybindings) => keybindings,
+                Err(error) => {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(error),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+            };
+
+            // Clamp size.
+            let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
+            (
+                clamped_cols,
+                clamped_rows,
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
+                surface_mode,
                 keybindings,
-            } => {
-                // Version check.
-                match protocol::check_client_version(version) {
-                    protocol::VersionCheck::Compatible => {}
-                    protocol::VersionCheck::Incompatible(reason) => {
-                        // Send rejection Welcome.
-                        let welcome = ServerMessage::Welcome {
-                            version: PROTOCOL_VERSION,
-                            encoding: RenderEncoding::SemanticFrame,
-                            error: Some(reason),
-                        };
-                        let _ = protocol::write_message(&mut stream, &welcome);
-                        return Ok(());
-                    }
-                }
-
-                let keybindings = match parse_client_keybindings(keybindings) {
-                    Ok(keybindings) => keybindings,
-                    Err(error) => {
-                        let welcome = ServerMessage::Welcome {
-                            version: PROTOCOL_VERSION,
-                            encoding: RenderEncoding::SemanticFrame,
-                            error: Some(error),
-                        };
-                        let _ = protocol::write_message(&mut stream, &welcome);
-                        return Ok(());
-                    }
-                };
-
-                // Clamp size.
-                let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
-                (
-                    clamped_cols,
-                    clamped_rows,
-                    cell_width_px,
-                    cell_height_px,
-                    requested_encoding,
-                    keybindings,
-                )
-            }
-            _ => {
-                // First message must be Hello.
-                debug!(client_id, "first message was not Hello, closing");
-                let welcome = ServerMessage::Welcome {
-                    version: PROTOCOL_VERSION,
-                    encoding: RenderEncoding::SemanticFrame,
-                    error: Some("expected Hello as first message".to_owned()),
-                };
-                let _ = protocol::write_message(&mut stream, &welcome);
-                return Ok(());
-            }
-        };
+            )
+        }
+        _ => {
+            // First message must be Hello.
+            debug!(client_id, "first message was not Hello, closing");
+            let welcome = ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: Some("expected Hello as first message".to_owned()),
+            };
+            let _ = protocol::write_message(&mut stream, &welcome);
+            return Ok(());
+        }
+    };
 
     // Send Welcome.
     let welcome = ServerMessage::Welcome {
@@ -248,6 +258,7 @@ pub(crate) fn handle_client_handshake(
         rows: client_rows,
         cell_width_px,
         cell_height_px,
+        surface_mode,
         render_encoding,
         keybindings,
         writer,
@@ -575,6 +586,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
             },
         )
@@ -605,6 +617,7 @@ new_tab = "ctrl+notakey"
                 rows,
                 cell_width_px,
                 cell_height_px,
+                surface_mode,
                 render_encoding,
                 keybindings,
                 writer,
@@ -612,6 +625,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(client_id, 42);
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
+                assert_eq!(surface_mode, ClientSurfaceMode::FullApp);
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 drop(writer);

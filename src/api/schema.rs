@@ -20,6 +20,14 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "remote.list")]
+    RemoteList(EmptyParams),
+    #[serde(rename = "remote.add")]
+    RemoteAdd(RemoteAddParams),
+    #[serde(rename = "remote.remove")]
+    RemoteRemove(RemoteRemoveParams),
+    #[serde(rename = "remote.rename")]
+    RemoteRename(RemoteRenameParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -109,6 +117,26 @@ pub struct EmptyParams {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PingParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAddParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub target: String,
+    #[serde(default)]
+    pub keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRemoveParams {
+    pub remote_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRenameParams {
+    pub remote_id: String,
+    pub name: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTarget {
@@ -465,7 +493,8 @@ pub enum Subscription {
     },
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged {
-        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
@@ -652,6 +681,18 @@ pub enum ResponseResult {
     },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    RemoteList {
+        remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
+    },
+    RemoteAdded {
+        remote: crate::remote_registry::RemoteDefinitionSnapshot,
+    },
+    RemoteRemoved {
+        remote_id: String,
+    },
+    RemoteRenamed {
+        remote: crate::remote_registry::RemoteDefinitionSnapshot,
     },
     WorktreeList {
         source: WorktreeSourceInfo,
@@ -1307,10 +1348,40 @@ mod tests {
         assert!(matches!(
             &params.subscriptions[1],
             Subscription::PaneAgentStatusChanged {
-                pane_id,
+                pane_id: Some(pane_id),
                 agent_status: Some(AgentStatus::Done),
             } if pane_id == "p_1_1"
         ));
+    }
+
+    #[test]
+    fn subscribe_request_parses_all_agent_status_subscription() {
+        let json = r#"
+        {
+            "id": "sub_all_status",
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [
+                    {
+                        "type": "pane.agent_status_changed"
+                    }
+                ]
+            }
+        }
+        "#;
+
+        let request: Request = serde_json::from_str(json).unwrap();
+        let Method::EventsSubscribe(params) = request.method else {
+            panic!("wrong method parsed");
+        };
+
+        assert_eq!(
+            params.subscriptions,
+            vec![Subscription::PaneAgentStatusChanged {
+                pane_id: None,
+                agent_status: None,
+            }]
+        );
     }
 
     #[test]
