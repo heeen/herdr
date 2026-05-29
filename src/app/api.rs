@@ -462,6 +462,12 @@ impl App {
                     },
                 }
             }
+            Method::ServerUiSettings(_) => SuccessResponse {
+                id: request.id,
+                result: ResponseResult::UiSettings {
+                    settings: self.ui_settings_info(),
+                },
+            },
             Method::RemoteList(_) => return self.handle_remote_list(request.id),
             Method::RemoteAdd(params) => return self.handle_remote_add(request.id, params),
             Method::RemoteRemove(params) => return self.handle_remote_remove(request.id, params),
@@ -541,4 +547,25 @@ impl App {
 
         serde_json::to_string(&response).unwrap()
     }
+
+    fn ui_settings_info(&self) -> crate::api::schema::UiSettingsInfo {
+        crate::api::schema::UiSettingsInfo {
+            sidebar_width: self.state.sidebar_width,
+            sidebar_default_width: self.state.default_sidebar_width,
+            sidebar_min_width: self.state.sidebar_min_width,
+            sidebar_max_width: self.state.sidebar_max_width,
+            sidebar_section_split_per_mille: sidebar_split_per_mille(
+                self.state.sidebar_section_split,
+            ),
+            sidebar_spaces: self.state.sidebar_space.clone(),
+            sidebar_agents: self.state.sidebar_agent.clone(),
+        }
+    }
+}
+
+fn sidebar_split_per_mille(split: f32) -> u16 {
+    if !split.is_finite() {
+        return 500;
+    }
+    (split.clamp(0.1, 0.9) * 1000.0).round() as u16
 }

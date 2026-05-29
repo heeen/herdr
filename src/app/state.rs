@@ -1653,6 +1653,8 @@ pub struct AppState {
     pub integration_install_messages: Vec<String>,
     /// Highlight state for the bottom-right global launcher menu.
     pub global_menu: MenuListState,
+    /// Client-owned shells can append local actions while reusing the server menu renderer.
+    pub(crate) global_menu_extra_labels: Vec<&'static str>,
     /// Resolved host terminal default colors for theming embedded panes.
     pub host_terminal_theme: TerminalTheme,
     /// Set when a persisted session snapshot would change.
@@ -1828,13 +1830,12 @@ pub fn key_matches(
 }
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// Lightweight state helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 impl AppState {
-    /// Create an AppState for testing — no channels, no PTYs.
-    pub fn test_new() -> Self {
+    /// Create an AppState for client-side shell rendering — no channels, no PTYs.
+    pub(crate) fn empty_for_client_rendering() -> Self {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
@@ -1961,10 +1962,19 @@ impl AppState {
             integration_recommendations: Vec::new(),
             integration_install_messages: Vec::new(),
             global_menu: MenuListState::new(0),
+            global_menu_extra_labels: Vec::new(),
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// Create an AppState for testing — no channels, no PTYs.
+    pub fn test_new() -> Self {
+        Self::empty_for_client_rendering()
     }
 
     /// Populate missing `TerminalState` entries for every pane so tests that

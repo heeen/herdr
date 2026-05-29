@@ -36,6 +36,7 @@ pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
         handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
+        open_keybind_help,
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,

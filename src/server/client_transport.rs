@@ -94,6 +94,10 @@ pub(crate) enum ServerEvent {
     },
     /// A client detached gracefully.
     ClientDetach { client_id: u64 },
+    /// A client requested the server-rendered settings UI.
+    ClientOpenSettings { client_id: u64 },
+    /// A client requested the server-rendered keybind help UI.
+    ClientOpenKeybindHelp { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
@@ -469,6 +473,8 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::OpenSettings => ServerEvent::ClientOpenSettings { client_id },
+            ClientMessage::OpenKeybindHelp => ServerEvent::ClientOpenKeybindHelp { client_id },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;

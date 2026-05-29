@@ -1883,6 +1883,16 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }
+            ServerEvent::ClientOpenSettings { client_id } => {
+                self.promote_client_to_foreground(client_id);
+                self.app.open_settings();
+                true
+            }
+            ServerEvent::ClientOpenKeybindHelp { client_id } => {
+                self.promote_client_to_foreground(client_id);
+                self.app.open_keybind_help();
+                true
+            }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
                 self.remove_client_and_resize_if_needed(client_id);

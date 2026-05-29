@@ -531,6 +531,7 @@ impl App {
             integration_recommendations: crate::integration::integration_recommendations(),
             integration_install_messages: Vec::new(),
             global_menu: state::MenuListState::new(0),
+            global_menu_extra_labels: Vec::new(),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
@@ -1009,6 +1010,14 @@ impl App {
 
     pub(crate) fn reload_config(&mut self) -> crate::config::ConfigReloadReport {
         self.apply_config_from_disk(true)
+    }
+
+    pub(crate) fn open_settings(&mut self) {
+        input::open_settings_at(&mut self.state, state::SettingsSection::Theme);
+    }
+
+    pub(crate) fn open_keybind_help(&mut self) {
+        input::open_keybind_help(&mut self.state);
     }
 
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
@@ -2118,6 +2127,46 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn api_server_ui_settings_returns_live_sidebar_preferences() {
+        let mut app = test_app();
+        app.state.sidebar_width = 31;
+        app.state.default_sidebar_width = 29;
+        app.state.sidebar_min_width = 20;
+        app.state.sidebar_max_width = 44;
+        app.state.sidebar_section_split = 0.4;
+
+        let mut spaces = app.state.sidebar_space.clone();
+        state::SidebarSpaceItem::Branch.set_enabled(&mut spaces, false);
+        app.state.sidebar_space = spaces.clone();
+
+        let mut agents = app.state.sidebar_agent.clone();
+        state::SidebarAgentItem::Time.set_enabled(&mut agents, false);
+        app.state.sidebar_agent = agents.clone();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_ui_settings".into(),
+            method: crate::api::schema::Method::ServerUiSettings(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        });
+        let response: crate::api::schema::SuccessResponse =
+            serde_json::from_str(&response).unwrap();
+
+        match response.result {
+            crate::api::schema::ResponseResult::UiSettings { settings } => {
+                assert_eq!(settings.sidebar_width, 31);
+                assert_eq!(settings.sidebar_default_width, 29);
+                assert_eq!(settings.sidebar_min_width, 20);
+                assert_eq!(settings.sidebar_max_width, 44);
+                assert_eq!(settings.sidebar_section_split_per_mille, 400);
+                assert_eq!(settings.sidebar_spaces, spaces);
+                assert_eq!(settings.sidebar_agents, agents);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]

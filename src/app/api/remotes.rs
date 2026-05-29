@@ -14,11 +14,12 @@ impl App {
     }
 
     pub(super) fn handle_remote_add(&mut self, id: String, params: RemoteAddParams) -> String {
-        match self
-            .state
-            .remote_registry
-            .add(params.name, params.target, params.keybindings)
-        {
+        match self.state.remote_registry.add_excluding_targets(
+            params.name,
+            params.target,
+            params.keybindings,
+            &main_server_remote_targets(),
+        ) {
             Ok(remote) => {
                 self.state.mark_session_dirty();
                 encode_success(id, ResponseResult::RemoteAdded { remote })
@@ -60,11 +61,25 @@ impl App {
     }
 }
 
+fn main_server_remote_targets() -> Vec<crate::remote_registry::RemoteTargetSnapshot> {
+    if let Ok(target) = std::env::var(crate::remote::MAIN_REMOTE_TARGET_ENV_VAR) {
+        return crate::remote_registry::RemoteTargetSnapshot::parse(&target)
+            .ok()
+            .into_iter()
+            .collect();
+    }
+
+    vec![crate::remote_registry::RemoteTargetSnapshot::Local {
+        session: crate::session::active_name(),
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{ErrorResponse, Request};
     use crate::app::App;
     use crate::config::Config;
+    use std::ffi::OsString;
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -103,6 +118,29 @@ mod tests {
             app.state.collapsed_space_keys.clone(),
             app.state.remote_registry.clone(),
         )
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
     }
 
     #[test]
@@ -161,6 +199,21 @@ mod tests {
             error_code(
                 &mut app,
                 r#"{"id":"dup_target","method":"remote.add","params":{"name":"y","target":"user@x"}}"#,
+            ),
+            "duplicate_remote_target"
+        );
+    }
+
+    #[test]
+    fn remote_add_rejects_current_main_local_target() {
+        let _session_env = EnvVarGuard::remove(crate::session::SESSION_ENV_VAR);
+        let _main_remote_env = EnvVarGuard::remove(crate::remote::MAIN_REMOTE_TARGET_ENV_VAR);
+        let mut app = test_app();
+
+        assert_eq!(
+            error_code(
+                &mut app,
+                r#"{"id":"add","method":"remote.add","params":{"name":"local","target":"localhost"}}"#
             ),
             "duplicate_remote_target"
         );

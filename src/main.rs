@@ -52,6 +52,7 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod version;
 mod workspace;
 mod worktree;
 
@@ -507,7 +508,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("herdr {}", env!("CARGO_PKG_VERSION"));
+        println!("herdr {}", version::display_version());
         return Ok(());
     }
 

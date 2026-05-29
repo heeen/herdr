@@ -136,6 +136,12 @@ pub enum ClientMessage {
         /// Crossterm-compatible modifier bits for forwarded mouse wheel events.
         modifiers: u8,
     },
+
+    /// Open the server-rendered settings UI for this client.
+    OpenSettings,
+
+    /// Open the server-rendered keybind help UI for this client.
+    OpenKeybindHelp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1545,6 +1551,8 @@ mod tests {
                 cell_height_px: 16,
             },
             ClientMessage::Detach,
+            ClientMessage::OpenSettings,
+            ClientMessage::OpenKeybindHelp,
         ];
 
         // Set non-blocking so we can write and read in the same test.

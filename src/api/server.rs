@@ -271,6 +271,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
         Method::ServerReloadConfig(_) => "server.reload_config",
+        Method::ServerUiSettings(_) => "server.ui_settings",
         Method::RemoteList(_) => "remote.list",
         Method::RemoteAdd(_) => "remote.add",
         Method::RemoteRemove(_) => "remote.remove",

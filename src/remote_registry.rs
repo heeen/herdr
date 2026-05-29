@@ -69,11 +69,22 @@ impl RemoteRegistryError {
 }
 
 impl RemoteRegistrySnapshot {
+    #[cfg(test)]
     pub fn add(
         &mut self,
         name: Option<String>,
         target: String,
         keybindings: RemoteKeybindingsSnapshot,
+    ) -> Result<RemoteDefinitionSnapshot, RemoteRegistryError> {
+        self.add_excluding_targets(name, target, keybindings, &[])
+    }
+
+    pub fn add_excluding_targets(
+        &mut self,
+        name: Option<String>,
+        target: String,
+        keybindings: RemoteKeybindingsSnapshot,
+        excluded_targets: &[RemoteTargetSnapshot],
     ) -> Result<RemoteDefinitionSnapshot, RemoteRegistryError> {
         let target = RemoteTargetSnapshot::parse(&target)?;
         let name = normalize_name(name.unwrap_or_else(|| target.default_display_name()))?;
@@ -82,6 +93,13 @@ impl RemoteRegistrySnapshot {
         }
 
         let target_key = target.canonical_key();
+        if excluded_targets
+            .iter()
+            .any(|excluded| excluded.canonical_key() == target_key)
+        {
+            return Err(RemoteRegistryError::DuplicateTarget);
+        }
+
         if self
             .remotes
             .iter()
@@ -272,5 +290,23 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(duplicate, RemoteRegistryError::DuplicateTarget);
+    }
+
+    #[test]
+    fn rejects_targets_excluded_by_the_caller() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        let excluded = vec![RemoteTargetSnapshot::Local { session: None }];
+
+        let duplicate = registry
+            .add_excluding_targets(
+                Some("local".into()),
+                "localhost".into(),
+                RemoteKeybindingsSnapshot::Local,
+                &excluded,
+            )
+            .unwrap_err();
+
+        assert_eq!(duplicate, RemoteRegistryError::DuplicateTarget);
+        assert!(registry.remotes.is_empty());
     }
 }

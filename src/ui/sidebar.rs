@@ -1203,7 +1203,7 @@ pub(crate) fn workspace_drop_indicator_row(
     None
 }
 
-pub(super) fn render_sidebar(
+pub(crate) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,

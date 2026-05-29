@@ -20,6 +20,8 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "server.ui_settings")]
+    ServerUiSettings(EmptyParams),
     #[serde(rename = "remote.list")]
     RemoteList(EmptyParams),
     #[serde(rename = "remote.add")]
@@ -663,6 +665,38 @@ pub struct ServerCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiSettingsInfo {
+    pub sidebar_width: u16,
+    pub sidebar_default_width: u16,
+    pub sidebar_min_width: u16,
+    pub sidebar_max_width: u16,
+    pub sidebar_section_split_per_mille: u16,
+    pub sidebar_spaces: crate::config::SidebarSpacesConfig,
+    pub sidebar_agents: crate::config::SidebarAgentsConfig,
+}
+
+impl Default for UiSettingsInfo {
+    fn default() -> Self {
+        let ui = crate::config::Config::default().ui;
+        Self {
+            sidebar_width: ui.sidebar_width,
+            sidebar_default_width: ui.sidebar_width,
+            sidebar_min_width: ui.sidebar_min_width,
+            sidebar_max_width: ui.sidebar_max_width,
+            sidebar_section_split_per_mille: 500,
+            sidebar_spaces: ui.sidebar.spaces,
+            sidebar_agents: ui.sidebar.agents,
+        }
+    }
+}
+
+impl UiSettingsInfo {
+    pub(crate) fn sidebar_section_split(&self) -> f32 {
+        (self.sidebar_section_split_per_mille as f32 / 1000.0).clamp(0.1, 0.9)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
     Pong {
@@ -767,6 +801,9 @@ pub enum ResponseResult {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
     },
+    UiSettings {
+        settings: UiSettingsInfo,
+    },
     Ok {},
 }
 
@@ -775,6 +812,8 @@ pub struct WorkspaceInfo {
     pub workspace_id: String,
     pub number: usize,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub focused: bool,
     pub pane_count: usize,
     pub tab_count: usize,
@@ -1210,6 +1249,29 @@ mod tests {
     }
 
     #[test]
+    fn request_round_trips_for_server_ui_settings() {
+        let request = Request {
+            id: "req_ui_settings".into(),
+            method: Method::ServerUiSettings(EmptyParams::default()),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "server.ui_settings");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+
+        let response = SuccessResponse {
+            id: "req_ui_settings".into(),
+            result: ResponseResult::UiSettings {
+                settings: UiSettingsInfo::default(),
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    #[test]
     fn unknown_method_is_rejected() {
         let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
         let err = serde_json::from_str::<Request>(json)
@@ -1449,6 +1511,7 @@ mod tests {
                     workspace_id: "w_1".into(),
                     number: 2,
                     label: "herdr".into(),
+                    branch: None,
                     focused: true,
                     pane_count: 1,
                     tab_count: 1,

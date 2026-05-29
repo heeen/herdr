@@ -25,9 +25,9 @@ use self::dialogs::{
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
+pub(crate) use self::menus::render_global_launcher_menu;
 use self::menus::{
-    render_context_menu, render_global_launcher_menu, render_navigate_overlay,
-    render_prefix_overlay, render_resize_overlay,
+    render_context_menu, render_navigate_overlay, render_prefix_overlay, render_resize_overlay,
 };
 use self::mobile::{
     compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
@@ -49,7 +49,8 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
-use self::sidebar::{render_sidebar, render_sidebar_collapsed};
+pub(crate) use self::sidebar::render_sidebar;
+use self::sidebar::render_sidebar_collapsed;
 use self::status::{
     render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,

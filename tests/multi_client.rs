@@ -1322,10 +1322,12 @@ fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survi
         "mixed client sidebar should show workspace labels from main and local:dev"
     );
 
-    // 80x24 host: footer row is y=23 (SGR row 24), and the second
-    // picker destination is y=22 (SGR row 23).
+    // 80x24 host: the original server sidebar places the footer at the bottom
+    // of the workspace section, y=11 (SGR row 12). The destination picker
+    // still opens above the terminal bottom, with the second destination at
+    // y=22 (SGR row 23).
     let mut client_writer = client._master.take_writer().expect("open PTY writer");
-    write_sgr_mouse_click(client_writer.as_mut(), 2, 24);
+    write_sgr_mouse_click(client_writer.as_mut(), 2, 12);
     assert!(
         wait_for_output_containing(
             &client_output,
@@ -1370,29 +1372,20 @@ fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survi
 }
 
 #[test]
-fn mixed_local_remote_client_menu_adds_first_secondary_remote() {
+fn mixed_client_menu_uses_server_launcher_surface() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
     let client_socket = runtime_dir.join("herdr-client.sock");
-    let dev_socket_dir = session_socket_dir(&config_home, "dev");
-    let dev_api_socket = dev_socket_dir.join("herdr.sock");
-    let dev_client_socket = dev_socket_dir.join("herdr-client.sock");
 
     let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
-    let dev_server = spawn_named_server(&config_home, &runtime_dir, "dev");
-    wait_for_socket(&dev_api_socket, Duration::from_secs(10));
-    wait_for_file(&dev_client_socket, Duration::from_secs(10));
-
     let main_log_path = server_log_path(&config_home);
-    let dev_log_path = dev_socket_dir.join("herdr-server.log");
     let main_connected_before = count_log_occurrences(&main_log_path, "client connected");
-    let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
 
     let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
     let client_output = spawn_pty_output_collector(client._master.as_ref());
@@ -1412,50 +1405,31 @@ fn mixed_local_remote_client_menu_adds_first_secondary_remote() {
         "client-owned footer should render before any secondary remote exists"
     );
 
-    // Footer menu is right-aligned inside the 26-column sidebar.
-    write_sgr_mouse_click(client_writer.as_mut(), 24, 24);
-    assert!(
-        wait_for_output_containing(&client_output, &["> add remote"], Duration::from_secs(5)),
-        "clicking menu should open the client global menu"
-    );
-
-    // The single menu item is on zero-based row 22 in an 80x24 host.
-    write_sgr_mouse_click(client_writer.as_mut(), 2, 23);
+    // Footer menu is right-aligned inside the original 26-column sidebar's
+    // workspace section.
+    write_sgr_mouse_click(client_writer.as_mut(), 24, 12);
     assert!(
         wait_for_output_containing(
             &client_output,
-            &["add remote", "target:"],
+            &[
+                "settings",
+                "keybinds",
+                "reload config",
+                "detach",
+                "add remote"
+            ],
             Duration::from_secs(5)
         ),
-        "clicking add remote should open the client add-remote form"
-    );
-
-    client_writer
-        .write_all(b"local:dev\r")
-        .expect("type local remote target");
-    client_writer.flush().expect("flush local remote target");
-
-    assert!(
-        wait_for_log_occurrence_count(
-            &dev_log_path,
-            "client connected",
-            dev_connected_before + 1,
-            Duration::from_secs(10),
-        ),
-        "client add-remote submission should connect to local:dev"
+        "clicking menu should open the original server launcher menu"
     );
 
     let list = send_json_request(
         &api_socket,
         r#"{"id":"remote_list","method":"remote.list","params":{}}"#,
     );
-    assert_eq!(list["result"]["remotes"].as_array().unwrap().len(), 1);
-    assert_eq!(list["result"]["remotes"][0]["name"], "dev");
-    assert_eq!(list["result"]["remotes"][0]["target"]["type"], "local");
-    assert_eq!(list["result"]["remotes"][0]["target"]["session"], "dev");
+    assert_eq!(list["result"]["remotes"].as_array().unwrap().len(), 0);
 
     drop(client);
-    drop(dev_server);
     cleanup_spawned_herdr(main_server, base);
 }
 

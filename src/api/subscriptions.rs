@@ -90,7 +90,15 @@ impl PanePresentationSnapshot {
 
 pub(super) struct ActiveEventSubscription {
     event_kind: crate::api::schema::EventKind,
+    filter: ActiveEventFilter,
     last_sequence: u64,
+}
+
+pub(super) enum ActiveEventFilter {
+    None,
+    PaneAgentStatus {
+        agent_status: Option<crate::api::schema::AgentStatus>,
+    },
 }
 
 pub(super) enum ActiveSubscription {
@@ -110,58 +118,72 @@ impl ActiveSubscription {
         match subscription {
             Subscription::WorkspaceCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceCreated,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceUpdated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceUpdated,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceClosed,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceFocused,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::TabCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabCreated,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::TabClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabClosed,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::TabFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabFocused,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::TabRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabRenamed,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneCreated,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneClosed,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneFocused,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneExited,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneAgentDetected,
+                filter: ActiveEventFilter::None,
                 last_sequence: 0,
             })),
             Subscription::PaneOutputMatched {
@@ -215,6 +237,7 @@ impl ActiveSubscription {
                 let Some(pane_id) = pane_id else {
                     return Ok(Self::Event(ActiveEventSubscription {
                         event_kind: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        filter: ActiveEventFilter::PaneAgentStatus { agent_status },
                         last_sequence: 0,
                     }));
                 };
@@ -271,11 +294,29 @@ impl ActiveEventSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
         for (sequence, event) in event_hub.events_after(self.last_sequence) {
             self.last_sequence = sequence;
-            if event.event == self.event_kind {
+            if event.event == self.event_kind && self.filter.matches(&event) {
                 return serde_json::to_value(event).ok();
             }
         }
         None
+    }
+}
+
+impl ActiveEventFilter {
+    fn matches(&self, event: &crate::api::schema::EventEnvelope) -> bool {
+        match self {
+            Self::None => true,
+            Self::PaneAgentStatus { agent_status } => {
+                let crate::api::schema::EventData::PaneAgentStatusChanged {
+                    agent_status: current,
+                    ..
+                } = &event.data
+                else {
+                    return false;
+                };
+                agent_status.is_none_or(|wanted| wanted == *current)
+            }
+        }
     }
 }
 
@@ -538,13 +579,16 @@ mod tests {
     use super::*;
     use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
 
-    fn status_event(custom_status: Option<&str>) -> EventEnvelope {
+    fn status_event_with_agent_status(
+        agent_status: AgentStatus,
+        custom_status: Option<&str>,
+    ) -> EventEnvelope {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
-                agent_status: AgentStatus::Working,
+                agent_status,
                 agent: Some("pi".into()),
                 title: None,
                 display_agent: None,
@@ -552,6 +596,34 @@ mod tests {
                 state_labels: HashMap::new(),
             },
         }
+    }
+
+    fn status_event(custom_status: Option<&str>) -> EventEnvelope {
+        status_event_with_agent_status(AgentStatus::Working, custom_status)
+    }
+
+    #[test]
+    fn all_pane_agent_status_subscription_honors_status_filter() {
+        let event_hub = EventHub::default();
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscription = ActiveSubscription::new(
+            crate::api::schema::Subscription::PaneAgentStatusChanged {
+                pane_id: None,
+                agent_status: Some(AgentStatus::Done),
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+        )
+        .unwrap();
+
+        event_hub.push(status_event_with_agent_status(AgentStatus::Working, None));
+        event_hub.push(status_event_with_agent_status(AgentStatus::Done, None));
+
+        let event = subscription.poll(&api_tx, &event_hub).expect("done event");
+
+        assert_eq!(event["data"]["agent_status"], "done");
     }
 
     #[test]

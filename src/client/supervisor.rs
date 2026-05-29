@@ -12,7 +12,7 @@ impl ServerId {
     }
 
     pub(crate) fn secondary(id: impl Into<String>) -> Self {
-        Self(id.into())
+        Self(format!("secondary:{}", id.into()))
     }
 }
 
@@ -67,6 +67,7 @@ pub(crate) struct ServerSummary {
 pub(crate) struct WorkspaceSummary {
     pub(crate) workspace_id: String,
     pub(crate) label: String,
+    pub(crate) branch: Option<String>,
     pub(crate) focused: bool,
 }
 
@@ -112,6 +113,10 @@ pub(crate) struct SummarySubscriptionPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientGlobalMenuAction {
+    Settings,
+    Keybinds,
+    ReloadConfig,
+    Detach,
     AddRemote,
 }
 
@@ -224,6 +229,7 @@ pub(crate) struct WorkspaceSidebarRow {
     pub(crate) server_id: ServerId,
     pub(crate) workspace_id: Option<String>,
     pub(crate) label: String,
+    pub(crate) branch: Option<String>,
     pub(crate) focused: bool,
     pub(crate) disabled: bool,
 }
@@ -249,6 +255,7 @@ pub(crate) struct ClientSupervisorModel {
     servers: Vec<ManagedServer>,
     filter: ServerFilter,
     active_server_id: ServerId,
+    ui_settings: crate::api::schema::UiSettingsInfo,
     new_workspace_picker_destinations: Option<Vec<ServerDestination>>,
     client_overlay: ClientOverlayState,
 }
@@ -285,6 +292,13 @@ pub(crate) fn bootstrap_from_main_api(
     model
         .set_summary(&ServerId::main(), summary)
         .map_err(|()| "main server is missing from supervisor model".to_string())?;
+    match request_ui_settings(api) {
+        Ok(ui_settings) => model.set_ui_settings(ui_settings),
+        Err(err) => tracing::warn!(
+            err = %err,
+            "failed to fetch main server UI settings; using defaults"
+        ),
+    }
     Ok(model)
 }
 
@@ -302,9 +316,41 @@ impl ClientSupervisorModel {
             }],
             filter: ServerFilter::All,
             active_server_id: ServerId::main(),
+            ui_settings: crate::api::schema::UiSettingsInfo::default(),
             new_workspace_picker_destinations: None,
             client_overlay: ClientOverlayState::None,
         }
+    }
+
+    pub(crate) fn ui_settings(&self) -> &crate::api::schema::UiSettingsInfo {
+        &self.ui_settings
+    }
+
+    pub(crate) fn set_ui_settings(&mut self, ui_settings: crate::api::schema::UiSettingsInfo) {
+        self.ui_settings = ui_settings;
+    }
+
+    pub(crate) fn refresh_main_ui_settings_from_api(
+        &mut self,
+        api: &mut impl SupervisorApi,
+    ) -> Result<(), String> {
+        let ui_settings = request_ui_settings(api)?;
+        self.set_ui_settings(ui_settings);
+        Ok(())
+    }
+
+    pub(crate) fn refresh_remote_registry_from_api(
+        &mut self,
+        api: &mut impl SupervisorApi,
+    ) -> Result<(), String> {
+        let remotes = request_remote_list(api)?;
+        self.sync_remote_registry(remotes);
+        Ok(())
+    }
+
+    pub(crate) fn activate_main_server(&mut self) {
+        self.close_new_workspace_picker();
+        self.active_server_id = ServerId::main();
     }
 
     pub(crate) fn add_secondary(
@@ -482,11 +528,34 @@ impl ClientSupervisorModel {
         self.server(id).map(|server| server.target.clone())
     }
 
-    pub(crate) fn disconnected_secondary_server_ids(&self) -> Vec<ServerId> {
+    pub(crate) fn unconnected_secondary_server_ids(&self) -> Vec<ServerId> {
         self.servers
             .iter()
             .filter(|server| server.role == ServerRole::Secondary)
-            .filter(|server| server.connection_state == ConnectionState::Disconnected)
+            .filter(|server| {
+                matches!(
+                    server.connection_state,
+                    ConnectionState::Connecting | ConnectionState::Disconnected
+                )
+            })
+            .map(|server| server.id.clone())
+            .collect()
+    }
+
+    pub(crate) fn secondary_server_ids_missing_client_stream(
+        &self,
+        connected_streams: &std::collections::HashSet<ServerId>,
+    ) -> Vec<ServerId> {
+        self.servers
+            .iter()
+            .filter(|server| server.role == ServerRole::Secondary)
+            .filter(|server| !connected_streams.contains(&server.id))
+            .filter(|server| {
+                !matches!(
+                    server.connection_state,
+                    ConnectionState::ProtocolMismatch { .. }
+                )
+            })
             .map(|server| server.id.clone())
             .collect()
     }
@@ -495,16 +564,31 @@ impl ClientSupervisorModel {
         &mut self,
         mut fetch: impl FnMut(&SecondaryConnectionPlan) -> Result<ServerSummary, ConnectionState>,
     ) {
-        for plan in self.secondary_connection_plans() {
-            match fetch(&plan) {
+        let results: Vec<_> = self
+            .secondary_connection_plans()
+            .into_iter()
+            .map(|plan| {
+                let result = fetch(&plan);
+                (plan.server_id, result)
+            })
+            .collect();
+        self.apply_secondary_summary_results(results);
+    }
+
+    pub(crate) fn apply_secondary_summary_results(
+        &mut self,
+        results: impl IntoIterator<Item = (ServerId, Result<ServerSummary, ConnectionState>)>,
+    ) {
+        for (server_id, result) in results {
+            match result {
                 Ok(summary) => {
-                    if let Some(server) = self.server_mut(&plan.server_id) {
+                    if let Some(server) = self.server_mut(&server_id) {
                         server.connection_state = ConnectionState::Connected;
                         server.summaries = summary;
                     }
                 }
                 Err(connection_state) => {
-                    if let Some(server) = self.server_mut(&plan.server_id) {
+                    if let Some(server) = self.server_mut(&server_id) {
                         server.connection_state = connection_state;
                     }
                 }
@@ -574,7 +658,13 @@ impl ClientSupervisorModel {
     }
 
     pub(crate) fn client_global_menu_items(&self) -> Vec<&'static str> {
-        vec!["add remote"]
+        vec![
+            "settings",
+            "keybinds",
+            "reload config",
+            "detach",
+            "add remote",
+        ]
     }
 
     pub(crate) fn client_global_menu_highlighted(&self) -> Option<usize> {
@@ -613,6 +703,22 @@ impl ClientSupervisorModel {
     ) -> Option<ClientGlobalMenuAction> {
         match index {
             0 => {
+                self.close_client_overlay();
+                Some(ClientGlobalMenuAction::Settings)
+            }
+            1 => {
+                self.close_client_overlay();
+                Some(ClientGlobalMenuAction::Keybinds)
+            }
+            2 => {
+                self.close_client_overlay();
+                Some(ClientGlobalMenuAction::ReloadConfig)
+            }
+            3 => {
+                self.close_client_overlay();
+                Some(ClientGlobalMenuAction::Detach)
+            }
+            4 => {
                 self.open_add_remote_form();
                 Some(ClientGlobalMenuAction::AddRemote)
             }
@@ -927,7 +1033,7 @@ impl ClientSupervisorModel {
                     .cloned()
             })
             .collect();
-        if next_destinations.len() > 1 {
+        if !next_destinations.is_empty() {
             self.new_workspace_picker_destinations = Some(next_destinations);
         }
     }
@@ -941,6 +1047,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             server_id: server.id.clone(),
             workspace_id: None,
             label: unavailable_row_label(server),
+            branch: None,
             focused: false,
             disabled: true,
         }];
@@ -951,6 +1058,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             server_id: server.id.clone(),
             workspace_id: None,
             label: format!("{} no workspaces", server.display_name),
+            branch: None,
             focused: false,
             disabled: true,
         }];
@@ -964,6 +1072,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             server_id: server.id.clone(),
             workspace_id: Some(workspace.workspace_id.clone()),
             label: workspace_label(server, &workspace.label, all_filter),
+            branch: workspace.branch.clone(),
             focused: workspace.focused,
             disabled: server.connection_state != ConnectionState::Connected,
         })
@@ -1141,6 +1250,23 @@ pub(crate) fn request_runtime_status(
     }
 }
 
+pub(crate) fn request_ui_settings(
+    api: &mut impl SupervisorApi,
+) -> Result<crate::api::schema::UiSettingsInfo, String> {
+    let response = api.request(crate::api::schema::Request {
+        id: "client-supervisor:ui-settings".into(),
+        method: crate::api::schema::Method::ServerUiSettings(
+            crate::api::schema::EmptyParams::default(),
+        ),
+    })?;
+    match response.result {
+        crate::api::schema::ResponseResult::UiSettings { settings } => Ok(settings),
+        other => Err(format!(
+            "server.ui_settings returned unexpected result: {other:?}"
+        )),
+    }
+}
+
 impl ServerSummary {
     fn from_api(
         workspaces: Vec<crate::api::schema::WorkspaceInfo>,
@@ -1152,6 +1278,7 @@ impl ServerSummary {
                 .map(|workspace| WorkspaceSummary {
                     workspace_id: workspace.workspace_id,
                     label: workspace.label,
+                    branch: workspace.branch,
                     focused: workspace.focused,
                 })
                 .collect(),
@@ -1240,6 +1367,7 @@ mod tests {
             workspace_id: workspace_id.into(),
             number: 1,
             label: label.into(),
+            branch: None,
             focused,
             pane_count: 1,
             tab_count: 1,
@@ -1281,6 +1409,8 @@ mod tests {
         remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
         workspaces: Vec<crate::api::schema::WorkspaceInfo>,
         agents: Vec<crate::api::schema::AgentInfo>,
+        ui_settings: crate::api::schema::UiSettingsInfo,
+        fail_ui_settings: bool,
     }
 
     impl SupervisorApi for FakeSupervisorApi {
@@ -1305,6 +1435,15 @@ mod tests {
                     self.requests.push("agent.list");
                     crate::api::schema::ResponseResult::AgentList {
                         agents: self.agents.clone(),
+                    }
+                }
+                crate::api::schema::Method::ServerUiSettings(_) => {
+                    self.requests.push("server.ui_settings");
+                    if self.fail_ui_settings {
+                        return Err("settings unavailable".into());
+                    }
+                    crate::api::schema::ResponseResult::UiSettings {
+                        settings: self.ui_settings.clone(),
                     }
                 }
                 other => return Err(format!("unexpected method: {other:?}")),
@@ -1339,7 +1478,12 @@ mod tests {
 
         assert_eq!(
             api.requests,
-            vec!["remote.list", "workspace.list", "agent.list"]
+            vec![
+                "remote.list",
+                "workspace.list",
+                "agent.list",
+                "server.ui_settings"
+            ]
         );
         assert_eq!(
             model.workspace_rows(),
@@ -1348,6 +1492,7 @@ mod tests {
                     server_id: ServerId::main(),
                     workspace_id: Some("main-workspace".into()),
                     label: "herdr".into(),
+                    branch: None,
                     focused: true,
                     disabled: false,
                 },
@@ -1355,6 +1500,7 @@ mod tests {
                     server_id: ServerId::secondary("remote-ssh"),
                     workspace_id: None,
                     label: "prod connecting".into(),
+                    branch: None,
                     focused: false,
                     disabled: true,
                 },
@@ -1362,6 +1508,7 @@ mod tests {
                     server_id: ServerId::secondary("remote-dev"),
                     workspace_id: None,
                     label: "dev connecting".into(),
+                    branch: None,
                     focused: false,
                     disabled: true,
                 },
@@ -1402,6 +1549,59 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_from_main_api_stores_main_ui_settings_snapshot() {
+        let mut ui_settings = crate::api::schema::UiSettingsInfo {
+            sidebar_width: 33,
+            ..crate::api::schema::UiSettingsInfo::default()
+        };
+        crate::app::state::SidebarSpaceItem::Branch
+            .set_enabled(&mut ui_settings.sidebar_spaces, false);
+        let mut api = FakeSupervisorApi {
+            workspaces: vec![workspace_info("main-workspace", "herdr", true)],
+            ui_settings: ui_settings.clone(),
+            ..FakeSupervisorApi::default()
+        };
+
+        let model = bootstrap_from_main_api(&mut api, "local").unwrap();
+
+        assert_eq!(model.ui_settings(), &ui_settings);
+        assert_eq!(
+            api.requests,
+            vec![
+                "remote.list",
+                "workspace.list",
+                "agent.list",
+                "server.ui_settings"
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_from_main_api_keeps_default_ui_settings_when_snapshot_fails() {
+        let mut api = FakeSupervisorApi {
+            workspaces: vec![workspace_info("main-workspace", "herdr", true)],
+            fail_ui_settings: true,
+            ..FakeSupervisorApi::default()
+        };
+
+        let model = bootstrap_from_main_api(&mut api, "local").unwrap();
+
+        assert_eq!(
+            model.ui_settings(),
+            &crate::api::schema::UiSettingsInfo::default()
+        );
+        assert_eq!(
+            api.requests,
+            vec![
+                "remote.list",
+                "workspace.list",
+                "agent.list",
+                "server.ui_settings"
+            ]
+        );
+    }
+
+    #[test]
     fn refresh_main_summary_from_api_replaces_main_summary_only() {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(ssh_remote("remote-x", "x", "x"));
@@ -1412,6 +1612,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "remote-api".into(),
                         label: "api".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: Vec::new(),
@@ -1440,6 +1641,7 @@ mod tests {
                     server_id: ServerId::main(),
                     workspace_id: Some("main-updated".into()),
                     label: "herdr".into(),
+                    branch: None,
                     focused: true,
                     disabled: false,
                 },
@@ -1447,6 +1649,7 @@ mod tests {
                     server_id: remote_id,
                     workspace_id: Some("remote-api".into()),
                     label: "x api".into(),
+                    branch: None,
                     focused: false,
                     disabled: false,
                 },
@@ -1470,6 +1673,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "dev-workspace".into(),
                         label: "api".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: Vec::new(),
@@ -1496,6 +1700,7 @@ mod tests {
                     server_id: ServerId::secondary("remote-ssh"),
                     workspace_id: None,
                     label: "prod protocol mismatch".into(),
+                    branch: None,
                     focused: false,
                     disabled: true,
                 },
@@ -1503,6 +1708,7 @@ mod tests {
                     server_id: ServerId::secondary("remote-dev"),
                     workspace_id: Some("dev-workspace".into()),
                     label: "dev api".into(),
+                    branch: None,
                     focused: false,
                     disabled: false,
                 },
@@ -1646,6 +1852,47 @@ mod tests {
     }
 
     #[test]
+    fn open_new_workspace_picker_keeps_single_remaining_destination() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = ServerId::secondary("remote-x");
+        model.add_secondary(ssh_remote("remote-x", "x", "x"));
+        model.open_new_workspace_picker();
+
+        model
+            .set_connection_state(&remote_id, ConnectionState::Disconnected)
+            .unwrap();
+
+        let expected = vec![ServerDestination {
+            server_id: ServerId::main(),
+            display_name: "local".into(),
+        }];
+        assert_eq!(
+            model.new_workspace_picker_destinations(),
+            Some(expected.as_slice())
+        );
+    }
+
+    #[test]
+    fn secondary_server_id_cannot_collide_with_main_server_id() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(local_remote("main", "remote main", Some("main")));
+
+        assert_ne!(remote_id, ServerId::main());
+        assert_eq!(
+            model
+                .servers
+                .iter()
+                .filter(|server| server.id == ServerId::main())
+                .count(),
+            1
+        );
+        assert_eq!(
+            model.server(&remote_id).map(|server| server.role),
+            Some(ServerRole::Secondary)
+        );
+    }
+
+    #[test]
     fn choosing_new_workspace_destination_routes_create_and_switches_active_server() {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = ServerId::secondary("remote-x");
@@ -1756,6 +2003,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "main-herdr".into(),
                         label: "herdr".into(),
+                        branch: None,
                         focused: true,
                     }],
                     agents: Vec::new(),
@@ -1769,6 +2017,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "remote-herdr".into(),
                         label: "herdr".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: Vec::new(),
@@ -1783,6 +2032,7 @@ mod tests {
                     server_id: ServerId::main(),
                     workspace_id: Some("main-herdr".into()),
                     label: "herdr".into(),
+                    branch: None,
                     focused: true,
                     disabled: false,
                 },
@@ -1790,6 +2040,7 @@ mod tests {
                     server_id: remote_id.clone(),
                     workspace_id: Some("remote-herdr".into()),
                     label: "x herdr".into(),
+                    branch: None,
                     focused: false,
                     disabled: false,
                 },
@@ -1803,6 +2054,7 @@ mod tests {
                 server_id: remote_id,
                 workspace_id: Some("remote-herdr".into()),
                 label: "herdr".into(),
+                branch: None,
                 focused: false,
                 disabled: false,
             }]
@@ -1824,6 +2076,7 @@ mod tests {
                 server_id: remote_id.clone(),
                 workspace_id: None,
                 label: "x offline".into(),
+                branch: None,
                 focused: false,
                 disabled: true,
             }]
@@ -1836,6 +2089,7 @@ mod tests {
                 server_id: remote_id,
                 workspace_id: None,
                 label: "x offline".into(),
+                branch: None,
                 focused: false,
                 disabled: true,
             }]
@@ -1857,6 +2111,7 @@ mod tests {
                 server_id: remote_id,
                 workspace_id: None,
                 label: "x no workspaces".into(),
+                branch: None,
                 focused: false,
                 disabled: true,
             }]
@@ -1875,6 +2130,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "main-herdr".into(),
                         label: "herdr".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: vec![AgentSummary {
@@ -1894,6 +2150,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "remote-herdr".into(),
                         label: "herdr".into(),
+                        branch: None,
                         focused: true,
                     }],
                     agents: vec![AgentSummary {
@@ -1967,6 +2224,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "remote-api".into(),
                         label: "api".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: Vec::new(),
@@ -2009,6 +2267,7 @@ mod tests {
                     workspaces: vec![WorkspaceSummary {
                         workspace_id: "remote-api".into(),
                         label: "api".into(),
+                        branch: None,
                         focused: false,
                     }],
                     agents: vec![AgentSummary {
@@ -2079,13 +2338,26 @@ mod tests {
     }
 
     #[test]
-    fn client_global_menu_opens_add_remote_form() {
+    fn client_global_menu_uses_server_launcher_items() {
         let mut model = ClientSupervisorModel::new("local");
 
         model.open_client_global_menu();
 
         assert_eq!(model.client_global_menu_highlighted(), Some(0));
-        assert_eq!(model.client_global_menu_items(), ["add remote"]);
+        assert_eq!(
+            model.client_global_menu_items(),
+            [
+                "settings",
+                "keybinds",
+                "reload config",
+                "detach",
+                "add remote"
+            ]
+        );
+        for _ in 0..4 {
+            model.move_client_global_menu_next();
+        }
+        assert_eq!(model.client_global_menu_highlighted(), Some(4));
         assert_eq!(
             model.accept_client_global_menu_item(),
             Some(ClientGlobalMenuAction::AddRemote)

@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn zig_target(target: &str) -> &str {
@@ -27,6 +27,39 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn build_commit(manifest_dir: &Path) -> String {
+    if let Ok(commit) = env::var("HERDR_BUILD_COMMIT") {
+        return commit;
+    }
+
+    let Some(mut commit) = git_output(manifest_dir, &["rev-parse", "--short", "HEAD"]) else {
+        return "unknown".into();
+    };
+
+    if git_output(
+        manifest_dir,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .is_some()
+    {
+        commit.push_str("-dirty");
+    }
+    commit
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -39,9 +72,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SIMD");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ZIG_SYSTEM_DIR");
+    println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    if let Some(git_head) = git_output(&manifest_dir, &["rev-parse", "--git-path", "HEAD"]) {
+        println!("cargo:rerun-if-changed={}", git_head);
+    }
+    if let Some(git_index) = git_output(&manifest_dir, &["rev-parse", "--git-path", "index"]) {
+        println!("cargo:rerun-if-changed={}", git_index);
+    }
+    println!(
+        "cargo:rustc-env=HERDR_BUILD_COMMIT={}",
+        build_commit(&manifest_dir)
+    );
+
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);

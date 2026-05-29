@@ -614,7 +614,7 @@ fn remote_herdr_from_path_probe(remote_herdr: &RemoteHerdr, stdout: &str) -> Opt
     let status = lines.next()?;
     let protocol = parse_client_status_json(status)?.protocol;
     if !path.starts_with('/')
-        || version != format!("herdr {CURRENT_VERSION}")
+        || !crate::version::version_line_matches_current(version)
         || protocol != CURRENT_PROTOCOL
     {
         return None;
@@ -649,7 +649,7 @@ fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result
     let mut lines = stdout.lines();
     let version = lines.next().unwrap_or_default().trim();
     let status = lines.next().unwrap_or_default();
-    Ok(version == format!("herdr {CURRENT_VERSION}")
+    Ok(crate::version::version_line_matches_current(version)
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false))
@@ -1398,6 +1398,17 @@ struct SshStdioBridge {
     thread: Option<JoinHandle<()>>,
 }
 
+fn spawn_bridge_worker(
+    stream: UnixStream,
+    run: impl FnOnce(UnixStream) -> io::Result<()> + Send + 'static,
+) {
+    let _ = thread::spawn(move || {
+        if let Err(err) = run(stream) {
+            eprintln!("herdr: remote bridge failed: {err}");
+        }
+    });
+}
+
 impl SshStdioBridge {
     fn start(
         target: String,
@@ -1423,11 +1434,18 @@ impl SshStdioBridge {
                             );
                             continue;
                         }
-                        if let Err(err) =
-                            bridge_connection(stream, &target, &remote_herdr, &session_name, kind)
-                        {
-                            eprintln!("herdr: remote bridge failed: {err}");
-                        }
+                        let worker_target = target.clone();
+                        let worker_remote_herdr = remote_herdr.clone();
+                        let worker_session_name = session_name.clone();
+                        spawn_bridge_worker(stream, move |stream| {
+                            bridge_connection(
+                                stream,
+                                &worker_target,
+                                &worker_remote_herdr,
+                                &worker_session_name,
+                                kind,
+                            )
+                        });
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
@@ -1686,6 +1704,22 @@ mod tests {
 
         drop(bridge);
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn bridge_worker_returns_before_connection_finishes() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        let start = Instant::now();
+        spawn_bridge_worker(stream, move |_| {
+            thread::sleep(Duration::from_millis(200));
+            finished_tx.send(()).unwrap();
+            Ok(())
+        });
+
+        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]

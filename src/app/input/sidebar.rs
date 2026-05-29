@@ -204,6 +204,7 @@ impl AppState {
             labels.push("what's new");
         }
         labels.push("detach");
+        labels.extend(self.global_menu_extra_labels.iter().copied());
         labels
     }
 
