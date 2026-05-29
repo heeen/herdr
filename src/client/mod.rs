@@ -41,6 +41,8 @@ use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 const CLIENT_SUPERVISOR_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -1648,14 +1650,36 @@ fn validate_add_remote_target(
         crate::api::client::ConnectionTarget,
     ) -> Result<crate::api::RuntimeStatus, String>,
 ) -> Result<(), String> {
-    let status = status_for_target(target)?;
-    if status.protocol != Some(PROTOCOL_VERSION) {
-        return Err(format!(
-            "protocol mismatch: server protocol {:?}, client protocol {}",
-            status.protocol, PROTOCOL_VERSION
-        ));
+    let deadline = Instant::now() + ADD_REMOTE_TARGET_VALIDATE_TIMEOUT;
+    loop {
+        match status_for_target(target.clone()) {
+            Ok(status) => {
+                if status.protocol != Some(PROTOCOL_VERSION) {
+                    return Err(format!(
+                        "protocol mismatch: server protocol {:?}, client protocol {}",
+                        status.protocol, PROTOCOL_VERSION
+                    ));
+                }
+                return Ok(());
+            }
+            Err(err)
+                if add_remote_target_status_error_is_transient(&err)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
     }
-    Ok(())
+}
+
+fn add_remote_target_status_error_is_transient(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("resource temporarily unavailable")
+        || error.contains("operation would block")
+        || error.contains("timed out")
+        || error.contains("connection refused")
+        || error.contains("no such file or directory")
 }
 
 fn refresh_client_supervisor_summaries(
@@ -3536,6 +3560,31 @@ mod tests {
         );
 
         assert_eq!(err, Ok(()));
+    }
+
+    #[test]
+    fn validate_add_remote_target_retries_transient_bridge_timeout() {
+        let mut attempts = 0;
+
+        let err = validate_add_remote_target(
+            crate::api::client::ConnectionTarget::SocketPath(std::path::PathBuf::from(
+                "/tmp/herdr-prod-api.sock",
+            )),
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err("Resource temporarily unavailable (os error 35)".to_string());
+                }
+                Ok(crate::api::RuntimeStatus {
+                    version: Some("0.6.0".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                    capabilities: None,
+                })
+            },
+        );
+
+        assert_eq!(err, Ok(()));
+        assert_eq!(attempts, 2);
     }
 
     #[test]
