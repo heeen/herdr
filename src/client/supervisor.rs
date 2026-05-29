@@ -606,16 +606,6 @@ impl ClientSupervisorModel {
             .map_err(|()| "main server is missing from supervisor model".to_string())
     }
 
-    pub(crate) fn refresh_local_secondary_summaries_from_api(&mut self) {
-        self.refresh_secondary_summaries(|plan| match &plan.target {
-            ServerConnectionTarget::LocalSession(session) => {
-                fetch_local_secondary_summary(session.clone())
-            }
-            ServerConnectionTarget::Ssh(_) => Err(ConnectionState::Connecting),
-            ServerConnectionTarget::Main => unreachable!("secondary plans never include main"),
-        });
-    }
-
     pub(crate) fn new_workspace_route(&self) -> NewWorkspaceRoute {
         match &self.filter {
             ServerFilter::Server(id) => self.route_for_specific_server(id),
@@ -1204,14 +1194,6 @@ fn request_server_summary(api: &mut impl SupervisorApi) -> Result<ServerSummary,
     };
 
     Ok(ServerSummary::from_api(workspaces, agents))
-}
-
-fn fetch_local_secondary_summary(
-    session: Option<String>,
-) -> Result<ServerSummary, ConnectionState> {
-    fetch_server_summary_from_api_target(crate::api::client::ConnectionTarget::LocalSession(
-        session,
-    ))
 }
 
 pub(crate) fn fetch_server_summary_from_api_target(

@@ -42,6 +42,7 @@ use crate::server::socket_paths::client_socket_path;
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 const CLIENT_SUPERVISOR_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_SUPERVISOR_API_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_60FPS_FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -53,6 +54,8 @@ const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(5
 struct ClientState {
     /// Stateful semantic-frame encoder used when the server sends FrameData.
     blit_encoder: render_ansi::BlitEncoder,
+    /// Client-side frame timing stats for render FPS diagnostics.
+    frame_stats: ClientFrameStats,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -81,6 +84,12 @@ struct ClientState {
     frame_cache: HashMap<supervisor::ServerId, protocol::FrameData>,
     /// Servers with active summary-event subscription workers.
     summary_subscription_server_ids: HashSet<supervisor::ServerId>,
+    /// Secondary servers with a summary refresh already running off the UI loop.
+    pending_summary_refresh_server_ids: HashSet<supervisor::ServerId>,
+    /// Secondary servers with a client-stream connection attempt running off the UI loop.
+    pending_secondary_connect_server_ids: HashSet<supervisor::ServerId>,
+    /// Whether an add-remote submission is running off the UI loop.
+    pending_add_remote: bool,
     /// SSH bridges owned by this client for secondary servers.
     ssh_bridges: HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
     /// Backoff state for secondary servers that should be reconnected.
@@ -91,6 +100,49 @@ struct ClientState {
 struct SecondaryRetryState {
     attempt: usize,
     next_retry_at: Instant,
+}
+
+struct SecondaryConnectionAttempt {
+    stream: UnixStream,
+    bridge: Option<crate::remote::RemoteBridge>,
+}
+
+struct ClientAddRemoteSuccess {
+    remote: crate::remote_registry::RemoteDefinitionSnapshot,
+    stream: UnixStream,
+    bridge: Option<crate::remote::RemoteBridge>,
+}
+
+#[derive(Clone)]
+struct ServerWriteHandle {
+    tx: std::sync::mpsc::Sender<ClientMessage>,
+}
+
+#[derive(Debug, Default)]
+struct ClientFrameStats {
+    last_render_duration: Option<Duration>,
+    last_render_fps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClientFrameSample {
+    render_duration: Duration,
+    render_fps: f64,
+    missed_sixty_fps_budget: bool,
+}
+
+impl ClientFrameStats {
+    fn record_render_duration(&mut self, render_duration: Duration) -> ClientFrameSample {
+        let render_fps = fps_for_frame_duration(render_duration);
+        let sample = ClientFrameSample {
+            render_duration,
+            render_fps,
+            missed_sixty_fps_budget: render_duration > CLIENT_60FPS_FRAME_BUDGET,
+        };
+        self.last_render_duration = Some(render_duration);
+        self.last_render_fps = Some(render_fps);
+        sample
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -889,8 +941,33 @@ enum ClientLoopEvent {
     },
     /// A subscribed sidebar-summary event arrived from one managed server.
     SupervisorSummaryChanged(supervisor::ServerId),
+    /// A secondary server summary refresh completed off the UI loop.
+    SupervisorSummaryFetched {
+        server_id: supervisor::ServerId,
+        result: Result<supervisor::ServerSummary, supervisor::ConnectionState>,
+        elapsed: Duration,
+    },
     /// A sidebar-summary subscription worker ended and should be eligible to restart.
     SupervisorSummarySubscriptionEnded(supervisor::ServerId),
+    /// A sidebar API request completed off the UI loop.
+    SupervisorApiRequestFinished {
+        server_id: supervisor::ServerId,
+        refresh: ClientApiRefreshPolicy,
+        result: Result<(), String>,
+        elapsed: Duration,
+    },
+    /// A secondary server client stream connection attempt completed off the UI loop.
+    SecondaryConnectionAttemptFinished {
+        server_id: supervisor::ServerId,
+        attempt: usize,
+        result: Result<SecondaryConnectionAttempt, ClientError>,
+        elapsed: Duration,
+    },
+    /// Add-remote validation and setup completed off the UI loop.
+    AddRemoteFinished {
+        result: Result<ClientAddRemoteSuccess, String>,
+        elapsed: Duration,
+    },
     /// Server reader thread exited (connection lost).
     ServerDisconnected(supervisor::ServerId),
     /// Timer tick.
@@ -976,16 +1053,10 @@ fn run_client_with_mode(
     let (cols, rows, cell_width_px, cell_height_px) =
         current_terminal_geometry(kitty_graphics_enabled);
 
-    let mut supervisor_model = if direct_attach_requested {
-        None
-    } else {
+    let mut supervisor_model = {
         let mut api = crate::api::client::ApiClient::local();
-        match bootstrap_supervisor_for_client(false, &mut api) {
-            Ok(Some(mut model)) => {
-                model.refresh_local_secondary_summaries_from_api();
-                Some(model)
-            }
-            Ok(None) => None,
+        match bootstrap_client_supervisor_model(direct_attach_requested, &mut api) {
+            Ok(model) => model,
             Err(err) => {
                 warn!(err = %err, "failed to bootstrap client supervisor from main API");
                 None
@@ -1160,6 +1231,13 @@ fn bootstrap_supervisor_for_client(
     supervisor::bootstrap_from_main_api(api, main_display_name_for_client()).map(Some)
 }
 
+fn bootstrap_client_supervisor_model(
+    direct_attach_requested: bool,
+    api: &mut impl supervisor::SupervisorApi,
+) -> Result<Option<supervisor::ClientSupervisorModel>, String> {
+    bootstrap_supervisor_for_client(direct_attach_requested, api)
+}
+
 fn main_display_name_for_client() -> String {
     std::env::var(crate::remote::MAIN_DISPLAY_NAME_ENV_VAR)
         .ok()
@@ -1232,63 +1310,45 @@ fn client_socket_path_for_supervisor_server(
 
 fn connect_secondary_client_streams(
     model: &mut supervisor::ClientSupervisorModel,
-    server_size: (u16, u16),
-    cell_width_px: u32,
-    cell_height_px: u32,
-    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    _server_size: (u16, u16),
+    _cell_width_px: u32,
+    _cell_height_px: u32,
+    _ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
 ) -> Vec<(supervisor::ServerId, UnixStream)> {
-    let mut streams = Vec::new();
     for plan in model.secondary_connection_plans() {
-        match connect_secondary_client_stream_for_plan(
-            &plan,
-            server_size,
-            cell_width_px,
-            cell_height_px,
-            ssh_bridges,
-        ) {
-            Ok(stream) => {
-                let _ = model
-                    .set_connection_state(&plan.server_id, supervisor::ConnectionState::Connected);
-                streams.push((plan.server_id, stream));
-            }
-            Err(err) => {
-                let state = connection_state_from_client_error(&err);
-                let _ = model.set_connection_state(&plan.server_id, state);
-                ssh_bridges.remove(&plan.server_id);
-                warn!(
-                    server_id = ?plan.server_id,
-                    err = %err,
-                    "failed to connect secondary client stream"
-                );
-            }
-        }
+        let _ =
+            model.set_connection_state(&plan.server_id, supervisor::ConnectionState::Connecting);
     }
-    streams
+    Vec::new()
 }
 
-fn connect_secondary_client_stream_for_plan(
-    plan: &supervisor::SecondaryConnectionPlan,
+fn connect_secondary_client_stream_for_plan_detached(
+    plan: supervisor::SecondaryConnectionPlan,
     server_size: (u16, u16),
     cell_width_px: u32,
     cell_height_px: u32,
-    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
-) -> Result<UnixStream, ClientError> {
+    existing_ssh_client_socket: Option<std::path::PathBuf>,
+) -> Result<SecondaryConnectionAttempt, ClientError> {
     let socket_path = match &plan.target {
         supervisor::ServerConnectionTarget::Ssh(target) => {
-            if !ssh_bridges.contains_key(&plan.server_id) {
+            if let Some(path) = existing_ssh_client_socket {
+                path
+            } else {
                 let bridge = crate::remote::start_ssh_remote_bridge(target, None)
                     .map_err(ClientError::ConnectionFailed)?;
-                ssh_bridges.insert(plan.server_id.clone(), bridge);
+                let socket_path = bridge.client_socket_path().to_path_buf();
+                return connect_secondary_client_stream(
+                    &socket_path,
+                    server_size,
+                    cell_width_px,
+                    cell_height_px,
+                    plan.keybindings,
+                )
+                .map(|stream| SecondaryConnectionAttempt {
+                    stream,
+                    bridge: Some(bridge),
+                });
             }
-            ssh_bridges
-                .get(&plan.server_id)
-                .map(|bridge| bridge.client_socket_path().to_path_buf())
-                .ok_or_else(|| {
-                    ClientError::ConnectionFailed(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "missing ssh bridge for secondary server",
-                    ))
-                })?
         }
         _ => client_socket_path_for_connection_target(&plan.target).ok_or_else(|| {
             ClientError::ConnectionFailed(io::Error::new(
@@ -1305,6 +1365,10 @@ fn connect_secondary_client_stream_for_plan(
         cell_height_px,
         plan.keybindings,
     )
+    .map(|stream| SecondaryConnectionAttempt {
+        stream,
+        bridge: None,
+    })
 }
 
 fn connect_secondary_client_stream(
@@ -1333,7 +1397,7 @@ fn attach_secondary_client_stream(
     stream: UnixStream,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
 ) -> Result<(), ClientError> {
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     let read_tx = event_tx.clone();
@@ -1351,8 +1415,31 @@ fn attach_secondary_client_stream(
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
-    server_writes.insert(server_id, stream);
+    let write_handle = spawn_server_writer(server_id.clone(), stream, event_tx.clone());
+    server_writes.insert(server_id, write_handle);
     Ok(())
+}
+
+fn spawn_server_writer(
+    server_id: supervisor::ServerId,
+    mut stream: UnixStream,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> ServerWriteHandle {
+    let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+    std::thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            if let Err(err) = write_to_server(&mut stream, &message) {
+                warn!(
+                    server_id = ?server_id,
+                    err = %err,
+                    "server writer failed"
+                );
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(server_id));
+                return;
+            }
+        }
+    });
+    ServerWriteHandle { tx }
 }
 
 fn connection_state_from_client_error(err: &ClientError) -> supervisor::ConnectionState {
@@ -1380,6 +1467,7 @@ fn client_keybindings_from_snapshot(
     }
 }
 
+#[cfg(test)]
 fn send_client_supervisor_request(
     model: &supervisor::ClientSupervisorModel,
     server_id: &supervisor::ServerId,
@@ -1388,6 +1476,13 @@ fn send_client_supervisor_request(
 ) -> Result<(), String> {
     let target = api_target_for_supervisor_server(model, server_id, ssh_bridges)
         .ok_or_else(|| format!("no API target for server {server_id:?}"))?;
+    send_client_supervisor_request_to_target(target, request)
+}
+
+fn send_client_supervisor_request_to_target(
+    target: crate::api::client::ConnectionTarget,
+    request: crate::api::schema::Request,
+) -> Result<(), String> {
     let api = crate::api::client::ApiClient::for_target(target);
     let value = api
         .request_value_with_timeout(&request, CLIENT_SUPERVISOR_API_TIMEOUT)
@@ -1395,6 +1490,39 @@ fn send_client_supervisor_request(
     crate::api::client::parse_response_value(value)
         .map(|_| ())
         .map_err(|err| err.to_string())
+}
+
+fn spawn_client_supervisor_request(
+    model: &supervisor::ClientSupervisorModel,
+    server_id: supervisor::ServerId,
+    refresh: ClientApiRefreshPolicy,
+    request: crate::api::schema::Request,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> Result<(), String> {
+    let target = api_target_for_supervisor_server(model, &server_id, ssh_bridges)
+        .ok_or_else(|| format!("no API target for server {server_id:?}"))?;
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = send_client_supervisor_request_to_target(target, request);
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorApiRequestFinished {
+            server_id,
+            refresh,
+            result,
+            elapsed,
+        });
+    });
+    Ok(())
+}
+
+fn fps_for_frame_duration(duration: Duration) -> f64 {
+    if duration.is_zero() {
+        f64::INFINITY
+    } else {
+        1.0 / duration.as_secs_f64()
+    }
 }
 
 fn submit_remote_add_to_main_api(
@@ -1550,22 +1678,37 @@ fn api_client_error_is_timeout(err: &crate::api::client::ApiClientError) -> bool
     )
 }
 
-fn handle_client_add_remote_submission(
+fn spawn_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
-    model: &mut supervisor::ClientSupervisorModel,
     server_size: (u16, u16),
     cell_size_px: (u32, u32),
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
-    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
-    ssh_bridges: &mut HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
-) -> Result<(), String> {
+    pending_add_remote: &mut bool,
+) {
+    if *pending_add_remote {
+        return;
+    }
+    *pending_add_remote = true;
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = prepare_client_add_remote_submission(draft, server_size, cell_size_px);
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::AddRemoteFinished { result, elapsed });
+    });
+}
+
+fn prepare_client_add_remote_submission(
+    draft: supervisor::AddRemoteDraft,
+    server_size: (u16, u16),
+    cell_size_px: (u32, u32),
+) -> Result<ClientAddRemoteSuccess, String> {
     let target = crate::remote_registry::RemoteTargetSnapshot::parse(&draft.target)
         .map_err(|err| err.message().to_string())?;
     reject_duplicate_main_target(&target)?;
 
     let keybindings = draft.keybindings;
-    let (pending_stream, pending_bridge) = match &target {
+    let (stream, bridge) = match &target {
         crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
             validate_add_remote_target(
                 crate::api::client::ConnectionTarget::LocalSession(session.clone()),
@@ -1583,7 +1726,7 @@ fn handle_client_add_remote_submission(
                 keybindings,
             )
             .map_err(|err| err.to_string())?;
-            (Some(stream), None)
+            (stream, None)
         }
         crate::remote_registry::RemoteTargetSnapshot::Ssh { target } => {
             let bridge = crate::remote::start_ssh_remote_bridge(target, None)
@@ -1605,32 +1748,17 @@ fn handle_client_add_remote_submission(
                 keybindings,
             )
             .map_err(|err| err.to_string())?;
-            (Some(stream), Some(bridge))
+            (stream, Some(bridge))
         }
     };
 
     let mut main_api = crate::api::client::ApiClient::local();
     let remote = submit_remote_add_to_main_api(&mut main_api, draft)?;
-    let server_id = model.add_secondary(remote);
-
-    if let Some(bridge) = pending_bridge {
-        ssh_bridges.insert(server_id.clone(), bridge);
-    }
-
-    if let Some(stream) = pending_stream {
-        attach_secondary_client_stream(
-            server_id.clone(),
-            stream,
-            event_tx,
-            should_quit,
-            server_writes,
-        )
-        .map_err(|err| err.to_string())?;
-        let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Connected);
-    }
-
-    model.finish_add_remote();
-    Ok(())
+    Ok(ClientAddRemoteSuccess {
+        remote,
+        stream,
+        bridge,
+    })
 }
 
 fn reject_duplicate_main_target(
@@ -1696,6 +1824,8 @@ fn add_remote_target_status_error_is_transient(error: &str) -> bool {
 fn refresh_client_supervisor_summaries(
     model: &mut supervisor::ClientSupervisorModel,
     ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     let mut api = crate::api::client::ApiClient::local();
     if let Err(err) = model.refresh_remote_registry_from_api(&mut api) {
@@ -1707,9 +1837,29 @@ fn refresh_client_supervisor_summaries(
     if let Err(err) = model.refresh_main_summary_from_api(&mut api) {
         warn!(err = %err, "failed to refresh main server summary");
     }
+    let immediate_results = start_secondary_supervisor_summary_refreshes(
+        model,
+        ssh_bridges,
+        pending_summary_refresh_server_ids,
+        event_tx,
+    );
+    model.apply_secondary_summary_results(immediate_results);
+}
+
+fn start_secondary_supervisor_summary_refreshes(
+    model: &supervisor::ClientSupervisorModel,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> Vec<(
+    supervisor::ServerId,
+    Result<supervisor::ServerSummary, supervisor::ConnectionState>,
+)> {
     let mut immediate_results = Vec::new();
-    let (tx, rx) = std::sync::mpsc::channel();
     for plan in model.secondary_connection_plans() {
+        if pending_summary_refresh_server_ids.contains(&plan.server_id) {
+            continue;
+        }
         let Some(target) =
             api_target_for_supervisor_target(&plan.server_id, &plan.target, ssh_bridges)
         else {
@@ -1717,15 +1867,20 @@ fn refresh_client_supervisor_summaries(
             continue;
         };
         let server_id = plan.server_id;
-        let tx = tx.clone();
+        pending_summary_refresh_server_ids.insert(server_id.clone());
+        let event_tx = event_tx.clone();
         std::thread::spawn(move || {
+            let started_at = Instant::now();
             let result = supervisor::fetch_server_summary_from_api_target(target);
-            let _ = tx.send((server_id, result));
+            let elapsed = started_at.elapsed();
+            let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
+                server_id,
+                result,
+                elapsed,
+            });
         });
     }
-    drop(tx);
-    immediate_results.extend(rx);
-    model.apply_secondary_summary_results(immediate_results);
+    immediate_results
 }
 
 fn supervisor_summary_refresh_due(now: Instant, last_refresh: Instant) -> bool {
@@ -1758,7 +1913,7 @@ fn schedule_secondary_retry(
 
 fn schedule_missing_secondary_stream_retries(
     state: &mut ClientState,
-    server_writes: &HashMap<supervisor::ServerId, UnixStream>,
+    server_writes: &HashMap<supervisor::ServerId, ServerWriteHandle>,
     now: Instant,
 ) {
     let Some(model) = &state.supervisor_model else {
@@ -1775,14 +1930,14 @@ fn schedule_missing_secondary_stream_retries(
             .entry(server_id.clone())
             .or_insert_with(|| SecondaryRetryState {
                 attempt: 0,
-                next_retry_at: now + secondary_retry_delay(0),
+                next_retry_at: now,
             });
     }
 }
 
 fn handle_server_write_failure(
     state: &mut ClientState,
-    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
     server_id: supervisor::ServerId,
     error: io::Error,
     now: Instant,
@@ -1799,6 +1954,10 @@ fn handle_server_write_failure(
     server_writes.remove(&server_id);
     state.frame_cache.remove(&server_id);
     state.summary_subscription_server_ids.remove(&server_id);
+    state.pending_summary_refresh_server_ids.remove(&server_id);
+    state
+        .pending_secondary_connect_server_ids
+        .remove(&server_id);
     state.ssh_bridges.remove(&server_id);
     if let Some(model) = &mut state.supervisor_model {
         let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Disconnected);
@@ -1812,8 +1971,7 @@ fn retry_due_secondary_connections(
     state: &mut ClientState,
     now: Instant,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
-    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
 ) {
     let due: Vec<(supervisor::ServerId, usize)> = state
         .secondary_retries
@@ -1825,6 +1983,12 @@ fn retry_due_secondary_connections(
     for (server_id, attempt) in due {
         if server_writes.contains_key(&server_id) {
             state.secondary_retries.remove(&server_id);
+            continue;
+        }
+        if state
+            .pending_secondary_connect_server_ids
+            .contains(&server_id)
+        {
             continue;
         }
 
@@ -1839,78 +2003,58 @@ fn retry_due_secondary_connections(
             continue;
         };
 
-        match connect_secondary_client_stream_for_plan(
-            &plan,
+        let existing_ssh_client_socket = state
+            .ssh_bridges
+            .get(&server_id)
+            .map(|bridge| bridge.client_socket_path().to_path_buf());
+        state
+            .pending_secondary_connect_server_ids
+            .insert(server_id.clone());
+        spawn_secondary_connection_retry(
+            server_id.clone(),
+            attempt,
+            plan,
             state.reported_size,
             state.cell_size_px.0,
             state.cell_size_px.1,
-            &mut state.ssh_bridges,
-        ) {
-            Ok(stream) => {
-                if let Err(err) = attach_secondary_client_stream(
-                    server_id.clone(),
-                    stream,
-                    event_tx,
-                    should_quit,
-                    server_writes,
-                ) {
-                    let next_attempt = attempt.saturating_add(1);
-                    schedule_secondary_retry(state, server_id.clone(), next_attempt, now);
-                    if let Some(model) = &mut state.supervisor_model {
-                        let _ = model.set_connection_state(
-                            &server_id,
-                            connection_state_from_client_error(&err),
-                        );
-                    }
-                    warn!(
-                        server_id = ?server_id,
-                        err = %err,
-                        "failed to attach retried secondary client stream"
-                    );
-                    state.request_full_redraw();
-                    continue;
-                }
-
-                state.secondary_retries.remove(&server_id);
-                if let Some(model) = &mut state.supervisor_model {
-                    let _ = model
-                        .set_connection_state(&server_id, supervisor::ConnectionState::Connected);
-                    refresh_client_supervisor_summaries(model, &state.ssh_bridges);
-                    start_missing_supervisor_summary_subscriptions(
-                        model,
-                        &mut state.summary_subscription_server_ids,
-                        &state.ssh_bridges,
-                        event_tx,
-                        should_quit,
-                    );
-                    state.last_supervisor_summary_refresh = now;
-                }
-                state.request_full_redraw();
-            }
-            Err(err) => {
-                let connection_state = connection_state_from_client_error(&err);
-                if matches!(
-                    connection_state,
-                    supervisor::ConnectionState::ProtocolMismatch { .. }
-                ) {
-                    state.secondary_retries.remove(&server_id);
-                } else {
-                    let next_attempt = attempt.saturating_add(1);
-                    schedule_secondary_retry(state, server_id.clone(), next_attempt, now);
-                }
-                state.ssh_bridges.remove(&server_id);
-                if let Some(model) = &mut state.supervisor_model {
-                    let _ = model.set_connection_state(&server_id, connection_state);
-                }
-                warn!(
-                    server_id = ?server_id,
-                    err = %err,
-                    "failed to retry secondary client connection"
-                );
-                state.request_full_redraw();
-            }
+            existing_ssh_client_socket,
+            event_tx,
+        );
+        if let Some(model) = &mut state.supervisor_model {
+            let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Connecting);
         }
+        state.request_full_redraw();
     }
+}
+
+fn spawn_secondary_connection_retry(
+    server_id: supervisor::ServerId,
+    attempt: usize,
+    plan: supervisor::SecondaryConnectionPlan,
+    server_size: (u16, u16),
+    cell_width_px: u32,
+    cell_height_px: u32,
+    existing_ssh_client_socket: Option<std::path::PathBuf>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = connect_secondary_client_stream_for_plan_detached(
+            plan,
+            server_size,
+            cell_width_px,
+            cell_height_px,
+            existing_ssh_client_socket,
+        );
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::SecondaryConnectionAttemptFinished {
+            server_id,
+            attempt,
+            result,
+            elapsed,
+        });
+    });
 }
 
 fn select_composited_render_frame<'a>(
@@ -1933,6 +2077,7 @@ fn render_cached_composited_frame(state: &mut ClientState) {
 
     let frame_data =
         compositor.compose_frame(model, &active_frame, state.host_size.0, state.host_size.1);
+    let render_started_at = Instant::now();
     let encoded = state.blit_encoder.encode(&frame_data, false);
     let graphics = if state.kitty_graphics_enabled {
         frame_data.graphics.as_slice()
@@ -1943,6 +2088,19 @@ fn render_cached_composited_frame(state: &mut ClientState) {
     let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
     let _ = stdout.flush();
     state.blit_encoder.commit(frame_data, encoded);
+    record_client_frame_sample(state, render_started_at.elapsed());
+}
+
+fn record_client_frame_sample(state: &mut ClientState, render_duration: Duration) {
+    let sample = state.frame_stats.record_render_duration(render_duration);
+    if sample.missed_sixty_fps_budget {
+        debug!(
+            render_ms = sample.render_duration.as_secs_f64() * 1000.0,
+            render_fps = sample.render_fps,
+            frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+            "client frame render missed 60fps budget"
+        );
+    }
 }
 
 /// The main client event loop.
@@ -1975,6 +2133,7 @@ async fn run_client_loop(
     } = options;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
+        frame_stats: ClientFrameStats::default(),
         mouse_capture_active,
         reported_size,
         host_size,
@@ -1989,6 +2148,9 @@ async fn run_client_loop(
         last_supervisor_summary_refresh: Instant::now(),
         frame_cache: HashMap::new(),
         summary_subscription_server_ids: HashSet::new(),
+        pending_summary_refresh_server_ids: HashSet::new(),
+        pending_secondary_connect_server_ids: HashSet::new(),
+        pending_add_remote: false,
         ssh_bridges,
         secondary_retries: HashMap::new(),
     };
@@ -2042,13 +2204,14 @@ async fn run_client_loop(
         );
     });
 
-    // Use the original stream for writing (blocking is fine since we write
-    // from the async loop).
     let mut server_writes = HashMap::new();
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
-    server_writes.insert(supervisor::ServerId::main(), stream);
+    server_writes.insert(
+        supervisor::ServerId::main(),
+        spawn_server_writer(supervisor::ServerId::main(), stream, event_tx.clone()),
+    );
 
     for (server_id, stream) in secondary_streams {
         let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
@@ -2067,10 +2230,12 @@ async fn run_client_loop(
         stream
             .set_nonblocking(false)
             .map_err(ClientError::ConnectionFailed)?;
-        server_writes.insert(server_id, stream);
+        let write_handle = spawn_server_writer(server_id.clone(), stream, event_tx.clone());
+        server_writes.insert(server_id, write_handle);
     }
 
     schedule_missing_secondary_stream_retries(&mut state, &server_writes, Instant::now());
+    retry_due_secondary_connections(&mut state, Instant::now(), &event_tx, &mut server_writes);
 
     if let Some(model) = &state.supervisor_model {
         start_missing_supervisor_summary_subscriptions(
@@ -2114,20 +2279,20 @@ async fn run_client_loop(
                                 row,
                                 modifiers,
                             };
-                            if let Err(e) = write_to_server_id(
-                                &mut server_writes,
+                            if let Err(e) = queue_to_server_id(
+                                &server_writes,
                                 &supervisor::ServerId::main(),
-                                &msg,
+                                msg,
                             ) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server_id(
-                                &mut server_writes,
+                            let _ = queue_to_server_id(
+                                &server_writes,
                                 &supervisor::ServerId::main(),
-                                &ClientMessage::Detach,
+                                ClientMessage::Detach,
                             );
                             return Ok(());
                         }
@@ -2148,7 +2313,7 @@ async fn run_client_loop(
                             ClientInputDispatch::Forward(data) => data,
                             ClientInputDispatch::ServerControl { server_id, message } => {
                                 if let Err(e) =
-                                    write_to_server_id(&mut server_writes, &server_id, &message)
+                                    queue_to_server_id(&server_writes, &server_id, message)
                                 {
                                     handle_server_write_failure(
                                         &mut state,
@@ -2167,70 +2332,33 @@ async fn run_client_loop(
                                 refresh,
                                 request,
                             } => {
-                                match send_client_supervisor_request(
+                                if let Err(err) = spawn_client_supervisor_request(
                                     model,
-                                    &server_id,
+                                    server_id.clone(),
+                                    refresh,
                                     *request,
                                     &state.ssh_bridges,
+                                    &event_tx,
                                 ) {
-                                    Ok(()) => {
-                                        if refresh == ClientApiRefreshPolicy::Immediate {
-                                            refresh_client_supervisor_summaries(
-                                                model,
-                                                &state.ssh_bridges,
-                                            );
-                                            start_missing_supervisor_summary_subscriptions(
-                                                model,
-                                                &mut state.summary_subscription_server_ids,
-                                                &state.ssh_bridges,
-                                                &event_tx,
-                                                &should_quit,
-                                            );
-                                            state.last_supervisor_summary_refresh = Instant::now();
-                                        }
-                                    }
-                                    Err(err) => {
-                                        warn!(
-                                            server_id = ?server_id,
-                                            err = %err,
-                                            "failed to route client sidebar request"
-                                        );
-                                    }
+                                    warn!(
+                                        server_id = ?server_id,
+                                        err = %err,
+                                        "failed to start client sidebar request"
+                                    );
                                 }
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
                             ClientInputDispatch::AddRemote(draft) => {
-                                match handle_client_add_remote_submission(
+                                model.set_add_remote_error("adding remote...");
+                                spawn_client_add_remote_submission(
                                     draft,
-                                    model,
                                     state.reported_size,
                                     state.cell_size_px,
                                     &event_tx,
-                                    &should_quit,
-                                    &mut server_writes,
-                                    &mut state.ssh_bridges,
-                                ) {
-                                    Ok(()) => {
-                                        refresh_client_supervisor_summaries(
-                                            model,
-                                            &state.ssh_bridges,
-                                        );
-                                        start_missing_supervisor_summary_subscriptions(
-                                            model,
-                                            &mut state.summary_subscription_server_ids,
-                                            &state.ssh_bridges,
-                                            &event_tx,
-                                            &should_quit,
-                                        );
-                                        state.last_supervisor_summary_refresh = Instant::now();
-                                    }
-                                    Err(err) => {
-                                        warn!(err = %err, "failed to add client remote");
-                                        model.set_add_remote_error(err);
-                                    }
-                                }
+                                    &mut state.pending_add_remote,
+                                );
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -2244,8 +2372,8 @@ async fn run_client_loop(
                                     cell_height_px: state.cell_size_px.1,
                                 };
                                 let mut write_failures = Vec::new();
-                                for (server_id, stream) in server_writes.iter_mut() {
-                                    if let Err(e) = write_to_server(stream, &msg) {
+                                for (server_id, handle) in server_writes.iter() {
+                                    if let Err(e) = queue_to_server(handle, msg.clone()) {
                                         write_failures.push((server_id.clone(), e));
                                     }
                                 }
@@ -2264,8 +2392,8 @@ async fn run_client_loop(
                             }
                             ClientInputDispatch::DetachAll => {
                                 let detach = ClientMessage::Detach;
-                                for stream in server_writes.values_mut() {
-                                    let _ = write_to_server(stream, &detach);
+                                for handle in server_writes.values() {
+                                    let _ = queue_to_server(handle, detach.clone());
                                 }
                                 return Ok(());
                             }
@@ -2300,7 +2428,7 @@ async fn run_client_loop(
                             data: image.bytes,
                         };
                         let server_id = active_server_id(&state);
-                        if let Err(e) = write_to_server_id(&mut server_writes, &server_id, &msg) {
+                        if let Err(e) = queue_to_server_id(&server_writes, &server_id, msg) {
                             handle_server_write_failure(
                                 &mut state,
                                 &mut server_writes,
@@ -2318,7 +2446,7 @@ async fn run_client_loop(
                 }
                 let msg = ClientMessage::Input { data };
                 let server_id = active_server_id(&state);
-                if let Err(e) = write_to_server_id(&mut server_writes, &server_id, &msg) {
+                if let Err(e) = queue_to_server_id(&server_writes, &server_id, msg) {
                     handle_server_write_failure(
                         &mut state,
                         &mut server_writes,
@@ -2345,8 +2473,8 @@ async fn run_client_loop(
                 };
                 if state.compositor.is_some() {
                     let mut write_failures = Vec::new();
-                    for (server_id, stream) in server_writes.iter_mut() {
-                        if let Err(e) = write_to_server(stream, &msg) {
+                    for (server_id, handle) in server_writes.iter() {
+                        if let Err(e) = queue_to_server(handle, msg.clone()) {
                             write_failures.push((server_id.clone(), e));
                         }
                     }
@@ -2361,7 +2489,7 @@ async fn run_client_loop(
                     }
                 } else {
                     let server_id = active_server_id(&state);
-                    if let Err(e) = write_to_server_id(&mut server_writes, &server_id, &msg) {
+                    if let Err(e) = queue_to_server_id(&server_writes, &server_id, msg) {
                         handle_server_write_failure(
                             &mut state,
                             &mut server_writes,
@@ -2393,6 +2521,7 @@ async fn run_client_loop(
                             state.host_size.1,
                         );
                     }
+                    let render_started_at = Instant::now();
                     let encoded = state.blit_encoder.encode(&frame_data, false);
                     let mut stdout = io::stdout();
                     let graphics = if state.kitty_graphics_enabled {
@@ -2404,6 +2533,7 @@ async fn run_client_loop(
                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
+                    record_client_frame_sample(&mut state, render_started_at.elapsed());
                 }
                 ServerMessage::Terminal(frame) => {
                     if server_id != active_server_id(&state) {
@@ -2432,6 +2562,10 @@ async fn run_client_loop(
                         server_writes.remove(&server_id);
                         state.frame_cache.remove(&server_id);
                         state.summary_subscription_server_ids.remove(&server_id);
+                        state.pending_summary_refresh_server_ids.remove(&server_id);
+                        state
+                            .pending_secondary_connect_server_ids
+                            .remove(&server_id);
                         state.ssh_bridges.remove(&server_id);
                         if let Some(model) = &mut state.supervisor_model {
                             let _ = model.set_connection_state(
@@ -2479,8 +2613,47 @@ async fn run_client_loop(
                     "supervisor summary event requested refresh"
                 );
                 if let Some(model) = &mut state.supervisor_model {
-                    refresh_client_supervisor_summaries(model, &state.ssh_bridges);
+                    refresh_client_supervisor_summaries(
+                        model,
+                        &state.ssh_bridges,
+                        &mut state.pending_summary_refresh_server_ids,
+                        &event_tx,
+                    );
                     state.last_supervisor_summary_refresh = Instant::now();
+                    state.request_full_redraw();
+                }
+                schedule_missing_secondary_stream_retries(
+                    &mut state,
+                    &server_writes,
+                    Instant::now(),
+                );
+                if let Some(model) = &state.supervisor_model {
+                    start_missing_supervisor_summary_subscriptions(
+                        model,
+                        &mut state.summary_subscription_server_ids,
+                        &state.ssh_bridges,
+                        &event_tx,
+                        &should_quit,
+                    );
+                }
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::SupervisorSummaryFetched {
+                server_id,
+                result,
+                elapsed,
+            } => {
+                state.pending_summary_refresh_server_ids.remove(&server_id);
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        server_id = ?server_id,
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "secondary supervisor summary completed off UI thread"
+                    );
+                }
+                if let Some(model) = &mut state.supervisor_model {
+                    model.apply_secondary_summary_results([(server_id.clone(), result)]);
                     state.request_full_redraw();
                 }
                 schedule_missing_secondary_stream_retries(
@@ -2502,6 +2675,230 @@ async fn run_client_loop(
             ClientLoopEvent::SupervisorSummarySubscriptionEnded(server_id) => {
                 state.summary_subscription_server_ids.remove(&server_id);
             }
+            ClientLoopEvent::SupervisorApiRequestFinished {
+                server_id,
+                refresh,
+                result,
+                elapsed,
+            } => {
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        server_id = ?server_id,
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "client sidebar API request completed off UI thread"
+                    );
+                }
+                match result {
+                    Ok(()) => {
+                        if refresh == ClientApiRefreshPolicy::Immediate {
+                            let now = Instant::now();
+                            if let Some(model) = &mut state.supervisor_model {
+                                refresh_client_supervisor_summaries(
+                                    model,
+                                    &state.ssh_bridges,
+                                    &mut state.pending_summary_refresh_server_ids,
+                                    &event_tx,
+                                );
+                                state.last_supervisor_summary_refresh = now;
+                                state.request_full_redraw();
+                            }
+                            schedule_missing_secondary_stream_retries(
+                                &mut state,
+                                &server_writes,
+                                now,
+                            );
+                            if let Some(model) = &state.supervisor_model {
+                                start_missing_supervisor_summary_subscriptions(
+                                    model,
+                                    &mut state.summary_subscription_server_ids,
+                                    &state.ssh_bridges,
+                                    &event_tx,
+                                    &should_quit,
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            server_id = ?server_id,
+                            err = %err,
+                            "failed to route client sidebar request"
+                        );
+                    }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::SecondaryConnectionAttemptFinished {
+                server_id,
+                attempt,
+                result,
+                elapsed,
+            } => {
+                state
+                    .pending_secondary_connect_server_ids
+                    .remove(&server_id);
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        server_id = ?server_id,
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "secondary client connection attempt completed off UI thread"
+                    );
+                }
+                match result {
+                    Ok(connection) => {
+                        if let Some(bridge) = connection.bridge {
+                            state.ssh_bridges.insert(server_id.clone(), bridge);
+                        }
+                        if let Err(err) = attach_secondary_client_stream(
+                            server_id.clone(),
+                            connection.stream,
+                            &event_tx,
+                            &should_quit,
+                            &mut server_writes,
+                        ) {
+                            let next_attempt = attempt.saturating_add(1);
+                            schedule_secondary_retry(
+                                &mut state,
+                                server_id.clone(),
+                                next_attempt,
+                                Instant::now(),
+                            );
+                            if let Some(model) = &mut state.supervisor_model {
+                                let _ = model.set_connection_state(
+                                    &server_id,
+                                    connection_state_from_client_error(&err),
+                                );
+                            }
+                            warn!(
+                                server_id = ?server_id,
+                                err = %err,
+                                "failed to attach retried secondary client stream"
+                            );
+                            state.request_full_redraw();
+                            render_cached_composited_frame(&mut state);
+                            continue;
+                        }
+
+                        state.secondary_retries.remove(&server_id);
+                        let now = Instant::now();
+                        if let Some(model) = &mut state.supervisor_model {
+                            let _ = model.set_connection_state(
+                                &server_id,
+                                supervisor::ConnectionState::Connected,
+                            );
+                            refresh_client_supervisor_summaries(
+                                model,
+                                &state.ssh_bridges,
+                                &mut state.pending_summary_refresh_server_ids,
+                                &event_tx,
+                            );
+                            start_missing_supervisor_summary_subscriptions(
+                                model,
+                                &mut state.summary_subscription_server_ids,
+                                &state.ssh_bridges,
+                                &event_tx,
+                                &should_quit,
+                            );
+                            state.last_supervisor_summary_refresh = now;
+                        }
+                    }
+                    Err(err) => {
+                        let connection_state = connection_state_from_client_error(&err);
+                        if matches!(
+                            connection_state,
+                            supervisor::ConnectionState::ProtocolMismatch { .. }
+                        ) {
+                            state.secondary_retries.remove(&server_id);
+                        } else {
+                            let next_attempt = attempt.saturating_add(1);
+                            schedule_secondary_retry(
+                                &mut state,
+                                server_id.clone(),
+                                next_attempt,
+                                Instant::now(),
+                            );
+                        }
+                        state.ssh_bridges.remove(&server_id);
+                        if let Some(model) = &mut state.supervisor_model {
+                            let _ = model.set_connection_state(&server_id, connection_state);
+                        }
+                        warn!(
+                            server_id = ?server_id,
+                            err = %err,
+                            "failed to retry secondary client connection"
+                        );
+                    }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::AddRemoteFinished { result, elapsed } => {
+                state.pending_add_remote = false;
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "client add-remote submission completed off UI thread"
+                    );
+                }
+                match result {
+                    Ok(success) => {
+                        if let Some(model) = &mut state.supervisor_model {
+                            let server_id = model.add_secondary(success.remote);
+                            if let Some(bridge) = success.bridge {
+                                state.ssh_bridges.insert(server_id.clone(), bridge);
+                            }
+                            match attach_secondary_client_stream(
+                                server_id.clone(),
+                                success.stream,
+                                &event_tx,
+                                &should_quit,
+                                &mut server_writes,
+                            ) {
+                                Ok(()) => {
+                                    let _ = model.set_connection_state(
+                                        &server_id,
+                                        supervisor::ConnectionState::Connected,
+                                    );
+                                    model.finish_add_remote();
+                                    refresh_client_supervisor_summaries(
+                                        model,
+                                        &state.ssh_bridges,
+                                        &mut state.pending_summary_refresh_server_ids,
+                                        &event_tx,
+                                    );
+                                    start_missing_supervisor_summary_subscriptions(
+                                        model,
+                                        &mut state.summary_subscription_server_ids,
+                                        &state.ssh_bridges,
+                                        &event_tx,
+                                        &should_quit,
+                                    );
+                                    state.last_supervisor_summary_refresh = Instant::now();
+                                }
+                                Err(err) => {
+                                    let _ = model.set_connection_state(
+                                        &server_id,
+                                        connection_state_from_client_error(&err),
+                                    );
+                                    model.set_add_remote_error(err.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(err = %err, "failed to add client remote");
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.set_add_remote_error(err);
+                        }
+                    }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
             ClientLoopEvent::ServerDisconnected(server_id) => {
                 if server_id == supervisor::ServerId::main() {
                     return Err(ClientError::ConnectionLost(io::Error::new(
@@ -2512,6 +2909,10 @@ async fn run_client_loop(
                 server_writes.remove(&server_id);
                 state.frame_cache.remove(&server_id);
                 state.summary_subscription_server_ids.remove(&server_id);
+                state.pending_summary_refresh_server_ids.remove(&server_id);
+                state
+                    .pending_secondary_connect_server_ids
+                    .remove(&server_id);
                 state.ssh_bridges.remove(&server_id);
                 if let Some(model) = &mut state.supervisor_model {
                     let _ = model.set_connection_state(
@@ -2526,16 +2927,15 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
                 let now = Instant::now();
-                retry_due_secondary_connections(
-                    &mut state,
-                    now,
-                    &event_tx,
-                    &should_quit,
-                    &mut server_writes,
-                );
+                retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
                 if supervisor_summary_refresh_due(now, state.last_supervisor_summary_refresh) {
                     if let Some(model) = &mut state.supervisor_model {
-                        refresh_client_supervisor_summaries(model, &state.ssh_bridges);
+                        refresh_client_supervisor_summaries(
+                            model,
+                            &state.ssh_bridges,
+                            &mut state.pending_summary_refresh_server_ids,
+                            &event_tx,
+                        );
                         state.last_supervisor_summary_refresh = now;
                         state.request_full_redraw();
                     }
@@ -2557,8 +2957,8 @@ async fn run_client_loop(
 
     // Clean exit (Ctrl+C). Send Detach before closing.
     let detach = ClientMessage::Detach;
-    for stream in server_writes.values_mut() {
-        let _ = write_to_server(stream, &detach);
+    for handle in server_writes.values() {
+        let _ = queue_to_server(handle, detach.clone());
     }
     let _ = io::stdout().flush();
 
@@ -2641,18 +3041,25 @@ fn active_server_id(state: &ClientState) -> supervisor::ServerId {
         .unwrap_or_else(supervisor::ServerId::main)
 }
 
-fn write_to_server_id(
-    server_writes: &mut HashMap<supervisor::ServerId, UnixStream>,
+fn queue_to_server(handle: &ServerWriteHandle, msg: ClientMessage) -> io::Result<()> {
+    handle
+        .tx
+        .send(msg)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "server writer stopped"))
+}
+
+fn queue_to_server_id(
+    server_writes: &HashMap<supervisor::ServerId, ServerWriteHandle>,
     server_id: &supervisor::ServerId,
-    msg: &ClientMessage,
+    msg: ClientMessage,
 ) -> io::Result<()> {
-    let Some(stream) = server_writes.get_mut(server_id) else {
+    let Some(handle) = server_writes.get(server_id) else {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
             format!("server stream {server_id:?} is not connected"),
         ));
     };
-    write_to_server(stream, msg)
+    queue_to_server(handle, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -2999,6 +3406,7 @@ mod tests {
     fn test_client_state_with_model(model: supervisor::ClientSupervisorModel) -> ClientState {
         ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            frame_stats: ClientFrameStats::default(),
             mouse_capture_active: false,
             reported_size: (80, 24),
             host_size: (80, 24),
@@ -3013,6 +3421,9 @@ mod tests {
             last_supervisor_summary_refresh: Instant::now(),
             frame_cache: HashMap::new(),
             summary_subscription_server_ids: HashSet::new(),
+            pending_summary_refresh_server_ids: HashSet::new(),
+            pending_secondary_connect_server_ids: HashSet::new(),
+            pending_add_remote: false,
             ssh_bridges: HashMap::new(),
             secondary_retries: HashMap::new(),
         }
@@ -3422,6 +3833,7 @@ mod tests {
     #[derive(Default)]
     struct BootstrapApi {
         requests: Vec<&'static str>,
+        remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
     }
 
     impl supervisor::SupervisorApi for BootstrapApi {
@@ -3433,7 +3845,7 @@ mod tests {
                 crate::api::schema::Method::RemoteList(_) => {
                     self.requests.push("remote.list");
                     crate::api::schema::ResponseResult::RemoteList {
-                        remotes: Vec::new(),
+                        remotes: self.remotes.clone(),
                     }
                 }
                 crate::api::schema::Method::WorkspaceList(_) => {
@@ -3694,6 +4106,29 @@ mod tests {
         model.cycle_filter();
 
         assert_eq!(model.filter_label(), "iq-64");
+    }
+
+    #[test]
+    fn client_bootstrap_leaves_secondary_summaries_for_async_refresh() {
+        let mut api = BootstrapApi {
+            remotes: vec![test_remote_definition("remote-dev", "dev")],
+            ..BootstrapApi::default()
+        };
+
+        let model = bootstrap_client_supervisor_model(false, &mut api)
+            .unwrap()
+            .expect("full app client should bootstrap supervisor");
+
+        assert_eq!(
+            api.requests,
+            vec![
+                "remote.list",
+                "workspace.list",
+                "agent.list",
+                "server.ui_settings"
+            ]
+        );
+        assert_eq!(model.secondary_connection_plans().len(), 1);
     }
 
     #[test]
@@ -4406,6 +4841,468 @@ mod tests {
     }
 
     #[test]
+    fn secondary_summary_refresh_returns_within_sixty_fps_budget_when_remote_is_slow() {
+        let socket_dir = std::path::PathBuf::from("/tmp").join(format!(
+            "hsum-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let api_socket = socket_dir.join("api.sock");
+        let client_socket = socket_dir.join("client.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&api_socket).unwrap();
+
+        let api_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+            assert!(request_line.contains("\"ping\""));
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = writeln!(
+                stream,
+                "{{\"id\":\"client-supervisor:status\",\"result\":{{\"type\":\"pong\",\"version\":\"0.6.4\",\"protocol\":{}}}}}",
+                PROTOCOL_VERSION
+            );
+        });
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-prod".into(),
+            name: "prod".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "prod.example.com".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+        let bridge =
+            crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
+        let ssh_bridges = HashMap::from([(remote_id.clone(), bridge)]);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+
+        let started_at = Instant::now();
+        start_secondary_supervisor_summary_refreshes(&model, &ssh_bridges, &mut pending, &event_tx);
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "starting a slow remote summary refresh blocked the UI thread for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        assert!(pending.contains(&remote_id));
+        assert!(event_rx.try_recv().is_err());
+
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } => {
+                assert_eq!(server_id, remote_id);
+            }
+            _ => panic!("expected async summary result"),
+        }
+
+        api_thread.join().unwrap();
+        std::fs::remove_dir_all(&socket_dir).unwrap();
+    }
+
+    #[test]
+    fn client_supervisor_api_request_returns_within_sixty_fps_budget_when_remote_is_slow() {
+        let socket_dir = std::path::PathBuf::from("/tmp").join(format!(
+            "hact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let api_socket = socket_dir.join("api.sock");
+        let client_socket = socket_dir.join("client.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&api_socket).unwrap();
+
+        let api_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+            assert!(request_line.contains("\"workspace.focus\""));
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = writeln!(
+                stream,
+                "{{\"id\":\"client:workspace-focus\",\"result\":{{\"type\":\"ok\"}}}}"
+            );
+        });
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-prod".into(),
+            name: "prod".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "prod.example.com".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+        let bridge =
+            crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
+        let ssh_bridges = HashMap::from([(remote_id.clone(), bridge)]);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let request = crate::api::schema::Request {
+            id: "client:workspace-focus".into(),
+            method: crate::api::schema::Method::WorkspaceFocus(
+                crate::api::schema::WorkspaceTarget {
+                    workspace_id: "remote-api".into(),
+                },
+            ),
+        };
+
+        let started_at = Instant::now();
+        let result = spawn_client_supervisor_request(
+            &model,
+            remote_id.clone(),
+            ClientApiRefreshPolicy::Deferred,
+            request,
+            &ssh_bridges,
+            &event_tx,
+        );
+        let elapsed = started_at.elapsed();
+
+        assert!(result.is_ok());
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "starting a slow remote API action blocked the UI thread for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        assert!(event_rx.try_recv().is_err());
+
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::SupervisorApiRequestFinished {
+                server_id, result, ..
+            } => {
+                assert_eq!(server_id, remote_id);
+                assert!(result.is_ok());
+            }
+            _ => panic!("expected async API result"),
+        }
+
+        api_thread.join().unwrap();
+        std::fs::remove_dir_all(&socket_dir).unwrap();
+    }
+
+    #[test]
+    fn secondary_connection_retry_returns_within_sixty_fps_budget_when_handshake_is_slow() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home = std::path::PathBuf::from("/tmp").join(format!(
+            "hcfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _config_env = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.to_str().unwrap());
+        let client_socket = crate::session::client_socket_path_for(Some("slow"));
+        std::fs::create_dir_all(client_socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&client_socket).unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(750));
+            protocol::write_message(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: None,
+                },
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(test_remote_definition("slow", "slow"));
+        let mut state = test_client_state_with_model(model);
+        let now = Instant::now();
+        state.secondary_retries.insert(
+            remote_id.clone(),
+            SecondaryRetryState {
+                attempt: 0,
+                next_retry_at: now,
+            },
+        );
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let mut server_writes = HashMap::new();
+
+        let started_at = Instant::now();
+        retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "starting a slow secondary reconnect blocked the UI thread for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        assert!(state
+            .pending_secondary_connect_server_ids
+            .contains(&remote_id));
+        assert!(event_rx.try_recv().is_err());
+
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::SecondaryConnectionAttemptFinished {
+                server_id, result, ..
+            } => {
+                assert_eq!(server_id, remote_id);
+                if let Err(err) = &result {
+                    panic!(
+                        "secondary reconnect should complete after the delayed handshake: {err:?}"
+                    );
+                }
+            }
+            _ => panic!("expected async secondary connection result"),
+        }
+
+        should_quit.store(true, Ordering::Release);
+        server_thread.join().unwrap();
+        std::fs::remove_file(client_socket).ok();
+        std::fs::remove_dir_all(config_home).ok();
+    }
+
+    #[test]
+    fn add_remote_submission_returns_within_sixty_fps_budget_when_remote_is_slow() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home = std::path::PathBuf::from("/tmp").join(format!(
+            "hadd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _config_env = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.to_str().unwrap());
+        let _session_env = EnvVarsRemovedGuard::new(&[
+            crate::session::SESSION_ENV_VAR,
+            crate::api::SOCKET_PATH_ENV_VAR,
+            crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
+        ]);
+        let session_api_socket = crate::session::api_socket_path_for(Some("slowadd"));
+        let session_client_socket = crate::session::client_socket_path_for(Some("slowadd"));
+        let main_api_socket = crate::api::socket_path();
+        std::fs::create_dir_all(session_api_socket.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(main_api_socket.parent().unwrap()).unwrap();
+        let session_api_listener =
+            std::os::unix::net::UnixListener::bind(&session_api_socket).unwrap();
+        let session_client_listener =
+            std::os::unix::net::UnixListener::bind(&session_client_socket).unwrap();
+        let main_api_listener = std::os::unix::net::UnixListener::bind(&main_api_socket).unwrap();
+
+        let session_api_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = session_api_listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+            assert!(request_line.contains("\"ping\""));
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = writeln!(
+                stream,
+                "{{\"id\":\"client-supervisor:status\",\"result\":{{\"type\":\"pong\",\"version\":\"0.6.4\",\"protocol\":{}}}}}",
+                PROTOCOL_VERSION
+            );
+        });
+        let session_client_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = session_client_listener.accept().unwrap();
+            let _hello: ClientMessage =
+                protocol::read_message(&mut stream, MAX_FRAME_SIZE).unwrap();
+            protocol::write_message(
+                &mut stream,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: None,
+                },
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let main_api_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = main_api_listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+            assert!(request_line.contains("\"remote.add\""));
+            let _ = writeln!(
+                stream,
+                "{{\"id\":\"client:remote-add\",\"result\":{{\"type\":\"remote_added\",\"remote\":{{\"id\":\"remote-slowadd\",\"name\":\"slowadd\",\"target\":{{\"type\":\"local\",\"session\":\"slowadd\"}},\"keybindings\":\"local\"}}}}}}"
+            );
+        });
+
+        let draft = supervisor::AddRemoteDraft {
+            target: "local:slowadd".into(),
+            name: Some("slowadd".into()),
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending_add_remote = false;
+
+        let started_at = Instant::now();
+        spawn_client_add_remote_submission(
+            draft,
+            (80, 24),
+            (0, 0),
+            &event_tx,
+            &mut pending_add_remote,
+        );
+        let elapsed = started_at.elapsed();
+
+        assert!(pending_add_remote);
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "starting a slow add-remote submission blocked the UI thread for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        assert!(event_rx.try_recv().is_err());
+
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::AddRemoteFinished { result, .. } => {
+                assert!(result.is_ok());
+            }
+            _ => panic!("expected async add-remote result"),
+        }
+
+        session_api_thread.join().unwrap();
+        session_client_thread.join().unwrap();
+        main_api_thread.join().unwrap();
+        std::fs::remove_dir_all(config_home).ok();
+    }
+
+    #[test]
+    fn server_writer_queue_returns_within_sixty_fps_budget_when_socket_write_is_slow() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let handle = spawn_server_writer(supervisor::ServerId::main(), client_stream, event_tx);
+        let large_message = ClientMessage::ClipboardImage {
+            extension: "png".into(),
+            data: vec![7; MAX_CLIPBOARD_IMAGE_PAYLOAD],
+        };
+
+        queue_to_server(&handle, large_message).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started_at = Instant::now();
+        queue_to_server(
+            &handle,
+            ClientMessage::Input {
+                data: b"x".to_vec(),
+            },
+        )
+        .unwrap();
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "queueing while a server writer is blocked took {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        drop(server_stream);
+    }
+
+    #[test]
+    fn startup_secondary_connects_return_within_sixty_fps_budget_when_handshake_is_slow() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home = std::path::PathBuf::from("/tmp").join(format!(
+            "hstart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _config_env = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.to_str().unwrap());
+        let client_socket = crate::session::client_socket_path_for(Some("slowstart"));
+        std::fs::create_dir_all(client_socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&client_socket).unwrap();
+
+        listener.set_nonblocking(true).unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        std::thread::sleep(Duration::from_millis(750));
+                        protocol::write_message(
+                            &mut stream,
+                            &ServerMessage::Welcome {
+                                version: PROTOCOL_VERSION,
+                                encoding: RenderEncoding::SemanticFrame,
+                                error: None,
+                            },
+                        )
+                        .unwrap();
+                        std::thread::sleep(Duration::from_millis(250));
+                        return;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("startup secondary listener failed: {err}"),
+                }
+            }
+        });
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        model.add_secondary(test_remote_definition("slowstart", "slowstart"));
+        let mut ssh_bridges = HashMap::new();
+
+        let started_at = Instant::now();
+        let streams =
+            connect_secondary_client_streams(&mut model, (80, 24), 0, 0, &mut ssh_bridges);
+        let elapsed = started_at.elapsed();
+
+        assert!(streams.is_empty());
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "startup secondary connection blocked for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+
+        drop(streams);
+        server_thread.join().unwrap();
+        std::fs::remove_file(client_socket).ok();
+        std::fs::remove_dir_all(config_home).ok();
+    }
+
+    #[test]
+    fn frame_stats_calculate_render_fps_from_frame_duration() {
+        let mut stats = ClientFrameStats::default();
+        let sample = stats.record_render_duration(Duration::from_micros(16_667));
+
+        assert!((sample.render_fps - 60.0).abs() < 0.1);
+        assert_eq!(sample.render_duration, Duration::from_micros(16_667));
+        assert!(!sample.missed_sixty_fps_budget);
+
+        let slow = stats.record_render_duration(Duration::from_millis(25));
+        assert!(slow.render_fps < 60.0);
+        assert!(slow.missed_sixty_fps_budget);
+    }
+
+    #[test]
+    fn frame_stats_use_stable_fps_for_zero_duration_frames() {
+        let mut stats = ClientFrameStats::default();
+        let sample = stats.record_render_duration(Duration::ZERO);
+
+        assert_eq!(sample.render_fps, f64::INFINITY);
+        assert!(!sample.missed_sixty_fps_budget);
+    }
+
+    #[test]
     fn supervisor_summary_refresh_due_uses_two_second_interval() {
         let start = Instant::now();
 
@@ -4553,7 +5450,7 @@ mod tests {
                 .secondary_retries
                 .get(&remote_id)
                 .map(|retry| retry.next_retry_at),
-            Some(now + secondary_retry_delay(0))
+            Some(now)
         );
     }
 
@@ -4572,7 +5469,7 @@ mod tests {
                 .secondary_retries
                 .get(&remote_id)
                 .map(|retry| retry.next_retry_at),
-            Some(now + secondary_retry_delay(0))
+            Some(now)
         );
     }
 
