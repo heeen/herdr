@@ -10,7 +10,63 @@ use super::widgets::{
     action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
+use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
+
+// item 1 (Area 3 / Decision 2): ui-owned view structs for the composited client modals. These
+// hold ONLY ui primitives / borrowed strings — they MUST NOT reference any supervisor-model
+// type (one-way `ui` <- `client` layering, contradiction 13). The compositor maps the model into
+// these views before calling the `render_*_overlay` functions below. The
+// `dialogs_does_not_reference_client_supervisor` test enforces this.
+
+/// View for the add-remote modal. `focused_is_target` selects which of the two fields draws the
+/// focused (filled) style + cursor block.
+pub(crate) struct AddRemoteOverlayView<'a> {
+    pub target: &'a str,
+    pub name: &'a str,
+    pub focused_is_target: bool,
+    pub error: Option<&'a str>,
+}
+
+/// View for one new-workspace destination row.
+pub(crate) struct DestinationView<'a> {
+    pub display_name: &'a str,
+}
+
+/// item 3 (Area 3/5): ui-owned glyph for a remote's state in the management overlay. This is a
+/// ui-local enum, NOT the supervisor `ConnectionState` (the one-way layering rule). The compositor
+/// maps the supervisor row state into this before calling `render_remote_manage_overlay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteStateGlyph {
+    Connected,
+    Connecting,
+    Disconnected,
+    Disabled,
+    ProtocolMismatch,
+}
+
+impl RemoteStateGlyph {
+    /// The single-cell status glyph drawn at the start of the row.
+    fn glyph(self) -> &'static str {
+        match self {
+            RemoteStateGlyph::Connected => "●",
+            RemoteStateGlyph::Connecting => "◐",
+            RemoteStateGlyph::Disconnected => "○",
+            RemoteStateGlyph::Disabled => "✕",
+            RemoteStateGlyph::ProtocolMismatch => "!",
+        }
+    }
+}
+
+/// item 3 (Area 3/5): ui-owned view for one management-overlay row. Holds only ui primitives /
+/// borrowed strings (no supervisor type), per the layering rule.
+pub(crate) struct RemoteManageRowView<'a> {
+    pub glyph: RemoteStateGlyph,
+    pub name: &'a str,
+    pub target: &'a str,
+    pub state_word: &'a str,
+    pub disabled: bool,
+}
 
 fn truncate_text(text: &str, max_width: usize) -> String {
     let len = text.chars().count();
@@ -661,11 +717,602 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
     (rects[0], rects[1])
 }
 
+// item 1 (Area 3 / Decision 3): single-source-of-truth geometry for the two composited client
+// modals. Both render and `ClientCompositor::hit_test` derive every row/button rect from these
+// helpers, so render geometry == hit-test geometry.
+
+/// Fixed inner rect for the add-remote modal (`render_modal_shell(area, 54, 9, palette)`). Returns
+/// `None` when the host is too small to fit the modal, in which case render and hit-test both no-op.
+pub(crate) fn add_remote_inner_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 54, 9).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+pub(crate) fn add_remote_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "add",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// The picker popup height for `count` destinations, derived from the row budget (header, the
+/// create-on label, one row per destination, the actions row, and vertical margins) and clamped to
+/// a sane band. Used by BOTH the inner-rect helper and the renderer so they cannot diverge.
+fn picker_popup_height(count: usize) -> u16 {
+    (count as u16).saturating_add(5).clamp(7, 18)
+}
+
+/// Shared inner rect for the new-workspace picker modal. The popup height is derived from the
+/// destination `count` exactly the way `render_new_workspace_picker_overlay` sizes it, mirroring
+/// `open_existing_worktree_inner_rect`.
+pub(crate) fn new_workspace_picker_inner_rect(area: Rect, count: usize) -> Option<Rect> {
+    centered_popup_rect(area, 44, picker_popup_height(count)).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The rect for destination row `row_index` inside the picker's inner rect. Rows start two lines
+/// below the inner top (header + create-on label). Used by BOTH render and hit-test.
+pub(crate) fn new_workspace_picker_row_rect(inner: Rect, row_index: usize) -> Rect {
+    let y = inner.y.saturating_add(2 + row_index as u16);
+    Rect::new(inner.x, y, inner.width, 1)
+}
+
+pub(crate) fn new_workspace_picker_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "create",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// item 1 (Area 3 / Decision 1): render the add-remote form as a centered ratatui modal, visually
+/// matching `render_rename_overlay` (accent border, bold header, focused-field fill + cursor block,
+/// red inline error, centered action buttons). Cursor stays hidden — the caller forces
+/// `frame.cursor = None` while a modal is open.
+pub(crate) fn render_add_remote_overlay(
+    palette: &Palette,
+    view: &AddRemoteOverlayView,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    super::dim_background(frame, area);
+
+    let Some(inner) = render_modal_shell(frame, area, 54, 9, palette) else {
+        return;
+    };
+    if inner.height < 5 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // target label/input
+        Constraint::Length(1), // name label/input
+        Constraint::Length(1), // gap
+        Constraint::Length(1), // error
+        Constraint::Min(0),    // actions live on inner.height - 1
+    ])
+    .areas::<6>(inner);
+
+    render_modal_header(frame, rows[0], "add remote", palette);
+
+    render_add_remote_field(
+        frame,
+        rows[1],
+        "target",
+        view.target,
+        view.focused_is_target,
+        palette,
+    );
+    render_add_remote_field(
+        frame,
+        rows[2],
+        "name",
+        view.name,
+        !view.focused_is_target,
+        palette,
+    );
+
+    if let Some(error) = view.error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
+            rows[4],
+        );
+    }
+
+    let (submit_rect, cancel_rect) = add_remote_button_rects(inner);
+    render_action_button(
+        frame,
+        submit_rect,
+        Some("↵"),
+        "add",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+fn render_add_remote_field(
+    frame: &mut Frame,
+    row: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    palette: &Palette,
+) {
+    if focused {
+        frame.render_widget(Clear, row);
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {label}  "),
+                Style::default().fg(palette.overlay0).bg(palette.surface0),
+            ),
+            Span::styled(
+                format!("{value}█"),
+                Style::default().fg(palette.text).bg(palette.surface0),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(palette.surface0)),
+            row,
+        );
+    } else {
+        let line = Line::from(vec![
+            Span::styled(format!(" {label}  "), Style::default().fg(palette.overlay0)),
+            Span::styled(value.to_string(), Style::default().fg(palette.subtext0)),
+        ]);
+        frame.render_widget(Paragraph::new(line), row);
+    }
+}
+
+/// item 1 (Area 3 / Decision 1+3): render the new-workspace destination picker as a centered
+/// ratatui modal with a selectable list (the `surface0`-filled `›`-marked selected row from the
+/// `render_open_existing_worktree_overlay` pattern), a `create on` sub-label, and centered
+/// create/cancel buttons. Geometry comes from `new_workspace_picker_inner_rect`/`_row_rect` so it
+/// matches `hit_test`.
+pub(crate) fn render_new_workspace_picker_overlay(
+    palette: &Palette,
+    destinations: &[DestinationView],
+    selected: usize,
+    hovered_row: Option<usize>,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    super::dim_background(frame, area);
+
+    // Draw the accent-bordered modal shell. Its inner rect is identical to
+    // `new_workspace_picker_inner_rect(area, count)` (both derive from the same
+    // `centered_popup_rect(area, 44, height)`), so render geometry == hit-test geometry.
+    let height = picker_popup_height(destinations.len());
+    let Some(inner) = render_modal_shell(frame, area, 44, height, palette) else {
+        return;
+    };
+    debug_assert_eq!(
+        Some(inner),
+        new_workspace_picker_inner_rect(area, destinations.len()),
+        "picker render and hit-test geometry diverged"
+    );
+    if inner.height < 4 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "new workspace",
+        palette,
+    );
+    frame.render_widget(
+        Paragraph::new(" create on").style(Style::default().fg(palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    // defensive clamp on the render-time read (per PRD risk: selection out of range).
+    let selected = selected.min(destinations.len().saturating_sub(1));
+    // rows live between the create-on label and the actions row (inner.height - 1).
+    let max_rows = inner.height.saturating_sub(3) as usize;
+    for (row_index, destination) in destinations.iter().enumerate().take(max_rows) {
+        let is_selected = row_index == selected;
+        // item 7 (Area 4): a hovered, non-selected row gets a subtle theme-derived bg lift
+        // (selection always wins; hover never bolds).
+        let is_hovered = !is_selected && hovered_row == Some(row_index);
+        let marker = if is_selected { "›" } else { " " };
+        let label = format!("{marker} {}", destination.display_name);
+        let style = if is_selected {
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else if is_hovered {
+            Style::default().fg(palette.subtext0).bg(palette.hover_bg())
+        } else {
+            Style::default().fg(palette.subtext0)
+        };
+        let row = new_workspace_picker_row_rect(inner, row_index);
+        frame.render_widget(
+            Paragraph::new(truncate_text(&label, inner.width as usize)).style(style),
+            row,
+        );
+    }
+
+    let (confirm_rect, cancel_rect) = new_workspace_picker_button_rects(inner);
+    render_action_button(
+        frame,
+        confirm_rect,
+        Some("↵"),
+        "create",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// The manage-overlay popup height for `count` rows, derived from the row budget (header, the
+/// column-label row, one row per remote, the footer hint, and vertical margins) clamped to a sane
+/// band. Used by BOTH the inner-rect helper and the renderer so they cannot diverge.
+fn remote_manage_popup_height(count: usize) -> u16 {
+    (count as u16).saturating_add(5).clamp(8, 20)
+}
+
+/// item 3 (Area 3/5): the SHARED inner rect for the management overlay (render + hit-test). The
+/// popup is centered, width 64, height derived from `count` exactly the way
+/// `render_remote_manage_overlay` sizes it. Returns `None` when the host is too small to fit.
+pub(crate) fn remote_manage_inner_rect(area: Rect, count: usize) -> Option<Rect> {
+    centered_popup_rect(area, 64, remote_manage_popup_height(count)).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The rect for remote row `row_index` inside the manage overlay's inner rect. Rows start two
+/// lines below the inner top (header + column-label row). Used by BOTH render and hit-test.
+pub(crate) fn remote_manage_row_rect(inner: Rect, row_index: usize) -> Rect {
+    let y = inner.y.saturating_add(2 + row_index as u16);
+    Rect::new(inner.x, y, inner.width, 1)
+}
+
+/// The delete-confirm popup rect (centered, smaller, red panel). Used by render + hit-test.
+pub(crate) fn remote_manage_confirm_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 56, 8)
+}
+
+/// The (delete, cancel) button rects inside the delete-confirm popup's inner rect.
+pub(crate) fn remote_manage_confirm_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "delete",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// item 3 (Area 3/5): render the remote-management overlay as a centered ratatui modal — a
+/// scrollable selectable list of remotes with per-remote state, plus a footer hint. When
+/// `confirm_delete.is_some()` the destructive two-step sub-state is drawn on top as a red
+/// `render_panel_shell` popup with delete/cancel buttons. Geometry comes from
+/// `remote_manage_inner_rect`/`_row_rect`/`_confirm_*` so it matches `hit_test`. Square corners
+/// (`border::PLAIN`). The caller forces `frame.cursor = None` while the modal is open.
+pub(crate) fn render_remote_manage_overlay(
+    palette: &Palette,
+    rows: &[RemoteManageRowView],
+    selected: usize,
+    scroll: usize,
+    confirm_delete: Option<&str>,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    super::dim_background(frame, area);
+
+    let height = remote_manage_popup_height(rows.len());
+    let Some(inner) = render_modal_shell(frame, area, 64, height, palette) else {
+        return;
+    };
+    debug_assert_eq!(
+        Some(inner),
+        remote_manage_inner_rect(area, rows.len()),
+        "manage overlay render and hit-test geometry diverged"
+    );
+    if inner.height < 4 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "manage remotes",
+        palette,
+    );
+    frame.render_widget(
+        Paragraph::new(" remote                          target              state")
+            .style(Style::default().fg(palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    // rows live between the column-label row and the footer hint row (inner.height - 1).
+    let max_rows = inner.height.saturating_sub(3) as usize;
+    let selected = selected.min(rows.len().saturating_sub(1));
+    // clamp the visible window so the selected row stays on screen (shared scroll math).
+    let start = scroll
+        .min(rows.len().saturating_sub(max_rows.max(1)))
+        .min(selected)
+        .max(open_existing_worktree_visible_start(
+            selected,
+            max_rows.max(1),
+        ));
+    for (visible_idx, (row_index, row)) in rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+        .enumerate()
+    {
+        let is_selected = row_index == selected;
+        let marker = if is_selected { "›" } else { " " };
+        let enabled_word = if row.disabled { "off" } else { "on" };
+        let label = format!(
+            "{marker} {} {:<24} {:<18} {}  [{}]",
+            row.glyph.glyph(),
+            truncate_text(row.name, 24),
+            truncate_text(row.target, 18),
+            row.state_word,
+            enabled_word
+        );
+        let base = if row.disabled {
+            Style::default().fg(palette.overlay0)
+        } else {
+            Style::default().fg(palette.subtext0)
+        };
+        let style = if is_selected {
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        let rect = remote_manage_row_rect(inner, visible_idx);
+        frame.render_widget(
+            Paragraph::new(truncate_text(&label, inner.width as usize)).style(style),
+            rect,
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(" space toggle   d delete   a add   esc close")
+            .style(Style::default().fg(palette.overlay0)),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+
+    if let Some(remote_id) = confirm_delete {
+        render_remote_manage_confirm(palette, rows, selected, remote_id, frame, area);
+    }
+}
+
+/// Render the destructive delete-confirm sub-state as a red panel popup over the list.
+fn render_remote_manage_confirm(
+    palette: &Palette,
+    rows: &[RemoteManageRowView],
+    selected: usize,
+    _remote_id: &str,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let Some(popup) = remote_manage_confirm_popup_rect(area) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.red, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 4 {
+        return;
+    }
+
+    let name = rows.get(selected).map(|row| row.name).unwrap_or("remote");
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " delete remote?",
+            Style::default()
+                .fg(palette.red)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {name} will be removed from the registry."))
+            .style(Style::default().fg(palette.text)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(" Active workspaces on it are not deleted.")
+            .style(Style::default().fg(palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+    );
+
+    let (delete_rect, cancel_rect) = remote_manage_confirm_button_rects(inner);
+    render_action_button(
+        frame,
+        delete_rect,
+        Some("↵"),
+        "delete",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{app::AppState, workspace::Workspace};
+    use ratatui::layout::Rect;
 
-    use super::confirm_close_overlay_text;
+    use super::{
+        add_remote_button_rects, add_remote_inner_rect, confirm_close_overlay_text,
+        new_workspace_picker_button_rects, new_workspace_picker_inner_rect,
+        new_workspace_picker_row_rect,
+    };
+
+    fn rects_are_disjoint(a: Rect, b: Rect) -> bool {
+        a.x + a.width <= b.x || b.x + b.width <= a.x
+    }
+
+    fn rect_within(child: Rect, parent: Rect) -> bool {
+        child.x >= parent.x
+            && child.y >= parent.y
+            && child.x + child.width <= parent.x + parent.width
+            && child.y + child.height <= parent.y + parent.height
+    }
+
+    #[test]
+    fn add_remote_button_rects_lays_out_two_centered_buttons() {
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = add_remote_inner_rect(area).expect("modal fits");
+        let (submit, cancel) = add_remote_button_rects(inner);
+
+        assert_eq!(submit.height, 1);
+        assert_eq!(cancel.height, 1);
+        assert!(rects_are_disjoint(submit, cancel));
+        assert!(rect_within(submit, inner));
+        assert!(rect_within(cancel, inner));
+        // submit is to the left of cancel.
+        assert!(submit.x < cancel.x);
+    }
+
+    #[test]
+    fn new_workspace_picker_button_rects_lays_out_two_centered_buttons() {
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = new_workspace_picker_inner_rect(area, 3).expect("modal fits");
+        let (confirm, cancel) = new_workspace_picker_button_rects(inner);
+
+        assert_eq!(confirm.height, 1);
+        assert_eq!(cancel.height, 1);
+        assert!(rects_are_disjoint(confirm, cancel));
+        assert!(rect_within(confirm, inner));
+        assert!(rect_within(cancel, inner));
+        assert!(confirm.x < cancel.x);
+    }
+
+    #[test]
+    fn new_workspace_picker_inner_rect_is_shared_geometry() {
+        let area = Rect::new(0, 0, 80, 24);
+        let count = 3usize;
+        let inner = new_workspace_picker_inner_rect(area, count).expect("modal fits");
+
+        // every destination row resolves inside the inner rect — the same helper render uses.
+        for n in 0..count {
+            let row = new_workspace_picker_row_rect(inner, n);
+            assert!(
+                rect_within(row, inner),
+                "row {n} {row:?} not within inner {inner:?}"
+            );
+        }
+        // a row past the count is allowed to spill below; the render-time max_rows clamp guards it.
+    }
+
+    #[test]
+    fn dialogs_does_not_reference_client_supervisor() {
+        // item 1 (Area 3 / contradiction 13): the `ui` layer must not depend on supervisor-model
+        // types. `render_*_overlay` take ui-owned view structs only. Build the forbidden path
+        // token at runtime so it never appears verbatim in this file (which the guard scans).
+        let forbidden = format!("{}::{}::{}", "crate", "client", "supervisor");
+        let source = include_str!("dialogs.rs");
+        assert!(
+            !source.contains(&forbidden),
+            "src/ui/dialogs.rs must not reference the supervisor module path"
+        );
+        // also reject the shorter relative form.
+        let forbidden_relative = format!("{}::{}", "client", "supervisor");
+        assert!(
+            !source.contains(&forbidden_relative),
+            "src/ui/dialogs.rs must not reference the supervisor module path"
+        );
+    }
 
     #[test]
     fn confirm_close_text_reports_parent_group_scope() {

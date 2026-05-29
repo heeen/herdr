@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -6,7 +7,7 @@ use ratatui::{
     text::Span,
     widgets::Paragraph,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::state::{MenuListState, ViewLayout};
 use crate::app::Mode;
@@ -22,6 +23,10 @@ pub(crate) struct ClientCompositor {
     workspace_scroll: usize,
     agent_panel_scroll: usize,
     resizing_sidebar: bool,
+    animation_tick: u32,                                  // item 5
+    hover: Option<crate::app::state::SidebarHoverTarget>, // item 7
+    // item 5 freshness, key = (server_id, agent_id):
+    working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,12 +48,19 @@ pub(crate) enum SidebarHitTarget {
     },
     New,
     Menu,
+    // item 1: composited-modal action buttons (centered ratatui modals).
+    AddRemoteSubmit,
+    AddRemoteCancel,
+    NewWorkspacePickerConfirm,
+    NewWorkspacePickerCancel,
+    // item 3 (Area 5): remote-management overlay targets.
+    RemoteManageRow {
+        index: usize,
+    },
+    RemoteManageAdd,
+    RemoteManageConfirmDelete,
+    RemoteManageCancelDelete,
 }
-
-type NewWorkspacePickerLayout = (
-    Option<u16>,
-    Vec<(u16, crate::client::supervisor::ServerDestination)>,
-);
 
 #[derive(Clone)]
 struct WorkspaceRoute {
@@ -68,6 +80,15 @@ struct ClientSidebarSnapshot {
     filter_label: String,
     workspace_routes: Vec<WorkspaceRoute>,
     agent_routes: Vec<AgentRoute>,
+    // overlay carriers (items 1 & 3), all ui-owned/cloned — see Area 3:
+    add_remote_form: Option<crate::client::supervisor::AddRemoteForm>, // item 1
+    new_workspace_picker: Option<(Vec<crate::client::supervisor::ServerDestination>, usize)>, // item 1
+    // item 3: the overlay state plus the snapshot of secondary rows it renders. The closure maps
+    // `RemoteManageRow` -> ui-owned `RemoteManageRowView` before calling `render_*` (layering).
+    remote_manage: Option<(
+        crate::client::supervisor::RemoteManageOverlay,
+        Vec<crate::client::supervisor::RemoteManageRow>,
+    )>,
 }
 
 impl ClientCompositor {
@@ -77,11 +98,67 @@ impl ClientCompositor {
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             resizing_sidebar: false,
+            animation_tick: 0,
+            hover: None,
+            working_since: HashMap::new(),
         }
     }
 
     pub(crate) fn sidebar_width(&self) -> u16 {
         self.sidebar_width
+    }
+
+    /// Advance the single client-owned animation clock by `step`. Called ONLY from the
+    /// `run_client_loop` `Timer` arm (never during render). `from_model` reads it into
+    /// `AppState.spinner_tick`; items 2/7 consume the SAME tick (no second clock).
+    pub(crate) fn advance_animation_tick(&mut self, step: u32) {
+        self.animation_tick = self.animation_tick.wrapping_add(step);
+    }
+
+    pub(crate) fn animation_tick(&self) -> u32 {
+        self.animation_tick
+    }
+
+    /// Insert/refresh the working-start instant for `(server_id, agent_id)`. Called by the
+    /// event-loop upkeep helper before compose so the live duration timer survives recompose.
+    pub(crate) fn seed_working_since(&mut self, key: (ServerId, String), now: Instant) {
+        self.working_since.entry(key).or_insert(now);
+    }
+
+    /// Drop every working-start instant whose key is not in `keep`. Keeps the map bounded to
+    /// currently-Working agents (option (a) freshness, contract Area 1 / Area 7 §6).
+    pub(crate) fn retain_working_since<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&(ServerId, String)) -> bool,
+    {
+        self.working_since.retain(|key, _| keep(key));
+    }
+
+    /// item 7: update the client-truth sidebar hover target, returning whether it changed. The
+    /// caller redraws only on a change so a same-row motion sweep coalesces to zero redraws.
+    pub(crate) fn set_hover(
+        &mut self,
+        next: Option<crate::app::state::SidebarHoverTarget>,
+    ) -> bool {
+        let changed = self.hover != next;
+        self.hover = next;
+        changed
+    }
+
+    /// item 7: the current client-truth hover target. Read by the `Moved` dispatch so motion off
+    /// the sidebar still clears a stale highlight, and by render mirroring in `from_model`.
+    pub(crate) fn hover(&self) -> Option<crate::app::state::SidebarHoverTarget> {
+        self.hover
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_since_len(&self) -> usize {
+        self.working_since.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_since_at(&self, key: &(ServerId, String)) -> Option<Instant> {
+        self.working_since.get(key).copied()
     }
 
     pub(crate) fn handle_sidebar_resize_mouse(
@@ -140,8 +217,14 @@ impl ClientCompositor {
             return None;
         }
 
-        let snapshot =
-            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             snapshot.app.view.sidebar_rect,
             snapshot.app.sidebar_section_split,
@@ -197,11 +280,18 @@ impl ClientCompositor {
         active_frame: &FrameData,
         host_width: u16,
         host_height: u16,
+        now: Instant,
     ) -> FrameData {
         let sidebar_width = self.effective_sidebar_width(host_width);
         let content_width = host_width.saturating_sub(sidebar_width);
-        let snapshot =
-            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            now,
+        );
         let global_menu_rect = snapshot.global_menu_rect();
         let mut frame = render_client_shell(&snapshot, host_width, host_height);
 
@@ -212,10 +302,14 @@ impl ClientCompositor {
             content_width,
             global_menu_rect,
         );
-        self.draw_new_workspace_picker(model, &mut frame, sidebar_width);
 
-        if model.add_remote_form().is_some() {
-            draw_add_remote_form(model, &mut frame);
+        // item 1/3: the add-remote / new-workspace-picker / manage modals are rendered as ratatui
+        // widgets inside `render_client_shell` (composited). Here we only force the cursor hidden
+        // while ANY modal is open so the real terminal cursor never leaks through the modal.
+        if model.add_remote_form().is_some()
+            || model.new_workspace_picker().is_some()
+            || model.remote_manage_overlay().is_some()
+        {
             frame.cursor = None;
         } else {
             frame.cursor =
@@ -258,11 +352,34 @@ impl ClientCompositor {
             return None;
         }
 
-        let snapshot =
-            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
 
         if let Some(target) = hit_test_global_menu(&snapshot.app, x, y) {
             return Some(target);
+        }
+
+        // item 1: the composited modals are centered over the WHOLE host rect, so their hit-test
+        // runs before the sidebar-width guard. Geometry is derived from the SAME shared helpers
+        // the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`/`add_remote_inner_rect`
+        // + the button-rect helpers), guaranteeing render == hit_test.
+        let full_rect = Rect::new(0, 0, host_width, host_height);
+        if let Some(target) = hit_test_new_workspace_picker(&snapshot, full_rect, x, y) {
+            return Some(target);
+        }
+        if let Some(target) = hit_test_add_remote(&snapshot, full_rect, x, y) {
+            return Some(target);
+        }
+        // item 3 (Area 5): the manage overlay intercepts the whole host rect first (so a click on
+        // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
+        if snapshot.remote_manage.is_some() {
+            return hit_test_remote_manage(&snapshot, full_rect, x, y);
         }
 
         if x >= sidebar_width {
@@ -283,16 +400,6 @@ impl ClientCompositor {
             return Some(SidebarHitTarget::Menu);
         }
 
-        if let Some((_, destination_rows)) = new_workspace_picker_layout(model, host_height) {
-            for (row, destination) in destination_rows {
-                if y == row {
-                    return Some(SidebarHitTarget::NewWorkspaceDestination {
-                        server_id: destination.server_id,
-                    });
-                }
-            }
-        }
-
         for card in &snapshot.app.view.workspace_card_areas {
             if rect_contains(card.rect, x, y) {
                 let route = snapshot.workspace_routes.get(card.ws_idx)?;
@@ -311,29 +418,124 @@ impl ClientCompositor {
         hit_test_agent_panel(&snapshot, x, y)
     }
 
-    fn draw_new_workspace_picker(
+    /// item 7 (Area 4): resolve a mouse-motion position to a sidebar hover target, sharing the
+    /// SAME `ClientSidebarSnapshot` + rect checks as `hit_test` so render geometry and hover
+    /// geometry cannot drift. Returns `None` (no highlight) for:
+    /// - a collapsed/zero-width sidebar (`effective_sidebar_width == 0`),
+    /// - an open add-remote form / global menu / manage overlay — those own their own hover, so
+    ///   the sidebar must not fight them (the `Moved` still reaches this fn via the unguarded
+    ///   overlay mouse arm),
+    /// - positions outside the sidebar content,
+    /// - disabled remote rows and `None`-`workspace_id` placeholders (matches `hit_test`),
+    /// - non-selectable layout rows (divider/banner-skip + headers/separator — they produce no
+    ///   card), and undrawn affordances (the ` new`/`menu` gate is `app.mouse_capture`).
+    ///
+    /// The new-workspace picker is a centered modal that DOES hover (its destination rows resolve
+    /// to `NewWorkspaceDestination { row }`, before the sidebar-width guard, like `hit_test`).
+    /// Never issues server traffic.
+    pub(crate) fn hover_test(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
-        frame: &mut FrameData,
-        sidebar_width: u16,
-    ) {
-        let Some((label_row, destination_rows)) = new_workspace_picker_layout(model, frame.height)
-        else {
-            return;
-        };
+        x: u16,
+        y: u16,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<crate::app::state::SidebarHoverTarget> {
+        use crate::app::state::SidebarHoverTarget;
 
-        if let Some(label_row) = label_row {
-            draw_text_cleared(frame, 0, label_row, sidebar_width, "create on");
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 || y >= host_height {
+            return None;
         }
-        for (row, destination) in destination_rows {
-            draw_text_cleared(
-                frame,
-                0,
-                row,
-                sidebar_width,
-                &format!("+ {}", destination.display_name),
-            );
+
+        // An open add-remote form / global menu / manage overlay owns input; the sidebar hover
+        // must yield so the existing overlay hover is authoritative.
+        if model.client_global_menu_highlighted().is_some()
+            || model.add_remote_form().is_some()
+            || model.remote_manage_overlay().is_some()
+        {
+            return None;
         }
+
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+
+        // The new-workspace picker is centered over the WHOLE host rect (item 1), so it hovers
+        // before the sidebar-width guard — the SAME order/geometry `hit_test` uses for it.
+        if let Some(target) = hover_test_new_workspace_picker(
+            &snapshot,
+            Rect::new(0, 0, host_width, host_height),
+            x,
+            y,
+        ) {
+            return Some(target);
+        }
+        // While the picker is open the dimmed sidebar beneath is inert (matches `hit_test`).
+        if snapshot.new_workspace_picker.is_some() {
+            return None;
+        }
+
+        if x >= sidebar_width {
+            return None;
+        }
+
+        if rect_contains(
+            filter_label_rect(snapshot.app.view.sidebar_rect, &snapshot.filter_label),
+            x,
+            y,
+        ) {
+            return Some(SidebarHoverTarget::Filter);
+        }
+        // Affordance hover respects the SAME draw gate as the renderer (`app.mouse_capture` at
+        // `sidebar.rs`): the ` new`/`menu` affordances only hover when they are actually drawn.
+        if snapshot.app.mouse_capture {
+            if rect_contains(snapshot.app.sidebar_new_button_rect(), x, y) {
+                return Some(SidebarHoverTarget::New);
+            }
+            if rect_contains(snapshot.app.global_launcher_rect(), x, y) {
+                return Some(SidebarHoverTarget::Menu);
+            }
+        }
+
+        // host-banner rect (item 2): hoverable as `HostBanner { banner_idx }` when drawn. The
+        // banner rows produce no `WorkspaceCardArea`, so they are skipped by the card loop below.
+        for banner in &snapshot.app.view.host_banner_areas {
+            if rect_contains(banner.rect, x, y) {
+                return Some(SidebarHoverTarget::HostBanner {
+                    banner_idx: banner.banner_idx,
+                });
+            }
+        }
+
+        // item-4 space-divider rows are non-selectable (they produce no card, so the card loop
+        // below would skip them). Resolve them to the defensive `Divider` target, which render
+        // treats as NO-highlight (a stable `None`-equivalent). Render never lifts a divider row —
+        // the contract's "hover never highlights the divider" (Decision 4).
+        if snapshot.app.view.divider_rows.contains(&y) {
+            return Some(SidebarHoverTarget::Divider);
+        }
+
+        for card in &snapshot.app.view.workspace_card_areas {
+            if rect_contains(card.rect, x, y) {
+                let route = snapshot.workspace_routes.get(card.ws_idx)?;
+                // disabled remote rows and `None`-id placeholders are not selectable → no hover
+                // (matches `hit_test`'s rejection so click and hover agree).
+                if route.disabled || route.workspace_id.is_none() {
+                    return None;
+                }
+                return Some(SidebarHoverTarget::Workspace {
+                    ws_idx: card.ws_idx,
+                });
+            }
+        }
+
+        hover_test_agent_panel(&snapshot, x, y)
     }
 }
 
@@ -360,6 +562,7 @@ impl ClientSidebarSnapshot {
         sidebar_width: u16,
         host_width: u16,
         host_height: u16,
+        now: Instant,
     ) -> Self {
         let mut app = crate::app::AppState::empty_for_client_rendering();
         let settings = model.ui_settings();
@@ -370,7 +573,9 @@ impl ClientSidebarSnapshot {
         app.sidebar_section_split = settings.sidebar_section_split();
         app.sidebar_space = settings.sidebar_spaces.clone();
         app.sidebar_agent = settings.sidebar_agents.clone();
-        app.global_menu_extra_labels = vec!["add remote"];
+        // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
+        app.sidebar_host = settings.sidebar_host.clone();
+        app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
         app.view.layout = ViewLayout::Desktop;
         app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
         app.view.terminal_area = Rect::new(
@@ -420,7 +625,30 @@ impl ClientSidebarSnapshot {
                 let (state, seen) = agent_state_from_status(&agent.status);
                 let mut terminal = TerminalState::new(terminal_id.clone(), "/".into());
                 terminal.set_agent_name(agent.label.clone());
-                terminal.state = state;
+                if state == AgentState::Working {
+                    // Working agents: seed working_since = the persisted start instant so the
+                    // live duration timer survives recompose. The map is upkept in the event
+                    // loop (pre-compose); here we only READ it. A first-seen agent falls back
+                    // to `now`, so its first frame shows ~0s. A fresh terminal starts in
+                    // `Unknown`, so the Unknown→Working transition fires (not short-circuited)
+                    // and `recompute_effective_state` sets `working_since = Some(started)`.
+                    let started = compositor
+                        .working_since
+                        .get(&(row.server_id.clone(), agent.agent_id.clone()))
+                        .copied()
+                        .unwrap_or(now);
+                    terminal.set_detected_state_with_screen_signals_at(
+                        None, // agent: no detected Agent on the client path
+                        crate::detect::AgentState::Working,
+                        false,   // visible_blocker
+                        false,   // visible_idle
+                        true,    // visible_working
+                        false,   // process_exited
+                        started, // now == persisted working-start instant
+                    );
+                } else {
+                    terminal.state = state;
+                }
                 app.terminals.insert(terminal_id.clone(), terminal);
                 pane_terminals.push((terminal_id, seen));
                 agent_routes.push(AgentRoute {
@@ -441,6 +669,9 @@ impl ClientSidebarSnapshot {
                 focused_agent_idx,
             );
             app.workspaces.push(workspace);
+            // item 4: mirror the per-row local/remote signal into AppState, index-aligned with
+            // app.workspaces. Empty in monolithic mode (no rows), so monolithic emits no divider.
+            app.client_workspace_remote.push(row.is_remote);
             workspace_routes.push(WorkspaceRoute {
                 server_id: row.server_id,
                 workspace_id: row.workspace_id,
@@ -463,14 +694,53 @@ impl ClientSidebarSnapshot {
         app.agent_panel_scroll = compositor
             .agent_panel_scroll
             .min(crate::ui::agent_panel_scroll_metrics(&app, detail_area).max_offset_from_bottom);
-        app.view.workspace_card_areas =
-            crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect);
+        // item 2 (C3): populate the per-host banner specs (one per visible Secondary, in
+        // visible_servers() order) and the coordination flag BEFORE computing geometry, so that
+        // `workspace_list_entries` emits the HostBanner rows and flips the divider to plain. The
+        // banner specs ride positionally: `HostBannerArea.banner_idx` indexes `app.host_banners`.
+        let host_banner_specs = model.host_banner_specs();
+        // The insertion index from `host_banner_specs` is a position in the flat
+        // `workspace_rows()` stream, which is 1:1 with `app.workspaces` (each row pushed in
+        // order above) — so it is a valid `ws_idx`. `host_banner_rows[i]` is the workspace the
+        // i-th banner is emitted immediately before; `host_banners[i]` is its spec.
+        app.host_banner_rows = host_banner_specs.iter().map(|(idx, _)| *idx).collect();
+        app.host_banners = host_banner_specs
+            .into_iter()
+            .map(|(_, spec)| spec)
+            .collect();
+        app.host_banner_active = model.host_banner_active();
+        // item 4: one pass produces card rects, host-banner rects (item 2), and divider rows,
+        // so render and hit-test share one geometry source. `host_banner_areas` is populated
+        // from the second slot of THIS single call (render == hit_test geometry), and
+        // `host_banner_active` (set above) flips the divider to plain when a banner is live.
+        let (cards, banners, dividers) =
+            crate::ui::compute_workspace_list_areas_full(&app, app.view.sidebar_rect);
+        app.view.workspace_card_areas = cards;
+        app.view.host_banner_areas = banners;
+        app.view.divider_rows = dividers;
+        // item 5: feed the single client-owned animation tick into the rendered AppState so
+        // the braille agent spinner advances (was frozen at 0 via empty_for_client_rendering).
+        app.spinner_tick = compositor.animation_tick();
+        // item 7 (Area 4): mirror the compositor's hover truth into the render snapshot (Copy;
+        // pure read). Render reads `app.sidebar_hover` and never mutates it.
+        app.set_sidebar_hover(compositor.hover);
 
         Self {
             app,
             filter_label: model.filter_label(),
             workspace_routes,
             agent_routes,
+            // item 1: clone the overlay state out of the model into ui-owned carriers (pure read).
+            // The closure maps these into ui view structs before rendering.
+            add_remote_form: model.add_remote_form().cloned(),
+            new_workspace_picker: model
+                .new_workspace_picker()
+                .map(|picker| (picker.destinations.clone(), picker.selected)),
+            // item 3: clone the overlay state + the secondary rows it renders out of the model
+            // (pure read). The render closure maps the rows into ui-owned views.
+            remote_manage: model
+                .remote_manage_overlay()
+                .map(|overlay| (overlay.clone(), model.remote_manage_rows())),
         }
     }
 
@@ -503,6 +773,64 @@ fn render_client_shell(
             if matches!(snapshot.app.mode, Mode::GlobalMenu) {
                 crate::ui::render_global_launcher_menu(&snapshot.app, frame);
             }
+            // item 1: render the composited client modals over the whole host rect — the proven
+            // `render_global_launcher_menu` compositing path. The compositor maps the ui-owned
+            // snapshot carriers into ui view structs here (no supervisor types reach `ui`).
+            let full_rect = Rect::new(0, 0, host_width, host_height);
+            if let Some((dests, selected)) = &snapshot.new_workspace_picker {
+                let views: Vec<crate::ui::DestinationView> = dests
+                    .iter()
+                    .map(|d| crate::ui::DestinationView {
+                        display_name: &d.display_name,
+                    })
+                    .collect();
+                // item 7 (Area 4): pass the hovered destination row (mirrored into the snapshot)
+                // so the modal lifts it; the picker's `Moved` resolves `NewWorkspaceDestination`.
+                let hovered_row = match snapshot.app.sidebar_hover {
+                    Some(crate::app::state::SidebarHoverTarget::NewWorkspaceDestination {
+                        row,
+                    }) => Some(row as usize),
+                    _ => None,
+                };
+                crate::ui::render_new_workspace_picker_overlay(
+                    &snapshot.app.palette,
+                    &views,
+                    *selected,
+                    hovered_row,
+                    frame,
+                    full_rect,
+                );
+            }
+            if let Some(form) = &snapshot.add_remote_form {
+                let view = crate::ui::AddRemoteOverlayView {
+                    target: &form.target,
+                    name: &form.name,
+                    focused_is_target: form.focused_field
+                        == crate::client::supervisor::AddRemoteField::Target,
+                    error: form.error.as_deref(),
+                };
+                crate::ui::render_add_remote_overlay(
+                    &snapshot.app.palette,
+                    &view,
+                    frame,
+                    full_rect,
+                );
+            }
+            // item 3 (Area 5): render the remote-management overlay over the whole host rect. The
+            // compositor maps the supervisor rows into ui-owned views here (no supervisor types
+            // reach `ui`).
+            if let Some((overlay, rows)) = &snapshot.remote_manage {
+                let views = model_remote_manage_row_views(rows);
+                crate::ui::render_remote_manage_overlay(
+                    &snapshot.app.palette,
+                    &views,
+                    overlay.selected,
+                    overlay.scroll,
+                    overlay.confirm_delete.as_deref(),
+                    frame,
+                    full_rect,
+                );
+            }
         })
         .expect("render to TestBackend should not fail");
 
@@ -515,12 +843,16 @@ fn render_filter_label(snapshot: &ClientSidebarSnapshot, frame: &mut ratatui::Fr
     if rect == Rect::default() {
         return;
     }
+    // item 7 (Area 4): the filter label hover lifts its fg overlay0 → subtext0.
+    let fg = if snapshot.app.sidebar_hover == Some(crate::app::state::SidebarHoverTarget::Filter) {
+        snapshot.app.palette.subtext0
+    } else {
+        snapshot.app.palette.overlay0
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(
             snapshot.filter_label.clone(),
-            Style::default()
-                .fg(snapshot.app.palette.overlay0)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Right),
         rect,
@@ -549,6 +881,199 @@ fn agent_state_from_status(status: &str) -> (AgentState, bool) {
         "idle" => (AgentState::Idle, true),
         _ => (AgentState::Unknown, true),
     }
+}
+
+/// Whether anything on the client sidebar is currently animating, gating the animation
+/// cadence (no idle CPU spin). Read-only over the cached model; performs NO I/O. The ONLY
+/// banner-active input is `host_banner_animation_active` (contract Area 1: do not invent a
+/// second clock or second flag); item 2 fills the banner hook, until then it is `false`.
+pub(crate) fn sidebar_wants_animation(
+    model: &crate::client::supervisor::ClientSupervisorModel,
+) -> bool {
+    model
+        .agent_groups()
+        .iter()
+        .any(|g| g.agents.iter().any(|r| r.status == "working"))
+        || model.host_banner_animation_active()
+}
+
+/// item 3 (Area 5): map the supervisor `RemoteManageRow`s into ui-owned `RemoteManageRowView`s
+/// (borrowing the row strings). This keeps `client::supervisor` types out of `ui` (the one-way
+/// layering rule, contradiction 13).
+fn model_remote_manage_row_views(
+    rows: &[crate::client::supervisor::RemoteManageRow],
+) -> Vec<crate::ui::RemoteManageRowView<'_>> {
+    use crate::client::supervisor::RemoteManageState;
+    rows.iter()
+        .map(|row| crate::ui::RemoteManageRowView {
+            glyph: match row.state {
+                RemoteManageState::Connected => crate::ui::RemoteStateGlyph::Connected,
+                RemoteManageState::Connecting => crate::ui::RemoteStateGlyph::Connecting,
+                RemoteManageState::Disconnected => crate::ui::RemoteStateGlyph::Disconnected,
+                RemoteManageState::Disabled => crate::ui::RemoteStateGlyph::Disabled,
+                RemoteManageState::ProtocolMismatch => {
+                    crate::ui::RemoteStateGlyph::ProtocolMismatch
+                }
+            },
+            name: &row.name,
+            target: &row.target,
+            state_word: row.state.state_word(),
+            disabled: !row.enabled,
+        })
+        .collect()
+}
+
+/// item 1: hit-test the centered new-workspace picker modal. Returns a destination row target,
+/// the confirm/cancel buttons, or `None` when the picker is closed or the click misses. Geometry
+/// is derived from the SAME helpers the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`
+/// + `new_workspace_picker_button_rects`) over the same `full_rect`, so render == hit_test.
+fn hit_test_new_workspace_picker(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    let (destinations, _) = snapshot.new_workspace_picker.as_ref()?;
+    let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, destinations.len())?;
+
+    // buttons take precedence over the (overlapping) actions row.
+    let (confirm_rect, cancel_rect) = crate::ui::new_workspace_picker_button_rects(inner);
+    if rect_contains(confirm_rect, x, y) {
+        return Some(SidebarHitTarget::NewWorkspacePickerConfirm);
+    }
+    if rect_contains(cancel_rect, x, y) {
+        return Some(SidebarHitTarget::NewWorkspacePickerCancel);
+    }
+
+    // destination rows — same `max_rows` clamp the renderer applies.
+    let max_rows = inner.height.saturating_sub(3) as usize;
+    for (row_index, destination) in destinations.iter().enumerate().take(max_rows) {
+        let row = crate::ui::new_workspace_picker_row_rect(inner, row_index);
+        if rect_contains(row, x, y) {
+            return Some(SidebarHitTarget::NewWorkspaceDestination {
+                server_id: destination.server_id.clone(),
+            });
+        }
+    }
+    None
+}
+
+/// item 7 (Area 4): hover sibling of `hit_test_new_workspace_picker`. Returns
+/// `NewWorkspaceDestination { row }` (keyed on the modal's logical row index, which the modal
+/// render keys on) for a hovered destination row. The confirm/cancel buttons have their own
+/// styling and are not hover targets. Uses the SAME centered geometry the renderer + hit-test
+/// use, so render == hover_test for the modal rows.
+fn hover_test_new_workspace_picker(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<crate::app::state::SidebarHoverTarget> {
+    let (destinations, _) = snapshot.new_workspace_picker.as_ref()?;
+    let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, destinations.len())?;
+    let max_rows = inner.height.saturating_sub(3) as usize;
+    for row_index in 0..destinations.len().min(max_rows) {
+        let row = crate::ui::new_workspace_picker_row_rect(inner, row_index);
+        if rect_contains(row, x, y) {
+            return Some(
+                crate::app::state::SidebarHoverTarget::NewWorkspaceDestination {
+                    row: row_index as u16,
+                },
+            );
+        }
+    }
+    None
+}
+
+/// item 1: hit-test the centered add-remote modal's submit/cancel buttons. Returns `None` when the
+/// form is closed or the click misses. Uses the shared fixed `add_remote_inner_rect` geometry.
+fn hit_test_add_remote(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    snapshot.add_remote_form.as_ref()?;
+    let inner = crate::ui::add_remote_inner_rect(full_rect)?;
+    let (submit_rect, cancel_rect) = crate::ui::add_remote_button_rects(inner);
+    if rect_contains(submit_rect, x, y) {
+        return Some(SidebarHitTarget::AddRemoteSubmit);
+    }
+    if rect_contains(cancel_rect, x, y) {
+        return Some(SidebarHitTarget::AddRemoteCancel);
+    }
+    None
+}
+
+/// item 3 (Area 5): hit-test the centered remote-management overlay. When delete-confirm is
+/// active the red popup OWNS input (its buttons are the only hit targets; list rows are inert).
+/// Otherwise a click on a rendered row selects it, and the footer `add` affordance opens the
+/// add-remote form. Geometry comes from the SAME shared helpers the renderer uses
+/// (`remote_manage_inner_rect`/`_row_rect`/`_confirm_*`), guaranteeing render == hit_test.
+fn hit_test_remote_manage(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    let (overlay, rows) = snapshot.remote_manage.as_ref()?;
+
+    // delete-confirm sub-state: only the popup buttons are hit-testable.
+    if overlay.confirm_delete.is_some() {
+        let popup = crate::ui::remote_manage_confirm_popup_rect(full_rect)?;
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (delete_rect, cancel_rect) = crate::ui::remote_manage_confirm_button_rects(inner);
+        if rect_contains(delete_rect, x, y) {
+            return Some(SidebarHitTarget::RemoteManageConfirmDelete);
+        }
+        if rect_contains(cancel_rect, x, y) {
+            return Some(SidebarHitTarget::RemoteManageCancelDelete);
+        }
+        return None;
+    }
+
+    let inner = crate::ui::remote_manage_inner_rect(full_rect, rows.len())?;
+
+    // footer hint row hosts the `add` affordance (whole footer row).
+    let footer = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
+    if rect_contains(footer, x, y) {
+        return Some(SidebarHitTarget::RemoteManageAdd);
+    }
+
+    // rows — same `max_rows`/visible-window clamp the renderer applies.
+    let max_rows = inner.height.saturating_sub(3) as usize;
+    let selected = overlay.selected.min(rows.len().saturating_sub(1));
+    let start = overlay
+        .scroll
+        .min(rows.len().saturating_sub(max_rows.max(1)))
+        .min(selected)
+        .max(crate::ui::open_existing_worktree_visible_start(
+            selected,
+            max_rows.max(1),
+        ));
+    for (visible_idx, (row_index, _)) in rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+        .enumerate()
+    {
+        let rect = crate::ui::remote_manage_row_rect(inner, visible_idx);
+        if rect_contains(rect, x, y) {
+            return Some(SidebarHitTarget::RemoteManageRow { index: row_index });
+        }
+    }
+    None
 }
 
 fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<SidebarHitTarget> {
@@ -603,6 +1128,44 @@ fn hit_test_agent_panel(
     })
 }
 
+/// item 7 (Area 4): hover sibling of `hit_test_agent_panel`. Returns `AgentRoute { route_idx }`
+/// where `route_idx = agent_panel_scroll + index` — the SAME flat `agent_routes` index
+/// `hit_test_agent_panel` resolves. The index is positional in `model.agent_groups()` order, so
+/// it survives recompose (a captured `pane_id` would not, contradiction 11). The client snapshot
+/// is always `AgentPanelScope::AllWorkspaces`, so this flat index equals the global
+/// `agent_panel_entries` index `render_agent_detail` walks (render == hover_test geometry).
+fn hover_test_agent_panel(
+    snapshot: &ClientSidebarSnapshot,
+    x: u16,
+    y: u16,
+) -> Option<crate::app::state::SidebarHoverTarget> {
+    let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+        snapshot.app.view.sidebar_rect,
+        snapshot.app.sidebar_section_split,
+    );
+    let metrics = crate::ui::agent_panel_scroll_metrics(&snapshot.app, detail_area);
+    let body =
+        crate::ui::agent_panel_body_rect(detail_area, crate::ui::should_show_scrollbar(metrics));
+    if !rect_contains(body, x, y) {
+        return None;
+    }
+
+    let entry_rows = crate::ui::agent_panel_entry_row_count(&snapshot.app);
+    if entry_rows == 0 {
+        return None;
+    }
+    let relative_row = y.saturating_sub(body.y);
+    let stride = entry_rows.saturating_add(1);
+    let index = (relative_row / stride) as usize;
+    if relative_row % stride >= entry_rows {
+        return None;
+    }
+    let route_idx = snapshot.app.agent_panel_scroll.saturating_add(index);
+    // only a real agent route resolves (the gap rows / over-scroll resolve to None).
+    snapshot.agent_routes.get(route_idx)?;
+    Some(crate::app::state::SidebarHoverTarget::AgentRoute { route_idx })
+}
+
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     rect.width > 0
         && rect.height > 0
@@ -632,173 +1195,6 @@ fn blank_cell() -> CellData {
         skip: false,
         hyperlink: None,
     }
-}
-
-fn new_workspace_picker_layout(
-    model: &crate::client::supervisor::ClientSupervisorModel,
-    host_height: u16,
-) -> Option<NewWorkspacePickerLayout> {
-    let destinations = model.new_workspace_picker_destinations()?;
-    if destinations.is_empty() || host_height < 3 {
-        return None;
-    }
-
-    let footer_row = host_height.saturating_sub(1);
-    let available_destination_rows = footer_row.saturating_sub(1);
-    if available_destination_rows == 0 {
-        return None;
-    }
-
-    let visible_destination_count = destinations.len().min(available_destination_rows as usize);
-    if visible_destination_count == 0 {
-        return None;
-    }
-
-    let destination_start = footer_row.saturating_sub(visible_destination_count as u16);
-    let label_row = (destination_start > 1).then_some(destination_start - 1);
-    let destination_rows = destinations
-        .iter()
-        .take(visible_destination_count)
-        .enumerate()
-        .map(|(offset, destination)| (destination_start + offset as u16, destination.clone()))
-        .collect();
-
-    Some((label_row, destination_rows))
-}
-
-fn draw_add_remote_form(
-    model: &crate::client::supervisor::ClientSupervisorModel,
-    frame: &mut FrameData,
-) {
-    let Some(form) = model.add_remote_form() else {
-        return;
-    };
-    if frame.width < 12 || frame.height < 7 {
-        return;
-    }
-
-    let popup_width = frame
-        .width
-        .saturating_sub(4)
-        .min(54)
-        .max(28.min(frame.width));
-    let popup_height = 9.min(frame.height);
-    let x = (frame.width.saturating_sub(popup_width)) / 2;
-    let y = (frame.height.saturating_sub(popup_height)) / 2;
-    draw_box(frame, x, y, popup_width, popup_height);
-
-    let inner_x = x + 1;
-    let inner_width = popup_width.saturating_sub(2);
-    draw_text_cleared(frame, inner_x, y + 1, inner_width, "add remote");
-
-    let target_marker = if form.focused_field == crate::client::supervisor::AddRemoteField::Target {
-        ">"
-    } else {
-        " "
-    };
-    let name_marker = if form.focused_field == crate::client::supervisor::AddRemoteField::Name {
-        ">"
-    } else {
-        " "
-    };
-    draw_text_cleared(
-        frame,
-        inner_x,
-        y + 3,
-        inner_width,
-        &format!("{target_marker} target  {}", form.target),
-    );
-    draw_text_cleared(
-        frame,
-        inner_x,
-        y + 4,
-        inner_width,
-        &format!("{name_marker} name    {}", form.name),
-    );
-    if let Some(error) = &form.error {
-        draw_text_cleared(frame, inner_x, y + 6, inner_width, error);
-    }
-    draw_text_cleared(frame, inner_x, y + 7, inner_width, "enter add   esc close");
-}
-
-fn draw_text(frame: &mut FrameData, x: u16, y: u16, max_width: u16, text: &str) {
-    if y >= frame.height {
-        return;
-    }
-    let mut offset: u16 = 0;
-    for ch in text.chars() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
-        if offset.saturating_add(width) > max_width {
-            break;
-        }
-        let col = x.saturating_add(offset);
-        if col >= frame.width {
-            break;
-        }
-        let idx = (y as usize) * (frame.width as usize) + (col as usize);
-        if let Some(cell) = frame.cells.get_mut(idx) {
-            cell.symbol = ch.to_string();
-            cell.skip = false;
-            cell.hyperlink = None;
-        }
-        offset = offset.saturating_add(width);
-    }
-}
-
-fn draw_box(frame: &mut FrameData, x: u16, y: u16, width: u16, height: u16) {
-    if width < 2 || height < 2 {
-        return;
-    }
-    for row in 0..height {
-        for col in 0..width {
-            let symbol = if (row == 0 || row == height - 1) && (col == 0 || col == width - 1) {
-                match (row == 0, col == 0) {
-                    (true, true) => "╭",
-                    (true, false) => "╮",
-                    (false, true) => "╰",
-                    (false, false) => "╯",
-                }
-            } else if row == 0 || row == height - 1 {
-                "─"
-            } else if col == 0 || col == width - 1 {
-                "│"
-            } else {
-                " "
-            };
-            put_symbol(frame, x + col, y + row, symbol);
-        }
-    }
-}
-
-fn put_symbol(frame: &mut FrameData, x: u16, y: u16, symbol: &str) {
-    if x >= frame.width || y >= frame.height {
-        return;
-    }
-    let idx = (y as usize) * (frame.width as usize) + (x as usize);
-    if let Some(cell) = frame.cells.get_mut(idx) {
-        cell.symbol = symbol.into();
-        cell.skip = false;
-        cell.hyperlink = None;
-    }
-}
-
-fn draw_text_cleared(frame: &mut FrameData, x: u16, y: u16, max_width: u16, text: &str) {
-    if y >= frame.height {
-        return;
-    }
-    for offset in 0..max_width {
-        let col = x.saturating_add(offset);
-        if col >= frame.width {
-            break;
-        }
-        let idx = (y as usize) * (frame.width as usize) + (col as usize);
-        if let Some(cell) = frame.cells.get_mut(idx) {
-            cell.symbol = " ".into();
-            cell.skip = false;
-            cell.hyperlink = None;
-        }
-    }
-    draw_text(frame, x, y, max_width, text);
 }
 
 fn copy_active_content_excluding(
@@ -849,9 +1245,11 @@ fn offset_cursor(
 mod tests {
     use super::*;
     use crate::client::supervisor::{
-        AgentSummary, ClientSupervisorModel, ServerId, ServerSummary, WorkspaceSummary,
+        AgentSummary, ClientSupervisorModel, NewWorkspaceRoute, ServerId, ServerSummary,
+        WorkspaceSummary,
     };
     use crate::protocol::CursorState;
+    use std::time::Duration;
 
     fn cell(symbol: &str) -> CellData {
         CellData {
@@ -913,6 +1311,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -950,10 +1349,18 @@ mod tests {
             .unwrap();
 
         let content = frame(8, 3, &["content", "frame"]);
-        let composed = ClientCompositor::new(26).compose_frame(&model, &content, 60, 20);
+        // item 2 (C3): the host banner adds a row to the spaces list, so render at a taller
+        // sidebar to keep the remote card's branch line on screen.
+        let composed = ClientCompositor::new(26).compose_frame(
+            &model,
+            &content,
+            60,
+            28,
+            std::time::Instant::now(),
+        );
 
         assert_eq!(composed.width, 60);
-        assert_eq!(composed.height, 20);
+        assert_eq!(composed.height, 28);
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
             .collect();
@@ -966,7 +1373,8 @@ mod tests {
         assert_eq!(composed.cells[25].symbol, "│");
         assert!(rows.iter().any(|row| row.contains("herdr")));
         assert!(rows.iter().any(|row| row.contains("master")));
-        assert!(rows.iter().any(|row| row.contains("x api")));
+        // item 2 (C3): bare space label "api" (host "x" now lives in the banner row above).
+        assert!(rows.iter().any(|row| row.contains("api")));
         assert!(rows.iter().any(|row| row.contains("feature/api")));
         assert!(rows.iter().any(|row| row.starts_with(" agents")));
         assert!(rows.iter().any(|row| row.contains("claude")));
@@ -996,6 +1404,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -1019,12 +1428,20 @@ mod tests {
         model.set_ui_settings(settings);
 
         let content = frame(8, 3, &["content", "frame"]);
-        let composed = ClientCompositor::new(26).compose_frame(&model, &content, 60, 16);
+        let composed = ClientCompositor::new(26).compose_frame(
+            &model,
+            &content,
+            60,
+            16,
+            std::time::Instant::now(),
+        );
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
             .collect();
 
-        assert!(rows.iter().any(|row| row.contains("x api")));
+        // item 2 (C3): the workspace label is now the bare space name (the host name lives in
+        // the banner above), and the branch column is disabled by the ui-settings overrides.
+        assert!(rows.iter().any(|row| row.contains("api")));
         assert!(!rows.iter().any(|row| row.contains("feature/api")));
     }
 
@@ -1042,7 +1459,7 @@ mod tests {
         let compositor = ClientCompositor::new(12);
         let content = frame(1, 1, &["x"]);
 
-        let composed = compositor.compose_frame(&model, &content, 8, 3);
+        let composed = compositor.compose_frame(&model, &content, 8, 3, std::time::Instant::now());
 
         assert_eq!(composed.width, 8);
         assert_eq!(composed.cells[7].symbol, "x");
@@ -1057,16 +1474,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_text_cleared_truncates_by_display_width() {
-        let mut output = blank_frame(3, 1);
-
-        draw_text_cleared(&mut output, 0, 0, 2, "가x");
-
-        assert_eq!(output.cells[0].symbol, "가");
-        assert_eq!(output.cells[1].symbol, " ");
-    }
-
-    #[test]
     fn hit_test_uses_server_sidebar_geometry() {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
@@ -1077,6 +1484,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -1114,41 +1522,77 @@ mod tests {
             .unwrap();
 
         let compositor = ClientCompositor::new(26);
+        // Derive row geometry from the same snapshot render uses (render == hit_test): the main
+        // card, the divider, item 2's host banner, and the remote card all come from one pass.
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        let main_card = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|c| c.ws_idx == 0)
+            .expect("main card");
+        let remote_card = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|c| c.ws_idx == 1)
+            .expect("remote card");
+        let divider_y = snapshot.app.view.divider_rows[0];
+        let banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
 
         assert_eq!(
-            compositor.hit_test(&model, 23, 0, 60, 16),
+            compositor.hit_test(&model, 23, 0, 60, 28),
             Some(SidebarHitTarget::Filter)
         );
         assert_eq!(
-            compositor.hit_test(&model, 1, 2, 60, 16),
+            compositor.hit_test(&model, 1, main_card.rect.y, 60, 28),
             Some(SidebarHitTarget::Workspace {
                 server_id: ServerId::main(),
                 workspace_id: "main-herdr".into(),
             })
         );
+        // item 4: the local→remote divider row resolves to no workspace. item 2 (C3): the host
+        // banner row (below the divider, above the remote card) also resolves to no workspace.
+        assert!(!matches!(
+            compositor.hit_test(&model, 1, divider_y, 60, 28),
+            Some(SidebarHitTarget::Workspace { .. })
+        ));
+        assert!(!matches!(
+            compositor.hit_test(&model, 1, banner_y, 60, 28),
+            Some(SidebarHitTarget::Workspace { .. })
+        ));
+        assert!(divider_y < banner_y && banner_y < remote_card.rect.y);
         assert_eq!(
-            compositor.hit_test(&model, 1, 4, 60, 16),
+            compositor.hit_test(&model, 1, remote_card.rect.y, 60, 28),
             Some(SidebarHitTarget::Workspace {
                 server_id: remote_id.clone(),
                 workspace_id: "remote-api".into(),
             })
         );
+        // The agent row + affordances still resolve to their targets at their geometry.
+        let new_rect = snapshot.app.sidebar_new_button_rect();
         assert_eq!(
-            compositor.hit_test(&model, 1, 11, 60, 16),
-            Some(SidebarHitTarget::Agent {
-                server_id: remote_id,
-                agent_id: "remote-agent".into(),
-            })
-        );
-        assert_eq!(
-            compositor.hit_test(&model, 1, 7, 60, 16),
+            compositor.hit_test(&model, new_rect.x, new_rect.y, 60, 28),
             Some(SidebarHitTarget::New)
         );
+        let menu_rect = snapshot.app.global_launcher_rect();
         assert_eq!(
-            compositor.hit_test(&model, 23, 7, 60, 16),
+            compositor.hit_test(
+                &model,
+                menu_rect.x + menu_rect.width - 1,
+                menu_rect.y,
+                60,
+                28
+            ),
             Some(SidebarHitTarget::Menu)
         );
-        assert_eq!(compositor.hit_test(&model, 27, 2, 60, 16), None);
+        assert_eq!(
+            compositor.hit_test(&model, 27, main_card.rect.y, 60, 28),
+            None
+        );
     }
 
     #[test]
@@ -1162,6 +1606,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -1189,8 +1634,8 @@ mod tests {
         assert_eq!(compositor.hit_test(&model, 1, 2, 60, 16), None);
     }
 
-    #[test]
-    fn destination_picker_draws_and_hit_tests_destination_rows() {
+    // item 4: a [Main, Secondary] model with workspaces on both sides.
+    fn mixed_supervisor_model() -> (ClientSupervisorModel, ServerId) {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "remote-x".into(),
@@ -1200,6 +1645,313 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: false,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        (model, remote_id)
+    }
+
+    #[test]
+    fn from_model_aligns_client_workspace_remote_with_workspaces() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+
+        // Index-aligned with app.workspaces, and matches each row's is_remote.
+        assert_eq!(
+            snapshot.app.client_workspace_remote.len(),
+            snapshot.app.workspaces.len()
+        );
+        let rows = model.workspace_rows();
+        let expected: Vec<bool> = rows.iter().map(|row| row.is_remote).collect();
+        assert_eq!(snapshot.app.client_workspace_remote, expected);
+        // [Main, Secondary] => exactly [false, true].
+        assert_eq!(snapshot.app.client_workspace_remote, vec![false, true]);
+    }
+
+    #[test]
+    fn from_model_populates_divider_rows_for_mixed_model() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        // A mixed model yields exactly one divider row. item 2 (C3): the single visible
+        // Secondary now also emits one host-banner area (from the same compute pass).
+        assert_eq!(snapshot.app.view.divider_rows.len(), 1);
+        assert_eq!(snapshot.app.view.host_banner_areas.len(), 1);
+    }
+
+    #[test]
+    fn from_model_populates_host_banner_areas() {
+        // item 2 (C3): the host-banner specs + the second slot of the single
+        // compute_workspace_list_areas pass populate `app.host_banners` and
+        // `app.view.host_banner_areas` (one per visible Secondary), and flip
+        // `host_banner_active`. The banner_idx indexes app.host_banners.
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+
+        assert!(snapshot.app.host_banner_active);
+        assert_eq!(snapshot.app.host_banners.len(), 1);
+        assert_eq!(snapshot.app.host_banners[0].display_name, "x");
+        assert_eq!(snapshot.app.view.host_banner_areas.len(), 1);
+        let area = snapshot.app.view.host_banner_areas[0];
+        assert_eq!(area.banner_idx, 0);
+        // The banner area never overlaps a workspace card (render == hit_test).
+        assert!(snapshot.app.view.workspace_card_areas.iter().all(|card| {
+            !(area.rect.y >= card.rect.y && area.rect.y < card.rect.y + card.rect.height)
+        }));
+    }
+
+    #[test]
+    fn divider_banner_insertion_does_not_shift_active_idx() {
+        // item 6 (Area 6) / Area 2 no-shift regression: the optimistic override flips a
+        // `focused` bool on a real Workspace row; `from_model` derives `active_idx` from the FLAT
+        // `workspace_rows()` stream (which contains NO divider/banner entries — those are
+        // layout-only). So even though this mixed model emits a divider AND a host banner,
+        // `app.active`/`app.selected` land on the optimistic remote workspace's flat index,
+        // unshifted by the non-selectable rows.
+        let (mut model, remote_id) = mixed_supervisor_model();
+
+        // Sanity: the model really does emit the non-selectable rows.
+        let compositor = ClientCompositor::new(26);
+        let pre =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        assert_eq!(pre.app.view.divider_rows.len(), 1);
+        assert_eq!(pre.app.view.host_banner_areas.len(), 1);
+
+        // The remote workspace's index in the flat workspace_rows() stream (no divider/banner).
+        let remote_idx = model
+            .workspace_rows()
+            .iter()
+            .position(|row| {
+                row.server_id == remote_id && row.workspace_id.as_deref() == Some("remote-api")
+            })
+            .expect("remote workspace row should be present in the flat stream");
+
+        model.focus_workspace_route(&remote_id, "remote-api");
+
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        // active/selected point at the optimistic remote row's flat index, NOT shifted by the
+        // divider/banner rows that sit above it in the rendered list.
+        assert_eq!(snapshot.app.active, Some(remote_idx));
+        assert_eq!(snapshot.app.selected, remote_idx);
+        // The flat workspace_rows() index is unchanged by the divider/banner insertion: the
+        // optimistic remote row is at the same index whether or not the layout rows exist.
+        assert_eq!(snapshot.app.workspaces.len(), model.workspace_rows().len());
+    }
+
+    #[test]
+    fn agents_panel_follows_optimistic_group() {
+        // item 6 (Area 6): with an optimistic agent focus, the agents panel follows the
+        // optimistic server's group — the active workspace is the agent's workspace and that
+        // workspace's pane (the agent) is focused, and `agent_groups()` reports the group focused.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: false,
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+
+        model.focus_agent_route(&remote_id, "remote-agent");
+
+        // The optimistic agent's group renders focused (the panel reads agent_groups()).
+        let group = model
+            .agent_groups()
+            .into_iter()
+            .find(|group| group.workspace_id == "remote-api")
+            .expect("the agent's workspace group should exist");
+        assert!(group.focused);
+        assert!(group
+            .agents
+            .iter()
+            .any(|agent| agent.agent_id == "remote-agent" && agent.focused));
+
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+
+        // active/selected point at the agent's workspace row, and that workspace has a focused
+        // pane (the agent) — so the composited agents panel renders that group as focused.
+        let remote_idx = model
+            .workspace_rows()
+            .iter()
+            .position(|row| {
+                row.server_id == remote_id && row.workspace_id.as_deref() == Some("remote-api")
+            })
+            .expect("remote workspace row should be present");
+        assert_eq!(snapshot.app.active, Some(remote_idx));
+        assert!(snapshot.app.workspaces[remote_idx]
+            .focused_pane_id()
+            .is_some());
+    }
+
+    #[test]
+    fn hit_test_none_over_banner_row() {
+        // The host-banner row is not a Workspace/affordance target — hit-test yields no
+        // Workspace target over it (render == hit_test; banners are non-selectable).
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        let banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
+        let hit = compositor.hit_test(&model, 1, banner_y, 60, 16);
+        assert!(
+            !matches!(hit, Some(SidebarHitTarget::Workspace { .. })),
+            "banner row {banner_y} hit-tested to a workspace: {hit:?}"
+        );
+        // No card overlaps the banner row, so the real rows still resolve to their cards.
+        for card in &snapshot.app.view.workspace_card_areas {
+            assert_ne!(card.rect.y, banner_y, "a card overlaps the banner row");
+        }
+    }
+
+    #[test]
+    fn from_model_no_divider_rows_for_all_local_model() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        assert!(snapshot.app.view.divider_rows.is_empty());
+    }
+
+    #[test]
+    fn client_hit_test_returns_no_workspace_for_divider_row() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        // Derive the divider y from the same snapshot geometry render uses (render == hit_test).
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        let divider_y = snapshot.app.view.divider_rows[0];
+
+        // The divider row resolves to no Workspace target.
+        let divider_hit = compositor.hit_test(&model, 1, divider_y, 60, 16);
+        assert!(
+            !matches!(divider_hit, Some(SidebarHitTarget::Workspace { .. })),
+            "divider row {divider_y} hit-tested to a workspace: {divider_hit:?}"
+        );
+        // The real workspace rows still resolve to their cards (none at the divider y).
+        for card in &snapshot.app.view.workspace_card_areas {
+            assert_ne!(card.rect.y, divider_y, "a card overlaps the divider row");
+            assert!(matches!(
+                compositor.hit_test(&model, 1, card.rect.y, 60, 16),
+                Some(SidebarHitTarget::Workspace { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn hover_hit_test_skips_divider_row() {
+        // Regression lock for the future hover impl (item 7): the click-path geometry used by
+        // hover (workspace_card_areas) yields no workspace for the divider row.
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        let divider_y = snapshot.app.view.divider_rows[0];
+        assert!(snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .all(|card| !(divider_y >= card.rect.y && divider_y < card.rect.y + card.rect.height)));
+    }
+
+    /// Build a mixed two-destination model (main `local` + remote `x`) and open the picker.
+    fn two_destination_picker_model() -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -1236,25 +1988,94 @@ mod tests {
             )
             .unwrap();
         model.open_new_workspace_picker();
+        (model, remote_id)
+    }
+
+    #[test]
+    fn new_workspace_picker_renders_centered_selectable_list() {
+        let (model, _) = two_destination_picker_model();
 
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
-        let composed = compositor.compose_frame(&model, &content, 60, 16);
+        let composed =
+            compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+        let rows: Vec<_> = (0..composed.height)
+            .map(|row| row_text(&composed, row))
+            .collect();
 
-        assert!(row_text(&composed, 12).starts_with("create on"));
-        assert!(row_text(&composed, 13).starts_with("+ local"));
-        assert!(row_text(&composed, 14).starts_with("+ x"));
+        // centered ratatui modal: square corner, header, sub-label, both destinations, buttons.
+        assert!(rows.iter().any(|row| row.contains("┌")));
+        assert!(rows.iter().any(|row| row.contains("new workspace")));
+        assert!(rows.iter().any(|row| row.contains("create on")));
+        assert!(rows.iter().any(|row| row.contains("local")));
+        assert!(rows.iter().any(|row| row.contains("x")));
+        // default selection (index 0) carries the `›` marker.
+        assert!(rows.iter().any(|row| row.contains("›")));
+        assert!(rows.iter().any(|row| row.contains("create")));
+        assert!(rows.iter().any(|row| row.contains("cancel")));
+        // the OLD bottom-anchored picker literals on rows 12-14 are GONE.
+        assert!(!row_text(&composed, 12).starts_with("create on"));
+        assert!(!row_text(&composed, 13).starts_with("+ local"));
+        assert!(!row_text(&composed, 14).starts_with("+ x"));
+    }
+
+    #[test]
+    fn new_workspace_picker_mouse_click_hit_tests_centered_rows() {
+        let (model, remote_id) = two_destination_picker_model();
+        let compositor = ClientCompositor::new(26);
+
+        // derive the CENTERED row coordinates from the SAME shared geometry the renderer uses.
+        let full_rect = Rect::new(0, 0, 60, 16);
+        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        let row0 = crate::ui::new_workspace_picker_row_rect(inner, 0);
+        let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
+
+        // explicitly NOT rows 13/14 (the old bottom-anchored geometry).
+        assert_ne!(row0.y, 13);
+        assert_ne!(row1.y, 14);
+
         assert_eq!(
-            compositor.hit_test(&model, 1, 13, 60, 16),
+            compositor.hit_test(&model, row0.x, row0.y, 60, 16),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: ServerId::main(),
             })
         );
         assert_eq!(
-            compositor.hit_test(&model, 1, 14, 60, 16),
+            compositor.hit_test(&model, row1.x, row1.y, 60, 16),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: remote_id,
             })
+        );
+    }
+
+    #[test]
+    fn new_workspace_picker_keyboard_navigates_and_confirms() {
+        let (mut model, remote_id) = two_destination_picker_model();
+        assert_eq!(model.new_workspace_picker().map(|p| p.selected), Some(0));
+
+        model.move_new_workspace_picker_next();
+        assert_eq!(model.new_workspace_picker().map(|p| p.selected), Some(1));
+
+        let route = model.accept_new_workspace_picker();
+        assert_eq!(route, NewWorkspaceRoute::CreateOn(remote_id));
+    }
+
+    #[test]
+    fn picker_confirm_and_cancel_buttons_hit_test() {
+        let (model, _) = two_destination_picker_model();
+        let compositor = ClientCompositor::new(26);
+
+        let full_rect = Rect::new(0, 0, 60, 16);
+        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        let (confirm, cancel) = crate::ui::new_workspace_picker_button_rects(inner);
+
+        assert_eq!(
+            compositor.hit_test(&model, confirm.x, confirm.y, 60, 16),
+            Some(SidebarHitTarget::NewWorkspacePickerConfirm)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel.x, cancel.y, 60, 16),
+            Some(SidebarHitTarget::NewWorkspacePickerCancel)
         );
     }
 
@@ -1265,7 +2086,8 @@ mod tests {
 
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
-        let composed = compositor.compose_frame(&model, &content, 60, 16);
+        let composed =
+            compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
 
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
@@ -1286,22 +2108,853 @@ mod tests {
         );
     }
 
+    /// Read the cell at (x, y) of a composited frame.
+    fn cell_at(frame: &FrameData, x: u16, y: u16) -> &CellData {
+        &frame.cells[(y as usize) * (frame.width as usize) + (x as usize)]
+    }
+
+    /// Encode an RGB color the same way `FrameData::from_ratatui_buffer_with_hyperlinks` does, so
+    /// the modal tests can match against palette colors.
+    fn encode_rgb(r: u8, g: u8, b: u8) -> u32 {
+        0x02_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    }
+
+    /// True iff any cell on `row` carries `bg` (e.g. the focused field's `surface0` fill).
+    fn row_has_bg(frame: &FrameData, row: u16, bg: u32) -> bool {
+        (0..frame.width).any(|x| cell_at(frame, x, row).bg == bg)
+    }
+
     #[test]
-    fn add_remote_form_uses_modal_surface_instead_of_ascii_placeholder() {
+    fn add_remote_modal_renders_accent_border_and_action_buttons() {
         let mut model = ClientSupervisorModel::new("local");
         model.open_add_remote_form();
 
         let compositor = ClientCompositor::new(26);
         let content = frame(20, 8, &["content", "frame"]);
-        let composed = compositor.compose_frame(&model, &content, 80, 24);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
             .collect();
 
-        assert!(rows.iter().any(|row| row.contains("╭")));
+        // border::PLAIN square corner (NOT the legacy rounded `╭`).
+        assert!(rows.iter().any(|row| row.contains("┌")));
+        assert!(!rows.iter().any(|row| row.contains("╭")));
         assert!(rows.iter().any(|row| row.contains("add remote")));
         assert!(rows.iter().any(|row| row.contains("target")));
         assert!(rows.iter().any(|row| row.contains("name")));
+        // action buttons.
+        assert!(rows.iter().any(|row| row.contains("add")));
+        assert!(rows.iter().any(|row| row.contains("cancel")));
+        // legacy ASCII art / raw markers / the old footer literal are ABSENT.
         assert!(!rows.iter().any(|row| row.contains("+---")));
+        assert!(!rows.iter().any(|row| row.contains("enter add   esc close")));
+    }
+
+    #[test]
+    fn add_remote_modal_marks_focused_field() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form(); // focus defaults to Target.
+
+        let compositor = ClientCompositor::new(26);
+        let content = frame(20, 8, &["content", "frame"]);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+
+        // inner rect for host 80x24: rows[1] (target) and rows[2] (name).
+        let inner = crate::ui::add_remote_inner_rect(Rect::new(0, 0, 80, 24)).expect("modal fits");
+        let target_row = inner.y.saturating_add(1);
+        let name_row = inner.y.saturating_add(2);
+
+        // catppuccin surface0 = Rgb(49, 50, 68); the focused target field carries that fill.
+        let surface0 = encode_rgb(49, 50, 68);
+        assert!(row_has_bg(&composed, target_row, surface0));
+        // the target label cells now carry non-zero fg (regression vs. the old colorless draw).
+        assert!((0..composed.width).any(|x| cell_at(&composed, x, target_row).fg != 0));
+        // the unfocused name row does NOT carry the focused `surface0` bg (it has panel_bg).
+        assert!(!row_has_bg(&composed, name_row, surface0));
+    }
+
+    #[test]
+    fn add_remote_modal_shows_inline_error() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        // Enter with an empty target produces the `target required` inline error.
+        model.handle_add_remote_key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let compositor = ClientCompositor::new(26);
+        let content = frame(20, 8, &["content", "frame"]);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let rows: Vec<_> = (0..composed.height)
+            .map(|row| row_text(&composed, row))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("target required")));
+
+        // an async-style error string renders too.
+        model.set_add_remote_error("adding remote...");
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let rows: Vec<_> = (0..composed.height)
+            .map(|row| row_text(&composed, row))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("adding remote...")));
+    }
+
+    #[test]
+    fn add_remote_modal_keeps_cursor_hidden() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+
+        let compositor = ClientCompositor::new(26);
+        let content = frame(20, 8, &["content", "frame"]);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+
+        assert!(composed.cursor.is_none());
+    }
+
+    #[test]
+    fn add_remote_button_click_submits_and_cancel_closes() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let compositor = ClientCompositor::new(26);
+
+        let inner = crate::ui::add_remote_inner_rect(Rect::new(0, 0, 80, 24)).expect("modal fits");
+        let (submit, cancel) = crate::ui::add_remote_button_rects(inner);
+
+        assert_eq!(
+            compositor.hit_test(&model, submit.x, submit.y, 80, 24),
+            Some(SidebarHitTarget::AddRemoteSubmit)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel.x, cancel.y, 80, 24),
+            Some(SidebarHitTarget::AddRemoteCancel)
+        );
+    }
+
+    // --- item 5: client agent animation --------------------------------------------------
+
+    /// Build a mixed model with one main workspace and one remote workspace whose single agent
+    /// has `agent_status` (e.g. "working" / "idle"). Both servers connect by default.
+    fn model_with_agent_status(agent_status: &str) -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: Some("feature/api".into()),
+                        focused: false,
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: agent_status.into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
+    }
+
+    #[test]
+    fn animation_tick_feeds_spinner_tick() {
+        let (model, _) = model_with_agent_status("working");
+        let mut compositor = ClientCompositor::new(26);
+        compositor.advance_animation_tick(8);
+
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            60,
+            16,
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(snapshot.app.spinner_tick, 8);
+    }
+
+    #[test]
+    fn spinner_cell_differs_between_tick_0_and_8() {
+        let (model, _) = model_with_agent_status("working");
+        let content = frame(8, 3, &["content", "frame"]);
+
+        let at_zero = ClientCompositor::new(26);
+        let frame_zero = at_zero.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+
+        let mut at_eight = ClientCompositor::new(26);
+        at_eight.advance_animation_tick(8);
+        let frame_eight =
+            at_eight.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+
+        let symbols_zero: Vec<_> = frame_zero.cells.iter().map(|c| c.symbol.clone()).collect();
+        let symbols_eight: Vec<_> = frame_eight.cells.iter().map(|c| c.symbol.clone()).collect();
+        assert_ne!(
+            symbols_zero, symbols_eight,
+            "spinner_frame should advance the agent-status cell between tick 0 and tick 8"
+        );
+        // The spinner glyph at tick 0 is SPINNERS[0] = ⠋, at tick 8 it is SPINNERS[1] = ⠙.
+        assert!(symbols_zero.iter().any(|s| s == "⠋"));
+        assert!(symbols_eight.iter().any(|s| s == "⠙"));
+    }
+
+    #[test]
+    fn advance_animation_tick_wraps_and_steps() {
+        let mut compositor = ClientCompositor::new(26);
+        assert_eq!(compositor.animation_tick(), 0);
+        compositor.advance_animation_tick(8);
+        assert_eq!(compositor.animation_tick(), 8);
+        compositor.advance_animation_tick(8);
+        assert_eq!(compositor.animation_tick(), 16);
+
+        // Wrap cleanly at the u32 boundary with no discontinuity in the visible step `tick/8`.
+        let mut wrapping = ClientCompositor::new(26);
+        wrapping.advance_animation_tick(u32::MAX - 3);
+        let before = wrapping.animation_tick();
+        wrapping.advance_animation_tick(8);
+        let after = wrapping.animation_tick();
+        assert_eq!(after, before.wrapping_add(8));
+        assert!(after < before, "tick should wrap past the u32 boundary");
+    }
+
+    #[test]
+    fn sidebar_wants_animation_true_with_working_agent() {
+        let (model, _) = model_with_agent_status("working");
+        assert!(sidebar_wants_animation(&model));
+    }
+
+    /// Force the host-banner animation off so a test can isolate the agent-driven animation
+    /// gate (item 2 (C3): a visible Secondary now animates its banner by default).
+    fn with_static_host_banner(model: &mut ClientSupervisorModel) {
+        let mut ui_settings = model.ui_settings().clone();
+        ui_settings.sidebar_host.animation = crate::config::HostBannerAnimation::Static;
+        model.set_ui_settings(ui_settings);
+    }
+
+    #[test]
+    fn sidebar_wants_animation_false_when_all_idle() {
+        // With the banner animation forced Static, only the agent gate remains — idle agents
+        // never request animation.
+        for status in ["idle", "done", "blocked", "unknown"] {
+            let (mut model, _) = model_with_agent_status(status);
+            with_static_host_banner(&mut model);
+            assert!(
+                !sidebar_wants_animation(&model),
+                "status {status:?} should not request animation"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_wants_animation_true_with_banner() {
+        // item 2 (C3): the banner hook is now the real gate. With no working agent the gate is
+        // driven solely by `host_banner_animation_active` — a visible Secondary with the default
+        // Animated setting makes the gate true (proving the banner hook is the single
+        // banner-active input the gate reads).
+        let (model, _) = model_with_agent_status("idle");
+        assert!(model.host_banner_animation_active());
+        assert!(sidebar_wants_animation(&model));
+        assert_eq!(
+            sidebar_wants_animation(&model),
+            model.host_banner_animation_active(),
+            "with no working agent the gate equals the banner hook"
+        );
+    }
+
+    #[test]
+    fn working_agent_seeds_working_since_from_map() {
+        let (model, remote_id) = model_with_agent_status("working");
+        let t0 = std::time::Instant::now();
+        let mut compositor = ClientCompositor::new(26);
+        compositor.seed_working_since((remote_id.clone(), "remote-agent".to_string()), t0);
+
+        let snapshot = ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, t0);
+
+        // Exactly one terminal (the working remote agent) was built.
+        let terminal = snapshot
+            .app
+            .terminals
+            .values()
+            .find(|t| t.working_duration_at(t0).is_some())
+            .expect("working agent terminal should expose a live duration");
+
+        let at_2s = terminal
+            .working_duration_at(t0 + Duration::from_secs(2))
+            .expect("working duration should be live");
+        let at_3s = terminal
+            .working_duration_at(t0 + Duration::from_secs(3))
+            .expect("working duration should be live");
+        assert!(at_2s.is_live);
+        assert_eq!(at_2s.elapsed.as_secs(), 2);
+        assert_eq!(at_3s.elapsed.as_secs(), 3);
+    }
+
+    #[test]
+    fn disabled_remote_agent_rows_do_not_gate_animation() {
+        // A disabled remote's placeholder rows are not `working`, so they never request
+        // animation on themselves (parity with the render==hit_test disabled-row rejection).
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_connection_state(
+                &remote_id,
+                crate::client::supervisor::ConnectionState::Disconnected,
+            )
+            .unwrap();
+        // Force the banner animation Static to isolate the agent gate: a disconnected remote's
+        // placeholder rows are not `working`, so they never request animation on themselves.
+        with_static_host_banner(&mut model);
+        assert!(!sidebar_wants_animation(&model));
+    }
+
+    // ----- item 3 (Area 5): remote-management overlay render == hit_test --------------------
+
+    fn manage_overlay_model() -> ClientSupervisorModel {
+        let mut model = ClientSupervisorModel::new("local");
+        model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "r1".into(),
+            name: "alpha".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "alpha".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "r2".into(),
+            name: "beta".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "beta".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model.open_remote_manage_overlay();
+        model
+    }
+
+    #[test]
+    fn remote_manage_render_equals_hit_test_geometry() {
+        let model = manage_overlay_model();
+        let compositor = ClientCompositor::new(26);
+        let full = Rect::new(0, 0, 80, 24);
+
+        // the rect the renderer draws row N into is the rect hit_test checks.
+        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+        let row0 = crate::ui::remote_manage_row_rect(inner, 0);
+        let row1 = crate::ui::remote_manage_row_rect(inner, 1);
+        assert_eq!(
+            compositor.hit_test(&model, row0.x, row0.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageRow { index: 0 })
+        );
+        assert_eq!(
+            compositor.hit_test(&model, row1.x, row1.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageRow { index: 1 })
+        );
+    }
+
+    #[test]
+    fn hit_test_returns_manage_targets() {
+        let model = manage_overlay_model();
+        let compositor = ClientCompositor::new(26);
+        let full = Rect::new(0, 0, 80, 24);
+        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+
+        // row click selects.
+        let row0 = crate::ui::remote_manage_row_rect(inner, 0);
+        assert_eq!(
+            compositor.hit_test(&model, row0.x, row0.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageRow { index: 0 })
+        );
+        // footer `add` affordance.
+        let footer_y = inner.y + inner.height.saturating_sub(1);
+        assert_eq!(
+            compositor.hit_test(&model, inner.x, footer_y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageAdd)
+        );
+        // click well outside the modal → None.
+        assert_eq!(compositor.hit_test(&model, 0, 0, 80, 24), None);
+    }
+
+    #[test]
+    fn manage_overlay_render_is_pure() {
+        let model = manage_overlay_model();
+        let compositor = ClientCompositor::new(26);
+        let content = frame(8, 3, &["content", "frame"]);
+
+        let a = compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let b = compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        assert_eq!(a.cells, b.cells, "list render must be deterministic");
+
+        // delete-confirm sub-state is also pure. `compose_frame` takes `&model` (shared ref), so
+        // non-mutation is structural; determinism across two renders confirms purity.
+        let mut model = manage_overlay_model();
+        model.begin_remote_manage_delete();
+        let c = compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let d = compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        assert_eq!(c.cells, d.cells, "confirm render must be deterministic");
+        assert!(model
+            .remote_manage_overlay()
+            .unwrap()
+            .confirm_delete
+            .is_some());
+    }
+
+    #[test]
+    fn confirm_delete_renders_red_panel() {
+        let mut model = manage_overlay_model();
+        model.begin_remote_manage_delete();
+        let compositor = ClientCompositor::new(26);
+        let content = frame(8, 3, &["content", "frame"]);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let rows: Vec<_> = (0..composed.height)
+            .map(|row| row_text(&composed, row))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("delete remote?")));
+        assert!(rows.iter().any(|row| row.contains("delete")));
+        assert!(rows.iter().any(|row| row.contains("cancel")));
+
+        // while confirm is active the list rows are NOT hit-testable; only the popup buttons are.
+        let full = Rect::new(0, 0, 80, 24);
+        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+        let row0 = crate::ui::remote_manage_row_rect(inner, 0);
+        assert!(!matches!(
+            compositor.hit_test(&model, row0.x, row0.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageRow { .. })
+        ));
+        let popup = crate::ui::remote_manage_confirm_popup_rect(full).expect("popup fits");
+        let pinner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (delete_rect, cancel_rect) = crate::ui::remote_manage_confirm_button_rects(pinner);
+        assert_eq!(
+            compositor.hit_test(&model, delete_rect.x, delete_rect.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageConfirmDelete)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel_rect.x, cancel_rect.y, 80, 24),
+            Some(SidebarHitTarget::RemoteManageCancelDelete)
+        );
+    }
+
+    #[test]
+    fn manage_overlay_hit_test_skips_non_modal() {
+        // A model with a focused main workspace AND the overlay open: a click on the (sidebar)
+        // workspace row resolves to a manage target or None, NEVER a Workspace hit — the overlay
+        // intercepts the whole host rect first.
+        let mut model = manage_overlay_model();
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-ws".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        let compositor = ClientCompositor::new(26);
+        // sweep a column of the sidebar; none may resolve to a Workspace.
+        for y in 0..24u16 {
+            let hit = compositor.hit_test(&model, 1, y, 80, 24);
+            assert!(
+                !matches!(hit, Some(SidebarHitTarget::Workspace { .. })),
+                "overlay must intercept sidebar workspace hits, got {hit:?} at y={y}"
+            );
+        }
+    }
+
+    // ---- item 7 (Area 4): hover_test / set_hover / from_model mirror ----
+
+    use crate::app::state::SidebarHoverTarget;
+
+    #[test]
+    fn set_hover_reports_change() {
+        let mut compositor = ClientCompositor::new(26);
+        assert!(compositor.set_hover(Some(SidebarHoverTarget::Workspace { ws_idx: 0 })));
+        assert!(!compositor.set_hover(Some(SidebarHoverTarget::Workspace { ws_idx: 0 })));
+        assert!(compositor.set_hover(Some(SidebarHoverTarget::Workspace { ws_idx: 1 })));
+        assert!(compositor.set_hover(None));
+        assert!(!compositor.set_hover(None));
+    }
+
+    #[test]
+    fn from_model_mirrors_compositor_hover() {
+        // A hover set on the compositor truth appears in the render snapshot (Copy; pure read).
+        let (model, _remote_id) = mixed_supervisor_model();
+        let mut compositor = ClientCompositor::new(26);
+        compositor.set_hover(Some(SidebarHoverTarget::Workspace { ws_idx: 1 }));
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+        assert_eq!(
+            snapshot.app.sidebar_hover,
+            Some(SidebarHoverTarget::Workspace { ws_idx: 1 })
+        );
+    }
+
+    #[test]
+    fn hover_test_resolves_workspace_row() {
+        // render == hit_test geometry: drive the row index off `hit_test` (like the click test),
+        // then assert `hover_test` over the same (x,y) resolves the matching Workspace ws_idx.
+        let (model, remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let remote_card = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|c| c.ws_idx == 1)
+            .expect("remote card");
+        // sanity: the click path resolves the remote workspace at this row.
+        assert_eq!(
+            compositor.hit_test(&model, 1, remote_card.rect.y, host.0, host.1),
+            Some(SidebarHitTarget::Workspace {
+                server_id: remote_id.clone(),
+                workspace_id: "remote-api".into(),
+            })
+        );
+        assert_eq!(
+            compositor.hover_test(&model, 1, remote_card.rect.y, host.0, host.1),
+            Some(SidebarHoverTarget::Workspace { ws_idx: 1 })
+        );
+    }
+
+    #[test]
+    fn hover_test_skips_non_selectable_rows() {
+        // the ` spaces`/` agents` header rows, the `─` separator, the right-edge resize column,
+        // and the item-4 divider row never resolve to a Workspace/Agent hover target.
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+
+        // ` spaces` header is the sidebar's first row.
+        let header_y = snapshot.app.view.sidebar_rect.y;
+        let hover = compositor.hover_test(&model, 1, header_y, host.0, host.1);
+        assert!(!matches!(
+            hover,
+            Some(SidebarHoverTarget::Workspace { .. })
+                | Some(SidebarHoverTarget::AgentRoute { .. })
+        ));
+
+        // the right-edge resize column (x == sidebar_width - 1 .. is the divider `│`): a position
+        // at x >= effective_sidebar_width resolves None.
+        assert_eq!(
+            compositor.hover_test(&model, 27, header_y, host.0, host.1),
+            None
+        );
+
+        // the item-4 divider row resolves to the defensive Divider (NEVER a Workspace/Agent) —
+        // render treats Divider as no-highlight.
+        let divider_y = snapshot.app.view.divider_rows[0];
+        assert_eq!(
+            compositor.hover_test(&model, 1, divider_y, host.0, host.1),
+            Some(SidebarHoverTarget::Divider)
+        );
+    }
+
+    #[test]
+    fn hover_test_ignores_disabled_workspace_rows() {
+        // mirror hit_test_ignores_disabled_workspace_rows: a disabled remote route hovers None.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: false,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_connection_state(
+                &remote_id,
+                crate::client::supervisor::ConnectionState::Disconnected,
+            )
+            .unwrap();
+        let compositor = ClientCompositor::new(26);
+        // sweep the sidebar column: no row resolves to a Workspace hover (disabled rows rejected).
+        for y in 0..16u16 {
+            assert!(!matches!(
+                compositor.hover_test(&model, 1, y, 60, 16),
+                Some(SidebarHoverTarget::Workspace { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn hover_test_agent_resolves_route_index_and_survives_recompose() {
+        // contradiction-11 regression: hover over an agent entry returns AgentRoute { route_idx };
+        // rebuilding the snapshot (recompose) keeps the SAME route_idx mapping to the same agent
+        // even though the placeholder pane_id is freshly alloc'd each recompose.
+        let (model, _remote_id) = mixed_supervisor_model_with_agent();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 20u16);
+
+        // find the agent row by sweeping (the click path resolves the agent there).
+        let agent_row = (0..host.1)
+            .find(|y| {
+                matches!(
+                    compositor.hit_test(&model, 1, *y, host.0, host.1),
+                    Some(SidebarHitTarget::Agent { agent_id, .. }) if agent_id == "remote-agent"
+                )
+            })
+            .expect("agent row should be hit-testable");
+
+        let hover = compositor.hover_test(&model, 1, agent_row, host.0, host.1);
+        let route_idx = match hover {
+            Some(SidebarHoverTarget::AgentRoute { route_idx }) => route_idx,
+            other => panic!("expected AgentRoute, got {other:?}"),
+        };
+
+        // recompose: the snapshot's agent_routes are rebuilt; the same route_idx still points at
+        // the same agent (positional index, not the dead pane_id).
+        let snap_a = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let snap_b = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        assert_eq!(
+            snap_a.agent_routes[route_idx].agent_id,
+            snap_b.agent_routes[route_idx].agent_id
+        );
+        assert_eq!(snap_a.agent_routes[route_idx].agent_id, "remote-agent");
+        // hover_test resolves the SAME route_idx after recompose.
+        assert_eq!(
+            compositor.hover_test(&model, 1, agent_row, host.0, host.1),
+            Some(SidebarHoverTarget::AgentRoute { route_idx })
+        );
+    }
+
+    #[test]
+    fn hover_test_affordances_respect_draw_gate() {
+        // over `new`/`menu`/`filter` the hover resolves to the matching affordance. The client
+        // snapshot is always `mouse_capture == true` (empty_for_client_rendering), so the
+        // affordances are drawn and hoverable (the gate-off branch is exercised monolithically,
+        // where mouse_capture can be false — see the input/mouse tests).
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+
+        let new_rect = snapshot.app.sidebar_new_button_rect();
+        let menu_rect = snapshot.app.global_launcher_rect();
+        // empty_for_client_rendering defaults mouse_capture = true, so affordances are drawn.
+        assert!(snapshot.app.mouse_capture);
+        assert_eq!(
+            compositor.hover_test(&model, new_rect.x, new_rect.y, host.0, host.1),
+            Some(SidebarHoverTarget::New)
+        );
+        assert_eq!(
+            compositor.hover_test(
+                &model,
+                menu_rect.x + menu_rect.width - 1,
+                menu_rect.y,
+                host.0,
+                host.1
+            ),
+            Some(SidebarHoverTarget::Menu)
+        );
+        // the filter label (top-right of the sidebar).
+        assert_eq!(
+            compositor.hover_test(&model, 23, snapshot.app.view.sidebar_rect.y, host.0, host.1),
+            Some(SidebarHoverTarget::Filter)
+        );
+    }
+
+    #[test]
+    fn hover_test_suppressed_when_overlay_open() {
+        // with the add-remote form open OR the client global menu highlighted, sidebar hover_test
+        // returns None (the overlay owns its own hover).
+        let (mut model, _remote_id) = mixed_supervisor_model();
+        model.open_add_remote_form();
+        for y in 0..16u16 {
+            assert_eq!(model_hover_anywhere(&model, y), None);
+        }
+        model.close_client_overlay();
+
+        let (mut model, _remote_id) = mixed_supervisor_model();
+        model.open_client_global_menu();
+        for y in 0..16u16 {
+            assert_eq!(model_hover_anywhere(&model, y), None);
+        }
+    }
+
+    fn model_hover_anywhere(model: &ClientSupervisorModel, y: u16) -> Option<SidebarHoverTarget> {
+        ClientCompositor::new(26).hover_test(model, 1, y, 60, 16)
+    }
+
+    #[test]
+    fn hover_test_none_when_collapsed() {
+        // effective_sidebar_width == 0 (host_width <= 1) → None.
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        assert_eq!(compositor.hover_test(&model, 0, 0, 1, 16), None);
+    }
+
+    #[test]
+    fn hover_test_resolves_new_workspace_picker_destination_row() {
+        // the centered picker modal hovers its destination rows to NewWorkspaceDestination { row }.
+        let (model, _remote_id) = two_destination_picker_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+        let full = Rect::new(0, 0, host.0, host.1);
+        let inner = crate::ui::new_workspace_picker_inner_rect(full, 2).expect("modal fits");
+        let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
+        assert_eq!(
+            compositor.hover_test(&model, row1.x, row1.y, host.0, host.1),
+            Some(SidebarHoverTarget::NewWorkspaceDestination { row: 1 })
+        );
+    }
+
+    // a [Main, Secondary] model with a remote agent, for agent-hover tests.
+    fn mixed_supervisor_model_with_agent() -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: false,
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
     }
 }

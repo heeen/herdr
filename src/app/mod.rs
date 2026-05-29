@@ -453,6 +453,8 @@ impl App {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                divider_rows: Vec::new(),
+                host_banner_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -514,6 +516,12 @@ impl App {
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             spinner_tick: 0,
+            client_workspace_remote: Vec::new(),
+            host_banners: Vec::new(),
+            host_banner_rows: Vec::new(),
+            host_banner_active: false,
+            sidebar_host: config.ui.sidebar.host.clone(),
+            sidebar_hover: None,
             palette: resolve_palette(config),
             theme_name: config
                 .theme
@@ -1128,6 +1136,7 @@ impl App {
                 self.state.agent_panel_scroll = 0;
                 self.state.sidebar_space = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_agent = config.ui.sidebar.agents.clone();
+                self.state.sidebar_host = config.ui.sidebar.host.clone();
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
                     self.state.request_client_config_reload = true;
@@ -2127,6 +2136,95 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_sidebar_host_preferences_writes_body() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-sidebar-host");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let preferences = crate::config::SidebarHostConfig {
+            gradient: crate::config::HostBannerGradient::Cool,
+            animation: crate::config::HostBannerAnimation::Static,
+            speed: crate::config::model::HostBannerSpeed::Lively,
+            glyph: crate::config::HostBannerGlyph::None,
+            show_count: true,
+        };
+
+        assert!(app.save_sidebar_host_preferences(preferences.clone()));
+
+        // The flat [ui.sidebar.host] body is written and live-reloaded into state.
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui.sidebar.host]"));
+        assert!(content.contains(r#"gradient = "cool""#));
+        assert!(content.contains(r#"animation = "static""#));
+        assert!(content.contains(r#"speed = "lively""#));
+        assert!(content.contains(r#"glyph = "none""#));
+        assert!(content.contains("show_count = true"));
+        assert_eq!(app.state.sidebar_host, preferences);
+        assert!(app.state.config_diagnostic.is_none());
+
+        // Round-trips back to the same SidebarHostConfig.
+        let reparsed: crate::config::Config = toml::from_str(&content).unwrap();
+        assert_eq!(reparsed.ui.sidebar.host, preferences);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn host_setting_toggle_mutates_state_immediately() {
+        // item 2 (C3): cycling an option mutates AppState.sidebar_host immediately (so the live
+        // demo reflects the change at once) and persists it through the save round-trip + live
+        // reload (immediate-save invariant). A config path is wired so the save succeeds.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-host-toggle");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.mode = Mode::Settings;
+        app.state.settings.section = state::SettingsSection::Sidebar;
+        app.state.settings.sidebar_config_group = state::SidebarConfigGroup::Host;
+        // Focus the glyph row (index 3) and cycle it with Space.
+        app.state.settings.list.selected = 3;
+        assert_eq!(
+            app.state.sidebar_host.glyph,
+            crate::config::HostBannerGlyph::Left
+        );
+
+        app.handle_settings_key(KeyEvent::from(KeyCode::Char(' ')));
+
+        assert_eq!(
+            app.state.sidebar_host.glyph,
+            crate::config::HostBannerGlyph::None
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(r#"glyph = "none""#));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn sidebar_group_nav_cycles_spaces_agents_host() {
+        use crate::app::state::SidebarConfigGroup;
+        assert_eq!(
+            SidebarConfigGroup::Spaces.next(),
+            SidebarConfigGroup::Agents
+        );
+        assert_eq!(SidebarConfigGroup::Agents.next(), SidebarConfigGroup::Host);
+        assert_eq!(SidebarConfigGroup::Host.next(), SidebarConfigGroup::Spaces);
+        // previous() reverses.
+        assert_eq!(
+            SidebarConfigGroup::Spaces.previous(),
+            SidebarConfigGroup::Host
+        );
     }
 
     #[test]

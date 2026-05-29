@@ -41,8 +41,16 @@ use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 const CLIENT_SUPERVISOR_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+// item 6 (Area 6): the focused-remote summary poll cadence. The active remote polls at 400ms
+// (vs the 2s background cadence) so a focus or in-flight change reconciles within one round-trip.
+const CLIENT_FOCUSED_SUMMARY_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
 const CLIENT_SUPERVISOR_API_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_60FPS_FRAME_BUDGET: Duration = Duration::from_micros(16_667);
+// item 5: the single client animation cadence. 80ms / step 8 advances exactly one visible
+// spinner frame per interval (`spinner_frame` maps `tick/8`), i.e. ~12.5 fps. SSH remotes use
+// the SAME cadence (the recompose is local; link speed only affects the encoded diff).
+const CLIENT_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+const CLIENT_ANIMATION_TICK_STEP: u32 = 8;
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -94,6 +102,12 @@ struct ClientState {
     ssh_bridges: HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
     /// Backoff state for secondary servers that should be reconnected.
     secondary_retries: HashMap<supervisor::ServerId, SecondaryRetryState>,
+    /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
+    last_animation_tick: Instant,
+    /// item 6 (Area 6): last time each connected secondary's summary refresh was STARTED. Drives
+    /// the adaptive cadence in `due_secondary_summary_refreshes` (400ms active / 2s background)
+    /// and is recorded on start and on completion so a slow SSH fetch does not stack.
+    last_summary_refresh: HashMap<supervisor::ServerId, Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +191,9 @@ enum AttachInputAction {
 enum ClientApiRefreshPolicy {
     Immediate,
     Deferred,
+    // item 6 (Area 6): fire a targeted single-server refresh for the focused server only (not
+    // the whole fleet) so a focus reconciles within one round-trip.
+    ImmediateFocused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +209,14 @@ enum ClientInputDispatch {
         request: Box<crate::api::schema::Request>,
     },
     AddRemote(supervisor::AddRemoteDraft),
+    // item 3 (Area 5): toggle / delete a remote off the UI loop against ServerId::main().
+    SetRemoteEnabled {
+        remote_id: String,
+        enabled: bool,
+    },
+    DeleteRemote {
+        remote_id: String,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -199,6 +224,23 @@ enum ClientInputDispatch {
     DetachAll,
     Redraw,
     Consumed,
+}
+
+/// item 3 (Area 5): map a `RemoteManageOutcome` from the model into the client input dispatch.
+/// `OpenAddRemote` maps to `Redraw` because the model already switched overlay state.
+fn dispatch_for_remote_manage_outcome(
+    outcome: supervisor::RemoteManageOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::RemoteManageOutcome::Redraw
+        | supervisor::RemoteManageOutcome::OpenAddRemote => ClientInputDispatch::Redraw,
+        supervisor::RemoteManageOutcome::SetEnabled { remote_id, enabled } => {
+            ClientInputDispatch::SetRemoteEnabled { remote_id, enabled }
+        }
+        supervisor::RemoteManageOutcome::Delete { remote_id } => {
+            ClientInputDispatch::DeleteRemote { remote_id }
+        }
+    }
 }
 
 impl AttachEscapeState {
@@ -307,7 +349,11 @@ fn dispatch_composited_input(
     model: &mut supervisor::ClientSupervisorModel,
     host_size: (u16, u16),
 ) -> ClientInputDispatch {
-    if model.add_remote_form().is_some() || model.client_global_menu_highlighted().is_some() {
+    if model.add_remote_form().is_some()
+        || model.client_global_menu_highlighted().is_some()
+        || model.new_workspace_picker().is_some()
+        || model.remote_manage_overlay().is_some()
+    {
         return dispatch_client_overlay_input(data, compositor, model, host_size);
     }
 
@@ -354,6 +400,14 @@ fn dispatch_client_overlay_input(
             {
                 dispatch_client_global_menu_key(model, key)
             }
+            crate::raw_input::RawInputEvent::Key(key) if model.new_workspace_picker().is_some() => {
+                dispatch_new_workspace_picker_key(model, key)
+            }
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.remote_manage_overlay().is_some() =>
+            {
+                dispatch_for_remote_manage_outcome(model.handle_remote_manage_key(key))
+            }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 dispatch_composited_mouse_input(data.clone(), compositor, model, host_size, &mouse)
             }
@@ -363,6 +417,8 @@ fn dispatch_client_overlay_input(
         if matches!(
             next,
             ClientInputDispatch::AddRemote(_)
+                | ClientInputDispatch::SetRemoteEnabled { .. }
+                | ClientInputDispatch::DeleteRemote { .. }
                 | ClientInputDispatch::ApiRequest { .. }
                 | ClientInputDispatch::ServerControl { .. }
                 | ClientInputDispatch::Resize { .. }
@@ -410,6 +466,54 @@ fn dispatch_client_global_menu_key(
     }
 }
 
+/// item 1: keyboard navigation for the composited new-workspace destination picker. ↑/k and ↓/j
+/// move the highlight, Enter confirms the highlighted destination, Esc closes the picker.
+fn dispatch_new_workspace_picker_key(
+    model: &mut supervisor::ClientSupervisorModel,
+    key: crate::input::TerminalKey,
+) -> ClientInputDispatch {
+    if !matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) {
+        return ClientInputDispatch::Consumed;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            model.close_new_workspace_picker();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.move_new_workspace_picker_prev();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.move_new_workspace_picker_next();
+            ClientInputDispatch::Redraw
+        }
+        KeyCode::Enter => accept_new_workspace_picker_dispatch(model),
+        _ => ClientInputDispatch::Consumed,
+    }
+}
+
+/// item 1: resolve the highlighted picker destination into a create-workspace API request, reusing
+/// the same `NewWorkspaceRoute::api_request` mapping the mouse destination-row path uses. Shared by
+/// the picker Enter key and the confirm button.
+fn accept_new_workspace_picker_dispatch(
+    model: &mut supervisor::ClientSupervisorModel,
+) -> ClientInputDispatch {
+    model
+        .accept_new_workspace_picker()
+        .api_request("client:workspace-create")
+        .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(request),
+        })
+        .unwrap_or(ClientInputDispatch::Consumed)
+}
+
 fn dispatch_client_global_menu_action(
     model: &mut supervisor::ClientSupervisorModel,
     action: Option<supervisor::ClientGlobalMenuAction>,
@@ -441,6 +545,9 @@ fn dispatch_client_global_menu_action(
         },
         Some(supervisor::ClientGlobalMenuAction::Detach) => ClientInputDispatch::DetachAll,
         Some(supervisor::ClientGlobalMenuAction::AddRemote) => ClientInputDispatch::Redraw,
+        // item 3 (Area 5): the overlay was already opened by `select_client_global_menu_item`;
+        // just repaint.
+        Some(supervisor::ClientGlobalMenuAction::ManageRemotes) => ClientInputDispatch::Redraw,
         None => ClientInputDispatch::Consumed,
     }
 }
@@ -452,6 +559,25 @@ fn dispatch_composited_mouse_input(
     host_size: (u16, u16),
     mouse: &MouseEvent,
 ) -> ClientInputDispatch {
+    // item 7 (Area 4): handle motion BEFORE resize/scroll/hit_test. The `hit_test` dispatch below
+    // early-returns `Consumed` for any non-`Down(Left)` kind, so without this top-of-fn arm a
+    // `Moved` over a sidebar row would never reach `hover_test`. Intercept only when over the
+    // sidebar OR a hover is currently set (so leaving the sidebar clears it); otherwise fall
+    // through so a content `Moved` still forwards its bytes via `translate_content_mouse_input`.
+    // The `Redraw` arm recomposes locally (commit 3d47acd: no supervisor request, no server I/O).
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        let sidebar_width = compositor.sidebar_width().min(host_size.0);
+        if mouse.column < sidebar_width || compositor.hover().is_some() {
+            let next =
+                compositor.hover_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
+            return if compositor.set_hover(next) {
+                ClientInputDispatch::Redraw
+            } else {
+                ClientInputDispatch::Consumed
+            };
+        }
+    }
+
     if let Some((cols, rows)) =
         compositor.handle_sidebar_resize_mouse(mouse, host_size.0, host_size.1, model.ui_settings())
     {
@@ -486,6 +612,22 @@ fn dispatch_composited_mouse_input(
     translate_content_mouse_input(data, mouse, sidebar_width)
 }
 
+/// item 6 (Area 6): the refresh policy for a focus dispatch. A focus that switches the active
+/// server returns `ImmediateFocused` (fire a targeted single-server fetch so the new server
+/// reconciles within one round-trip). A focus that stays on the already-active server returns
+/// `Deferred` — the active remote's 400ms fast poll already covers it, so an extra immediate
+/// fetch would be redundant SSH load. `current_active` is read BEFORE the focus route mutates it.
+fn focus_refresh_policy(
+    current_active: &supervisor::ServerId,
+    target_server: &supervisor::ServerId,
+) -> ClientApiRefreshPolicy {
+    if current_active == target_server {
+        ClientApiRefreshPolicy::Deferred
+    } else {
+        ClientApiRefreshPolicy::ImmediateFocused
+    }
+}
+
 fn dispatch_sidebar_hit_target(
     target: compositor::SidebarHitTarget,
     model: &mut supervisor::ClientSupervisorModel,
@@ -503,27 +645,38 @@ fn dispatch_sidebar_hit_target(
         compositor::SidebarHitTarget::Workspace {
             server_id,
             workspace_id,
-        } => model
-            .focus_workspace_route(&server_id, &workspace_id)
-            .api_request("client:workspace-focus")
-            .map(|request| ClientInputDispatch::ApiRequest {
-                server_id,
-                refresh: ClientApiRefreshPolicy::Deferred,
-                request: Box::new(request),
-            })
-            .unwrap_or(ClientInputDispatch::Consumed),
+        } => {
+            // item 6 (Area 6): focusing a row that SWITCHES the active server fires a targeted
+            // single-server fetch (`ImmediateFocused`) so the new server reconciles within one
+            // round-trip. Re-focusing within the already-active server needs no extra immediate
+            // fetch — the active remote's 400ms fast poll already covers it — so it carries the
+            // `Deferred` (no-refresh) policy.
+            let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+            model
+                .focus_workspace_route(&server_id, &workspace_id)
+                .api_request("client:workspace-focus")
+                .map(|request| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    refresh,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Consumed)
+        }
         compositor::SidebarHitTarget::Agent {
             server_id,
             agent_id,
-        } => model
-            .focus_agent_route(&server_id, &agent_id)
-            .api_request("client:agent-focus")
-            .map(|request| ClientInputDispatch::ApiRequest {
-                server_id,
-                refresh: ClientApiRefreshPolicy::Deferred,
-                request: Box::new(request),
-            })
-            .unwrap_or(ClientInputDispatch::Consumed),
+        } => {
+            let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+            model
+                .focus_agent_route(&server_id, &agent_id)
+                .api_request("client:agent-focus")
+                .map(|request| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    refresh,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Consumed)
+        }
         compositor::SidebarHitTarget::New => match model.open_new_workspace_picker() {
             route @ supervisor::NewWorkspaceRoute::CreateOn(_) => route
                 .api_request("client:workspace-create")
@@ -553,7 +706,54 @@ fn dispatch_sidebar_hit_target(
             model.open_client_global_menu();
             ClientInputDispatch::Redraw
         }
+        // item 1: composited-modal action buttons.
+        compositor::SidebarHitTarget::AddRemoteSubmit => {
+            // re-run the SAME empty-target validation as the Enter key by replaying an Enter
+            // through `handle_add_remote_key`; an empty target yields the inline error (Redraw),
+            // a valid target yields the submit draft.
+            match model.handle_add_remote_key(enter_key()) {
+                supervisor::AddRemoteFormOutcome::Redraw => ClientInputDispatch::Redraw,
+                supervisor::AddRemoteFormOutcome::Submit(draft) => {
+                    ClientInputDispatch::AddRemote(draft)
+                }
+            }
+        }
+        compositor::SidebarHitTarget::AddRemoteCancel => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::NewWorkspacePickerConfirm => {
+            accept_new_workspace_picker_dispatch(model)
+        }
+        compositor::SidebarHitTarget::NewWorkspacePickerCancel => {
+            model.close_new_workspace_picker();
+            ClientInputDispatch::Redraw
+        }
+        // item 3 (Area 5): manage-overlay mouse targets. A row click selects it (toggle/delete are
+        // keyboard-driven); `add` jumps to the add-remote form; the confirm popup buttons confirm
+        // or cancel the two-step delete.
+        compositor::SidebarHitTarget::RemoteManageRow { index } => {
+            model.set_remote_manage_selected(index);
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::RemoteManageAdd => {
+            model.open_add_remote_form();
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::RemoteManageConfirmDelete => {
+            dispatch_for_remote_manage_outcome(model.confirm_remote_manage_delete())
+        }
+        compositor::SidebarHitTarget::RemoteManageCancelDelete => {
+            model.cancel_remote_manage_delete();
+            ClientInputDispatch::Redraw
+        }
     }
+}
+
+/// item 1: a synthetic Enter key-press, used so the add-remote submit BUTTON re-runs the exact
+/// same validation/submit path as the Enter KEY in `handle_add_remote_key`.
+fn enter_key() -> crate::input::TerminalKey {
+    crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())
 }
 
 fn translate_content_mouse_input(
@@ -966,6 +1166,14 @@ enum ClientLoopEvent {
     /// Add-remote validation and setup completed off the UI loop.
     AddRemoteFinished {
         result: Result<ClientAddRemoteSuccess, String>,
+        elapsed: Duration,
+    },
+    /// item 3 (Area 5): a remote-management `remote.set_enabled`/`remote.remove` request finished
+    /// off the UI loop. The handler branches on `action` to apply teardown / reconnect.
+    RemoteManageRequestFinished {
+        action: RemoteManageAction,
+        remote_id: String,
+        result: Result<(), String>,
         elapsed: Duration,
     },
     /// Server reader thread exited (connection lost).
@@ -1678,6 +1886,70 @@ fn api_client_error_is_timeout(err: &crate::api::client::ApiClientError) -> bool
     )
 }
 
+/// item 3 (Area 5): the kind of registry mutation a manage request performs. Carried back in
+/// `RemoteManageRequestFinished` so the handler can branch teardown vs. reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteManageAction {
+    SetEnabled { enabled: bool },
+    Delete,
+}
+
+/// item 3 (Area 5): build the `remote.set_enabled`/`remote.remove` request for a manage action.
+fn remote_manage_request(
+    action: RemoteManageAction,
+    remote_id: &str,
+) -> crate::api::schema::Request {
+    let method = match action {
+        RemoteManageAction::SetEnabled { enabled } => crate::api::schema::Method::RemoteSetEnabled(
+            crate::api::schema::RemoteSetEnabledParams {
+                remote_id: remote_id.to_string(),
+                enabled,
+            },
+        ),
+        RemoteManageAction::Delete => {
+            crate::api::schema::Method::RemoteRemove(crate::api::schema::RemoteRemoveParams {
+                remote_id: remote_id.to_string(),
+            })
+        }
+    };
+    crate::api::schema::Request {
+        id: "client:remote-manage".into(),
+        method,
+    }
+}
+
+/// item 3 (Area 5): spawn the `remote.set_enabled`/`remote.remove` request off the UI loop against
+/// `ServerId::main()` (the local socket — no SSH bridge needed), then emit
+/// `RemoteManageRequestFinished`. Modeled on `spawn_client_add_remote_submission`; it does NOT
+/// reuse `spawn_client_supervisor_request` (which emits the unrelated `SupervisorApiRequestFinished`
+/// and discards the response body), because the manage handler must branch on `action`.
+fn spawn_client_remote_manage_request(
+    model: &supervisor::ClientSupervisorModel,
+    action: RemoteManageAction,
+    remote_id: String,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let main_id = supervisor::ServerId::main();
+    let target = api_target_for_supervisor_server(model, &main_id, ssh_bridges);
+    let request = remote_manage_request(action, &remote_id);
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = match target {
+            Some(target) => send_client_supervisor_request_to_target(target, request),
+            None => Err("no API target for main server".to_string()),
+        };
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::RemoteManageRequestFinished {
+            action,
+            remote_id,
+            result,
+            elapsed,
+        });
+    });
+}
+
 fn spawn_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
     server_size: (u16, u16),
@@ -1821,12 +2093,11 @@ fn add_remote_target_status_error_is_transient(error: &str) -> bool {
         || error.contains("no such file or directory")
 }
 
-fn refresh_client_supervisor_summaries(
-    model: &mut supervisor::ClientSupervisorModel,
-    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
-    pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
-    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-) {
+/// item 6 (Area 6): the LOCAL main/registry/ui-settings refresh (Unix socket, no SSH RTT). This
+/// is the `refresh_client_supervisor_summaries` body MINUS the secondary fan-out. The Timer's 2s
+/// gate calls this directly so the per-secondary `due_secondary_summary_refreshes` loop is the
+/// single source of secondary cadence (the fan-out would duplicate it).
+fn refresh_main_local_summaries(model: &mut supervisor::ClientSupervisorModel) {
     let mut api = crate::api::client::ApiClient::local();
     if let Err(err) = model.refresh_remote_registry_from_api(&mut api) {
         warn!(err = %err, "failed to refresh main server remote registry");
@@ -1837,6 +2108,15 @@ fn refresh_client_supervisor_summaries(
     if let Err(err) = model.refresh_main_summary_from_api(&mut api) {
         warn!(err = %err, "failed to refresh main server summary");
     }
+}
+
+fn refresh_client_supervisor_summaries(
+    model: &mut supervisor::ClientSupervisorModel,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    refresh_main_local_summaries(model);
     let immediate_results = start_secondary_supervisor_summary_refreshes(
         model,
         ssh_bridges,
@@ -1883,8 +2163,137 @@ fn start_secondary_supervisor_summary_refreshes(
     immediate_results
 }
 
+/// item 6 (Area 6): a targeted single-server summary fetch. Mirrors the per-plan body of
+/// `start_secondary_supervisor_summary_refreshes` for exactly ONE server id, so a focus / connect
+/// / event-push refreshes only the changed server (not the whole fleet).
+///
+/// The contract fixes the `model` param as a SHARED `&ClientSupervisorModel`, but the local main
+/// refresh requires `&mut self`. So the **main-server id is a no-op here**: the local main refresh
+/// is owned by each caller (which already holds `&mut state.supervisor_model`). The Timer path
+/// never passes main — `due_secondary_summary_refreshes` filters it out. Secondary ids dedupe via
+/// `pending` and spawn the fetch off the UI loop (NO blocking SSH/API call on the loop).
+fn start_single_secondary_summary_refresh(
+    model: &supervisor::ClientSupervisorModel,
+    server_id: &supervisor::ServerId,
+    ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
+    pending: &mut HashSet<supervisor::ServerId>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    // Main-server id: no SSH fetch. The caller performs the local `&mut`
+    // `refresh_main_summary_from_api` (D1 signature constraint).
+    if *server_id == supervisor::ServerId::main() {
+        return;
+    }
+    // Dedupe: a refresh for this server is already running off the UI loop.
+    if pending.contains(server_id) {
+        return;
+    }
+    let Some(target) = model.server_connection_target(server_id) else {
+        return;
+    };
+    let Some(api_target) = api_target_for_supervisor_target(server_id, &target, ssh_bridges) else {
+        // The SSH bridge is not up yet; the connect/retry path owns bringing it up and the next
+        // tick re-attempts. Do nothing this call.
+        return;
+    };
+    pending.insert(server_id.clone());
+    let server_id = server_id.clone();
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = supervisor::fetch_server_summary_from_api_target(api_target);
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
+            server_id,
+            result,
+            elapsed,
+        });
+    });
+}
+
 fn supervisor_summary_refresh_due(now: Instant, last_refresh: Instant) -> bool {
     now.duration_since(last_refresh) >= CLIENT_SUPERVISOR_REFRESH_INTERVAL
+}
+
+/// item 6 (Area 6): the adaptive secondary refresh schedule. Returns the connected secondary ids
+/// whose per-server cadence is due at `now`. The active remote uses the fast 400ms cadence; all
+/// other connected secondaries use the 2s background cadence. Main is ALWAYS excluded (the local
+/// main refresh is owned by the 2s gate / the `&mut` callers). A server with no recorded
+/// `last_summary_refresh` is treated as due immediately (a baseline at least one interval in the
+/// past). This is a pure helper so the cadence is unit-testable and the Timer body issues no
+/// inline blocking call.
+fn due_secondary_summary_refreshes(state: &ClientState, now: Instant) -> Vec<supervisor::ServerId> {
+    let Some(model) = state.supervisor_model.as_ref() else {
+        return Vec::new();
+    };
+    let active = model.active_server_id();
+    model
+        .summary_subscription_plans()
+        .into_iter()
+        .map(|plan| plan.server_id)
+        .filter(|server_id| *server_id != supervisor::ServerId::main())
+        .filter(|server_id| {
+            let interval = if server_id == active {
+                CLIENT_FOCUSED_SUMMARY_REFRESH_INTERVAL
+            } else {
+                CLIENT_SUPERVISOR_REFRESH_INTERVAL
+            };
+            match state.last_summary_refresh.get(server_id) {
+                Some(last) => now.duration_since(*last) >= interval,
+                None => true,
+            }
+        })
+        .collect()
+}
+
+/// item 5: the select-loop wakeup deadline. With nothing animating we keep the existing 100ms
+/// housekeeping cadence (idle behavior unchanged, zero recompose). While animating we wake at
+/// whichever is sooner: the 100ms housekeeping tick or the next 80ms animation step. Kept on
+/// std `Instant` for unit-testability; the call site converts to `tokio::time::Instant`.
+fn next_select_deadline(
+    now: Instant,
+    last_animation_tick: Instant,
+    wants_animation: bool,
+) -> Instant {
+    let housekeeping = now + Duration::from_millis(100);
+    if wants_animation {
+        housekeeping.min(last_animation_tick + CLIENT_ANIMATION_INTERVAL)
+    } else {
+        housekeeping
+    }
+}
+
+/// item 5: whether the gated animation step should advance the tick this Timer event. True only
+/// when something is animating AND at least one full 80ms interval has elapsed since the last
+/// advance — the `last_animation_tick` guard coalesces sub-80ms Timer storms to <=1 tick.
+fn should_advance_animation(
+    wants_animation: bool,
+    now: Instant,
+    last_animation_tick: Instant,
+) -> bool {
+    wants_animation && now.duration_since(last_animation_tick) >= CLIENT_ANIMATION_INTERVAL
+}
+
+/// item 5: working-since map upkeep, run in the event loop BEFORE compose (keeps render pure).
+/// Reads the cached model only; performs NO I/O. Inserts `now` for every currently-Working
+/// `(server_id, agent_id)` not already tracked (first-working-start preserved across composes),
+/// and drops any tracked key that is no longer Working so the map stays bounded.
+fn prune_and_seed_working_since(
+    compositor: &mut compositor::ClientCompositor,
+    model: &supervisor::ClientSupervisorModel,
+    now: Instant,
+) {
+    let mut working_keys = std::collections::HashSet::new();
+    for group in model.agent_groups() {
+        for agent in &group.agents {
+            if agent.status == "working" {
+                let key = (group.server_id.clone(), agent.agent_id.clone());
+                working_keys.insert(key.clone());
+                compositor.seed_working_since(key, now);
+            }
+        }
+    }
+    compositor.retain_working_since(|key| working_keys.contains(key));
 }
 
 fn secondary_retry_delay(attempt: usize) -> Duration {
@@ -1894,6 +2303,102 @@ fn secondary_retry_delay(attempt: usize) -> Duration {
         2 => Duration::from_secs(5),
         _ => Duration::from_secs(15),
     }
+}
+
+/// item 3 (Area 5): apply the result of a finished `remote.set_enabled`/`remote.remove` request.
+/// The registry refresh rides the synchronous-against-local-main path inside
+/// `refresh_client_supervisor_summaries` (LOCAL socket, no SSH RTT — the same call
+/// `AddRemoteFinished` makes), so it stays on the loop without violating the off-UI-loop SSH rule;
+/// the off-thread part (`3d47acd`) was only the `set_enabled`/`remove` request itself. On error it
+/// clears `pending`. On success it refreshes the registry and then:
+/// - re-enable → explicit `Connecting` (so the now-ungated plans pick it up next tick),
+/// - disable-while-connected → teardown like `ServerDisconnected` + `Disconnected`,
+/// - delete → `remove_secondary` + teardown.
+fn apply_remote_manage_request_finished(
+    state: &mut ClientState,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
+    action: RemoteManageAction,
+    remote_id: &str,
+    result: Result<(), String>,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let server_id = supervisor::ServerId::secondary(remote_id);
+    if let Err(err) = result {
+        warn!(remote_id = %remote_id, err = %err, "remote-manage request failed");
+        if let Some(model) = &mut state.supervisor_model {
+            model.clear_remote_manage_pending(remote_id);
+        }
+        return;
+    }
+
+    match action {
+        RemoteManageAction::SetEnabled { enabled: true } => {
+            if let Some(model) = &mut state.supervisor_model {
+                refresh_client_supervisor_summaries(
+                    model,
+                    &state.ssh_bridges,
+                    &mut state.pending_summary_refresh_server_ids,
+                    event_tx,
+                );
+                // re-enable MUST explicitly yield `Connecting` so the now-ungated
+                // `unconnected_secondary_server_ids()` picks it up next tick
+                // (`sync_remote_registry` never re-applies connection_state).
+                let _ =
+                    model.set_connection_state(&server_id, supervisor::ConnectionState::Connecting);
+                model.clear_remote_manage_pending(remote_id);
+            }
+        }
+        RemoteManageAction::SetEnabled { enabled: false } => {
+            if let Some(model) = &mut state.supervisor_model {
+                refresh_client_supervisor_summaries(
+                    model,
+                    &state.ssh_bridges,
+                    &mut state.pending_summary_refresh_server_ids,
+                    event_tx,
+                );
+            }
+            teardown_secondary_connection(state, server_writes, &server_id);
+            if let Some(model) = &mut state.supervisor_model {
+                let _ = model
+                    .set_connection_state(&server_id, supervisor::ConnectionState::Disconnected);
+                model.clear_remote_manage_pending(remote_id);
+            }
+        }
+        RemoteManageAction::Delete => {
+            teardown_secondary_connection(state, server_writes, &server_id);
+            if let Some(model) = &mut state.supervisor_model {
+                model.remove_secondary(&server_id);
+                refresh_client_supervisor_summaries(
+                    model,
+                    &state.ssh_bridges,
+                    &mut state.pending_summary_refresh_server_ids,
+                    event_tx,
+                );
+                model.clear_remote_manage_pending(remote_id);
+            }
+        }
+    }
+}
+
+/// item 3 (Area 5): tear down a secondary's stream/bridge/poll state exactly like the
+/// `ServerDisconnected` handler does (remove from `server_writes`, `frame_cache`,
+/// `summary_subscription_server_ids`, `pending_summary_refresh_server_ids`,
+/// `pending_secondary_connect_server_ids`, `ssh_bridges`). Unlike `ServerDisconnected` it does NOT
+/// schedule a retry — the caller (disable / delete) wants the remote to stay down (the gated
+/// producers exclude a disabled remote; a deleted remote is gone). Does NOT touch the model
+/// `connection_state` (the caller sets it).
+fn teardown_secondary_connection(
+    state: &mut ClientState,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
+    server_id: &supervisor::ServerId,
+) {
+    server_writes.remove(server_id);
+    state.frame_cache.remove(server_id);
+    state.summary_subscription_server_ids.remove(server_id);
+    state.pending_summary_refresh_server_ids.remove(server_id);
+    state.pending_secondary_connect_server_ids.remove(server_id);
+    state.ssh_bridges.remove(server_id);
+    state.secondary_retries.remove(server_id);
 }
 
 fn schedule_secondary_retry(
@@ -2066,6 +2571,16 @@ fn select_composited_render_frame<'a>(
 }
 
 fn render_cached_composited_frame(state: &mut ClientState) {
+    // item 5: take &mut access to the compositor so we can refresh the working-since map before
+    // the immutable compose borrow — keeps the live duration timer fresh on every compose, not
+    // just animation ticks (render itself stays pure; the map upkeep performs no I/O).
+    let now = Instant::now();
+    if let (Some(compositor), Some(model)) =
+        (state.compositor.as_mut(), state.supervisor_model.as_ref())
+    {
+        prune_and_seed_working_since(compositor, model, now);
+    }
+
     let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) else {
         return;
     };
@@ -2075,8 +2590,13 @@ fn render_cached_composited_frame(state: &mut ClientState) {
         return;
     };
 
-    let frame_data =
-        compositor.compose_frame(model, &active_frame, state.host_size.0, state.host_size.1);
+    let frame_data = compositor.compose_frame(
+        model,
+        &active_frame,
+        state.host_size.0,
+        state.host_size.1,
+        now,
+    );
     let render_started_at = Instant::now();
     let encoded = state.blit_encoder.encode(&frame_data, false);
     let graphics = if state.kitty_graphics_enabled {
@@ -2153,6 +2673,8 @@ async fn run_client_loop(
         pending_add_remote: false,
         ssh_bridges,
         secondary_retries: HashMap::new(),
+        last_animation_tick: Instant::now(),
+        last_summary_refresh: HashMap::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -2249,9 +2771,19 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        // item 5: wake sooner (80ms) when the sidebar is animating, else keep the 100ms
+        // housekeeping cadence (idle behavior unchanged). The gate reads the cached model only
+        // and performs no I/O; real input still pre-empts the deadline via `event_rx.recv()`.
+        let wants_animation = state.compositor.is_some()
+            && state
+                .supervisor_model
+                .as_ref()
+                .is_some_and(compositor::sidebar_wants_animation);
+        let deadline =
+            next_select_deadline(Instant::now(), state.last_animation_tick, wants_animation);
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => ClientLoopEvent::Timer,
         };
 
         match event {
@@ -2358,6 +2890,35 @@ async fn run_client_loop(
                                     state.cell_size_px,
                                     &event_tx,
                                     &mut state.pending_add_remote,
+                                );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // item 3 (Area 5): the model already set `overlay.pending` for this
+                            // remote when it emitted the outcome (blocking re-issue while in
+                            // flight). Spawn the registry mutation off the UI loop against the
+                            // local main socket; the `RemoteManageRequestFinished` handler applies
+                            // the registry refresh + teardown/reconnect.
+                            ClientInputDispatch::SetRemoteEnabled { remote_id, enabled } => {
+                                spawn_client_remote_manage_request(
+                                    model,
+                                    RemoteManageAction::SetEnabled { enabled },
+                                    remote_id,
+                                    &state.ssh_bridges,
+                                    &event_tx,
+                                );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::DeleteRemote { remote_id } => {
+                                spawn_client_remote_manage_request(
+                                    model,
+                                    RemoteManageAction::Delete,
+                                    remote_id,
+                                    &state.ssh_bridges,
+                                    &event_tx,
                                 );
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
@@ -2519,6 +3080,7 @@ async fn run_client_loop(
                             active_frame,
                             state.host_size.0,
                             state.host_size.1,
+                            Instant::now(),
                         );
                     }
                     let render_started_at = Instant::now();
@@ -2612,14 +3174,27 @@ async fn run_client_loop(
                     server_id = ?server_id,
                     "supervisor summary event requested refresh"
                 );
+                // item 6 (Area 6): targeted event-push — refresh ONLY the changed server, not the
+                // whole fleet. A main id refreshes locally (`&mut`); a secondary id spawns a single
+                // off-loop fetch (the helper is a no-op on a main id).
+                let now = Instant::now();
                 if let Some(model) = &mut state.supervisor_model {
-                    refresh_client_supervisor_summaries(
-                        model,
-                        &state.ssh_bridges,
-                        &mut state.pending_summary_refresh_server_ids,
-                        &event_tx,
-                    );
-                    state.last_supervisor_summary_refresh = Instant::now();
+                    if server_id == supervisor::ServerId::main() {
+                        if let Err(err) = model.refresh_main_summary_from_api(
+                            &mut crate::api::client::ApiClient::local(),
+                        ) {
+                            warn!(err = %err, "failed to refresh changed main summary");
+                        }
+                    } else {
+                        start_single_secondary_summary_refresh(
+                            model,
+                            &server_id,
+                            &state.ssh_bridges,
+                            &mut state.pending_summary_refresh_server_ids,
+                            &event_tx,
+                        );
+                    }
+                    state.last_summary_refresh.insert(server_id.clone(), now);
                     state.request_full_redraw();
                 }
                 schedule_missing_secondary_stream_retries(
@@ -2644,6 +3219,12 @@ async fn run_client_loop(
                 elapsed,
             } => {
                 state.pending_summary_refresh_server_ids.remove(&server_id);
+                // item 6 (Area 6): track the last successful poll for both the fast (active) and
+                // slow (background) cadence classes so `due_secondary_summary_refreshes` measures
+                // from the latest completion too (not only from the start recorded by the Timer).
+                state
+                    .last_summary_refresh
+                    .insert(server_id.clone(), Instant::now());
                 if elapsed > CLIENT_60FPS_FRAME_BUDGET {
                     debug!(
                         server_id = ?server_id,
@@ -2717,6 +3298,30 @@ async fn run_client_loop(
                                     &should_quit,
                                 );
                             }
+                        } else if refresh == ClientApiRefreshPolicy::ImmediateFocused {
+                            // item 6 (Area 6): targeted single-server fetch for the focused server
+                            // ONLY (not the whole fleet). A focused main workspace produces
+                            // server_id == main, so the local `&mut` refresh path is reachable.
+                            let now = Instant::now();
+                            if let Some(model) = &mut state.supervisor_model {
+                                if server_id == supervisor::ServerId::main() {
+                                    if let Err(err) = model.refresh_main_summary_from_api(
+                                        &mut crate::api::client::ApiClient::local(),
+                                    ) {
+                                        warn!(err = %err, "failed to refresh focused main summary");
+                                    }
+                                } else {
+                                    start_single_secondary_summary_refresh(
+                                        model,
+                                        &server_id,
+                                        &state.ssh_bridges,
+                                        &mut state.pending_summary_refresh_server_ids,
+                                        &event_tx,
+                                    );
+                                }
+                                state.request_full_redraw();
+                            }
+                            state.last_summary_refresh.insert(server_id.clone(), now);
                         }
                     }
                     Err(err) => {
@@ -2725,6 +3330,11 @@ async fn run_client_loop(
                             err = %err,
                             "failed to route client sidebar request"
                         );
+                        // item 6 (Area 6): reconcile the optimistic highlight back to summary
+                        // truth on the next refresh when the focus request itself failed.
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.clear_optimistic_focus_on_failure(&server_id);
+                        }
                     }
                 }
                 state.request_full_redraw();
@@ -2789,6 +3399,20 @@ async fn run_client_loop(
                                 &server_id,
                                 supervisor::ConnectionState::Connected,
                             );
+                            // item 6 (Area 6): prioritize the just-connected server. Neither
+                            // `set_connection_state(.., Connected)` nor anything here sets
+                            // `active_server_id`, so key off the handler's explicit `server_id`
+                            // (NOT `active_server_id()`). Its summary is put in flight FIRST; the
+                            // dedupe guard then prevents the whole-fleet fan-out below from
+                            // double-spawning it.
+                            start_single_secondary_summary_refresh(
+                                model,
+                                &server_id,
+                                &state.ssh_bridges,
+                                &mut state.pending_summary_refresh_server_ids,
+                                &event_tx,
+                            );
+                            state.last_summary_refresh.insert(server_id.clone(), now);
                             refresh_client_supervisor_summaries(
                                 model,
                                 &state.ssh_bridges,
@@ -2864,6 +3488,19 @@ async fn run_client_loop(
                                         supervisor::ConnectionState::Connected,
                                     );
                                     model.finish_add_remote();
+                                    let now = Instant::now();
+                                    // item 6 (Area 6): prioritize the just-added server's summary
+                                    // by the handler's explicit `server_id` (adding a remote does
+                                    // not set `active_server_id`). Put it in flight FIRST; the
+                                    // dedupe guard collapses the follow-on fan-out for this id.
+                                    start_single_secondary_summary_refresh(
+                                        model,
+                                        &server_id,
+                                        &state.ssh_bridges,
+                                        &mut state.pending_summary_refresh_server_ids,
+                                        &event_tx,
+                                    );
+                                    state.last_summary_refresh.insert(server_id.clone(), now);
                                     refresh_client_supervisor_summaries(
                                         model,
                                         &state.ssh_bridges,
@@ -2877,7 +3514,7 @@ async fn run_client_loop(
                                         &event_tx,
                                         &should_quit,
                                     );
-                                    state.last_supervisor_summary_refresh = Instant::now();
+                                    state.last_supervisor_summary_refresh = now;
                                 }
                                 Err(err) => {
                                     let _ = model.set_connection_state(
@@ -2896,6 +3533,30 @@ async fn run_client_loop(
                         }
                     }
                 }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::RemoteManageRequestFinished {
+                action,
+                remote_id,
+                result,
+                elapsed,
+            } => {
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "client remote-manage request completed off UI thread"
+                    );
+                }
+                apply_remote_manage_request_finished(
+                    &mut state,
+                    &mut server_writes,
+                    action,
+                    &remote_id,
+                    result,
+                    &event_tx,
+                );
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);
             }
@@ -2928,14 +3589,35 @@ async fn run_client_loop(
                 // Check if we should quit.
                 let now = Instant::now();
                 retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
+
+                // item 6 (Area 6): adaptive secondary cadence (400ms active / 2s background). Each
+                // due secondary fetch goes through the spawn helper (off the UI loop); we record
+                // `last_summary_refresh[id]` on START so a slow SSH fetch does not stack (the
+                // `pending_summary_refresh_server_ids` guard also prevents duplicate workers). The
+                // Timer body issues NO inline blocking secondary API call.
+                let due = due_secondary_summary_refreshes(&state, now);
+                if !due.is_empty() {
+                    if let Some(model) = &state.supervisor_model {
+                        for server_id in &due {
+                            start_single_secondary_summary_refresh(
+                                model,
+                                server_id,
+                                &state.ssh_bridges,
+                                &mut state.pending_summary_refresh_server_ids,
+                                &event_tx,
+                            );
+                            state.last_summary_refresh.insert(server_id.clone(), now);
+                        }
+                    }
+                }
+
+                let mut did_local_refresh = false;
                 if supervisor_summary_refresh_due(now, state.last_supervisor_summary_refresh) {
+                    // The 2s gate now drives ONLY the local main/registry/ui-settings refresh
+                    // (Unix socket, no SSH RTT). The secondary fan-out is OMITTED — the per-
+                    // secondary `due` loop above is the single source of secondary cadence.
                     if let Some(model) = &mut state.supervisor_model {
-                        refresh_client_supervisor_summaries(
-                            model,
-                            &state.ssh_bridges,
-                            &mut state.pending_summary_refresh_server_ids,
-                            &event_tx,
-                        );
+                        refresh_main_local_summaries(model);
                         state.last_supervisor_summary_refresh = now;
                         state.request_full_redraw();
                     }
@@ -2949,6 +3631,31 @@ async fn run_client_loop(
                             &should_quit,
                         );
                     }
+                    did_local_refresh = true;
+                }
+                if !due.is_empty() || did_local_refresh {
+                    render_cached_composited_frame(&mut state);
+                }
+
+                // item 5: gated, fully-local animation step. Advances the single client
+                // animation tick at the 80ms cadence and recomposes via the blit diff (NOT a
+                // full redraw). It calls ONLY advance_animation_tick + prune_and_seed_working_since
+                // (map only) + render_cached_composited_frame — never any SSH/API I/O (commit
+                // 3d47acd). When nothing is animating, `wants` is false and the tick never
+                // advances (zero idle recompose).
+                let wants = state.compositor.is_some()
+                    && state
+                        .supervisor_model
+                        .as_ref()
+                        .is_some_and(compositor::sidebar_wants_animation);
+                if should_advance_animation(wants, now, state.last_animation_tick) {
+                    if let (Some(c), Some(m)) =
+                        (state.compositor.as_mut(), state.supervisor_model.as_ref())
+                    {
+                        c.advance_animation_tick(CLIENT_ANIMATION_TICK_STEP);
+                        prune_and_seed_working_since(c, m, now);
+                    }
+                    state.last_animation_tick = now;
                     render_cached_composited_frame(&mut state);
                 }
             }
@@ -3400,6 +4107,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         }
     }
 
@@ -3426,6 +4134,8 @@ mod tests {
             pending_add_remote: false,
             ssh_bridges: HashMap::new(),
             secondary_retries: HashMap::new(),
+            last_animation_tick: Instant::now(),
+            last_summary_refresh: HashMap::new(),
         }
     }
 
@@ -3899,6 +4609,7 @@ mod tests {
                                 session: None,
                                 keybindings:
                                     crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                                disabled: false,
                             },
                         },
                     })
@@ -4177,6 +4888,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
 
         let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
@@ -4200,6 +4912,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         model
             .set_summary(
@@ -4251,6 +4964,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
 
         let main_workspaces = (0..main_count)
@@ -4315,10 +5029,13 @@ mod tests {
     fn composited_input_clicking_workspace_returns_owner_api_request() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let row = (0..16)
+        // item 2 (C3): the host banner adds a row above the remote group, so render at a taller
+        // sidebar and scan the full height for the remote workspace row (render == hit_test).
+        let host_size = (60, 24);
+        let row = (0..host_size.1)
             .find(|row| {
                 matches!(
-                    compositor.hit_test(&model, 1, *row, 60, 20),
+                    compositor.hit_test(&model, 1, *row, host_size.0, host_size.1),
                     Some(compositor::SidebarHitTarget::Workspace {
                         server_id,
                         workspace_id,
@@ -4331,14 +5048,14 @@ mod tests {
             format!("\x1b[<0;2;{}M", row + 1).into_bytes(),
             &mut compositor,
             &mut model,
-            (60, 20),
+            host_size,
         );
 
         assert_eq!(
             dispatch,
             ClientInputDispatch::ApiRequest {
                 server_id: remote_id.clone(),
-                refresh: ClientApiRefreshPolicy::Deferred,
+                refresh: ClientApiRefreshPolicy::ImmediateFocused,
                 request: Box::new(crate::api::schema::Request {
                     id: "client:workspace-focus".into(),
                     method: crate::api::schema::Method::WorkspaceFocus(
@@ -4371,7 +5088,22 @@ mod tests {
             "remote workspaces should start below the visible workspace viewport"
         );
 
-        for _ in 0..8 {
+        // item 2 (C3): the host banner adds a row to the list, so scroll until the first remote
+        // workspace row becomes hit-testable (a few extra scroll steps over the item-4 count).
+        let mut row = None;
+        for _ in 0..16 {
+            row = (0..host_size.1).find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host_size.0, host_size.1),
+                    Some(compositor::SidebarHitTarget::Workspace {
+                        server_id,
+                        workspace_id,
+                    }) if server_id == remote_id && workspace_id == "remote-0"
+                )
+            });
+            if row.is_some() {
+                break;
+            }
             assert_eq!(
                 dispatch_composited_input(
                     b"\x1b[<65;2;3M".to_vec(),
@@ -4382,18 +5114,7 @@ mod tests {
                 ClientInputDispatch::Redraw
             );
         }
-
-        let row = (0..host_size.1)
-            .find(|row| {
-                matches!(
-                    compositor.hit_test(&model, 1, *row, host_size.0, host_size.1),
-                    Some(compositor::SidebarHitTarget::Workspace {
-                        server_id,
-                        workspace_id,
-                    }) if server_id == remote_id && workspace_id == "remote-0"
-                )
-            })
-            .expect("scrolling should reveal the first remote workspace row");
+        let row = row.expect("scrolling should reveal the first remote workspace row");
 
         let dispatch = dispatch_composited_input(
             format!("\x1b[<0;2;{}M", row + 1).into_bytes(),
@@ -4406,7 +5127,7 @@ mod tests {
             dispatch,
             ClientInputDispatch::ApiRequest {
                 server_id: remote_id.clone(),
-                refresh: ClientApiRefreshPolicy::Deferred,
+                refresh: ClientApiRefreshPolicy::ImmediateFocused,
                 request: Box::new(crate::api::schema::Request {
                     id: "client:workspace-focus".into(),
                     method: crate::api::schema::Method::WorkspaceFocus(
@@ -4436,7 +5157,7 @@ mod tests {
             dispatch,
             ClientInputDispatch::ApiRequest {
                 server_id: remote_id.clone(),
-                refresh: ClientApiRefreshPolicy::Deferred,
+                refresh: ClientApiRefreshPolicy::ImmediateFocused,
                 request: Box::new(crate::api::schema::Request {
                     id: "client:agent-focus".into(),
                     method: crate::api::schema::Method::AgentFocus(
@@ -4448,6 +5169,285 @@ mod tests {
             }
         );
         assert_eq!(model.active_server_id(), &remote_id);
+    }
+
+    // item 6 (Area 6): the focus dispatch emits ImmediateFocused (a server-switching focus), not
+    // the old Deferred. This is the render==hit_test-style consistency check for this item: the
+    // policy the dispatch emits matches the policy the handler acts on.
+    #[test]
+    fn focus_dispatch_uses_immediate_focused_policy() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let workspace_dispatch = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::Workspace {
+                server_id: remote_id.clone(),
+                workspace_id: "remote-api".into(),
+            },
+            &mut model,
+            &mouse,
+        );
+        assert!(matches!(
+            workspace_dispatch,
+            ClientInputDispatch::ApiRequest {
+                refresh: ClientApiRefreshPolicy::ImmediateFocused,
+                ..
+            }
+        ));
+
+        // A second model so the agent focus is also a server switch (active starts at main).
+        let (mut model, remote_id) = mixed_remote_model();
+        let agent_dispatch = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::Agent {
+                server_id: remote_id.clone(),
+                agent_id: "remote-agent".into(),
+            },
+            &mut model,
+            &mouse,
+        );
+        assert!(matches!(
+            agent_dispatch,
+            ClientInputDispatch::ApiRequest {
+                refresh: ClientApiRefreshPolicy::ImmediateFocused,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn single_secondary_summary_refresh_dedupes_pending() {
+        let (model, remote_id) = mixed_remote_model();
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+        pending.insert(remote_id.clone());
+
+        start_single_secondary_summary_refresh(
+            &model,
+            &remote_id,
+            &ssh_bridges,
+            &mut pending,
+            &event_tx,
+        );
+
+        // Already pending: no second worker spawned, pending unchanged, nothing queued.
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&remote_id));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn single_secondary_summary_refresh_skips_main_id() {
+        let (model, _remote_id) = mixed_remote_model();
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+
+        start_single_secondary_summary_refresh(
+            &model,
+            &supervisor::ServerId::main(),
+            &ssh_bridges,
+            &mut pending,
+            &event_tx,
+        );
+
+        // Main id is a no-op inside the helper: nothing spawned, pending stays empty.
+        assert!(pending.is_empty());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn single_secondary_summary_refresh_targets_one_server() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let id_a = model.add_secondary(test_remote_definition("a", "a"));
+        let id_b = model.add_secondary(test_remote_definition("b", "b"));
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+
+        start_single_secondary_summary_refresh(
+            &model,
+            &id_b,
+            &ssh_bridges,
+            &mut pending,
+            &event_tx,
+        );
+
+        // Only id_b is in flight (a single id in, a single fetch out — targeted, not fleet).
+        assert!(pending.contains(&id_b));
+        assert!(!pending.contains(&id_a));
+        assert_eq!(pending.len(), 1);
+
+        // The worker thread enqueues exactly one SupervisorSummaryFetched for id_b.
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } => {
+                assert_eq!(server_id, id_b);
+            }
+            _ => panic!("expected a single SupervisorSummaryFetched for id_b"),
+        }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn due_secondary_summary_refreshes_uses_fast_cadence_for_active() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let active = model.add_secondary(test_remote_definition("active", "active"));
+        let background = model.add_secondary(test_remote_definition("bg", "bg"));
+        model.set_active_server(active.clone()).unwrap();
+        let mut state = test_client_state_with_model(model);
+
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(500);
+        state.last_summary_refresh.insert(active.clone(), stale);
+        state.last_summary_refresh.insert(background.clone(), stale);
+
+        let due = due_secondary_summary_refreshes(&state, now);
+        // Active remote (500ms old) is due at the 400ms fast cadence; the background remote
+        // (500ms old) is NOT due at the 2s background cadence.
+        assert!(due.contains(&active));
+        assert!(!due.contains(&background));
+    }
+
+    #[test]
+    fn due_secondary_summary_refreshes_returns_background_after_slow_interval() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let active = model.add_secondary(test_remote_definition("active", "active"));
+        let background = model.add_secondary(test_remote_definition("bg", "bg"));
+        model.set_active_server(active.clone()).unwrap();
+        let mut state = test_client_state_with_model(model);
+
+        let now = Instant::now();
+        // Background just past the 2s background interval; active just refreshed (not yet due).
+        state
+            .last_summary_refresh
+            .insert(active.clone(), now - Duration::from_millis(10));
+        state.last_summary_refresh.insert(
+            background.clone(),
+            now - CLIENT_SUPERVISOR_REFRESH_INTERVAL - Duration::from_millis(1),
+        );
+
+        let due = due_secondary_summary_refreshes(&state, now);
+        assert!(due.contains(&background));
+        assert!(!due.contains(&active));
+        // Main never appears in the result.
+        assert!(!due.contains(&supervisor::ServerId::main()));
+    }
+
+    #[test]
+    fn timer_issues_no_inline_blocking_secondary_fetch() {
+        // Structural guard: feeding due secondaries into the spawn helper enqueues a background
+        // SupervisorSummaryFetched (worker thread) and returns within the 60fps budget — proving
+        // no synchronous SSH call is on the loop.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(test_remote_definition("slow", "slow"));
+        let mut state = test_client_state_with_model(model);
+        // Force the secondary due immediately (no prior refresh).
+        let now = Instant::now();
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let due = due_secondary_summary_refreshes(&state, now);
+        assert!(due.contains(&remote_id));
+
+        let started_at = Instant::now();
+        if let Some(model) = &state.supervisor_model {
+            for server_id in &due {
+                start_single_secondary_summary_refresh(
+                    model,
+                    server_id,
+                    &ssh_bridges,
+                    &mut state.pending_summary_refresh_server_ids,
+                    &event_tx,
+                );
+                state.last_summary_refresh.insert(server_id.clone(), now);
+            }
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "the Timer's secondary fan-out blocked the UI thread for {elapsed:?}, about {:.1} fps",
+            fps_for_frame_duration(elapsed)
+        );
+        assert!(state
+            .pending_summary_refresh_server_ids
+            .contains(&remote_id));
+        // The fetch happens on the worker thread (off the loop): the event arrives later.
+        let event = event_rx.blocking_recv().unwrap();
+        assert!(matches!(
+            event,
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } if server_id == remote_id
+        ));
+    }
+
+    #[test]
+    fn supervisor_summary_changed_refreshes_only_that_server() {
+        // The SupervisorSummaryChanged handler routes a secondary id through the single-server
+        // helper (the targeted event-push), never the whole-fleet refresh — so only the changed
+        // server lands in `pending`. Two secondaries; only the changed one is fetched.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let changed = model.add_secondary(test_remote_definition("changed", "changed"));
+        let other = model.add_secondary(test_remote_definition("other", "other"));
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+
+        // Mirror the handler's secondary branch exactly.
+        start_single_secondary_summary_refresh(
+            &model,
+            &changed,
+            &ssh_bridges,
+            &mut pending,
+            &event_tx,
+        );
+
+        assert!(pending.contains(&changed));
+        assert!(!pending.contains(&other));
+        assert!(!pending.contains(&supervisor::ServerId::main()));
+
+        let event = event_rx.blocking_recv().unwrap();
+        assert!(matches!(
+            event,
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } if server_id == changed
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn connect_prioritizes_connected_server_refresh() {
+        // On connect, the just-connected server's summary is put in flight by the handler's
+        // EXPLICIT server_id (connecting does NOT change active_server_id, which stays at main).
+        // So prioritization keys off the connected id, not active_server_id().
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let connected = model.add_secondary(test_remote_definition("connected", "connected"));
+        // active_server_id remains main after a connect (set_connection_state(.., Connected) does
+        // not touch it) — assert that so the test pins the contract's "not active_server_id" rule.
+        assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
+        let ssh_bridges = HashMap::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashSet::new();
+
+        // Mirror the connect handler's prioritized single-server fetch.
+        start_single_secondary_summary_refresh(
+            &model,
+            &connected,
+            &ssh_bridges,
+            &mut pending,
+            &event_tx,
+        );
+
+        assert!(pending.contains(&connected));
+        let event = event_rx.blocking_recv().unwrap();
+        assert!(matches!(
+            event,
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } if server_id == connected
+        ));
     }
 
     #[test]
@@ -4466,6 +5466,119 @@ mod tests {
             dispatch,
             ClientInputDispatch::Forward(b"\x1b[<0;2;3M".to_vec())
         );
+    }
+
+    // item 7 (Area 4): an SGR no-button motion report (`\x1b[<35;col;rowM`, drag-bit set, button
+    // code 3) parses to `MouseEventKind::Moved`. Builds the 1-based escape over a 0-based (col,row).
+    fn moved_bytes(col: u16, row: u16) -> Vec<u8> {
+        format!("\x1b[<35;{};{}M", col + 1, row + 1).into_bytes()
+    }
+
+    // find the first sidebar row that hit-tests to the remote workspace (render == hit_test).
+    fn remote_workspace_row(
+        compositor: &compositor::ClientCompositor,
+        model: &supervisor::ClientSupervisorModel,
+        remote_id: &supervisor::ServerId,
+        host: (u16, u16),
+    ) -> u16 {
+        (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, .. })
+                        if server_id == *remote_id
+                )
+            })
+            .expect("remote workspace row should be hit-testable")
+    }
+
+    #[test]
+    fn composited_moved_sets_hover_and_redraws_then_coalesces() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = remote_workspace_row(&compositor, &model, &remote_id, host);
+
+        // first motion over the row → Redraw (hover changed from None).
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        assert!(matches!(
+            compositor.hover(),
+            Some(crate::app::state::SidebarHoverTarget::Workspace { .. })
+        ));
+        // a second identical motion → Consumed (change-detection coalescing, zero redraw).
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
+            ClientInputDispatch::Consumed
+        );
+    }
+
+    #[test]
+    fn composited_moved_off_sidebar_clears_hover_once() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = remote_workspace_row(&compositor, &model, &remote_id, host);
+
+        // establish a sidebar hover.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        // motion into the content area clears the hover → exactly one Redraw.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(40, 3), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        assert_eq!(compositor.hover(), None);
+        // a second content motion (no prior hover) is NOT intercepted: it falls through to
+        // translate_content_mouse_input, which maps Moved → the original bytes (Forward).
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(40, 3), &mut compositor, &mut model, host),
+            ClientInputDispatch::Forward(moved_bytes(40, 3))
+        );
+    }
+
+    #[test]
+    fn hover_never_produces_server_traffic() {
+        // a client Moved over a workspace OR agent row only ever returns Redraw/Consumed —
+        // never ApiRequest/ServerControl/AddRemote/SetRemoteEnabled/DeleteRemote.
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+
+        let no_traffic = |dispatch: &ClientInputDispatch| {
+            !matches!(
+                dispatch,
+                ClientInputDispatch::ApiRequest { .. }
+                    | ClientInputDispatch::ServerControl { .. }
+                    | ClientInputDispatch::AddRemote(_)
+                    | ClientInputDispatch::SetRemoteEnabled { .. }
+                    | ClientInputDispatch::DeleteRemote { .. }
+                    | ClientInputDispatch::Forward(_)
+            )
+        };
+
+        // sweep every sidebar row with a motion; none may produce traffic.
+        let _ = remote_workspace_row(&compositor, &model, &remote_id, host);
+        for row in 0..host.1 {
+            let dispatch =
+                dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host);
+            assert!(
+                no_traffic(&dispatch),
+                "hover motion produced traffic {dispatch:?} at row {row}"
+            );
+            assert!(
+                matches!(
+                    dispatch,
+                    ClientInputDispatch::Redraw | ClientInputDispatch::Consumed
+                ),
+                "hover motion produced non-hover dispatch {dispatch:?} at row {row}"
+            );
+        }
+        assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
     }
 
     #[test]
@@ -4523,14 +5636,26 @@ mod tests {
         );
     }
 
+    /// SGR mouse-down (button left) at 0-based `(col, row)`. The SGR protocol uses 1-based coords.
+    fn sgr_left_down(col: u16, row: u16) -> Vec<u8> {
+        format!("\x1b[<0;{};{}M", col + 1, row + 1).into_bytes()
+    }
+
     #[test]
     fn composited_input_clicking_picker_destination_returns_create_request() {
         let (mut model, remote_id) = mixed_remote_model();
         model.open_new_workspace_picker();
         let mut compositor = compositor::ClientCompositor::new(26);
 
+        // item 1: click the CENTERED remote destination row (index 1), using the same shared
+        // geometry the renderer uses (NOT the old bottom-anchored rows 13/14).
+        let full_rect = ratatui::layout::Rect::new(0, 0, 60, 16);
+        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
+        assert_ne!(row1.y, 14);
+
         let dispatch = dispatch_composited_input(
-            b"\x1b[<0;2;15M".to_vec(),
+            sgr_left_down(row1.x, row1.y),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -4555,6 +5680,55 @@ mod tests {
         );
         assert_eq!(model.active_server_id(), &remote_id);
         assert_eq!(model.new_workspace_picker_destinations(), None);
+    }
+
+    #[test]
+    fn composited_input_picker_keyboard_navigates_and_confirms() {
+        let (mut model, remote_id) = mixed_remote_model();
+        model.open_new_workspace_picker();
+        let mut compositor = compositor::ClientCompositor::new(26);
+
+        // ↓ moves the highlight onto the remote (index 1).
+        let nav =
+            dispatch_composited_input(b"\x1b[B".to_vec(), &mut compositor, &mut model, (60, 16));
+        assert_eq!(nav, ClientInputDispatch::Redraw);
+        assert_eq!(model.new_workspace_picker().map(|p| p.selected), Some(1));
+
+        // Enter confirms the highlighted destination → create on the remote.
+        let confirm =
+            dispatch_composited_input(b"\r".to_vec(), &mut compositor, &mut model, (60, 16));
+        assert_eq!(
+            confirm,
+            ClientInputDispatch::ApiRequest {
+                server_id: remote_id.clone(),
+                refresh: ClientApiRefreshPolicy::Immediate,
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-create".into(),
+                    method: crate::api::schema::Method::WorkspaceCreate(
+                        crate::api::schema::WorkspaceCreateParams {
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                        },
+                    ),
+                }),
+            }
+        );
+        assert_eq!(model.active_server_id(), &remote_id);
+        assert_eq!(model.new_workspace_picker(), None);
+    }
+
+    #[test]
+    fn composited_input_picker_esc_closes() {
+        let (mut model, _) = mixed_remote_model();
+        model.open_new_workspace_picker();
+        let mut compositor = compositor::ClientCompositor::new(26);
+
+        let dispatch =
+            dispatch_composited_input(b"\x1b".to_vec(), &mut compositor, &mut model, (60, 16));
+
+        assert_eq!(dispatch, ClientInputDispatch::Redraw);
+        assert_eq!(model.new_workspace_picker(), None);
     }
 
     #[test]
@@ -4764,6 +5938,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         let api_socket = std::path::PathBuf::from("/tmp/herdr-prod-api.sock");
         let client_socket = std::path::PathBuf::from("/tmp/herdr-prod-client.sock");
@@ -4821,6 +5996,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -4878,6 +6054,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -4946,6 +6123,7 @@ mod tests {
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -5553,5 +6731,459 @@ mod tests {
         unsafe {
             std::env::remove_var("SSH_CONNECTION");
         }
+    }
+
+    // --- item 5: client agent animation --------------------------------------------------
+
+    /// Mixed model with one main workspace and one remote workspace whose single agent has the
+    /// given `status`. Both servers connect by default, so a "working" agent makes
+    /// `sidebar_wants_animation` true.
+    fn animation_model(status: &str) -> (supervisor::ClientSupervisorModel, supervisor::ServerId) {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(test_remote_definition("remote-x", "x"));
+        model
+            .set_summary(
+                &supervisor::ServerId::main(),
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: Some("master".into()),
+                        focused: true,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: Some("feature/api".into()),
+                        focused: false,
+                    }],
+                    agents: vec![supervisor::AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: status.into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
+    }
+
+    #[test]
+    fn client_animation_cadence_matches_visible_step_rate() {
+        // Cadence is fixed by the contract: 80ms / step 8.
+        assert_eq!(CLIENT_ANIMATION_INTERVAL, Duration::from_millis(80));
+        assert_eq!(CLIENT_ANIMATION_TICK_STEP, 8);
+
+        // `spinner_frame` maps SPINNERS[(tick/8) % len], so step 8 advances exactly one visible
+        // spinner frame per interval. Visible-step period = INTERVAL / (STEP / 8) = 80ms / 1.
+        let visible_steps_per_interval = CLIENT_ANIMATION_TICK_STEP / 8;
+        assert_eq!(visible_steps_per_interval, 1);
+        let visible_step_period = CLIENT_ANIMATION_INTERVAL / visible_steps_per_interval;
+        assert_eq!(visible_step_period, Duration::from_millis(80));
+
+        // Within the 64..=128ms band bounded by the server (16ms * 8 = 128ms visible period)
+        // and headless (128ms / (8/8) = 128ms visible period).
+        assert!(visible_step_period >= Duration::from_millis(64));
+        assert!(visible_step_period <= Duration::from_millis(128));
+    }
+
+    #[test]
+    fn next_select_deadline_picks_min_when_active() {
+        let now = Instant::now();
+        let last = now - Duration::from_millis(30);
+
+        // Active: min(now + 100ms housekeeping, last + 80ms animation). last + 80ms = now + 50ms
+        // is sooner, so it wins.
+        let active = next_select_deadline(now, last, true);
+        assert_eq!(active, last + CLIENT_ANIMATION_INTERVAL);
+        assert_eq!(active, now + Duration::from_millis(50));
+
+        // Inactive: always the 100ms housekeeping deadline (idle behavior unchanged).
+        let idle = next_select_deadline(now, last, false);
+        assert_eq!(idle, now + Duration::from_millis(100));
+
+        // Active but the animation deadline is further out than housekeeping → housekeeping
+        // wins. last + 80ms must exceed now + 100ms, i.e. last is >20ms in the future.
+        let far_last = now + Duration::from_millis(50);
+        let active_far = next_select_deadline(now, far_last, true);
+        assert_eq!(active_far, now + Duration::from_millis(100));
+        assert!(far_last + CLIENT_ANIMATION_INTERVAL > now + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn prune_and_seed_working_since_inserts_then_removes() {
+        let (model, remote_id) = animation_model("working");
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let key = (remote_id.clone(), "remote-agent".to_string());
+
+        // First upkeep with a working agent inserts a start instant.
+        let t0 = Instant::now();
+        prune_and_seed_working_since(&mut compositor, &model, t0);
+        assert_eq!(compositor.working_since_len(), 1);
+        assert_eq!(compositor.working_since_at(&key), Some(t0));
+
+        // A second upkeep with a LATER `now` must NOT overwrite the preserved start time.
+        let t1 = t0 + Duration::from_secs(5);
+        prune_and_seed_working_since(&mut compositor, &model, t1);
+        assert_eq!(compositor.working_since_len(), 1);
+        assert_eq!(
+            compositor.working_since_at(&key),
+            Some(t0),
+            "an already-working key must not be re-seeded to a later instant"
+        );
+
+        // After the agent leaves Working, the key is pruned.
+        let (idle_model, _) = animation_model("idle");
+        prune_and_seed_working_since(&mut compositor, &idle_model, t1);
+        assert_eq!(compositor.working_since_len(), 0);
+        assert_eq!(compositor.working_since_at(&key), None);
+    }
+
+    #[test]
+    fn two_timers_within_interval_advance_tick_once() {
+        let t0 = Instant::now();
+        // First Timer at t0: at least one interval since `last` → advance.
+        assert!(should_advance_animation(
+            true,
+            t0,
+            t0 - CLIENT_ANIMATION_INTERVAL
+        ));
+        // Second Timer 40ms later (< 80ms since the just-recorded t0) → no advance (coalesced).
+        assert!(!should_advance_animation(
+            true,
+            t0 + Duration::from_millis(40),
+            t0
+        ));
+        // A Timer a full interval later → advance again.
+        assert!(should_advance_animation(
+            true,
+            t0 + CLIENT_ANIMATION_INTERVAL,
+            t0
+        ));
+    }
+
+    #[test]
+    fn no_tick_advance_when_idle() {
+        // With no working agent — and the host banner animation forced Static so the banner does
+        // not gate animation (item 2/C3) — the gate is false, so the animation step never runs
+        // regardless of elapsed time → the tick stays put.
+        let (mut idle_model, _) = animation_model("idle");
+        let mut ui_settings = idle_model.ui_settings().clone();
+        ui_settings.sidebar_host.animation = crate::config::HostBannerAnimation::Static;
+        idle_model.set_ui_settings(ui_settings);
+        assert!(!compositor::sidebar_wants_animation(&idle_model));
+        let wants = compositor::sidebar_wants_animation(&idle_model);
+        let t0 = Instant::now();
+        assert!(!should_advance_animation(
+            wants,
+            t0 + Duration::from_secs(10),
+            t0
+        ));
+
+        // And driving the compositor with no advance leaves the tick unchanged.
+        let mut compositor = compositor::ClientCompositor::new(26);
+        assert_eq!(compositor.animation_tick(), 0);
+        prune_and_seed_working_since(&mut compositor, &idle_model, t0);
+        assert_eq!(compositor.animation_tick(), 0);
+        assert_eq!(compositor.working_since_len(), 0);
+    }
+
+    #[test]
+    fn animation_step_performs_no_io() {
+        // Replicate the exact component sequence of the Timer animation step and assert it
+        // touches NONE of the off-UI-loop pending sets that the SSH/API helpers populate
+        // (commit 3d47acd: no SSH/API I/O on the UI loop).
+        let (model, _) = animation_model("working");
+        let mut state = test_client_state_with_model(model);
+        state.compositor = Some(compositor::ClientCompositor::new(26));
+
+        assert!(state.pending_summary_refresh_server_ids.is_empty());
+        assert!(state.pending_secondary_connect_server_ids.is_empty());
+        assert!(state.summary_subscription_server_ids.is_empty());
+
+        let now = Instant::now();
+        let wants = state.compositor.is_some()
+            && state
+                .supervisor_model
+                .as_ref()
+                .is_some_and(compositor::sidebar_wants_animation);
+        assert!(wants);
+        if should_advance_animation(
+            wants,
+            now,
+            state.last_animation_tick - CLIENT_ANIMATION_INTERVAL,
+        ) {
+            if let (Some(c), Some(m)) = (state.compositor.as_mut(), state.supervisor_model.as_ref())
+            {
+                c.advance_animation_tick(CLIENT_ANIMATION_TICK_STEP);
+                prune_and_seed_working_since(c, m, now);
+            }
+            render_cached_composited_frame(&mut state);
+        }
+
+        // The tick advanced and the working-since map was seeded...
+        assert_eq!(
+            state.compositor.as_ref().unwrap().animation_tick(),
+            CLIENT_ANIMATION_TICK_STEP
+        );
+        // ...but no SSH/API refresh or connect work was scheduled.
+        assert!(state.pending_summary_refresh_server_ids.is_empty());
+        assert!(state.pending_secondary_connect_server_ids.is_empty());
+        assert!(state.summary_subscription_server_ids.is_empty());
+    }
+
+    // ----- item 3 (Area 5): manage loop wiring (off-UI-loop) --------------------------------
+
+    /// §D: a disabled secondary with a DUE retry entry (as `ServerDisconnected`'s unconditional
+    /// `schedule_secondary_retry` would leave) is dropped by `retry_due_secondary_connections`
+    /// before any reconnect, because the gated `secondary_connection_plans()` yields no plan.
+    #[test]
+    fn disabled_server_retry_entry_dropped_before_reconnect() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        // a single DISABLED secondary.
+        model.sync_remote_registry(vec![{
+            let mut def = test_remote_definition("r1", "alpha");
+            def.disabled = true;
+            def
+        }]);
+        let server_id = supervisor::ServerId::secondary("r1");
+
+        let mut state = test_client_state_with_model(model);
+        let now = Instant::now();
+        state.secondary_retries.insert(
+            server_id.clone(),
+            SecondaryRetryState {
+                attempt: 0,
+                next_retry_at: now,
+            },
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut server_writes = HashMap::new();
+        retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
+
+        // the gated plan yields nothing → the entry is removed, no connect attempt is spawned.
+        assert!(!state.secondary_retries.contains_key(&server_id));
+        assert!(!state
+            .pending_secondary_connect_server_ids
+            .contains(&server_id));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// §G: `SetRemoteEnabled`/`DeleteRemote` dispatch targets `ServerId::main()` off the UI loop —
+    /// the spawn helper returns within the frame budget and does not block on the API call.
+    #[test]
+    fn set_enabled_dispatch_spawns_main_request() {
+        let _guard = env_lock().lock().unwrap();
+        // point the local socket at a guaranteed-missing path so the spawned thread fails fast.
+        let _sock = EnvVarGuard::set(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/tmp/herdr-nonexistent-manage-test.sock",
+        );
+        let (model, _) = mixed_remote_model();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let started = Instant::now();
+        spawn_client_remote_manage_request(
+            &model,
+            RemoteManageAction::SetEnabled { enabled: false },
+            "remote-x".into(),
+            &HashMap::new(),
+            &event_tx,
+        );
+        let elapsed = started.elapsed();
+        // the spawn helper returns essentially immediately — the API round-trip happens on the
+        // spawned thread, NOT inline on the UI loop (no blocking synchronous API call here).
+        assert!(
+            elapsed <= CLIENT_60FPS_FRAME_BUDGET,
+            "spawning a manage request blocked the UI thread for {elapsed:?}"
+        );
+
+        // the request DOES complete off-thread and emits the finished event addressed to remote-x.
+        let event = event_rx.blocking_recv().unwrap();
+        match event {
+            ClientLoopEvent::RemoteManageRequestFinished {
+                action, remote_id, ..
+            } => {
+                assert_eq!(action, RemoteManageAction::SetEnabled { enabled: false });
+                assert_eq!(remote_id, "remote-x");
+            }
+            _ => panic!("expected RemoteManageRequestFinished"),
+        }
+    }
+
+    /// §G: building the manage request targets the right API method.
+    #[test]
+    fn remote_manage_request_builds_set_enabled_and_remove() {
+        let set = remote_manage_request(RemoteManageAction::SetEnabled { enabled: true }, "r1");
+        match set.method {
+            crate::api::schema::Method::RemoteSetEnabled(params) => {
+                assert_eq!(params.remote_id, "r1");
+                assert!(params.enabled);
+            }
+            other => panic!("expected remote.set_enabled, got {other:?}"),
+        }
+        let del = remote_manage_request(RemoteManageAction::Delete, "r1");
+        match del.method {
+            crate::api::schema::Method::RemoteRemove(params) => {
+                assert_eq!(params.remote_id, "r1");
+            }
+            other => panic!("expected remote.remove, got {other:?}"),
+        }
+    }
+
+    /// §G: the re-enable handler sets the server `connection_state == Connecting` so the gated
+    /// plans pick it up on the next tick (`sync_remote_registry` never re-applies state).
+    #[test]
+    fn re_enable_yields_connecting() {
+        let _guard = env_lock().lock().unwrap();
+        let _sock = EnvVarGuard::set(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/tmp/herdr-nonexistent-manage-test.sock",
+        );
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let server_id = model.add_secondary({
+            let mut def = test_remote_definition("r1", "alpha");
+            def.disabled = true;
+            def
+        });
+        model
+            .set_connection_state(&server_id, supervisor::ConnectionState::Disconnected)
+            .unwrap();
+        let mut state = test_client_state_with_model(model);
+        let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut server_writes = HashMap::new();
+
+        apply_remote_manage_request_finished(
+            &mut state,
+            &mut server_writes,
+            RemoteManageAction::SetEnabled { enabled: true },
+            "r1",
+            Ok(()),
+            &event_tx,
+        );
+
+        let server = state
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .server_for_test(&server_id)
+            .unwrap();
+        assert_eq!(
+            server.connection_state,
+            supervisor::ConnectionState::Connecting
+        );
+    }
+
+    /// §G: disabling a currently-connected remote tears down its stream/bridge/subscription state
+    /// and sets `Disconnected`.
+    #[test]
+    fn disable_while_connected_tears_down() {
+        let _guard = env_lock().lock().unwrap();
+        let _sock = EnvVarGuard::set(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/tmp/herdr-nonexistent-manage-test.sock",
+        );
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let server_id = model.add_secondary(test_remote_definition("r1", "alpha"));
+        model
+            .set_connection_state(&server_id, supervisor::ConnectionState::Connected)
+            .unwrap();
+        let mut state = test_client_state_with_model(model);
+        // seed live stream/bridge/subscription/pending state for the server.
+        state
+            .summary_subscription_server_ids
+            .insert(server_id.clone());
+        state
+            .pending_summary_refresh_server_ids
+            .insert(server_id.clone());
+        state
+            .pending_secondary_connect_server_ids
+            .insert(server_id.clone());
+        let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut server_writes = HashMap::new();
+
+        apply_remote_manage_request_finished(
+            &mut state,
+            &mut server_writes,
+            RemoteManageAction::SetEnabled { enabled: false },
+            "r1",
+            Ok(()),
+            &event_tx,
+        );
+
+        assert!(!state.summary_subscription_server_ids.contains(&server_id));
+        assert!(!state
+            .pending_summary_refresh_server_ids
+            .contains(&server_id));
+        assert!(!state
+            .pending_secondary_connect_server_ids
+            .contains(&server_id));
+        assert!(!state.ssh_bridges.contains_key(&server_id));
+        let server = state
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .server_for_test(&server_id)
+            .unwrap();
+        assert_eq!(
+            server.connection_state,
+            supervisor::ConnectionState::Disconnected
+        );
+    }
+
+    /// §G: deleting a remote removes the secondary from the model, tears down, and clears the
+    /// overlay confirm/pending markers.
+    #[test]
+    fn delete_removes_secondary_and_clears_overlay() {
+        let _guard = env_lock().lock().unwrap();
+        let _sock = EnvVarGuard::set(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/tmp/herdr-nonexistent-manage-test.sock",
+        );
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let server_id = model.add_secondary(test_remote_definition("r1", "alpha"));
+        model.open_remote_manage_overlay();
+        // enter delete-confirm + mark pending for r1 (as the dispatch would).
+        model.begin_remote_manage_delete();
+        assert_eq!(
+            model
+                .remote_manage_overlay()
+                .unwrap()
+                .confirm_delete
+                .as_deref(),
+            Some("r1")
+        );
+        let mut state = test_client_state_with_model(model);
+        let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut server_writes = HashMap::new();
+
+        apply_remote_manage_request_finished(
+            &mut state,
+            &mut server_writes,
+            RemoteManageAction::Delete,
+            "r1",
+            Ok(()),
+            &event_tx,
+        );
+
+        let model = state.supervisor_model.as_ref().unwrap();
+        assert!(
+            model.server_for_test(&server_id).is_none(),
+            "secondary removed from model"
+        );
+        let overlay = model.remote_manage_overlay().unwrap();
+        assert!(overlay.confirm_delete.is_none());
+        assert!(overlay.pending.is_none());
     }
 }

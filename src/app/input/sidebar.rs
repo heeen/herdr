@@ -485,6 +485,79 @@ impl AppState {
         }
         None
     }
+
+    /// item 7 (Area 4): resolve a monolithic mouse-motion position to a sidebar hover target,
+    /// reusing the SAME geometry helpers the click path uses (so hover and click agree). Returns
+    /// `None` for non-selectable rows — the resize divider and the section separator (skipped via
+    /// `on_sidebar_divider`/`on_sidebar_section_divider`), and any row that maps to no
+    /// affordance/banner/card/agent entry. The ` new`/`menu` affordances hover only when drawn
+    /// (`self.mouse_capture` + `launcher_enabled`, matching the renderer's draw gate). The caller
+    /// gates this to `in_sidebar && !sidebar_collapsed` in a navigate-ish mode. No server traffic.
+    pub(super) fn resolve_sidebar_hover(
+        &self,
+        col: u16,
+        row: u16,
+        affordances_drawn: bool,
+    ) -> Option<crate::app::state::SidebarHoverTarget> {
+        use crate::app::state::SidebarHoverTarget;
+
+        // the resize column / section separator are not hoverable.
+        if self.on_sidebar_divider(col, row) || self.on_sidebar_section_divider(col, row) {
+            return None;
+        }
+
+        // item-4 space-divider rows are non-selectable. Resolve them to the defensive `Divider`
+        // target, which render treats as NO-highlight (a stable `None`-equivalent), rather than
+        // letting the card loop below claim the row. The contract's "hover never highlights the
+        // divider" (Decision 4) holds because render has no `Divider` arm.
+        if self.view.divider_rows.contains(&row) {
+            return Some(SidebarHoverTarget::Divider);
+        }
+
+        let in_rect = |rect: Rect| {
+            rect.width > 0
+                && col >= rect.x
+                && col < rect.x.saturating_add(rect.width)
+                && row >= rect.y
+                && row < rect.y.saturating_add(rect.height)
+        };
+
+        if affordances_drawn {
+            if in_rect(self.sidebar_new_button_rect()) {
+                return Some(SidebarHoverTarget::New);
+            }
+            if in_rect(self.global_launcher_rect()) {
+                return Some(SidebarHoverTarget::Menu);
+            }
+        }
+
+        if self.on_agent_panel_scope_toggle(col, row) {
+            return Some(SidebarHoverTarget::ScopeToggle);
+        }
+
+        // host-banner rect (item 2): empty in monolithic, hoverable defensively when present.
+        for banner in &self.view.host_banner_areas {
+            if in_rect(banner.rect) {
+                return Some(SidebarHoverTarget::HostBanner {
+                    banner_idx: banner.banner_idx,
+                });
+            }
+        }
+
+        if let Some(ws_idx) = self.workspace_at_row(row) {
+            return Some(SidebarHoverTarget::Workspace { ws_idx });
+        }
+
+        if let Some((ws_idx, tab_idx, pane_id)) = self.agent_detail_target_at(row) {
+            return Some(SidebarHoverTarget::AgentMono {
+                ws_idx,
+                tab_idx,
+                pane_id,
+            });
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -496,10 +569,53 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelScope, DragTarget, Mode, SidebarAgentItem},
+        app::state::{AgentPanelScope, AppState, DragTarget, Mode, SidebarAgentItem},
         detect::Agent,
         workspace::Workspace,
     };
+
+    // item 4: the divider row produces no card, so hit-test on it resolves to no workspace.
+    fn divider_hit_test_app() -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local"), Workspace::test_new("remote")];
+        app.client_workspace_remote = vec![false, true];
+        app.active = None;
+        app.mode = Mode::Terminal;
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.sidebar_rect = area;
+        let (cards, _banners, divider_rows) =
+            crate::ui::compute_workspace_list_areas_full(&app, area);
+        app.view.workspace_card_areas = cards;
+        app.view.divider_rows = divider_rows;
+        app
+    }
+
+    #[test]
+    fn workspace_at_row_returns_none_for_divider_row() {
+        let app = divider_hit_test_app();
+        assert_eq!(app.view.divider_rows.len(), 1);
+        let divider_y = app.view.divider_rows[0];
+        // The two real workspace rows still resolve to their cards.
+        let local_y = app.view.workspace_card_areas[0].rect.y;
+        let remote_y = app.view.workspace_card_areas[1].rect.y;
+        assert_eq!(app.workspace_at_row(local_y), Some(0));
+        assert_eq!(app.workspace_at_row(remote_y), Some(1));
+        // The divider row resolves to no workspace.
+        assert_eq!(app.workspace_at_row(divider_y), None);
+    }
+
+    #[test]
+    fn workspace_drop_index_at_row_unaffected_by_divider() {
+        // Dropping "onto" the divider row resolves via the adjacent real cards, never to a
+        // divider-derived index; drop geometry iterates workspace_card_areas only.
+        let app = divider_hit_test_app();
+        let divider_y = app.view.divider_rows[0];
+        let drop = app.workspace_drop_index_at_row(divider_y);
+        // The result (if any) is a valid insert index within workspaces bounds.
+        if let Some(insert_idx) = drop {
+            assert!(insert_idx <= app.workspaces.len());
+        }
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {

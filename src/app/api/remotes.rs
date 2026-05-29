@@ -1,4 +1,6 @@
-use crate::api::schema::{RemoteAddParams, RemoteRemoveParams, RemoteRenameParams, ResponseResult};
+use crate::api::schema::{
+    RemoteAddParams, RemoteRemoveParams, RemoteRenameParams, RemoteSetEnabledParams, ResponseResult,
+};
 use crate::app::App;
 
 use super::responses::{encode_error, encode_success};
@@ -55,6 +57,24 @@ impl App {
             Ok(remote) => {
                 self.state.mark_session_dirty();
                 encode_success(id, ResponseResult::RemoteRenamed { remote })
+            }
+            Err(err) => encode_error(id, err.code(), err.message()),
+        }
+    }
+
+    pub(super) fn handle_remote_set_enabled(
+        &mut self,
+        id: String,
+        params: RemoteSetEnabledParams,
+    ) -> String {
+        match self
+            .state
+            .remote_registry
+            .set_enabled(&params.remote_id, params.enabled)
+        {
+            Ok(remote) => {
+                self.state.mark_session_dirty();
+                encode_success(id, ResponseResult::RemoteEnabledChanged { remote })
             }
             Err(err) => encode_error(id, err.code(), err.message()),
         }
@@ -253,5 +273,64 @@ mod tests {
             r#"{"id":"list","method":"remote.list","params":{}}"#,
         );
         assert!(list["result"]["remotes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_set_enabled_flips_marks_dirty_and_lists() {
+        let mut app = test_app();
+
+        let add = call(
+            &mut app,
+            r#"{"id":"add","method":"remote.add","params":{"name":"x","target":"user@x"}}"#,
+        );
+        let remote_id = add["result"]["remote"]["id"].as_str().unwrap().to_string();
+        app.state.session_dirty = false;
+
+        let disable = format!(
+            r#"{{"id":"disable","method":"remote.set_enabled","params":{{"remote_id":"{remote_id}","enabled":false}}}}"#
+        );
+        let response = call(&mut app, &disable);
+
+        assert_eq!(response["result"]["type"], "remote_enabled_changed");
+        assert_eq!(response["result"]["remote"]["id"], remote_id);
+        assert_eq!(response["result"]["remote"]["disabled"], true);
+        assert!(app.state.session_dirty);
+
+        let snapshot = capture_snapshot(&app);
+        assert_eq!(snapshot.remote_registry.remotes.len(), 1);
+        assert!(snapshot.remote_registry.remotes[0].disabled);
+
+        let list = call(
+            &mut app,
+            r#"{"id":"list","method":"remote.list","params":{}}"#,
+        );
+        assert_eq!(list["result"]["remotes"][0]["disabled"], true);
+    }
+
+    #[test]
+    fn remote_set_enabled_unknown_id_returns_not_found() {
+        let mut app = test_app();
+        assert_eq!(
+            error_code(
+                &mut app,
+                r#"{"id":"set","method":"remote.set_enabled","params":{"remote_id":"missing","enabled":false}}"#,
+            ),
+            "remote_not_found"
+        );
+    }
+
+    #[test]
+    fn enabled_remote_list_json_omits_disabled_key() {
+        let mut app = test_app();
+        call(
+            &mut app,
+            r#"{"id":"add","method":"remote.add","params":{"name":"x","target":"user@x"}}"#,
+        );
+
+        let list = call(
+            &mut app,
+            r#"{"id":"list","method":"remote.list","params":{}}"#,
+        );
+        assert!(list["result"]["remotes"][0].get("disabled").is_none());
     }
 }

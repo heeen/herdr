@@ -31,6 +31,10 @@ pub(super) enum SettingsAction {
         previous: SidebarAgentPreferences,
         preferences: SidebarAgentPreferences,
     },
+    SaveSidebarHost {
+        previous: crate::config::SidebarHostConfig,
+        preferences: crate::config::SidebarHostConfig,
+    },
     InstallRecommendedIntegrations,
 }
 
@@ -62,6 +66,14 @@ impl App {
                 } => {
                     if !self.save_sidebar_agent_preferences(preferences) {
                         self.state.sidebar_agent = previous;
+                    }
+                }
+                SettingsAction::SaveSidebarHost {
+                    previous,
+                    preferences,
+                } => {
+                    if !self.save_sidebar_host_preferences(preferences) {
+                        self.state.sidebar_host = previous;
                     }
                 }
                 SettingsAction::InstallRecommendedIntegrations => {
@@ -107,10 +119,15 @@ fn toast_delivery_for_index(idx: usize) -> ToastDelivery {
     }
 }
 
+/// item 2 (C3): the host group exposes a fixed option list (gradient/animation/speed/glyph/
+/// show_count). It does NOT use the `lines` model.
+const SIDEBAR_HOST_OPTION_COUNT: usize = 5;
+
 fn sidebar_config_row_count(group: SidebarConfigGroup) -> usize {
     match group {
         SidebarConfigGroup::Spaces => SIDEBAR_SPACE_ITEMS.len(),
         SidebarConfigGroup::Agents => SIDEBAR_AGENT_ITEMS.len(),
+        SidebarConfigGroup::Host => SIDEBAR_HOST_OPTION_COUNT,
     }
 }
 
@@ -170,6 +187,8 @@ fn sidebar_config_row_offsets(state: &AppState) -> Vec<(usize, u16)> {
                 }
             }
         }
+        // item 2: host group has no reorderable rows (C3 fills behavior).
+        SidebarConfigGroup::Host => {}
     }
     rows
 }
@@ -322,7 +341,30 @@ fn toggle_sidebar_config_item(state: &mut AppState) -> Option<SettingsAction> {
                 preferences,
             })
         }
+        // item 2 (C3): Space cycles the focused host option (or toggles show_count).
+        SidebarConfigGroup::Host => cycle_sidebar_host_option(state),
     }
+}
+
+/// item 2 (C3): cycle the focused `[ui.sidebar.host]` option to its next value (or toggle
+/// `show_count`), mutate `AppState.sidebar_host` immediately (so the demo updates before the
+/// save round-trips), and emit a `SaveSidebarHost` so the change is persisted + live-reloaded.
+fn cycle_sidebar_host_option(state: &mut AppState) -> Option<SettingsAction> {
+    let previous = state.sidebar_host.clone();
+    let mut preferences = previous.clone();
+    match state.settings.list.selected {
+        0 => preferences.gradient = preferences.gradient.next(),
+        1 => preferences.animation = preferences.animation.next(),
+        2 => preferences.speed = preferences.speed.next(),
+        3 => preferences.glyph = preferences.glyph.next(),
+        4 => preferences.show_count = !preferences.show_count,
+        _ => return None,
+    }
+    state.sidebar_host = preferences.clone();
+    Some(SettingsAction::SaveSidebarHost {
+        previous,
+        preferences,
+    })
 }
 
 fn cycle_sidebar_config_item_color(state: &mut AppState) -> Option<SettingsAction> {
@@ -347,6 +389,17 @@ fn cycle_sidebar_config_item_color(state: &mut AppState) -> Option<SettingsActio
             item.set_color(&mut preferences, next_color);
             state.sidebar_agent = preferences.clone();
             Some(SettingsAction::SaveSidebarAgent {
+                previous,
+                preferences,
+            })
+        }
+        // item 2 (C3): `c` cycles the gradient preset (the host group's color knob).
+        SidebarConfigGroup::Host => {
+            let previous = state.sidebar_host.clone();
+            let mut preferences = previous.clone();
+            preferences.gradient = preferences.gradient.next();
+            state.sidebar_host = preferences.clone();
+            Some(SettingsAction::SaveSidebarHost {
                 previous,
                 preferences,
             })
@@ -432,6 +485,8 @@ fn reorder_selected_sidebar_item(state: &mut AppState, delta: i8) -> Option<Sett
                 preferences,
             })
         }
+        // item 2: host group is not item-based (C3 fills behavior).
+        SidebarConfigGroup::Host => None,
     }
 }
 
@@ -600,6 +655,32 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
             KeyCode::Enter if state.settings.sidebar_config_editing => {
                 state.settings.sidebar_config_editing = false;
             }
+            // item 2 (C3): while editing a host option, Left/Right/Space cycle its value
+            // (the host group has no reorderable rows). Up/Down still navigate the option list.
+            KeyCode::Left
+            | KeyCode::Char('h')
+            | KeyCode::Right
+            | KeyCode::Char('l')
+            | KeyCode::Char(' ')
+                if state.settings.sidebar_config_editing
+                    && state.settings.sidebar_config_group == SidebarConfigGroup::Host =>
+            {
+                return cycle_sidebar_host_option(state);
+            }
+            KeyCode::Up | KeyCode::Char('k')
+                if state.settings.sidebar_config_editing
+                    && state.settings.sidebar_config_group == SidebarConfigGroup::Host =>
+            {
+                state.settings.list.move_prev();
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if state.settings.sidebar_config_editing
+                    && state.settings.sidebar_config_group == SidebarConfigGroup::Host =>
+            {
+                state.settings.list.move_next(sidebar_config_row_count(
+                    state.settings.sidebar_config_group,
+                ));
+            }
             KeyCode::Up | KeyCode::Char('k') if state.settings.sidebar_config_editing => {
                 return reorder_selected_sidebar_item(state, -1);
             }
@@ -637,6 +718,12 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 }
                 SidebarConfigGroup::Agents => {
                     if selected_sidebar_agent_item(state).is_some() {
+                        state.settings.sidebar_config_editing = true;
+                    }
+                }
+                // item 2 (C3): Enter enters edit mode on the focused host option row.
+                SidebarConfigGroup::Host => {
+                    if state.settings.list.selected < SIDEBAR_HOST_OPTION_COUNT {
                         state.settings.sidebar_config_editing = true;
                     }
                 }

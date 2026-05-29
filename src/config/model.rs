@@ -291,6 +291,209 @@ pub struct UiConfig {
 pub struct SidebarConfig {
     pub spaces: SidebarSpacesConfig,
     pub agents: SidebarAgentsConfig,
+    pub host: SidebarHostConfig,
+}
+
+/// Host-banner sidebar configuration (item 2 / C3). Styles the per-host banner row that
+/// sits above each remote host's spaces. There is NO off switch — the banner is always
+/// drawn for remote hosts; only its presentation is configured here.
+///
+/// Deserialization is hand-written via [`RawSidebarHostConfig`] (mirroring
+/// `SidebarSpacesConfig`) so unknown TOML enum values fall back to the documented defaults
+/// instead of failing the parse (contract Area 7 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SidebarHostConfig {
+    pub gradient: HostBannerGradient,
+    pub animation: HostBannerAnimation,
+    pub speed: HostBannerSpeed,
+    pub glyph: HostBannerGlyph,
+    pub show_count: bool,
+}
+
+impl Default for SidebarHostConfig {
+    fn default() -> Self {
+        Self {
+            gradient: HostBannerGradient::Rainbow,
+            animation: HostBannerAnimation::Animated,
+            speed: HostBannerSpeed::Calm,
+            glyph: HostBannerGlyph::Left,
+            show_count: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBannerGradient {
+    Rainbow,
+    Accent,
+    Cool,
+    Warm,
+    Muted,
+}
+
+impl HostBannerGradient {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Rainbow => Self::Accent,
+            Self::Accent => Self::Cool,
+            Self::Cool => Self::Warm,
+            Self::Warm => Self::Muted,
+            Self::Muted => Self::Rainbow,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rainbow => "rainbow",
+            Self::Accent => "accent",
+            Self::Cool => "cool",
+            Self::Warm => "warm",
+            Self::Muted => "muted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBannerAnimation {
+    Animated,
+    Static,
+}
+
+impl HostBannerAnimation {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Animated => Self::Static,
+            Self::Static => Self::Animated,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Animated => "animated",
+            Self::Static => "static",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBannerSpeed {
+    Calm,
+    Normal,
+    Lively,
+}
+
+impl HostBannerSpeed {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Calm => Self::Normal,
+            Self::Normal => Self::Lively,
+            Self::Lively => Self::Calm,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calm => "calm",
+            Self::Normal => "normal",
+            Self::Lively => "lively",
+        }
+    }
+
+    /// Per-tick phase drift used by the lolcat gradient animation. `Calm < Normal < Lively`.
+    pub fn drift(self) -> f32 {
+        match self {
+            Self::Calm => 0.04,
+            Self::Normal => 0.09,
+            Self::Lively => 0.16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBannerGlyph {
+    Left,
+    None,
+}
+
+impl HostBannerGlyph {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Left => Self::None,
+            Self::None => Self::Left,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Raw intermediate for [`SidebarHostConfig`] deserialization. Every enum field is parsed
+/// through a `parse_host_*` helper whose final arm yields the default, so unknown / `"off"`
+/// / missing values degrade to defaults instead of rejecting the config.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawSidebarHostConfig {
+    gradient: Option<String>,
+    animation: Option<String>,
+    speed: Option<String>,
+    glyph: Option<String>,
+    show_count: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for SidebarHostConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawSidebarHostConfig::deserialize(deserializer)?;
+        Ok(SidebarHostConfig {
+            gradient: parse_host_gradient(raw.gradient.as_deref()),
+            animation: parse_host_animation(raw.animation.as_deref()),
+            speed: parse_host_speed(raw.speed.as_deref()),
+            glyph: parse_host_glyph(raw.glyph.as_deref()),
+            show_count: raw.show_count.unwrap_or(false),
+        })
+    }
+}
+
+fn parse_host_gradient(value: Option<&str>) -> HostBannerGradient {
+    match value {
+        Some("accent") => HostBannerGradient::Accent,
+        Some("cool") => HostBannerGradient::Cool,
+        Some("warm") => HostBannerGradient::Warm,
+        Some("muted") => HostBannerGradient::Muted,
+        _ => HostBannerGradient::Rainbow,
+    }
+}
+
+fn parse_host_animation(value: Option<&str>) -> HostBannerAnimation {
+    match value {
+        Some("static") => HostBannerAnimation::Static,
+        _ => HostBannerAnimation::Animated,
+    }
+}
+
+fn parse_host_speed(value: Option<&str>) -> HostBannerSpeed {
+    match value {
+        Some("normal") => HostBannerSpeed::Normal,
+        Some("lively") => HostBannerSpeed::Lively,
+        _ => HostBannerSpeed::Calm,
+    }
+}
+
+fn parse_host_glyph(value: Option<&str>) -> HostBannerGlyph {
+    match value {
+        Some("none") => HostBannerGlyph::None,
+        _ => HostBannerGlyph::Left,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1477,5 +1680,104 @@ scrollback_lines = 12345
             assert_eq!(&current, expected_next);
         }
         assert_eq!(current, SidebarColorPreset::Default);
+    }
+
+    #[test]
+    fn sidebar_host_config_default() {
+        let host = SidebarHostConfig::default();
+        assert_eq!(host.gradient, HostBannerGradient::Rainbow);
+        assert_eq!(host.animation, HostBannerAnimation::Animated);
+        assert_eq!(host.speed, HostBannerSpeed::Calm);
+        assert_eq!(host.glyph, HostBannerGlyph::Left);
+        assert!(!host.show_count);
+        // A config with no `[ui.sidebar.host]` table yields the default.
+        let config = Config::default();
+        assert_eq!(config.ui.sidebar.host, SidebarHostConfig::default());
+    }
+
+    #[test]
+    fn sidebar_host_partial_toml_falls_back() {
+        let toml = r#"
+[ui.sidebar.host]
+glyph = "none"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.sidebar.host.glyph, HostBannerGlyph::None);
+        // The other four keep their defaults.
+        assert_eq!(config.ui.sidebar.host.gradient, HostBannerGradient::Rainbow);
+        assert_eq!(
+            config.ui.sidebar.host.animation,
+            HostBannerAnimation::Animated
+        );
+        assert_eq!(config.ui.sidebar.host.speed, HostBannerSpeed::Calm);
+        assert!(!config.ui.sidebar.host.show_count);
+    }
+
+    #[test]
+    fn sidebar_host_unknown_value_falls_back() {
+        // The governing deserialization-fallback test (contract Area 7 §3): unknown / "off"
+        // string values degrade to the documented defaults instead of failing the parse.
+        let toml = r#"
+[ui.sidebar.host]
+gradient = "off"
+animation = "wobble"
+speed = "warp"
+glyph = "right"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.sidebar.host.gradient, HostBannerGradient::Rainbow);
+        assert_eq!(
+            config.ui.sidebar.host.animation,
+            HostBannerAnimation::Animated
+        );
+        assert_eq!(config.ui.sidebar.host.speed, HostBannerSpeed::Calm);
+        assert_eq!(config.ui.sidebar.host.glyph, HostBannerGlyph::Left);
+    }
+
+    #[test]
+    fn host_config_has_no_off_switch() {
+        // Structural guard: there is no `enabled`/`show`/`off` key and no `Off` gradient.
+        // `"off"` deserializes to the default gradient (asserted above); a TOML table that sets
+        // `enabled` parses fine (the key is ignored) — there is no off switch to honour.
+        let toml = r#"
+[ui.sidebar.host]
+enabled = false
+show = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.sidebar.host, SidebarHostConfig::default());
+        // Round-tripping the serialized form never emits an off/enabled key.
+        let serialized = toml::to_string(&config.ui.sidebar.host).unwrap();
+        assert!(!serialized.contains("enabled"));
+        assert!(!serialized.contains("\"off\""));
+    }
+
+    #[test]
+    fn host_speed_presets_ordered() {
+        assert!(HostBannerSpeed::Calm.drift() < HostBannerSpeed::Normal.drift());
+        assert!(HostBannerSpeed::Normal.drift() < HostBannerSpeed::Lively.drift());
+    }
+
+    #[test]
+    fn host_banner_enums_cycle_through_all_variants() {
+        assert_eq!(
+            HostBannerGradient::Rainbow.next(),
+            HostBannerGradient::Accent
+        );
+        assert_eq!(
+            HostBannerGradient::Muted.next(),
+            HostBannerGradient::Rainbow
+        );
+        assert_eq!(
+            HostBannerAnimation::Animated.next(),
+            HostBannerAnimation::Static
+        );
+        assert_eq!(
+            HostBannerAnimation::Static.next(),
+            HostBannerAnimation::Animated
+        );
+        assert_eq!(HostBannerSpeed::Lively.next(), HostBannerSpeed::Calm);
+        assert_eq!(HostBannerGlyph::Left.next(), HostBannerGlyph::None);
+        assert_eq!(HostBannerGlyph::None.next(), HostBannerGlyph::Left);
     }
 }

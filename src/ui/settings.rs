@@ -518,6 +518,29 @@ fn render_settings_sidebar_config(app: &AppState, frame: &mut Frame, area: Rect)
                 }
             }
         }
+        // item 2 (C3): the host group exposes a fixed option list (no off control). Each row
+        // shows `label < value >`; `count` is a checkbox. Selected/edit styling is shared with
+        // the spaces/agents rows below.
+        SidebarConfigGroup::Host => {
+            let host = &app.sidebar_host;
+            let options: [(usize, &str, String); 5] = [
+                (0, "gradient", format!("< {} >", host.gradient.as_str())),
+                (1, "animation", format!("< {} >", host.animation.as_str())),
+                (2, "speed", format!("< {} >", host.speed.as_str())),
+                (3, "glyph", format!("< {} >", host.glyph.as_str())),
+                (
+                    4,
+                    "count",
+                    format!(
+                        "{} show space count",
+                        if host.show_count { "[✓]" } else { "[ ]" }
+                    ),
+                ),
+            ];
+            for (idx, label, value) in options {
+                rows.push((Line::from(format!(" {label}  {value}")), Some(idx), false));
+            }
+        }
     };
 
     let list_bottom = list_area.y.saturating_add(list_area.height);
@@ -559,6 +582,7 @@ fn render_settings_sidebar_config(app: &AppState, frame: &mut Frame, area: Rect)
     let demo_title = match app.settings.sidebar_config_group {
         SidebarConfigGroup::Spaces => "demo spaces",
         SidebarConfigGroup::Agents => "demo agents",
+        SidebarConfigGroup::Host => "demo host", // item 2 (C3 refines)
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -573,12 +597,14 @@ fn render_settings_sidebar_config(app: &AppState, frame: &mut Frame, area: Rect)
         SidebarConfigGroup::Agents => super::sidebar::settings_sidebar_agent_demo_width(app)
             .max(1)
             .min(list_area.width),
+        SidebarConfigGroup::Host => list_area.width, // item 2 (C3 refines)
     };
     let demo_lines = match app.settings.sidebar_config_group {
         SidebarConfigGroup::Spaces => super::sidebar::settings_sidebar_space_demo_lines(app),
         SidebarConfigGroup::Agents => {
             super::sidebar::settings_sidebar_agent_demo_lines(app, demo_width)
         }
+        SidebarConfigGroup::Host => vec![super::sidebar::settings_sidebar_host_demo_line(app)],
     };
     for (idx, line) in demo_lines.into_iter().enumerate() {
         let y = demo_y + 1 + idx as u16;
@@ -716,6 +742,45 @@ mod tests {
         assert!(!rendered.contains("1st line 1"));
         assert!(rendered.contains("demo spaces"));
         assert!(rendered.contains("↑2"));
+    }
+
+    #[test]
+    fn host_settings_renders_options_and_demo() {
+        // item 2 (C3): the host group renders `host - sidebar config`, the five options, and a
+        // labeled demo banner — and NO off control.
+        let mut app = AppState::test_new();
+        app.settings.section = SettingsSection::Sidebar;
+        app.settings.sidebar_config_group = crate::app::state::SidebarConfigGroup::Host;
+        app.settings.list.selected = 0;
+        app.mode = Mode::Settings;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_settings_overlay(&app, frame, Rect::new(0, 0, 80, 24)))
+            .expect("settings overlay should render");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("host - sidebar config"));
+        assert!(rendered.contains("gradient"));
+        assert!(rendered.contains("rainbow"));
+        assert!(rendered.contains("animation"));
+        assert!(rendered.contains("animated"));
+        assert!(rendered.contains("speed"));
+        assert!(rendered.contains("calm"));
+        assert!(rendered.contains("glyph"));
+        assert!(rendered.contains("show space count"));
+        assert!(rendered.contains("demo host"));
+        // No off control.
+        assert!(!rendered.contains("off"));
+        assert!(!rendered.contains("enabled"));
     }
 
     #[test]

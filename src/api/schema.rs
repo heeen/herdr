@@ -30,6 +30,8 @@ pub enum Method {
     RemoteRemove(RemoteRemoveParams),
     #[serde(rename = "remote.rename")]
     RemoteRename(RemoteRenameParams),
+    #[serde(rename = "remote.set_enabled")]
+    RemoteSetEnabled(RemoteSetEnabledParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -138,6 +140,12 @@ pub struct RemoteRemoveParams {
 pub struct RemoteRenameParams {
     pub remote_id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSetEnabledParams {
+    pub remote_id: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,6 +681,7 @@ pub struct UiSettingsInfo {
     pub sidebar_section_split_per_mille: u16,
     pub sidebar_spaces: crate::config::SidebarSpacesConfig,
     pub sidebar_agents: crate::config::SidebarAgentsConfig,
+    pub sidebar_host: crate::config::SidebarHostConfig,
 }
 
 impl Default for UiSettingsInfo {
@@ -686,6 +695,7 @@ impl Default for UiSettingsInfo {
             sidebar_section_split_per_mille: 500,
             sidebar_spaces: ui.sidebar.spaces,
             sidebar_agents: ui.sidebar.agents,
+            sidebar_host: ui.sidebar.host,
         }
     }
 }
@@ -726,6 +736,9 @@ pub enum ResponseResult {
         remote_id: String,
     },
     RemoteRenamed {
+        remote: crate::remote_registry::RemoteDefinitionSnapshot,
+    },
+    RemoteEnabledChanged {
         remote: crate::remote_registry::RemoteDefinitionSnapshot,
     },
     WorktreeList {

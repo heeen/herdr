@@ -234,6 +234,14 @@ impl App {
                             self.state.sidebar_agent = previous;
                         }
                     }
+                    SettingsAction::SaveSidebarHost {
+                        previous,
+                        preferences,
+                    } => {
+                        if !self.save_sidebar_host_preferences(preferences) {
+                            self.state.sidebar_host = previous;
+                        }
+                    }
                     SettingsAction::InstallRecommendedIntegrations => {
                         self.install_recommended_integrations()
                     }

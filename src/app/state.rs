@@ -80,6 +80,24 @@ pub struct Palette {
     pub peach: Color,
 }
 
+/// Linearly blend two colors channel-wise at ratio `t` (item 7). Returns a faint mix used
+/// for the subtle hover surface. Only `Color::Rgb` pairs can blend; if either input is a
+/// non-`Rgb` color (e.g. the 16-color `terminal()` palette), fall back to `b` (the
+/// stronger/`surface_dim` side) so the result stays a safe, never-bold background.
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let mix = |from: u8, to: u8| {
+                let from = from as f32;
+                let to = to as f32;
+                (from + (to - from) * t).round().clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+        }
+        _ => b,
+    }
+}
+
 impl Palette {
     pub(crate) fn sidebar_color(&self, preset: SidebarColorPreset, default: Color) -> Color {
         match preset {
@@ -89,6 +107,14 @@ impl Palette {
             SidebarColorPreset::Cool => self.teal,
             SidebarColorPreset::Warm => self.peach,
         }
+    }
+
+    /// Subtle hover background for sidebar rows/affordances (item 7). A faint lift between the
+    /// page background and the selection surface, so hover reads strictly weaker than
+    /// selected(`surface0`)/active(`surface_dim`)/drag(`surface1`). Theme-derived (no per-theme
+    /// table); non-`Rgb` palettes fall back to `surface_dim` (never bold). Hover NEVER bolds.
+    pub(crate) fn hover_bg(&self) -> Color {
+        blend_color(self.panel_bg, self.surface_dim, 0.5)
     }
 
     /// Catppuccin Mocha — the default.
@@ -574,6 +600,52 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// One per `HostBanner` entry in the workspace list (item 2). Empty in monolithic mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBannerSpec {
+    pub display_name: String,
+    pub connection_state: HostBannerState,
+    pub space_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostBannerState {
+    Connected,
+    Connecting,
+    Disconnected,
+    ProtocolMismatch,
+    Disabled,
+}
+
+/// Sidebar hover target (item 7). The agent variant is route-index keyed for the
+/// client path (route_idx survives recompose; pane_id does not) and pane_id keyed
+/// for the monolithic path (terminals are stable there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarHoverTarget {
+    Workspace {
+        ws_idx: usize,
+    },
+    AgentMono {
+        ws_idx: usize,
+        tab_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    AgentRoute {
+        route_idx: usize,
+    },
+    New,
+    Menu,
+    ScopeToggle,
+    Filter,
+    NewWorkspaceDestination {
+        row: u16,
+    },
+    HostBanner {
+        banner_idx: usize,
+    },
+    Divider,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -631,6 +703,8 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    pub divider_rows: Vec<u16>,                            // item 4
+    pub host_banner_areas: Vec<crate::ui::HostBannerArea>, // item 2
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
@@ -1148,15 +1222,17 @@ pub enum SidebarConfigGroup {
     #[default]
     Spaces,
     Agents,
+    Host, // item 2
 }
 
 impl SidebarConfigGroup {
-    const ALL: [Self; 2] = [Self::Spaces, Self::Agents];
+    const ALL: [Self; 3] = [Self::Spaces, Self::Agents, Self::Host];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Spaces => "spaces",
             Self::Agents => "agents",
+            Self::Host => "host", // item 2 (C3 refines)
         }
     }
 
@@ -1164,6 +1240,7 @@ impl SidebarConfigGroup {
         configured_line_count.max(match self {
             Self::Spaces => 2,
             Self::Agents => 3,
+            Self::Host => 5, // item 2 (C3 refines)
         })
     }
 
@@ -1641,6 +1718,21 @@ pub struct AppState {
     pub keybinds: Keybinds,
     /// Frame counter for spinner animations (wraps around).
     pub spinner_tick: u32,
+    /// item 4: per-workspace local/remote flag, index-aligned with `workspaces`; empty in monolithic.
+    pub(crate) client_workspace_remote: Vec<bool>,
+    /// item 2: one per HostBanner entry; empty in monolithic.
+    pub host_banners: Vec<HostBannerSpec>,
+    /// item 2: index-aligned with `host_banners`; each value is the `ws_idx` of the remote
+    /// host group's first workspace, i.e. the workspace the banner is emitted immediately
+    /// before. Empty in monolithic. Derived once in `from_model` from `host_banner_specs()`,
+    /// so render geometry stays a pure read.
+    pub(crate) host_banner_rows: Vec<usize>,
+    /// items 2/4: divider labeled↔plain coordination flag; false in monolithic.
+    pub(crate) host_banner_active: bool,
+    /// item 2: host banner config.
+    pub sidebar_host: crate::config::model::SidebarHostConfig,
+    /// item 7: current sidebar hover target.
+    pub(crate) sidebar_hover: Option<SidebarHoverTarget>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1671,6 +1763,13 @@ impl AppState {
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
         self.pane_id_aliases.remove(&pane_id.raw());
+    }
+
+    /// item 7: update the sidebar hover target, returning whether it changed.
+    pub(crate) fn set_sidebar_hover(&mut self, next: Option<SidebarHoverTarget>) -> bool {
+        let changed = self.sidebar_hover != next;
+        self.sidebar_hover = next;
+        changed
     }
 
     pub fn sound_enabled(&self) -> bool {
@@ -1885,6 +1984,8 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                divider_rows: Vec::new(),
+                host_banner_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -1949,6 +2050,12 @@ impl AppState {
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             spinner_tick: 0,
+            client_workspace_remote: Vec::new(),
+            host_banners: Vec::new(),
+            host_banner_rows: Vec::new(),
+            host_banner_active: false,
+            sidebar_host: crate::config::model::SidebarHostConfig::default(),
+            sidebar_hover: None,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             settings: SettingsState {
@@ -2015,6 +2122,124 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    // Area 0 inert-shape guards: exercise the shared symbols landed for the remote/sidebar
+    // overhaul so the tree compiles and the shapes exist before any item fills them.
+
+    #[test]
+    fn client_workspace_remote_is_empty_in_monolithic() {
+        let app = AppState::test_new();
+        assert!(app.client_workspace_remote.is_empty());
+        assert!(app.host_banners.is_empty());
+        assert!(!app.host_banner_active);
+        assert_eq!(
+            app.sidebar_host,
+            crate::config::model::SidebarHostConfig::default()
+        );
+        assert!(app.sidebar_hover.is_none());
+    }
+
+    #[test]
+    fn set_sidebar_hover_reports_changes() {
+        let mut app = AppState::test_new();
+        // Each shared hover variant must be constructible (item 7 fills behavior later).
+        let targets = [
+            SidebarHoverTarget::Workspace { ws_idx: 0 },
+            SidebarHoverTarget::AgentMono {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId::alloc(),
+            },
+            SidebarHoverTarget::AgentRoute { route_idx: 0 },
+            SidebarHoverTarget::New,
+            SidebarHoverTarget::Menu,
+            SidebarHoverTarget::ScopeToggle,
+            SidebarHoverTarget::Filter,
+            SidebarHoverTarget::NewWorkspaceDestination { row: 0 },
+            SidebarHoverTarget::HostBanner { banner_idx: 0 },
+            SidebarHoverTarget::Divider,
+        ];
+        assert!(app.set_sidebar_hover(Some(targets[0])));
+        assert!(!app.set_sidebar_hover(Some(targets[0])));
+        assert!(app.set_sidebar_hover(None));
+    }
+
+    #[test]
+    fn palette_hover_bg_is_between_panel_bg_and_surface_dim() {
+        // Mocha (Rgb) blends to the channel-wise midpoint of panel_bg and surface_dim, and is
+        // distinct from both endpoints so hover reads weaker than selection but visible.
+        let mocha = Palette::catppuccin();
+        let (Color::Rgb(pr, pg, pb), Color::Rgb(sr, sg, sb)) = (mocha.panel_bg, mocha.surface_dim)
+        else {
+            panic!("mocha panel_bg/surface_dim should be Rgb");
+        };
+        let mid = |a: u8, b: u8| ((a as f32 + (b as f32 - a as f32) * 0.5).round()) as u8;
+        assert_eq!(
+            mocha.hover_bg(),
+            Color::Rgb(mid(pr, sr), mid(pg, sg), mid(pb, sb))
+        );
+        assert_ne!(mocha.hover_bg(), mocha.surface_dim);
+        assert_ne!(mocha.hover_bg(), mocha.panel_bg);
+
+        // The 16-color terminal() palette can't blend (non-Rgb), so hover_bg falls back to the
+        // surface_dim side: a safe, never-bold background (no panic).
+        let term = Palette::terminal();
+        assert_eq!(term.hover_bg(), term.surface_dim);
+    }
+
+    #[test]
+    fn blend_color_falls_back_to_b_for_non_rgb() {
+        // Non-Rgb on either side returns `b` unchanged.
+        assert_eq!(
+            blend_color(Color::Reset, Color::DarkGray, 0.5),
+            Color::DarkGray
+        );
+        assert_eq!(
+            blend_color(Color::Rgb(0, 0, 0), Color::Green, 0.5),
+            Color::Green
+        );
+        // Rgb pair blends channel-wise.
+        assert_eq!(
+            blend_color(Color::Rgb(0, 0, 0), Color::Rgb(10, 20, 30), 0.5),
+            Color::Rgb(5, 10, 15)
+        );
+    }
+
+    #[test]
+    fn host_banner_spec_shape_exists() {
+        let spec = HostBannerSpec {
+            display_name: "prod".into(),
+            connection_state: HostBannerState::Connected,
+            space_count: 2,
+        };
+        assert_eq!(spec.display_name, "prod");
+        assert_eq!(spec.space_count, 2);
+        // every connection-state variant exists (item 2 maps server state → these).
+        for state in [
+            HostBannerState::Connected,
+            HostBannerState::Connecting,
+            HostBannerState::Disconnected,
+            HostBannerState::ProtocolMismatch,
+            HostBannerState::Disabled,
+        ] {
+            assert_eq!(
+                HostBannerSpec {
+                    display_name: spec.display_name.clone(),
+                    connection_state: state,
+                    space_count: spec.space_count,
+                }
+                .connection_state,
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn view_state_carries_divider_and_banner_channels() {
+        let app = AppState::test_new();
+        assert!(app.view.divider_rows.is_empty());
+        assert!(app.view.host_banner_areas.is_empty());
+    }
 
     #[test]
     fn built_in_theme_names_resolve() {

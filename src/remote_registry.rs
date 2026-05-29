@@ -15,6 +15,16 @@ pub struct RemoteDefinitionSnapshot {
     pub session: Option<String>,
     #[serde(default)]
     pub keybindings: RemoteKeybindingsSnapshot,
+    // item 3 (Area 5): a disabled remote stays persisted but is inert in the client supervisor
+    // (no SSH bridge, no client stream, no API poll, no reconnect candidate). `#[serde(default)]`
+    // makes old snapshots / old API JSON deserialize to `false` (enabled); `skip_serializing_if`
+    // keeps enabled remotes serializing byte-identical to today (no golden-file / on-disk churn).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +124,7 @@ impl RemoteRegistrySnapshot {
             target,
             session: None,
             keybindings,
+            disabled: false,
         };
         self.remotes.push(remote.clone());
         Ok(remote)
@@ -148,6 +159,23 @@ impl RemoteRegistrySnapshot {
             .find(|remote| remote.id == remote_id)
             .ok_or(RemoteRegistryError::NotFound)?;
         remote.name = name;
+        Ok(remote.clone())
+    }
+
+    /// item 3 (Area 5): flip a remote's enabled flag. `enabled == false` sets `disabled = true`,
+    /// keeping the definition persisted (the client supervisor gates it out of all plan
+    /// producers). Returns the updated definition clone, or `NotFound` if the id is unknown.
+    pub fn set_enabled(
+        &mut self,
+        remote_id: &str,
+        enabled: bool,
+    ) -> Result<RemoteDefinitionSnapshot, RemoteRegistryError> {
+        let remote = self
+            .remotes
+            .iter_mut()
+            .find(|remote| remote.id == remote_id)
+            .ok_or(RemoteRegistryError::NotFound)?;
+        remote.disabled = !enabled;
         Ok(remote.clone())
     }
 
@@ -308,5 +336,95 @@ mod tests {
 
         assert_eq!(duplicate, RemoteRegistryError::DuplicateTarget);
         assert!(registry.remotes.is_empty());
+    }
+
+    #[test]
+    fn disabled_defaults_to_false_for_new_remote() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        let remote = registry
+            .add(
+                Some("dev".into()),
+                "user@dev".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+
+        assert!(!remote.disabled);
+        assert!(!registry.remotes[0].disabled);
+    }
+
+    #[test]
+    fn enabled_remote_serializes_without_disabled_key() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        registry
+            .add(
+                Some("dev".into()),
+                "user@dev".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            !json.contains("disabled"),
+            "enabled remote must not serialize the disabled key: {json}"
+        );
+    }
+
+    #[test]
+    fn disabled_remote_serializes_the_key() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        let remote = registry
+            .add(
+                Some("dev".into()),
+                "user@dev".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        registry.set_enabled(&remote.id, false).unwrap();
+
+        let json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            json.contains("\"disabled\":true"),
+            "disabled remote must serialize the key: {json}"
+        );
+    }
+
+    #[test]
+    fn missing_disabled_key_deserializes_false() {
+        let json = r#"{"remotes":[{"id":"remote-1","name":"dev","target":{"type":"ssh","target":"user@dev"}}]}"#;
+        let registry: RemoteRegistrySnapshot = serde_json::from_str(json).unwrap();
+
+        assert_eq!(registry.remotes.len(), 1);
+        assert!(!registry.remotes[0].disabled);
+    }
+
+    #[test]
+    fn set_enabled_toggles_disabled() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        let remote = registry
+            .add(
+                Some("dev".into()),
+                "user@dev".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+
+        let disabled = registry.set_enabled(&remote.id, false).unwrap();
+        assert!(disabled.disabled);
+        assert!(registry.remotes[0].disabled);
+
+        let enabled = registry.set_enabled(&remote.id, true).unwrap();
+        assert!(!enabled.disabled);
+        assert!(!registry.remotes[0].disabled);
+    }
+
+    #[test]
+    fn set_enabled_missing_id_returns_not_found() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        assert_eq!(
+            registry.set_enabled("missing", false).unwrap_err(),
+            RemoteRegistryError::NotFound
+        );
     }
 }

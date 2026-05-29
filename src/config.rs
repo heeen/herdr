@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 mod io;
 mod keybinds;
-mod model;
+pub(crate) mod model;
 mod sound;
 mod theme;
 
@@ -19,9 +19,10 @@ pub use self::{
     },
     model::{
         validated_sidebar_bounds, AgentPanelScopeConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, KeysConfig, NewTerminalCwdConfig, SidebarAgentField,
-        SidebarAgentsConfig, SidebarColorPreset, SidebarItem, SidebarSpaceField,
-        SidebarSpacesConfig, ToastConfig, ToastDelivery,
+        ConfigReloadStatus, HostBannerAnimation, HostBannerGlyph, HostBannerGradient, KeysConfig,
+        NewTerminalCwdConfig, SidebarAgentField, SidebarAgentsConfig, SidebarColorPreset,
+        SidebarHostConfig, SidebarItem, SidebarSpaceField, SidebarSpacesConfig, ToastConfig,
+        ToastDelivery,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

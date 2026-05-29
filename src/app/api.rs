@@ -472,6 +472,9 @@ impl App {
             Method::RemoteAdd(params) => return self.handle_remote_add(request.id, params),
             Method::RemoteRemove(params) => return self.handle_remote_remove(request.id, params),
             Method::RemoteRename(params) => return self.handle_remote_rename(request.id, params),
+            Method::RemoteSetEnabled(params) => {
+                return self.handle_remote_set_enabled(request.id, params)
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
@@ -559,6 +562,7 @@ impl App {
             ),
             sidebar_spaces: self.state.sidebar_space.clone(),
             sidebar_agents: self.state.sidebar_agent.clone(),
+            sidebar_host: self.state.sidebar_host.clone(),
         }
     }
 }

@@ -58,10 +58,16 @@ use self::status::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
-        new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
+        add_remote_button_rects, add_remote_inner_rect, confirm_close_button_rects,
+        confirm_close_popup_rect, new_linked_worktree_button_rects, new_linked_worktree_inner_rect,
+        new_workspace_picker_button_rects, new_workspace_picker_inner_rect,
+        new_workspace_picker_row_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_visible_start,
-        remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
+        remote_manage_confirm_button_rects, remote_manage_confirm_popup_rect,
+        remote_manage_inner_rect, remote_manage_row_rect, remove_worktree_button_rects,
+        remove_worktree_popup_rect, rename_button_rects, render_add_remote_overlay,
+        render_new_workspace_picker_overlay, render_remote_manage_overlay, AddRemoteOverlayView,
+        DestinationView, RemoteManageRowView, RemoteStateGlyph,
     },
     settings::{
         settings_button_rects, settings_show_primary_action, SETTINGS_POPUP_HEIGHT,
@@ -71,10 +77,10 @@ pub(crate) use self::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_entry_row_count,
         agent_panel_scroll_metrics, agent_panel_scrollbar_rect, agent_panel_toggle_rect,
         collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
-        expanded_sidebar_sections, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_indicator_row, workspace_list_entries, workspace_list_rect,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        WorkspaceListEntry,
+        compute_workspace_list_areas_full, expanded_sidebar_sections, normalized_workspace_scroll,
+        sidebar_section_divider_rect, workspace_drop_indicator_row, workspace_list_entries,
+        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
+        workspace_parent_group_state, HostBannerArea, WorkspaceListEntry,
     },
 };
 pub(crate) use self::{
@@ -215,6 +221,8 @@ pub(crate) fn compute_embedded_content_view_with_cell_size(
         layout: ViewLayout::Desktop,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        divider_rows: Vec::new(),
+        host_banner_areas: Vec::new(),
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -341,6 +349,8 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
+        divider_rows: Vec::new(),
+        host_banner_areas: Vec::new(),
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -410,6 +420,8 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        divider_rows: Vec::new(),
+        host_banner_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
         tab_scroll_left_hit_area: Rect::default(),
@@ -546,7 +558,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
     }
 }
 
-fn dim_background(frame: &mut Frame, area: Rect) {
+pub(crate) fn dim_background(frame: &mut Frame, area: Rect) {
     let buf = frame.buffer_mut();
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
