@@ -409,6 +409,16 @@ fn dispatch_composited_mouse_input(
         };
     }
 
+    if let Some(changed) =
+        compositor.handle_sidebar_scroll_mouse(model, mouse, host_size.0, host_size.1)
+    {
+        return if changed {
+            ClientInputDispatch::Redraw
+        } else {
+            ClientInputDispatch::Consumed
+        };
+    }
+
     if let Some(target) =
         compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
     {
@@ -3792,6 +3802,60 @@ mod tests {
         (model, remote_id)
     }
 
+    fn mixed_remote_model_with_many_workspaces(
+        main_count: usize,
+        remote_count: usize,
+    ) -> (supervisor::ClientSupervisorModel, supervisor::ServerId) {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+
+        let main_workspaces = (0..main_count)
+            .map(|idx| supervisor::WorkspaceSummary {
+                workspace_id: format!("main-{idx}"),
+                label: format!("main-{idx}"),
+                branch: None,
+                focused: idx == 0,
+            })
+            .collect();
+        model
+            .set_summary(
+                &supervisor::ServerId::main(),
+                supervisor::ServerSummary {
+                    workspaces: main_workspaces,
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let remote_workspaces = (0..remote_count)
+            .map(|idx| supervisor::WorkspaceSummary {
+                workspace_id: format!("remote-{idx}"),
+                label: format!("remote-{idx}"),
+                branch: None,
+                focused: false,
+            })
+            .collect();
+        model
+            .set_summary(
+                &remote_id,
+                supervisor::ServerSummary {
+                    workspaces: remote_workspaces,
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        (model, remote_id)
+    }
+
     #[test]
     fn composited_input_clicking_filter_cycles_sidebar_filter_without_forwarding() {
         let (mut model, _) = mixed_remote_model();
@@ -3844,6 +3908,74 @@ mod tests {
                     method: crate::api::schema::Method::WorkspaceFocus(
                         crate::api::schema::WorkspaceTarget {
                             workspace_id: "remote-api".into(),
+                        },
+                    ),
+                }),
+            }
+        );
+        assert_eq!(model.active_server_id(), &remote_id);
+    }
+
+    #[test]
+    fn composited_input_scrolls_workspace_list_before_clicking_remote_workspace() {
+        let (mut model, remote_id) = mixed_remote_model_with_many_workspaces(8, 2);
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host_size = (60, 12);
+
+        assert!(
+            (0..host_size.1).all(|row| {
+                !matches!(
+                    compositor.hit_test(&model, 1, row, host_size.0, host_size.1),
+                    Some(compositor::SidebarHitTarget::Workspace {
+                        server_id,
+                        workspace_id: _,
+                    }) if server_id == remote_id
+                )
+            }),
+            "remote workspaces should start below the visible workspace viewport"
+        );
+
+        for _ in 0..8 {
+            assert_eq!(
+                dispatch_composited_input(
+                    b"\x1b[<65;2;3M".to_vec(),
+                    &mut compositor,
+                    &mut model,
+                    host_size,
+                ),
+                ClientInputDispatch::Redraw
+            );
+        }
+
+        let row = (0..host_size.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host_size.0, host_size.1),
+                    Some(compositor::SidebarHitTarget::Workspace {
+                        server_id,
+                        workspace_id,
+                    }) if server_id == remote_id && workspace_id == "remote-0"
+                )
+            })
+            .expect("scrolling should reveal the first remote workspace row");
+
+        let dispatch = dispatch_composited_input(
+            format!("\x1b[<0;2;{}M", row + 1).into_bytes(),
+            &mut compositor,
+            &mut model,
+            host_size,
+        );
+
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: remote_id.clone(),
+                refresh: ClientApiRefreshPolicy::Deferred,
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-focus".into(),
+                    method: crate::api::schema::Method::WorkspaceFocus(
+                        crate::api::schema::WorkspaceTarget {
+                            workspace_id: "remote-0".into(),
                         },
                     ),
                 }),

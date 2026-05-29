@@ -19,6 +19,8 @@ pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 
 pub(crate) struct ClientCompositor {
     sidebar_width: u16,
+    workspace_scroll: usize,
+    agent_panel_scroll: usize,
     resizing_sidebar: bool,
 }
 
@@ -72,6 +74,8 @@ impl ClientCompositor {
     pub(crate) fn new(sidebar_width: u16) -> Self {
         Self {
             sidebar_width,
+            workspace_scroll: 0,
+            agent_panel_scroll: 0,
             resizing_sidebar: false,
         }
     }
@@ -113,6 +117,64 @@ impl ClientCompositor {
         }
     }
 
+    pub(crate) fn handle_sidebar_scroll_mouse(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<bool> {
+        use crossterm::event::MouseEventKind;
+
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return None,
+        };
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0
+            || host_height == 0
+            || mouse.column >= sidebar_width
+            || mouse.row >= host_height
+        {
+            return None;
+        }
+
+        let snapshot =
+            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        let over_agent_panel = detail_area != Rect::default()
+            && mouse.row >= detail_area.y
+            && mouse.row < detail_area.y.saturating_add(detail_area.height);
+
+        if over_agent_panel {
+            let metrics = crate::ui::agent_panel_scroll_metrics(&snapshot.app, detail_area);
+            if !crate::ui::should_show_scrollbar(metrics) {
+                return Some(false);
+            }
+            let next = scrolled_offset(snapshot.app.agent_panel_scroll, delta, metrics);
+            let changed = next != snapshot.app.agent_panel_scroll;
+            self.agent_panel_scroll = next;
+            return Some(changed);
+        }
+
+        let area = crate::ui::workspace_list_rect(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        let metrics = crate::ui::workspace_list_scroll_metrics(&snapshot.app, area);
+        if !crate::ui::should_show_scrollbar(metrics) {
+            return Some(false);
+        }
+        let next = scrolled_offset(snapshot.app.workspace_scroll, delta, metrics);
+        let changed = next != snapshot.app.workspace_scroll;
+        self.workspace_scroll = next;
+        Some(changed)
+    }
+
     fn set_sidebar_width_from_column(
         &mut self,
         column: u16,
@@ -139,7 +201,7 @@ impl ClientCompositor {
         let sidebar_width = self.effective_sidebar_width(host_width);
         let content_width = host_width.saturating_sub(sidebar_width);
         let snapshot =
-            ClientSidebarSnapshot::from_model(model, sidebar_width, host_width, host_height);
+            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
         let global_menu_rect = snapshot.global_menu_rect();
         let mut frame = render_client_shell(&snapshot, host_width, host_height);
 
@@ -197,7 +259,7 @@ impl ClientCompositor {
         }
 
         let snapshot =
-            ClientSidebarSnapshot::from_model(model, sidebar_width, host_width, host_height);
+            ClientSidebarSnapshot::from_model(model, self, sidebar_width, host_width, host_height);
 
         if let Some(target) = hit_test_global_menu(&snapshot.app, x, y) {
             return Some(target);
@@ -275,6 +337,16 @@ impl ClientCompositor {
     }
 }
 
+fn scrolled_offset(current: usize, delta: i16, metrics: crate::pane::ScrollMetrics) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        current
+            .saturating_add(delta as usize)
+            .min(metrics.max_offset_from_bottom)
+    }
+}
+
 impl Default for ClientCompositor {
     fn default() -> Self {
         Self::new(DEFAULT_SIDEBAR_WIDTH)
@@ -284,6 +356,7 @@ impl Default for ClientCompositor {
 impl ClientSidebarSnapshot {
     fn from_model(
         model: &crate::client::supervisor::ClientSupervisorModel,
+        compositor: &ClientCompositor,
         sidebar_width: u16,
         host_width: u16,
         host_height: u16,
@@ -380,6 +453,16 @@ impl ClientSidebarSnapshot {
             app.active = Some(selected);
             app.selected = selected;
         }
+        app.workspace_scroll = crate::ui::normalized_workspace_scroll(
+            &app,
+            app.view.sidebar_rect,
+            compositor.workspace_scroll,
+        );
+        let (_, detail_area) =
+            crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+        app.agent_panel_scroll = compositor
+            .agent_panel_scroll
+            .min(crate::ui::agent_panel_scroll_metrics(&app, detail_area).max_offset_from_bottom);
         app.view.workspace_card_areas =
             crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect);
 
