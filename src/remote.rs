@@ -23,6 +23,7 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+const REMOTE_BRIDGE_PROBE_ENV_VAR: &str = "HERDR_REMOTE_BRIDGE_PROBE";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const MAIN_DISPLAY_NAME_ENV_VAR: &str = "HERDR_MAIN_DISPLAY_NAME";
 pub(crate) const MAIN_REMOTE_TARGET_ENV_VAR: &str = "HERDR_MAIN_REMOTE_TARGET";
@@ -285,6 +286,10 @@ fn start_ssh_remote_bridge_with_prepared(
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
+    if remote_bridge_probe_requested() {
+        return Ok(());
+    }
+
     ensure_remote_server_running()?;
 
     let socket_path = crate::server::socket_paths::client_socket_path();
@@ -292,10 +297,18 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 }
 
 pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+    if remote_bridge_probe_requested() {
+        return Ok(());
+    }
+
     ensure_remote_server_running()?;
 
     let socket_path = crate::api::socket_path();
     bridge_stdio_to_socket(&socket_path, "API")
+}
+
+fn remote_bridge_probe_requested() -> bool {
+    std::env::var_os(REMOTE_BRIDGE_PROBE_ENV_VAR).is_some()
 }
 
 fn bridge_stdio_to_socket(socket_path: &Path, label: &str) -> io::Result<()> {
@@ -398,7 +411,10 @@ struct RemoteHerdr {
 
 impl RemoteHerdr {
     fn for_platform(platform: RemotePlatform) -> Self {
-        let install_suffix = ".local/bin/herdr".to_string();
+        Self::for_install_suffix(platform, ".local/bin/herdr".to_string())
+    }
+
+    fn for_install_suffix(platform: RemotePlatform, install_suffix: String) -> Self {
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
             install_suffix,
@@ -513,6 +529,7 @@ fn prepare_remote_herdr(
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
     let path_remote_herdr = remote_binary_on_path_any(target, &remote_herdr)?;
+    let exe_name_remote_herdr = remote_herdr_from_current_exe_name(&remote_herdr.platform);
 
     if override_binary.is_none() {
         if let Some(path_remote_herdr) = path_remote_herdr
@@ -521,6 +538,15 @@ fn prepare_remote_herdr(
         {
             return Ok(PreparedRemoteHerdr {
                 remote_herdr: path_remote_herdr.clone(),
+                installed_or_replaced: false,
+            });
+        }
+        if let Some(exe_name_remote_herdr) = exe_name_remote_herdr
+            .as_ref()
+            .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
+        {
+            return Ok(PreparedRemoteHerdr {
+                remote_herdr: exe_name_remote_herdr.clone(),
                 installed_or_replaced: false,
             });
         }
@@ -635,11 +661,30 @@ fn remote_herdr_from_path_probe_any(
     Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
 }
 
+fn remote_herdr_from_current_exe_name(platform: &RemotePlatform) -> Option<RemoteHerdr> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_name()?.to_str()?;
+    remote_herdr_from_exe_name(platform.clone(), name)
+}
+
+fn remote_herdr_from_exe_name(platform: RemotePlatform, name: &str) -> Option<RemoteHerdr> {
+    if name == "herdr"
+        || name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+
+    Some(RemoteHerdr::for_install_suffix(
+        platform,
+        format!(".local/bin/{name}"),
+    ))
+}
+
 fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
-    let command = format!(
-        "test -x {0} && {0} --version && {0} status client --json",
-        remote_herdr.shell_path
-    );
+    let command = remote_binary_match_command(remote_herdr);
     let output = ssh_output(target, &command)?;
     if !output.status.success() {
         return Ok(false);
@@ -653,6 +698,13 @@ fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result
         && parse_client_status_json(status)
             .map(|status| status.protocol == CURRENT_PROTOCOL)
             .unwrap_or(false))
+}
+
+fn remote_binary_match_command(remote_herdr: &RemoteHerdr) -> String {
+    format!(
+        "test -x {0} && {0} --version && {0} status client --json && {1}=1 {0} remote-client-bridge && {1}=1 {0} remote-api-bridge",
+        remote_herdr.shell_path, REMOTE_BRIDGE_PROBE_ENV_VAR
+    )
 }
 
 fn remote_binary_exists(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -2051,6 +2103,48 @@ mod tests {
             ),
             "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
         );
+    }
+
+    #[test]
+    fn remote_binary_match_command_requires_bridge_probe() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "macos",
+            arch: "aarch64",
+        });
+
+        assert_eq!(
+            remote_binary_match_command(&remote_herdr),
+            "test -x \"$HOME/.local/bin/herdr\" && \"$HOME/.local/bin/herdr\" --version && \"$HOME/.local/bin/herdr\" status client --json && HERDR_REMOTE_BRIDGE_PROBE=1 \"$HOME/.local/bin/herdr\" remote-client-bridge && HERDR_REMOTE_BRIDGE_PROBE=1 \"$HOME/.local/bin/herdr\" remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_herdr_from_exe_name_uses_commit_labeled_binary() {
+        let platform = RemotePlatform {
+            os: "macos",
+            arch: "aarch64",
+        };
+        let remote_herdr =
+            remote_herdr_from_exe_name(platform, "herdr-39986ed").expect("commit binary");
+
+        assert_eq!(
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteBridgeKind::Api,
+            ),
+            "exec \"$HOME/.local/bin/herdr-39986ed\" remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_herdr_from_exe_name_skips_plain_binary_name() {
+        let platform = RemotePlatform {
+            os: "macos",
+            arch: "aarch64",
+        };
+
+        assert!(remote_herdr_from_exe_name(platform, "herdr").is_none());
     }
 
     #[test]
