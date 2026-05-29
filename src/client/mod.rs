@@ -41,6 +41,7 @@ use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 const CLIENT_SUPERVISOR_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const CLIENT_SUPERVISOR_API_TIMEOUT: Duration = Duration::from_secs(2);
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -1389,7 +1390,7 @@ fn send_client_supervisor_request(
         .ok_or_else(|| format!("no API target for server {server_id:?}"))?;
     let api = crate::api::client::ApiClient::for_target(target);
     let value = api
-        .request_value_with_timeout(&request, Duration::from_millis(500))
+        .request_value_with_timeout(&request, CLIENT_SUPERVISOR_API_TIMEOUT)
         .map_err(|err| err.to_string())?;
     crate::api::client::parse_response_value(value)
         .map(|_| ())
@@ -1493,7 +1494,7 @@ fn spawn_supervisor_summary_subscription(
         let client = crate::api::client::ApiClient::for_target(target);
         let request = summary_refresh_subscription_request(format!("client:summary:{server_id:?}"));
         let (ack, mut stream) =
-            match client.subscribe_value(&request, Some(Duration::from_millis(500))) {
+            match client.subscribe_value(&request, Some(CLIENT_SUPERVISOR_API_TIMEOUT)) {
                 Ok(value) => value,
                 Err(err) => {
                     warn!(
@@ -4344,6 +4345,63 @@ mod tests {
         assert_eq!(
             client_socket_path_for_supervisor_server(&model, &remote_id, &ssh_bridges),
             Some(client_socket)
+        );
+    }
+
+    #[test]
+    fn client_supervisor_request_allows_ssh_bridge_latency() {
+        let socket_dir = std::env::temp_dir().join(format!(
+            "herdr-delayed-api-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let api_socket = socket_dir.join("api.sock");
+        let client_socket = socket_dir.join("client.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&api_socket).unwrap();
+
+        let api_thread = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
+            assert!(request_line.contains("\"ping\""));
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = writeln!(
+                stream,
+                "{{\"id\":\"delayed\",\"result\":{{\"type\":\"pong\",\"version\":\"0.6.4\",\"protocol\":{}}}}}",
+                PROTOCOL_VERSION
+            );
+        });
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-prod".into(),
+            name: "prod".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "prod.example.com".into(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+        });
+        let bridge =
+            crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
+        let ssh_bridges = HashMap::from([(remote_id.clone(), bridge)]);
+        let request = crate::api::schema::Request {
+            id: "delayed".into(),
+            method: crate::api::schema::Method::Ping(crate::api::schema::PingParams::default()),
+        };
+
+        let result = send_client_supervisor_request(&model, &remote_id, request, &ssh_bridges);
+
+        api_thread.join().unwrap();
+        std::fs::remove_dir_all(&socket_dir).unwrap();
+        assert!(
+            result.is_ok(),
+            "SSH bridge API requests should tolerate sub-second remote latency: {result:?}"
         );
     }
 

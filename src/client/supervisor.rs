@@ -260,7 +260,7 @@ pub(crate) struct ClientSupervisorModel {
     client_overlay: ClientOverlayState,
 }
 
-const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(crate) trait SupervisorApi {
     fn request(

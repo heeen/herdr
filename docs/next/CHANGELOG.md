@@ -7,6 +7,7 @@
 
 ### Fixed
 - Fixed mixed remote client sidebar wheel scrolling so overflowed remote spaces can be reached and clicked.
+- Fixed SSH-backed mixed remote sidebar actions timing out too aggressively, so clicking remote spaces can route focus over slower remote API bridges.
 
 ## [0.6.4] - 2026-05-27
 

@@ -1372,6 +1372,134 @@ fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survi
 }
 
 #[test]
+fn mixed_client_clicking_remote_workspace_focuses_and_displays_remote_content() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let dev_socket_dir = session_socket_dir(&config_home, "dev");
+    let dev_api_socket = dev_socket_dir.join("herdr.sock");
+    let dev_client_socket = dev_socket_dir.join("herdr-client.sock");
+
+    let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_main_workspace_id, main_pane_id) =
+        create_workspace_and_root_pane(&api_socket, "main-visible");
+
+    let dev_server = spawn_named_server(&config_home, &runtime_dir, "dev");
+    wait_for_socket(&dev_api_socket, Duration::from_secs(10));
+    wait_for_file(&dev_client_socket, Duration::from_secs(10));
+    let (_dev_workspace_id, dev_pane_id) =
+        create_workspace_and_root_pane(&dev_api_socket, "dev-visible");
+
+    let main_marker = format!("MAIN_CLICK_CONTENT_{}", std::process::id());
+    let dev_marker = format!("REMOTE_CLICK_CONTENT_{}", std::process::id());
+    pane_send_input(
+        &api_socket,
+        &main_pane_id,
+        &format!("printf '{main_marker}\\n'"),
+    );
+    pane_send_input(
+        &dev_api_socket,
+        &dev_pane_id,
+        &format!("printf '{dev_marker}\\n'"),
+    );
+    assert!(
+        pane_read_recent_contains(
+            &api_socket,
+            &main_pane_id,
+            &main_marker,
+            Duration::from_secs(5)
+        ),
+        "main pane should contain marker before launching mixed client"
+    );
+    assert!(
+        pane_read_recent_contains(
+            &dev_api_socket,
+            &dev_pane_id,
+            &dev_marker,
+            Duration::from_secs(5)
+        ),
+        "remote pane should contain marker before launching mixed client"
+    );
+
+    let add_remote = send_json_request(
+        &api_socket,
+        r#"{"id":"remote_add","method":"remote.add","params":{"name":"dev","target":"local:dev"}}"#,
+    );
+    if add_remote.get("error").is_some() {
+        panic!("remote.add failed: {add_remote}");
+    }
+
+    let main_log_path = server_log_path(&config_home);
+    let dev_log_path = dev_socket_dir.join("herdr-server.log");
+    let main_connected_before = count_log_occurrences(&main_log_path, "client connected");
+    let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
+    let dev_focus_before = count_log_occurrences(&dev_log_path, "client:workspace-focus");
+
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let client_output = spawn_pty_output_collector(client._master.as_ref());
+    let mut client_writer = client._master.take_writer().expect("open PTY writer");
+
+    assert!(
+        wait_for_log_occurrence_count(
+            &main_log_path,
+            "client connected",
+            main_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the main client stream"
+    );
+    assert!(
+        wait_for_log_occurrence_count(
+            &dev_log_path,
+            "client connected",
+            dev_connected_before + 1,
+            Duration::from_secs(10),
+        ),
+        "thin client should connect to the local:dev client stream"
+    );
+    assert!(
+        wait_for_output_containing(
+            &client_output,
+            &["main-visible", "dev-visible", &main_marker],
+            Duration::from_secs(10),
+        ),
+        "mixed client should render main content and both workspace labels before clicking"
+    );
+
+    let mut displayed_remote = false;
+    for sgr_row in 2..=11 {
+        write_sgr_mouse_click(client_writer.as_mut(), 2, sgr_row);
+        if wait_for_output_containing(&client_output, &[&dev_marker], Duration::from_millis(400)) {
+            displayed_remote = true;
+            break;
+        }
+    }
+
+    assert!(
+        displayed_remote,
+        "clicking a visible remote workspace row should switch the mixed client content to the remote frame"
+    );
+    assert!(
+        wait_for_log_occurrence_count(
+            &dev_log_path,
+            "client:workspace-focus",
+            dev_focus_before + 1,
+            Duration::from_secs(5),
+        ),
+        "clicking the remote workspace row should route workspace.focus to the remote API"
+    );
+
+    drop(client);
+    drop(dev_server);
+    cleanup_spawned_herdr(main_server, base);
+}
+
+#[test]
 fn mixed_client_menu_uses_server_launcher_surface() {
     let _lock = test_lock();
     let base = unique_test_dir();
