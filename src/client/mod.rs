@@ -2965,7 +2965,7 @@ async fn run_client_loop(
                                 continue;
                             }
                             ClientInputDispatch::AddRemote(draft) => {
-                                model.set_add_remote_error("adding remote...");
+                                model.set_add_remote_in_progress();
                                 spawn_client_add_remote_submission(
                                     draft,
                                     state.reported_size,

@@ -886,6 +886,8 @@ fn render_client_shell(
                     focused_is_target: form.focused_field
                         == crate::client::supervisor::AddRemoteField::Target,
                     error: form.error.as_deref(),
+                    in_progress: form.in_progress,
+                    spinner: crate::ui::spinner_frame(snapshot.app.spinner_tick),
                 };
                 crate::ui::render_add_remote_overlay(
                     &snapshot.app.palette,
@@ -973,6 +975,7 @@ pub(crate) fn sidebar_wants_animation(
         .iter()
         .any(|g| g.agents.iter().any(|r| r.status == "working"))
         || model.host_banner_animation_active()
+        || model.add_remote_in_progress()
 }
 
 /// item 3 (Area 5): map the supervisor `RemoteManageRow`s into ui-owned `RemoteManageRowView`s

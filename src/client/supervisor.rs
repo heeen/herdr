@@ -186,6 +186,10 @@ pub(crate) struct AddRemoteForm {
     pub(crate) name: String,
     pub(crate) focused_field: AddRemoteField,
     pub(crate) error: Option<String>,
+    /// True while the submission worker is connecting/installing/attaching. Rendered as an
+    /// animated status line (distinct from `error`) so a slow connect reads as progress, not as a
+    /// failure, and never as the old static red "adding remote..." string.
+    pub(crate) in_progress: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,6 +967,7 @@ impl ClientSupervisorModel {
             name: String::new(),
             focused_field: AddRemoteField::Target,
             error: None,
+            in_progress: false,
         });
     }
 
@@ -1060,7 +1065,21 @@ impl ClientSupervisorModel {
     pub(crate) fn set_add_remote_error(&mut self, error: impl Into<String>) {
         if let Some(form) = self.add_remote_form_mut() {
             form.error = Some(error.into());
+            form.in_progress = false;
         }
+    }
+
+    /// Mark the add-remote submission as in flight: clears any prior error and switches the status
+    /// row to the animated progress line.
+    pub(crate) fn set_add_remote_in_progress(&mut self) {
+        if let Some(form) = self.add_remote_form_mut() {
+            form.error = None;
+            form.in_progress = true;
+        }
+    }
+
+    pub(crate) fn add_remote_in_progress(&self) -> bool {
+        self.add_remote_form().is_some_and(|form| form.in_progress)
     }
 
     pub(crate) fn finish_add_remote(&mut self) {
@@ -1954,6 +1973,42 @@ fn agent_status_label(status: crate::api::schema::AgentStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_remote_in_progress_clears_error_and_animates() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        assert!(!model.add_remote_in_progress());
+
+        model.set_add_remote_error("boom");
+        assert!(!model.add_remote_in_progress());
+        assert_eq!(
+            model.add_remote_form().unwrap().error.as_deref(),
+            Some("boom")
+        );
+
+        model.set_add_remote_in_progress();
+        assert!(model.add_remote_in_progress());
+        assert_eq!(model.add_remote_form().unwrap().error, None);
+    }
+
+    #[test]
+    fn add_remote_error_supersedes_in_progress() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        model.set_add_remote_in_progress();
+        assert!(model.add_remote_in_progress());
+
+        // Mirrors the AddRemoteFinished(Err) path: the failure replaces the spinner with an error.
+        model.set_add_remote_error("cannot reach host over ssh — check the address");
+        assert!(!model.add_remote_in_progress());
+        assert!(model
+            .add_remote_form()
+            .unwrap()
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("cannot reach host")));
+    }
 
     #[test]
     fn workspace_sidebar_row_is_remote_set_in_all_paths() {
@@ -3541,6 +3596,7 @@ mod tests {
                 name: String::new(),
                 focused_field: AddRemoteField::Target,
                 error: None,
+                in_progress: false,
             })
         );
     }

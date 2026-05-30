@@ -27,6 +27,11 @@ pub(crate) struct AddRemoteOverlayView<'a> {
     pub name: &'a str,
     pub focused_is_target: bool,
     pub error: Option<&'a str>,
+    /// When true, the status row shows an animated "connecting" line instead of an error. Takes
+    /// precedence over `error` (the worker clears the error when it starts).
+    pub in_progress: bool,
+    /// Current spinner glyph for the in-progress line (advances with the shared animation tick).
+    pub spinner: &'a str,
 }
 
 /// View for one new-workspace destination row.
@@ -869,7 +874,13 @@ pub(crate) fn render_add_remote_overlay(
         palette,
     );
 
-    if let Some(error) = view.error {
+    if view.in_progress {
+        frame.render_widget(
+            Paragraph::new(format!(" {} connecting to remote…", view.spinner))
+                .style(Style::default().fg(palette.accent)),
+            rows[4],
+        );
+    } else if let Some(error) = view.error {
         frame.render_widget(
             Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
             rows[4],
