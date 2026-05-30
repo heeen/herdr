@@ -50,7 +50,12 @@ pub(crate) enum ConnectionState {
 pub(crate) enum ServerConnectionTarget {
     Main,
     LocalSession(Option<String>),
-    Ssh(String),
+    /// `destination` is the ssh host (dedup/display key); `options` are the extra ssh flags from a
+    /// full add-remote spec (e.g. `-L`, `-J`, `-p`) carried so port-forwards/jump hosts apply.
+    Ssh {
+        destination: String,
+        options: Vec<String>,
+    },
 }
 
 impl From<crate::remote_registry::RemoteTargetSnapshot> for ServerConnectionTarget {
@@ -59,7 +64,10 @@ impl From<crate::remote_registry::RemoteTargetSnapshot> for ServerConnectionTarg
             crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
                 Self::LocalSession(session)
             }
-            crate::remote_registry::RemoteTargetSnapshot::Ssh { target, .. } => Self::Ssh(target),
+            crate::remote_registry::RemoteTargetSnapshot::Ssh { target, args } => Self::Ssh {
+                destination: target,
+                options: args,
+            },
         }
     }
 }
@@ -72,7 +80,21 @@ impl ServerConnectionTarget {
             ServerConnectionTarget::LocalSession(session) => {
                 format!("local:{}", session.as_deref().unwrap_or("default"))
             }
-            ServerConnectionTarget::Ssh(target) => target.clone(),
+            ServerConnectionTarget::Ssh { destination, .. } => destination.clone(),
+        }
+    }
+
+    /// The resolved ssh connection (destination + options) for an ssh target, or `None` otherwise.
+    pub(crate) fn ssh_target(&self) -> Option<crate::remote::SshTarget> {
+        match self {
+            ServerConnectionTarget::Ssh {
+                destination,
+                options,
+            } => Some(crate::remote::SshTarget::new(
+                destination.clone(),
+                options.clone(),
+            )),
+            _ => None,
         }
     }
 }
@@ -1775,7 +1797,7 @@ fn managed_secondary(
 fn connection_target_rank(target: &ServerConnectionTarget) -> u8 {
     match target {
         ServerConnectionTarget::LocalSession(_) => 0,
-        ServerConnectionTarget::Ssh(_) => 1,
+        ServerConnectionTarget::Ssh { .. } => 1,
         ServerConnectionTarget::Main => 2,
     }
 }
@@ -2285,7 +2307,10 @@ mod tests {
                 SecondaryConnectionPlan {
                     server_id: ServerId::secondary("remote-ssh"),
                     display_name: "prod".into(),
-                    target: ServerConnectionTarget::Ssh("prod.example.com".into()),
+                    target: ServerConnectionTarget::Ssh {
+                        destination: "prod.example.com".into(),
+                        options: Vec::new(),
+                    },
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                 },
             ]
@@ -2424,7 +2449,7 @@ mod tests {
                     }],
                     agents: Vec::new(),
                 }),
-                ServerConnectionTarget::Ssh(_) => Err(ConnectionState::ProtocolMismatch {
+                ServerConnectionTarget::Ssh { .. } => Err(ConnectionState::ProtocolMismatch {
                     server_protocol: Some(10),
                     client_protocol: crate::protocol::PROTOCOL_VERSION,
                 }),
@@ -2436,7 +2461,10 @@ mod tests {
             visited,
             vec![
                 ServerConnectionTarget::LocalSession(Some("dev".into())),
-                ServerConnectionTarget::Ssh("prod.example.com".into()),
+                ServerConnectionTarget::Ssh {
+                    destination: "prod.example.com".into(),
+                    options: Vec::new(),
+                },
             ]
         );
         assert_eq!(

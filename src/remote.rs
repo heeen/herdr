@@ -218,13 +218,16 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
+    // The CLI `--remote <host>` path is always a bare destination (leading-`-` is rejected by
+    // `validate_remote_target`), so there are no extra ssh options to carry.
+    let ssh_target = SshTarget::bare(&remote.target);
     let prepared_remote = prepare_remote_herdr(
-        &remote.target,
+        &ssh_target,
         remote.live_handoff,
         RemotePrepPolicy::Interactive,
     )?;
     ensure_remote_server_ready(
-        &remote.target,
+        &ssh_target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         remote.live_handoff,
@@ -232,7 +235,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )?;
 
     let bridge = start_ssh_remote_bridge_with_prepared(
-        &remote.target,
+        &ssh_target,
         &session_name,
         prepared_remote.remote_herdr,
     )?;
@@ -244,6 +247,58 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         &remote.target,
     )
+}
+
+/// A resolved ssh connection: the destination plus any user-supplied ssh options that must
+/// precede it (e.g. `-L`, `-J`, `-p`, `-o`). The destination alone is the dedup / socket-path /
+/// display key; the options are emitted on every ssh invocation so port-forwards and jump hosts
+/// from a full ssh add-remote spec actually take effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshTarget {
+    destination: String,
+    options: Vec<String>,
+}
+
+impl SshTarget {
+    pub(crate) fn new(destination: impl Into<String>, options: Vec<String>) -> Self {
+        Self {
+            destination: destination.into(),
+            options,
+        }
+    }
+
+    /// A bare destination with no extra ssh options (the `herdr --remote <host>` CLI path).
+    pub(crate) fn bare(destination: impl Into<String>) -> Self {
+        Self::new(destination, Vec::new())
+    }
+
+    pub(crate) fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    /// Build `ssh <options...> -T <destination> <remote_command>`. `-T` (disable pseudo-tty) is
+    /// inserted before the destination unless the user already supplied it; the herdr payload is
+    /// always the trailing positional so it runs on the remote rather than being parsed as an
+    /// ssh option.
+    fn command(&self, remote_command: &str) -> Command {
+        let mut command = Command::new("ssh");
+        // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
+        // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
+        if !self
+            .options
+            .iter()
+            .any(|opt| opt.contains("ConnectTimeout"))
+        {
+            command.arg("-o").arg("ConnectTimeout=10");
+        }
+        command.args(&self.options);
+        if !self.options.iter().any(|opt| opt == "-T") {
+            command.arg("-T");
+        }
+        command.arg(&self.destination);
+        command.arg(remote_command);
+        command
+    }
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -260,39 +315,39 @@ pub(crate) enum RemotePrepPolicy {
 }
 
 pub(crate) fn start_ssh_remote_bridge(
-    target: &str,
+    target: SshTarget,
     session_name: Option<&str>,
 ) -> io::Result<RemoteBridge> {
     let session_name = session_name.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
     // Client-driven attach: never block on stdin, and prefer live-handoff so an out-of-date
     // remote server is upgraded without killing its panes.
     let policy = RemotePrepPolicy::NonInteractive;
-    let prepared_remote = prepare_remote_herdr(target, true, policy)?;
+    let prepared_remote = prepare_remote_herdr(&target, true, policy)?;
     ensure_remote_server_ready(
-        target,
+        &target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         true,
         policy,
     )?;
-    start_ssh_remote_bridge_with_prepared(target, session_name, prepared_remote.remote_herdr)
+    start_ssh_remote_bridge_with_prepared(&target, session_name, prepared_remote.remote_herdr)
 }
 
 fn start_ssh_remote_bridge_with_prepared(
-    target: &str,
+    target: &SshTarget,
     session_name: &str,
     remote_herdr: RemoteHerdr,
 ) -> io::Result<RemoteBridge> {
-    let paths = remote_bridge_socket_paths(target, session_name);
+    let paths = remote_bridge_socket_paths(target.destination(), session_name);
     let client_bridge = SshStdioBridge::start(
-        target.to_string(),
+        target.clone(),
         remote_herdr.clone(),
         paths.client_socket.clone(),
         session_name.to_string(),
         RemoteBridgeKind::Client,
     )?;
     let api_bridge = SshStdioBridge::start(
-        target.to_string(),
+        target.clone(),
         remote_herdr,
         paths.api_socket.clone(),
         session_name.to_string(),
@@ -544,7 +599,7 @@ impl InstallSource {
 }
 
 fn prepare_remote_herdr(
-    target: &str,
+    target: &SshTarget,
     live_handoff_enabled: bool,
     policy: RemotePrepPolicy,
 ) -> io::Result<PreparedRemoteHerdr> {
@@ -594,7 +649,7 @@ fn prepare_remote_herdr(
         )?;
     }
     confirm_remote_install(
-        target,
+        target.destination(),
         &remote_herdr,
         &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
         policy,
@@ -618,7 +673,7 @@ fn prepare_remote_herdr(
     })
 }
 
-fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
+fn detect_remote_platform(target: &SshTarget) -> io::Result<RemotePlatform> {
     let output = ssh_output(target, "uname -s; uname -m")?;
     if !output.status.success() {
         return Err(command_failed("remote platform detection failed", &output));
@@ -638,7 +693,7 @@ fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
 }
 
 fn remote_binary_on_path_any(
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteHerdr>> {
     let output = ssh_output(target, remote_path_probe_any_command())?;
@@ -708,7 +763,7 @@ fn remote_herdr_from_exe_name(platform: RemotePlatform, name: &str) -> Option<Re
     ))
 }
 
-fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
+fn remote_binary_matches(target: &SshTarget, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = remote_binary_match_command(remote_herdr);
     let output = ssh_output(target, &command)?;
     if !output.status.success() {
@@ -732,7 +787,7 @@ fn remote_binary_match_command(remote_herdr: &RemoteHerdr) -> String {
     )
 }
 
-fn remote_binary_exists(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
+fn remote_binary_exists(target: &SshTarget, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = format!("test -x {}", remote_herdr.shell_path);
     Ok(ssh_output(target, &command)?.status.success())
 }
@@ -844,7 +899,7 @@ enum RemoteServerRestartReason {
 }
 
 fn ensure_remote_server_ready(
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
     remote_binary_changed: bool,
     live_handoff_enabled: bool,
@@ -886,7 +941,8 @@ fn ensure_remote_server_ready(
             }
             NonInteractiveServerAction::ProtocolStuck => {
                 return Err(io::Error::other(format!(
-                    "remote herdr server on {target} runs protocol {}, but this client needs protocol {CURRENT_PROTOCOL}, and it does not support live-handoff. Update the remote herdr (it must be a live-handoff-capable build) and try again.",
+                    "remote herdr server on {} runs protocol {}, but this client needs protocol {CURRENT_PROTOCOL}, and it does not support live-handoff. Update the remote herdr (it must be a live-handoff-capable build) and try again.",
+                    target.destination(),
                     protocol_label(protocol)
                 )));
             }
@@ -895,7 +951,12 @@ fn ensure_remote_server_ready(
 
     if live_handoff_enabled
         && live_handoff
-        && confirm_remote_server_handoff(target, version.as_deref(), protocol, reason)?
+        && confirm_remote_server_handoff(
+            target.destination(),
+            version.as_deref(),
+            protocol,
+            reason,
+        )?
     {
         match live_handoff_remote_server(target, remote_herdr) {
             Ok(()) => return Ok(()),
@@ -906,7 +967,7 @@ fn ensure_remote_server_ready(
         }
     }
 
-    if confirm_remote_server_stop(target, version.as_deref(), protocol, reason)? {
+    if confirm_remote_server_stop(target.destination(), version.as_deref(), protocol, reason)? {
         stop_remote_server(target, remote_herdr)?;
     }
     Ok(())
@@ -969,7 +1030,7 @@ fn non_interactive_server_action(
 }
 
 fn confirm_remote_install_with_running_server(
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
     live_handoff_enabled: bool,
     policy: RemotePrepPolicy,
@@ -979,16 +1040,17 @@ fn confirm_remote_install_with_running_server(
     if policy == RemotePrepPolicy::NonInteractive {
         return Ok(());
     }
+    let dest = target.destination();
     let status = match remote_server_status(target, remote_herdr) {
         Ok(status) => status,
         Err(err) => {
             if !io::stdin().is_terminal() {
                 return Err(io::Error::other(format!(
-                    "could not inspect the running remote herdr server on {target} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
+                    "could not inspect the running remote herdr server on {dest} before installing: {err}; run from an interactive terminal to approve updating the remote binary"
                 )));
             }
             eprintln!(
-                "could not inspect the running remote herdr server on {target} before installing: {err}"
+                "could not inspect the running remote herdr server on {dest} before installing: {err}"
             );
             eprint!("continue installing the remote herdr binary? [Y/n] ");
             io::stderr().flush()?;
@@ -1019,13 +1081,13 @@ fn confirm_remote_install_with_running_server(
 
     if !io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
-            "remote herdr server on {target} is running v{} protocol {}; run from an interactive terminal to approve updating the remote binary",
+            "remote herdr server on {dest} is running v{} protocol {}; run from an interactive terminal to approve updating the remote binary",
             version_label(version.as_deref()),
             protocol_label(protocol)
         )));
     }
 
-    eprintln!("remote herdr server on {target} is currently running:");
+    eprintln!("remote herdr server on {dest} is currently running:");
     eprintln!(
         "  server: v{} protocol {}",
         version_label(version.as_deref()),
@@ -1052,7 +1114,7 @@ fn confirm_remote_install_with_running_server(
 }
 
 fn remote_server_status(
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<RemoteServerStatus> {
     let command = format!("{} status server --json", remote_herdr.shell_path);
@@ -1235,7 +1297,7 @@ fn confirm_remote_server_handoff(
     Ok(answer != "n" && answer != "no")
 }
 
-fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn live_handoff_remote_server(target: &SshTarget, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let command = format!(
         "{} server live-handoff --import-exe {} --expected-protocol {CURRENT_PROTOCOL} --expected-version {CURRENT_VERSION}",
         remote_herdr.shell_path,
@@ -1247,12 +1309,13 @@ fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::R
     }
 
     eprintln!(
-        "handed off the remote herdr server on {target}; reconnecting to the prepared server."
+        "handed off the remote herdr server on {}; reconnecting to the prepared server.",
+        target.destination()
     );
     Ok(())
 }
 
-fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn stop_remote_server(target: &SshTarget, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let command = format!("{} server stop", remote_herdr.shell_path);
     let output = ssh_output(target, &command)?;
     if !output.status.success() {
@@ -1260,11 +1323,17 @@ fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()
     }
 
     wait_for_remote_server_shutdown(target, remote_herdr)?;
-    eprintln!("stopped the remote herdr server on {target}; it will restart when the remote client bridge attaches.");
+    eprintln!(
+        "stopped the remote herdr server on {}; it will restart when the remote client bridge attaches.",
+        target.destination()
+    );
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn wait_for_remote_server_shutdown(
+    target: &SshTarget,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
         if remote_server_status(target, remote_herdr)? == RemoteServerStatus::NotRunning {
@@ -1274,7 +1343,8 @@ fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> 
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "shutdown was requested, but the old remote herdr server on {target} is still responding after {} seconds",
+                    "shutdown was requested, but the old remote herdr server on {} is still responding after {} seconds",
+                    target.destination(),
                     REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT.as_secs()
                 ),
             ));
@@ -1293,7 +1363,7 @@ fn protocol_label(protocol: Option<u32>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
+fn warn_if_remote_bin_not_on_path(target: &SshTarget) -> io::Result<()> {
     let output = ssh_output(
         target,
         "case \":$PATH:\" in *\":$HOME/.local/bin:\"*) exit 0 ;; *) exit 1 ;; esac",
@@ -1428,7 +1498,7 @@ fn confirm_remote_install(
 }
 
 fn install_remote_herdr(
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
     source_path: &Path,
 ) -> io::Result<()> {
@@ -1444,10 +1514,8 @@ mv "$tmp" "$dest"
         install_suffix = remote_herdr.install_suffix
     );
 
-    let mut child = Command::new("ssh")
-        .arg("-T")
-        .arg(target)
-        .arg(format!("sh -eu -c {}", shell_quote(&script)))
+    let mut child = target
+        .command(&format!("sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1475,16 +1543,8 @@ mv "$tmp" "$dest"
     }
 }
 
-fn ssh_output(target: &str, command: &str) -> io::Result<Output> {
-    Command::new("ssh")
-        // Bound the connection phase so an unreachable host fails fast instead of stalling the
-        // add-remote worker for the OS TCP timeout. Probes are short, so this only caps connect.
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-T")
-        .arg(target)
-        .arg(command)
-        .output()
+fn ssh_output(target: &SshTarget, command: &str) -> io::Result<Output> {
+    target.command(command).output()
 }
 
 fn remote_bridge_command(
@@ -1570,7 +1630,7 @@ fn spawn_bridge_worker(
 
 impl SshStdioBridge {
     fn start(
-        target: String,
+        target: SshTarget,
         remote_herdr: RemoteHerdr,
         local_socket: PathBuf,
         session_name: String,
@@ -1637,16 +1697,12 @@ impl Drop for SshStdioBridge {
 
 fn bridge_connection(
     stream: UnixStream,
-    target: &str,
+    target: &SshTarget,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     kind: RemoteBridgeKind,
 ) -> io::Result<()> {
-    let mut command = Command::new("ssh");
-    command
-        .arg("-T")
-        .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name, kind));
+    let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1837,6 +1893,67 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn ssh_argv(target: &SshTarget, remote_command: &str) -> Vec<String> {
+        target
+            .command(remote_command)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ssh_target_command_inserts_dash_t_before_bare_destination() {
+        assert_eq!(
+            ssh_argv(&SshTarget::bare("iq-64"), "uname -s"),
+            ["-o", "ConnectTimeout=10", "-T", "iq-64", "uname -s"]
+        );
+    }
+
+    #[test]
+    fn ssh_target_command_emits_options_before_destination() {
+        let target = SshTarget::new(
+            "iq-64",
+            vec![
+                "-L".into(),
+                "9000:localhost:9000".into(),
+                "-J".into(),
+                "jump".into(),
+            ],
+        );
+        assert_eq!(
+            ssh_argv(&target, "uname -s"),
+            [
+                "-o",
+                "ConnectTimeout=10",
+                "-L",
+                "9000:localhost:9000",
+                "-J",
+                "jump",
+                "-T",
+                "iq-64",
+                "uname -s"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_target_command_does_not_duplicate_user_supplied_dash_t() {
+        let target = SshTarget::new("iq-64", vec!["-T".into()]);
+        assert_eq!(
+            ssh_argv(&target, "x"),
+            ["-o", "ConnectTimeout=10", "-T", "iq-64", "x"]
+        );
+    }
+
+    #[test]
+    fn ssh_target_command_respects_user_connect_timeout() {
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "ConnectTimeout=3".into()]);
+        assert_eq!(
+            ssh_argv(&target, "x"),
+            ["-o", "ConnectTimeout=3", "-T", "iq-64", "x"]
+        );
+    }
+
     #[test]
     fn non_interactive_attaches_to_protocol_compatible_running_server_without_handoff() {
         // Version/binary differs but protocol matches: attach to the running server, no restart.
@@ -1897,7 +2014,7 @@ mod tests {
             arch: "x86_64",
         });
         let bridge = SshStdioBridge::start(
-            "example".to_string(),
+            SshTarget::bare("example"),
             remote_herdr,
             socket.clone(),
             "default".to_string(),

@@ -1490,9 +1490,13 @@ fn api_target_for_supervisor_target(
     ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
 ) -> Option<crate::api::client::ConnectionTarget> {
     match target {
-        supervisor::ServerConnectionTarget::Ssh(_) => ssh_bridges.get(server_id).map(|bridge| {
-            crate::api::client::ConnectionTarget::SocketPath(bridge.api_socket_path().to_path_buf())
-        }),
+        supervisor::ServerConnectionTarget::Ssh { .. } => {
+            ssh_bridges.get(server_id).map(|bridge| {
+                crate::api::client::ConnectionTarget::SocketPath(
+                    bridge.api_socket_path().to_path_buf(),
+                )
+            })
+        }
         _ => api_target_for_connection_target(target),
     }
 }
@@ -1507,7 +1511,7 @@ fn api_target_for_connection_target(
         supervisor::ServerConnectionTarget::LocalSession(session) => Some(
             crate::api::client::ConnectionTarget::LocalSession(session.clone()),
         ),
-        supervisor::ServerConnectionTarget::Ssh(_) => None,
+        supervisor::ServerConnectionTarget::Ssh { .. } => None,
     }
 }
 
@@ -1519,7 +1523,7 @@ fn client_socket_path_for_connection_target(
         supervisor::ServerConnectionTarget::LocalSession(session) => {
             Some(crate::session::client_socket_path_for(session.as_deref()))
         }
-        supervisor::ServerConnectionTarget::Ssh(_) => None,
+        supervisor::ServerConnectionTarget::Ssh { .. } => None,
     }
 }
 
@@ -1531,7 +1535,7 @@ fn client_socket_path_for_supervisor_server(
 ) -> Option<std::path::PathBuf> {
     let target = model.server_connection_target(server_id)?;
     match target {
-        supervisor::ServerConnectionTarget::Ssh(_) => ssh_bridges
+        supervisor::ServerConnectionTarget::Ssh { .. } => ssh_bridges
             .get(server_id)
             .map(|bridge| bridge.client_socket_path().to_path_buf()),
         _ => client_socket_path_for_connection_target(&target),
@@ -1560,11 +1564,16 @@ fn connect_secondary_client_stream_for_plan_detached(
     existing_ssh_client_socket: Option<std::path::PathBuf>,
 ) -> Result<SecondaryConnectionAttempt, ClientError> {
     let socket_path = match &plan.target {
-        supervisor::ServerConnectionTarget::Ssh(target) => {
+        supervisor::ServerConnectionTarget::Ssh {
+            destination,
+            options,
+        } => {
             if let Some(path) = existing_ssh_client_socket {
                 path
             } else {
-                let bridge = crate::remote::start_ssh_remote_bridge(target, None)
+                let ssh_target =
+                    crate::remote::SshTarget::new(destination.clone(), options.clone());
+                let bridge = crate::remote::start_ssh_remote_bridge(ssh_target, None)
                     .map_err(ClientError::ConnectionFailed)?;
                 let socket_path = bridge.client_socket_path().to_path_buf();
                 return connect_secondary_client_stream(
@@ -2070,10 +2079,10 @@ fn prepare_client_add_remote_submission(
             .map_err(|err| err.to_string())?;
             (stream, None)
         }
-        crate::remote_registry::RemoteTargetSnapshot::Ssh { target, .. } => {
-            let bridge_target = target.clone();
+        crate::remote_registry::RemoteTargetSnapshot::Ssh { target, args } => {
+            let ssh_target = crate::remote::SshTarget::new(target.clone(), args.clone());
             let bridge = run_remote_op_with_timeout(ADD_REMOTE_BRIDGE_TIMEOUT, move || {
-                crate::remote::start_ssh_remote_bridge(&bridge_target, None)
+                crate::remote::start_ssh_remote_bridge(ssh_target, None)
             })
             .map_err(|err| format!("failed to start ssh remote bridge: {err}"))?;
             validate_add_remote_target(
@@ -6685,9 +6694,10 @@ mod tests {
         assert!(default.ends_with("herdr-client.sock"));
 
         assert_eq!(
-            client_socket_path_for_connection_target(&supervisor::ServerConnectionTarget::Ssh(
-                "host".into()
-            )),
+            client_socket_path_for_connection_target(&supervisor::ServerConnectionTarget::Ssh {
+                destination: "host".into(),
+                options: Vec::new(),
+            }),
             None
         );
     }
