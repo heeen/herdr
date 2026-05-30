@@ -59,7 +59,7 @@ impl From<crate::remote_registry::RemoteTargetSnapshot> for ServerConnectionTarg
             crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
                 Self::LocalSession(session)
             }
-            crate::remote_registry::RemoteTargetSnapshot::Ssh { target } => Self::Ssh(target),
+            crate::remote_registry::RemoteTargetSnapshot::Ssh { target, .. } => Self::Ssh(target),
         }
     }
 }
@@ -2017,6 +2017,7 @@ mod tests {
             name: name.into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: target.into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,

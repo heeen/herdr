@@ -597,6 +597,7 @@ mod tests {
                     name: "x".into(),
                     target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                         target: "user@x".into(),
+                        args: Vec::new(),
                     },
                     session: None,
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,

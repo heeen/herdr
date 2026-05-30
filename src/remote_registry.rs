@@ -31,7 +31,16 @@ fn is_false(b: &bool) -> bool {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteTargetSnapshot {
     Ssh {
+        /// The ssh destination (`user@host`, host alias, `ssh://…`). Used as the dedup/identity
+        /// key, the socket-path key, and the display name. For a full ssh spec this is the last
+        /// positional token (the destination); for a bare token it is the token itself.
         target: String,
+        /// ssh options that precede the destination (e.g. `-L`, `-J`, `-p`, `-o`). Empty for a
+        /// bare-host target. `#[serde(default)]` makes legacy snapshots (only `target`)
+        /// deserialize to an empty vec; `skip_serializing_if` keeps bare targets serializing
+        /// byte-identical to today (no `args` key on disk).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
     },
     Local {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,14 +220,46 @@ impl RemoteTargetSnapshot {
             return Ok(Self::Local { session });
         }
 
-        Ok(Self::Ssh {
-            target: target.to_string(),
-        })
+        Self::parse_ssh(target)
+    }
+
+    /// Parse a generic ssh spec. A single bare token (no leading `-`, not the literal `ssh`)
+    /// means `ssh <token>`. Anything else — a leading `ssh`, multiple tokens, or any flag —
+    /// is treated as a full ssh argv: the destination is the last non-flag token and the
+    /// remaining options are preserved (they are emitted before the destination at connect time).
+    fn parse_ssh(input: &str) -> Result<Self, RemoteRegistryError> {
+        let tokens = shlex::split(input).ok_or(RemoteRegistryError::InvalidTarget)?;
+        if tokens.is_empty() {
+            return Err(RemoteRegistryError::InvalidTarget);
+        }
+
+        if tokens.len() == 1 && tokens[0] != "ssh" && !tokens[0].starts_with('-') {
+            return Ok(Self::Ssh {
+                target: tokens[0].clone(),
+                args: Vec::new(),
+            });
+        }
+
+        let mut argv = tokens;
+        if argv.first().is_some_and(|token| token == "ssh") {
+            argv.remove(0);
+        }
+        let destination_index = argv
+            .iter()
+            .rposition(|token| !token.starts_with('-'))
+            .ok_or(RemoteRegistryError::InvalidTarget)?;
+        let target = argv.remove(destination_index);
+        Ok(Self::Ssh { target, args: argv })
     }
 
     pub fn canonical_key(&self) -> String {
         match self {
-            Self::Ssh { target } => format!("ssh:{target}"),
+            Self::Ssh { target, args } if args.is_empty() => format!("ssh:{target}"),
+            Self::Ssh { target, args } => {
+                // Unit separator keeps two distinct option sets (e.g. different `-L` forwards)
+                // from colliding while staying stable across reloads.
+                format!("ssh:{target}\u{1f}{}", args.join("\u{1f}"))
+            }
             Self::Local { session } => {
                 format!("local:{}", session.as_deref().unwrap_or("default"))
             }
@@ -228,7 +269,7 @@ impl RemoteTargetSnapshot {
     fn default_display_name(&self) -> String {
         match self {
             Self::Local { session } => session.clone().unwrap_or_else(|| "local".to_string()),
-            Self::Ssh { target } => ssh_display_name(target),
+            Self::Ssh { target, .. } => ssh_display_name(target),
         }
     }
 }
@@ -258,6 +299,152 @@ fn ssh_display_name(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ssh(target: &str, args: &[&str]) -> RemoteTargetSnapshot {
+        RemoteTargetSnapshot::Ssh {
+            target: target.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_bare_host_as_ssh_without_args() {
+        let target = RemoteTargetSnapshot::parse("iq-64").unwrap();
+        assert_eq!(target, ssh("iq-64", &[]));
+    }
+
+    #[test]
+    fn parses_user_at_host_as_bare_ssh_without_args() {
+        let target = RemoteTargetSnapshot::parse("user@iq-64").unwrap();
+        assert_eq!(target, ssh("user@iq-64", &[]));
+    }
+
+    #[test]
+    fn strips_leading_ssh_program_for_bare_destination() {
+        let explicit = RemoteTargetSnapshot::parse("ssh iq-64").unwrap();
+        assert_eq!(explicit, ssh("iq-64", &[]));
+        // "iq-64" and "ssh iq-64" describe the same connection.
+        let bare = RemoteTargetSnapshot::parse("iq-64").unwrap();
+        assert_eq!(explicit.canonical_key(), bare.canonical_key());
+    }
+
+    #[test]
+    fn parses_full_ssh_command_with_flags() {
+        let target =
+            RemoteTargetSnapshot::parse("ssh -L 9000:localhost:9000 -J jump icedac iq-64").unwrap();
+        assert_eq!(
+            target,
+            ssh(
+                "iq-64",
+                &["-L", "9000:localhost:9000", "-J", "jump", "icedac"]
+            )
+        );
+    }
+
+    #[test]
+    fn parses_full_ssh_command_with_port_and_user() {
+        let target = RemoteTargetSnapshot::parse("ssh -p 2222 user@host").unwrap();
+        assert_eq!(target, ssh("user@host", &["-p", "2222"]));
+    }
+
+    #[test]
+    fn full_spec_without_leading_ssh_is_still_accepted() {
+        // A multi-token / flagged input is treated as a full ssh argv even without a leading `ssh`.
+        let target = RemoteTargetSnapshot::parse("-p 2222 host").unwrap();
+        assert_eq!(target, ssh("host", &["-p", "2222"]));
+    }
+
+    #[test]
+    fn preserves_quoted_option_values_as_single_token() {
+        let target =
+            RemoteTargetSnapshot::parse("ssh -o 'ProxyCommand=ssh -W %h:%p bastion' iq-64")
+                .unwrap();
+        assert_eq!(
+            target,
+            ssh("iq-64", &["-o", "ProxyCommand=ssh -W %h:%p bastion"])
+        );
+    }
+
+    #[test]
+    fn rejects_ssh_spec_without_a_destination() {
+        assert_eq!(
+            RemoteTargetSnapshot::parse("ssh -v").unwrap_err(),
+            RemoteRegistryError::InvalidTarget
+        );
+        assert_eq!(
+            RemoteTargetSnapshot::parse("ssh").unwrap_err(),
+            RemoteRegistryError::InvalidTarget
+        );
+    }
+
+    #[test]
+    fn canonical_key_distinguishes_ssh_options() {
+        let plain = RemoteTargetSnapshot::parse("ssh iq-64").unwrap();
+        let forwarded = RemoteTargetSnapshot::parse("ssh -L 9000:localhost:9000 iq-64").unwrap();
+        let other_forward =
+            RemoteTargetSnapshot::parse("ssh -L 9100:localhost:9100 iq-64").unwrap();
+
+        assert_ne!(plain.canonical_key(), forwarded.canonical_key());
+        assert_ne!(forwarded.canonical_key(), other_forward.canonical_key());
+    }
+
+    #[test]
+    fn full_spec_display_name_uses_destination() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        let remote = registry
+            .add(
+                None,
+                "ssh -L 9000:localhost:9000 -J jump you@iq-64".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        assert_eq!(remote.name, "iq-64");
+    }
+
+    #[test]
+    fn full_spec_ssh_target_serializes_args_and_round_trips() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        registry
+            .add(
+                Some("fwd".into()),
+                "ssh -L 9000:localhost:9000 iq-64".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            json.contains("\"args\""),
+            "full spec must persist args: {json}"
+        );
+
+        let restored: RemoteRegistrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, registry);
+    }
+
+    #[test]
+    fn bare_ssh_target_does_not_serialize_args_key() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        registry
+            .add(
+                Some("bare".into()),
+                "iq-64".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        let json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            !json.contains("args"),
+            "bare target must not emit args key: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_ssh_snapshot_without_args_deserializes_to_empty() {
+        let json = r#"{"remotes":[{"id":"remote-1","name":"dev","target":{"type":"ssh","target":"user@dev"}}]}"#;
+        let registry: RemoteRegistrySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(registry.remotes[0].target, ssh("user@dev", &[]));
+    }
 
     #[test]
     fn parses_local_default_targets_to_the_same_canonical_key() {

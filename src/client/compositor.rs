@@ -2682,6 +2682,7 @@ mod tests {
             name: "alpha".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "alpha".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
@@ -2692,6 +2693,7 @@ mod tests {
             name: "beta".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "beta".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,

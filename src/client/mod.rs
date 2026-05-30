@@ -53,6 +53,11 @@ const CLIENT_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 const CLIENT_ANIMATION_TICK_STEP: u32 = 8;
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Hard ceiling for bringing up an ssh remote bridge (connect + detect + auto-install + server
+// start). Without this an unreachable/slow/auth-prompting host would block the add-remote worker
+// forever, leaving the dialog stuck on its in-progress state with no error. Generous enough to
+// cover a real binary install over ssh; the ssh `ConnectTimeout` bounds the unreachable case.
+const ADD_REMOTE_BRIDGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -1774,7 +1779,30 @@ fn add_remote_error_message(error: &str) -> String {
     match error {
         "remote target already exists" => "remote already added".to_string(),
         "remote name already exists" => "name already used".to_string(),
-        other => other.to_string(),
+        other => map_remote_bridge_error(other),
+    }
+}
+
+/// Map raw ssh/bridge failures into short, actionable dialog text. The add-remote worker can fail
+/// for very different reasons (host unreachable, ssh auth, missing/old herdr); a bare io error
+/// string is not helpful in the small dialog status row.
+fn map_remote_bridge_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") {
+        "timed out reaching host — check the address and your ssh access".to_string()
+    } else if lower.contains("connection refused")
+        || lower.contains("could not resolve")
+        || lower.contains("name or service not known")
+        || lower.contains("no route to host")
+    {
+        "cannot reach host over ssh — check the address".to_string()
+    } else if lower.contains("permission denied") || lower.contains("authentication") {
+        "ssh authentication failed — set up key access to this host".to_string()
+    } else if lower.contains("does not support live-handoff") || lower.contains("protocol") {
+        "remote herdr is incompatible and can't be upgraded in place — update it and retry"
+            .to_string()
+    } else {
+        error.to_string()
     }
 }
 
@@ -1987,6 +2015,31 @@ fn spawn_client_add_remote_submission(
     });
 }
 
+/// Run a blocking remote operation on a helper thread, failing with a descriptive error if it
+/// does not finish within `timeout`. Used to bound ssh bridge setup so the add-remote worker can
+/// never wedge the dialog on an unreachable/slow/auth-prompting host (see [`ADD_REMOTE_BRIDGE_TIMEOUT`]).
+fn run_remote_op_with_timeout<T, F>(timeout: Duration, op: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(op());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "timed out after {}s connecting to the remote host",
+            timeout.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("remote connection worker exited unexpectedly".to_string())
+        }
+    }
+}
+
 fn prepare_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
     server_size: (u16, u16),
@@ -2017,9 +2070,12 @@ fn prepare_client_add_remote_submission(
             .map_err(|err| err.to_string())?;
             (stream, None)
         }
-        crate::remote_registry::RemoteTargetSnapshot::Ssh { target } => {
-            let bridge = crate::remote::start_ssh_remote_bridge(target, None)
-                .map_err(|err| format!("failed to start ssh remote bridge: {err}"))?;
+        crate::remote_registry::RemoteTargetSnapshot::Ssh { target, .. } => {
+            let bridge_target = target.clone();
+            let bridge = run_remote_op_with_timeout(ADD_REMOTE_BRIDGE_TIMEOUT, move || {
+                crate::remote::start_ssh_remote_bridge(&bridge_target, None)
+            })
+            .map_err(|err| format!("failed to start ssh remote bridge: {err}"))?;
             validate_add_remote_target(
                 crate::api::client::ConnectionTarget::SocketPath(
                     bridge.api_socket_path().to_path_buf(),
@@ -4080,6 +4136,58 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn run_remote_op_with_timeout_returns_fast_success() {
+        let value = run_remote_op_with_timeout(Duration::from_secs(5), || Ok(7u32));
+        assert_eq!(value, Ok(7));
+    }
+
+    #[test]
+    fn run_remote_op_with_timeout_surfaces_inner_error() {
+        let result: Result<(), String> =
+            run_remote_op_with_timeout(Duration::from_secs(5), || Err(io::Error::other("boom")));
+        assert_eq!(result, Err("boom".to_string()));
+    }
+
+    #[test]
+    fn run_remote_op_with_timeout_fails_when_op_exceeds_deadline() {
+        // The core anti-hang guarantee: a stuck remote op yields a timeout error, not a wedge.
+        let result: Result<(), String> =
+            run_remote_op_with_timeout(Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(())
+            });
+        assert!(
+            result.is_err_and(|err| err.contains("timed out")),
+            "slow op must time out with a descriptive error"
+        );
+    }
+
+    #[test]
+    fn maps_common_bridge_failures_to_actionable_text() {
+        assert!(map_remote_bridge_error(
+            "operation timed out after 90s connecting to the remote host"
+        )
+        .contains("timed out"));
+        assert!(
+            map_remote_bridge_error("ssh: connect to host x port 22: Connection refused")
+                .contains("cannot reach host")
+        );
+        assert!(
+            map_remote_bridge_error("Permission denied (publickey,password).")
+                .contains("authentication failed")
+        );
+        assert!(
+            map_remote_bridge_error("ssh: Could not resolve hostname nope")
+                .contains("cannot reach host")
+        );
+        // An unmatched error passes through verbatim so we never hide unexpected detail.
+        assert_eq!(
+            map_remote_bridge_error("weird novel failure"),
+            "weird novel failure"
+        );
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -4671,9 +4779,10 @@ mod tests {
             add_remote_error_message("remote name already exists"),
             "name already used"
         );
+        // An error that matches no bridge-failure heuristic passes through verbatim.
         assert_eq!(
-            add_remote_error_message("connection refused"),
-            "connection refused"
+            add_remote_error_message("some unmapped failure"),
+            "some unmapped failure"
         );
     }
 
@@ -4761,6 +4870,7 @@ mod tests {
 
         let target = crate::remote_registry::RemoteTargetSnapshot::Ssh {
             target: "iq-64".into(),
+            args: Vec::new(),
         };
 
         assert_eq!(
@@ -5989,6 +6099,7 @@ mod tests {
             name: "prod".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "prod.example.com".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
@@ -6047,6 +6158,7 @@ mod tests {
             name: "prod".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "prod.example.com".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
@@ -6105,6 +6217,7 @@ mod tests {
             name: "prod".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "prod.example.com".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
@@ -6174,6 +6287,7 @@ mod tests {
             name: "prod".into(),
             target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
                 target: "prod.example.com".into(),
+                args: Vec::new(),
             },
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,

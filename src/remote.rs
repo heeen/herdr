@@ -218,12 +218,17 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let prepared_remote = prepare_remote_herdr(&remote.target, remote.live_handoff)?;
+    let prepared_remote = prepare_remote_herdr(
+        &remote.target,
+        remote.live_handoff,
+        RemotePrepPolicy::Interactive,
+    )?;
     ensure_remote_server_ready(
         &remote.target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         remote.live_handoff,
+        RemotePrepPolicy::Interactive,
     )?;
 
     let bridge = start_ssh_remote_bridge_with_prepared(
@@ -241,17 +246,34 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )
 }
 
+/// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
+/// decisions on a remote host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemotePrepPolicy {
+    /// `herdr --remote` from a shell: prompt on a TTY, refuse without one.
+    Interactive,
+    /// The in-client add-remote worker: never read stdin (the TUI owns it in raw mode, so any
+    /// `read_line` would hang invisibly). Auto-approve installing herdr on a fresh host, prefer
+    /// live-handoff for an out-of-date running server, and refuse to silently hard-stop a remote
+    /// server that cannot hand off (surface it as an error instead of killing live panes).
+    NonInteractive,
+}
+
 pub(crate) fn start_ssh_remote_bridge(
     target: &str,
     session_name: Option<&str>,
 ) -> io::Result<RemoteBridge> {
     let session_name = session_name.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
-    let prepared_remote = prepare_remote_herdr(target, false)?;
+    // Client-driven attach: never block on stdin, and prefer live-handoff so an out-of-date
+    // remote server is upgraded without killing its panes.
+    let policy = RemotePrepPolicy::NonInteractive;
+    let prepared_remote = prepare_remote_herdr(target, true, policy)?;
     ensure_remote_server_ready(
         target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
-        false,
+        true,
+        policy,
     )?;
     start_ssh_remote_bridge_with_prepared(target, session_name, prepared_remote.remote_herdr)
 }
@@ -524,6 +546,7 @@ impl InstallSource {
 fn prepare_remote_herdr(
     target: &str,
     live_handoff_enabled: bool,
+    policy: RemotePrepPolicy,
 ) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
@@ -567,12 +590,14 @@ fn prepare_remote_herdr(
             target,
             status_probe_herdr,
             live_handoff_enabled,
+            policy,
         )?;
     }
     confirm_remote_install(
         target,
         &remote_herdr,
         &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
+        policy,
     )?;
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
     let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
@@ -823,6 +848,7 @@ fn ensure_remote_server_ready(
     remote_herdr: &RemoteHerdr,
     remote_binary_changed: bool,
     live_handoff_enabled: bool,
+    policy: RemotePrepPolicy,
 ) -> io::Result<()> {
     let status = remote_server_status(target, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -839,6 +865,33 @@ fn ensure_remote_server_ready(
     else {
         return Ok(());
     };
+
+    // Non-interactive (client) attach: decide without prompting and never hard-stop.
+    if policy == RemotePrepPolicy::NonInteractive {
+        match non_interactive_server_action(reason, live_handoff_enabled, live_handoff) {
+            NonInteractiveServerAction::AttachExisting => return Ok(()),
+            NonInteractiveServerAction::LiveHandoff => {
+                return match live_handoff_remote_server(target, remote_herdr) {
+                    Ok(()) => Ok(()),
+                    // A failed handoff for a protocol mismatch leaves us unable to attach; surface
+                    // it rather than killing panes. For a compatible server, fall back to attaching.
+                    Err(err) if reason == RemoteServerRestartReason::ProtocolMismatch => Err(err),
+                    Err(err) => {
+                        eprintln!(
+                            "remote live handoff failed: {err}; attaching to the running server."
+                        );
+                        Ok(())
+                    }
+                };
+            }
+            NonInteractiveServerAction::ProtocolStuck => {
+                return Err(io::Error::other(format!(
+                    "remote herdr server on {target} runs protocol {}, but this client needs protocol {CURRENT_PROTOCOL}, and it does not support live-handoff. Update the remote herdr (it must be a live-handoff-capable build) and try again.",
+                    protocol_label(protocol)
+                )));
+            }
+        }
+    }
 
     if live_handoff_enabled
         && live_handoff
@@ -876,11 +929,56 @@ fn remote_server_restart_reason(
     None
 }
 
+/// What a non-interactive (client-driven) attach should do with an out-of-date running remote
+/// server, given the restart reason and whether live-handoff is possible. It never hard-stops:
+/// a protocol mismatch that cannot hand off is reported as an error rather than killing panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonInteractiveServerAction {
+    /// Attach to the running server unchanged (protocol is compatible).
+    AttachExisting,
+    /// Live-handoff to the prepared server (preserves panes), then attach.
+    LiveHandoff,
+    /// Cannot attach: protocol mismatch and live-handoff is unavailable.
+    ProtocolStuck,
+}
+
+fn non_interactive_server_action(
+    reason: RemoteServerRestartReason,
+    live_handoff_enabled: bool,
+    live_handoff_supported: bool,
+) -> NonInteractiveServerAction {
+    let can_handoff = live_handoff_enabled && live_handoff_supported;
+    match reason {
+        RemoteServerRestartReason::ProtocolMismatch => {
+            if can_handoff {
+                NonInteractiveServerAction::LiveHandoff
+            } else {
+                NonInteractiveServerAction::ProtocolStuck
+            }
+        }
+        // Protocol is compatible: prefer a pane-preserving handoff to pick up the new binary, but
+        // attaching to the running server is always a safe fallback (no hard restart).
+        RemoteServerRestartReason::BinaryUpdated | RemoteServerRestartReason::VersionMismatch => {
+            if can_handoff {
+                NonInteractiveServerAction::LiveHandoff
+            } else {
+                NonInteractiveServerAction::AttachExisting
+            }
+        }
+    }
+}
+
 fn confirm_remote_install_with_running_server(
     target: &str,
     remote_herdr: &RemoteHerdr,
     live_handoff_enabled: bool,
+    policy: RemotePrepPolicy,
 ) -> io::Result<()> {
+    // Non-interactive (client) attach auto-approves replacing the binary; the running server is
+    // reconciled later in `ensure_remote_server_ready` (live-handoff when possible).
+    if policy == RemotePrepPolicy::NonInteractive {
+        return Ok(());
+    }
     let status = match remote_server_status(target, remote_herdr) {
         Ok(status) => status,
         Err(err) => {
@@ -1293,7 +1391,12 @@ fn confirm_remote_install(
     target: &str,
     remote_herdr: &RemoteHerdr,
     source_description: &str,
+    policy: RemotePrepPolicy,
 ) -> io::Result<()> {
+    // Core of requirement #5: a fresh ssh-reachable host auto-installs herdr with no prompt.
+    if policy == RemotePrepPolicy::NonInteractive {
+        return Ok(());
+    }
     if !io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
             "matching remote herdr {CURRENT_VERSION} is not installed at {}; run from an interactive terminal to approve installation",
@@ -1374,6 +1477,10 @@ mv "$tmp" "$dest"
 
 fn ssh_output(target: &str, command: &str) -> io::Result<Output> {
     Command::new("ssh")
+        // Bound the connection phase so an unreachable host fails fast instead of stalling the
+        // add-remote worker for the OS TCP timeout. Probes are short, so this only caps connect.
+        .arg("-o")
+        .arg("ConnectTimeout=10")
         .arg("-T")
         .arg(target)
         .arg(command)
@@ -1729,6 +1836,53 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_interactive_attaches_to_protocol_compatible_running_server_without_handoff() {
+        // Version/binary differs but protocol matches: attach to the running server, no restart.
+        for reason in [
+            RemoteServerRestartReason::VersionMismatch,
+            RemoteServerRestartReason::BinaryUpdated,
+        ] {
+            assert_eq!(
+                non_interactive_server_action(reason, false, false),
+                NonInteractiveServerAction::AttachExisting
+            );
+            // Even if handoff is enabled, an unsupported server still attaches as-is.
+            assert_eq!(
+                non_interactive_server_action(reason, true, false),
+                NonInteractiveServerAction::AttachExisting
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_prefers_live_handoff_when_available() {
+        for reason in [
+            RemoteServerRestartReason::ProtocolMismatch,
+            RemoteServerRestartReason::VersionMismatch,
+            RemoteServerRestartReason::BinaryUpdated,
+        ] {
+            assert_eq!(
+                non_interactive_server_action(reason, true, true),
+                NonInteractiveServerAction::LiveHandoff
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_protocol_mismatch_without_handoff_is_stuck_not_hard_stopped() {
+        // The key safety property: a protocol mismatch we cannot hand off is reported as stuck,
+        // never resolved by hard-stopping (which would kill the remote server's panes).
+        assert_eq!(
+            non_interactive_server_action(RemoteServerRestartReason::ProtocolMismatch, true, false),
+            NonInteractiveServerAction::ProtocolStuck
+        );
+        assert_eq!(
+            non_interactive_server_action(RemoteServerRestartReason::ProtocolMismatch, false, true),
+            NonInteractiveServerAction::ProtocolStuck
+        );
+    }
 
     #[test]
     fn bridge_socket_is_user_only() {
