@@ -1605,3 +1605,79 @@ fn multi_client_rapid_connect_disconnect_stress_10_cycles() {
 
     cleanup_spawned_herdr(server, base);
 }
+
+/// End-to-end (issue #11, #2): a full ssh add-remote spec flows through the real `remote.add`
+/// API, captures its options, names + dedups off the destination, and round-trips via
+/// `remote.list`. `remote.add` is registry-only (no ssh connection), so this is deterministic.
+#[test]
+fn remote_add_accepts_full_ssh_spec_and_dedups_by_destination_plus_options() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let main_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // Full ssh spec: leading `ssh` stripped, flags captured, destination = last positional.
+    let add = send_json_request(
+        &api_socket,
+        r#"{"id":"a","method":"remote.add","params":{"target":"ssh -L 9000:localhost:9000 -J jump iq-64"}}"#,
+    );
+    assert!(
+        add.get("error").is_none(),
+        "remote.add full spec failed: {add}"
+    );
+    let remote = &add["result"]["remote"];
+    assert_eq!(
+        remote["name"], "iq-64",
+        "name should default to the destination"
+    );
+    assert_eq!(remote["target"]["type"], "ssh");
+    assert_eq!(remote["target"]["target"], "iq-64");
+    assert_eq!(
+        remote["target"]["args"],
+        serde_json::json!(["-L", "9000:localhost:9000", "-J", "jump"]),
+        "ssh options must persist"
+    );
+
+    // remote.list reflects the persisted spec.
+    let list = send_json_request(
+        &api_socket,
+        r#"{"id":"l","method":"remote.list","params":{}}"#,
+    );
+    let remotes = list["result"]["remotes"].as_array().unwrap();
+    assert_eq!(remotes.len(), 1);
+    assert_eq!(remotes[0]["target"]["target"], "iq-64");
+    assert_eq!(
+        remotes[0]["target"]["args"],
+        serde_json::json!(["-L", "9000:localhost:9000", "-J", "jump"])
+    );
+
+    // The identical spec is a duplicate target (dedup keys off destination + options).
+    let dup = send_json_request(
+        &api_socket,
+        r#"{"id":"d","method":"remote.add","params":{"target":"ssh -L 9000:localhost:9000 -J jump iq-64"}}"#,
+    );
+    assert!(
+        dup.get("error").is_some(),
+        "identical full spec should be rejected: {dup}"
+    );
+
+    // A bare host to the same destination is a distinct connection (no options): accepted, and it
+    // persists with no `args` key (bare targets stay byte-identical to the legacy on-disk form).
+    let bare = send_json_request(
+        &api_socket,
+        r#"{"id":"b","method":"remote.add","params":{"name":"plain","target":"iq-64"}}"#,
+    );
+    assert!(bare.get("error").is_none(), "bare host add failed: {bare}");
+    assert_eq!(bare["result"]["remote"]["target"]["target"], "iq-64");
+    assert_eq!(
+        bare["result"]["remote"]["target"]["args"],
+        Value::Null,
+        "bare target must not serialize an args key"
+    );
+
+    cleanup_spawned_herdr(main_server, base);
+}
