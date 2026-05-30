@@ -1187,7 +1187,7 @@ enum ClientLoopEvent {
     },
     /// Add-remote validation and setup completed off the UI loop.
     AddRemoteFinished {
-        result: Result<ClientAddRemoteSuccess, String>,
+        result: Result<ClientAddRemoteSuccess, AddRemoteFailure>,
         elapsed: Duration,
     },
     /// item 3 (Area 5): a remote-management `remote.set_enabled`/`remote.remove` request finished
@@ -1573,7 +1573,8 @@ fn connect_secondary_client_stream_for_plan_detached(
             } else {
                 let ssh_target =
                     crate::remote::SshTarget::new(destination.clone(), options.clone());
-                let bridge = crate::remote::start_ssh_remote_bridge(ssh_target, None)
+                // Reconnect path: can't prompt, so never auto-restart an incompatible server.
+                let bridge = crate::remote::start_ssh_remote_bridge(ssh_target, false, None)
                     .map_err(ClientError::ConnectionFailed)?;
                 let socket_path = bridge.client_socket_path().to_path_buf();
                 return connect_secondary_client_stream(
@@ -2024,10 +2025,36 @@ fn spawn_client_add_remote_submission(
     });
 }
 
-/// Run a blocking remote operation on a helper thread, failing with a descriptive error if it
-/// does not finish within `timeout`. Used to bound ssh bridge setup so the add-remote worker can
-/// never wedge the dialog on an unreachable/slow/auth-prompting host (see [`ADD_REMOTE_BRIDGE_TIMEOUT`]).
-fn run_remote_op_with_timeout<T, F>(timeout: Duration, op: F) -> Result<T, String>
+/// Outcome of a bounded remote op (see [`run_remote_op_with_timeout`]). Preserves the underlying
+/// `io::Error` so callers can downcast typed signals (e.g. [`crate::remote::RestartConfirmNeeded`]).
+#[derive(Debug)]
+enum RemoteOpError {
+    TimedOut(Duration),
+    WorkerGone,
+    Failed(io::Error),
+}
+
+/// Why an add-remote submission did not succeed.
+#[derive(Debug)]
+enum AddRemoteFailure {
+    /// A plain message for the dialog's status row.
+    Message(String),
+    /// The remote runs an incompatible server that can't live-handoff; ask the user whether to
+    /// restart it (issue #12, macmini). `detail` is the prompt text; `destination` re-targets the
+    /// retry.
+    NeedsRestartConfirm { destination: String, detail: String },
+}
+
+impl From<String> for AddRemoteFailure {
+    fn from(message: String) -> Self {
+        AddRemoteFailure::Message(message)
+    }
+}
+
+/// Run a blocking remote operation on a helper thread, failing if it does not finish within
+/// `timeout`. Bounds ssh bridge setup so the add-remote worker can never wedge the dialog on an
+/// unreachable/slow/auth-prompting host (see [`ADD_REMOTE_BRIDGE_TIMEOUT`]).
+fn run_remote_op_with_timeout<T, F>(timeout: Duration, op: F) -> Result<T, RemoteOpError>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -2038,14 +2065,35 @@ where
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "timed out after {}s connecting to the remote host",
+        Ok(Err(err)) => Err(RemoteOpError::Failed(err)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RemoteOpError::TimedOut(timeout)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RemoteOpError::WorkerGone),
+    }
+}
+
+/// Turn a bridge-setup failure into a dialog-facing [`AddRemoteFailure`]. A
+/// [`crate::remote::RestartConfirmNeeded`] signal becomes a y/N confirm; everything else becomes a
+/// mapped error message.
+fn classify_add_remote_bridge_error(err: RemoteOpError) -> AddRemoteFailure {
+    match err {
+        RemoteOpError::TimedOut(timeout) => AddRemoteFailure::Message(format!(
+            "failed to start ssh remote bridge: timed out after {}s connecting to the remote host",
             timeout.as_secs()
         )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err("remote connection worker exited unexpectedly".to_string())
-        }
+        RemoteOpError::WorkerGone => AddRemoteFailure::Message(
+            "failed to start ssh remote bridge: remote connection worker exited unexpectedly"
+                .to_string(),
+        ),
+        RemoteOpError::Failed(err) => match crate::remote::restart_confirm_needed(&err) {
+            Some(confirm) => AddRemoteFailure::NeedsRestartConfirm {
+                destination: confirm.destination.clone(),
+                detail: confirm.to_string(),
+            },
+            None => AddRemoteFailure::Message(format!(
+                "failed to start ssh remote bridge: {}",
+                map_remote_bridge_error(&err.to_string())
+            )),
+        },
     }
 }
 
@@ -2053,12 +2101,13 @@ fn prepare_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
     server_size: (u16, u16),
     cell_size_px: (u32, u32),
-) -> Result<ClientAddRemoteSuccess, String> {
+) -> Result<ClientAddRemoteSuccess, AddRemoteFailure> {
     let target = crate::remote_registry::RemoteTargetSnapshot::parse(&draft.target)
         .map_err(|err| err.message().to_string())?;
     reject_duplicate_main_target(&target)?;
 
     let keybindings = draft.keybindings;
+    let restart_incompatible = draft.restart_incompatible;
     let (stream, bridge) = match &target {
         crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
             validate_add_remote_target(
@@ -2082,9 +2131,9 @@ fn prepare_client_add_remote_submission(
         crate::remote_registry::RemoteTargetSnapshot::Ssh { target, args } => {
             let ssh_target = crate::remote::SshTarget::new(target.clone(), args.clone());
             let bridge = run_remote_op_with_timeout(ADD_REMOTE_BRIDGE_TIMEOUT, move || {
-                crate::remote::start_ssh_remote_bridge(ssh_target, None)
+                crate::remote::start_ssh_remote_bridge(ssh_target, restart_incompatible, None)
             })
-            .map_err(|err| format!("failed to start ssh remote bridge: {err}"))?;
+            .map_err(classify_add_remote_bridge_error)?;
             validate_add_remote_target(
                 crate::api::client::ConnectionTarget::SocketPath(
                     bridge.api_socket_path().to_path_buf(),
@@ -3608,10 +3657,22 @@ async fn run_client_loop(
                             }
                         }
                     }
-                    Err(err) => {
+                    Err(AddRemoteFailure::Message(err)) => {
                         warn!(err = %err, "failed to add client remote");
                         if let Some(model) = &mut state.supervisor_model {
                             model.set_add_remote_error(err);
+                        }
+                    }
+                    Err(AddRemoteFailure::NeedsRestartConfirm {
+                        destination,
+                        detail,
+                    }) => {
+                        warn!(
+                            destination = %destination,
+                            "add-remote blocked on an incompatible no-handoff server; prompting to restart"
+                        );
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.set_add_remote_restart_confirm(destination, detail);
                         }
                     }
                 }
@@ -4147,29 +4208,64 @@ mod tests {
 
     #[test]
     fn run_remote_op_with_timeout_returns_fast_success() {
-        let value = run_remote_op_with_timeout(Duration::from_secs(5), || Ok(7u32));
-        assert_eq!(value, Ok(7));
+        let value = run_remote_op_with_timeout(Duration::from_secs(5), || Ok(7u32)).unwrap();
+        assert_eq!(value, 7);
     }
 
     #[test]
     fn run_remote_op_with_timeout_surfaces_inner_error() {
-        let result: Result<(), String> =
+        let result: Result<(), RemoteOpError> =
             run_remote_op_with_timeout(Duration::from_secs(5), || Err(io::Error::other("boom")));
-        assert_eq!(result, Err("boom".to_string()));
+        match result {
+            Err(RemoteOpError::Failed(err)) => assert_eq!(err.to_string(), "boom"),
+            other => panic!("expected Failed(boom), got {other:?}"),
+        }
     }
 
     #[test]
     fn run_remote_op_with_timeout_fails_when_op_exceeds_deadline() {
         // The core anti-hang guarantee: a stuck remote op yields a timeout error, not a wedge.
-        let result: Result<(), String> =
+        let result: Result<(), RemoteOpError> =
             run_remote_op_with_timeout(Duration::from_millis(50), || {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(())
             });
         assert!(
-            result.is_err_and(|err| err.contains("timed out")),
-            "slow op must time out with a descriptive error"
+            matches!(result, Err(RemoteOpError::TimedOut(_))),
+            "slow op must time out, got {result:?}"
         );
+    }
+
+    #[test]
+    fn classify_bridge_error_turns_restart_signal_into_confirm() {
+        let signal = crate::remote::RestartConfirmNeeded {
+            destination: "macmini".to_string(),
+            version: Some("0.5.10".to_string()),
+            protocol: Some(6),
+        };
+        let failure =
+            classify_add_remote_bridge_error(RemoteOpError::Failed(io::Error::other(signal)));
+        match failure {
+            AddRemoteFailure::NeedsRestartConfirm {
+                destination,
+                detail,
+            } => {
+                assert_eq!(destination, "macmini");
+                assert!(detail.contains("protocol 6") && detail.contains("Restart"));
+            }
+            other => panic!("expected NeedsRestartConfirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_bridge_error_maps_plain_failures_to_message() {
+        let failure = classify_add_remote_bridge_error(RemoteOpError::Failed(io::Error::other(
+            "ssh: connect to host x port 22: Connection refused",
+        )));
+        match failure {
+            AddRemoteFailure::Message(msg) => assert!(msg.contains("cannot reach host")),
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4763,6 +4859,7 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                restart_incompatible: false,
             },
         )
         .unwrap();
@@ -6076,6 +6173,7 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                restart_incompatible: false,
             })
         );
     }
@@ -6502,6 +6600,7 @@ mod tests {
             target: "local:slowadd".into(),
             name: Some("slowadd".into()),
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            restart_incompatible: false,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let mut pending_add_remote = false;

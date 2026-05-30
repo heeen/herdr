@@ -888,6 +888,10 @@ fn render_client_shell(
                     error: form.error.as_deref(),
                     in_progress: form.in_progress,
                     spinner: crate::ui::spinner_frame(snapshot.app.spinner_tick),
+                    restart_confirm_destination: form
+                        .restart_confirm
+                        .as_ref()
+                        .map(|confirm| confirm.destination.as_str()),
                 };
                 crate::ui::render_add_remote_overlay(
                     &snapshot.app.palette,

@@ -310,18 +310,52 @@ pub(crate) enum RemotePrepPolicy {
     /// The in-client add-remote worker: never read stdin (the TUI owns it in raw mode, so any
     /// `read_line` would hang invisibly). Auto-approve installing herdr on a fresh host, prefer
     /// live-handoff for an out-of-date running server, and refuse to silently hard-stop a remote
-    /// server that cannot hand off (surface it as an error instead of killing live panes).
-    NonInteractive,
+    /// server that cannot hand off — unless `restart_incompatible` is set, which means the user
+    /// explicitly approved stopping an incompatible no-handoff server (issue #12, macmini).
+    NonInteractive { restart_incompatible: bool },
+}
+
+/// Typed signal (wrapped in an `io::Error`) that a non-interactive attach hit an incompatible
+/// remote server that cannot live-handoff. The client downcasts this to show a y/N restart prompt
+/// instead of a dead-end error, then retries with `restart_incompatible = true`.
+#[derive(Debug, Clone)]
+pub(crate) struct RestartConfirmNeeded {
+    pub(crate) destination: String,
+    pub(crate) version: Option<String>,
+    pub(crate) protocol: Option<u32>,
+}
+
+impl std::fmt::Display for RestartConfirmNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} runs an older herdr (v{} protocol {}) that can't live-handoff. Restart it with the updated herdr? This interrupts its running panes.",
+            self.destination,
+            version_label(self.version.as_deref()),
+            protocol_label(self.protocol)
+        )
+    }
+}
+
+impl std::error::Error for RestartConfirmNeeded {}
+
+/// If `err` carries a [`RestartConfirmNeeded`] signal, borrow it.
+pub(crate) fn restart_confirm_needed(err: &io::Error) -> Option<&RestartConfirmNeeded> {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<RestartConfirmNeeded>())
 }
 
 pub(crate) fn start_ssh_remote_bridge(
     target: SshTarget,
+    restart_incompatible: bool,
     session_name: Option<&str>,
 ) -> io::Result<RemoteBridge> {
     let session_name = session_name.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
     // Client-driven attach: never block on stdin, and prefer live-handoff so an out-of-date
     // remote server is upgraded without killing its panes.
-    let policy = RemotePrepPolicy::NonInteractive;
+    let policy = RemotePrepPolicy::NonInteractive {
+        restart_incompatible,
+    };
     let prepared_remote = prepare_remote_herdr(&target, true, policy)?;
     ensure_remote_server_ready(
         &target,
@@ -1048,7 +1082,10 @@ fn ensure_remote_server_ready(
     };
 
     // Non-interactive (client) attach: decide without prompting and never hard-stop.
-    if policy == RemotePrepPolicy::NonInteractive {
+    if let RemotePrepPolicy::NonInteractive {
+        restart_incompatible,
+    } = policy
+    {
         match non_interactive_server_action(reason, live_handoff_enabled, live_handoff) {
             NonInteractiveServerAction::AttachExisting => return Ok(()),
             NonInteractiveServerAction::LiveHandoff => {
@@ -1066,11 +1103,19 @@ fn ensure_remote_server_ready(
                 };
             }
             NonInteractiveServerAction::ProtocolStuck => {
-                return Err(io::Error::other(format!(
-                    "remote herdr server on {} runs protocol {}, but this client needs protocol {CURRENT_PROTOCOL}, and it does not support live-handoff. Update the remote herdr (it must be a live-handoff-capable build) and try again.",
-                    target.destination(),
-                    protocol_label(protocol)
-                )));
+                // The remote runs an incompatible server that can't live-handoff. Stopping it would
+                // interrupt its panes, so we never do that silently — unless the user explicitly
+                // approved it via the add-remote y/N (issue #12, macmini). Otherwise we surface a
+                // typed signal the client turns into that prompt.
+                if restart_incompatible {
+                    stop_remote_server(target, remote_herdr)?;
+                    return Ok(());
+                }
+                return Err(io::Error::other(RestartConfirmNeeded {
+                    destination: target.destination().to_string(),
+                    version: version.clone(),
+                    protocol,
+                }));
             }
         }
     }
@@ -1163,7 +1208,7 @@ fn confirm_remote_install_with_running_server(
 ) -> io::Result<()> {
     // Non-interactive (client) attach auto-approves replacing the binary; the running server is
     // reconciled later in `ensure_remote_server_ready` (live-handoff when possible).
-    if policy == RemotePrepPolicy::NonInteractive {
+    if matches!(policy, RemotePrepPolicy::NonInteractive { .. }) {
         return Ok(());
     }
     let dest = target.destination();
@@ -1590,7 +1635,7 @@ fn confirm_remote_install(
     policy: RemotePrepPolicy,
 ) -> io::Result<()> {
     // Core of requirement #5: a fresh ssh-reachable host auto-installs herdr with no prompt.
-    if policy == RemotePrepPolicy::NonInteractive {
+    if matches!(policy, RemotePrepPolicy::NonInteractive { .. }) {
         return Ok(());
     }
     if !io::stdin().is_terminal() {

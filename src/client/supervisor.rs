@@ -176,6 +176,9 @@ pub(crate) struct AddRemoteForm {
     /// animated status line (distinct from `error`) so a slow connect reads as progress, not as a
     /// failure, and never as the old static red "adding remote..." string.
     pub(crate) in_progress: bool,
+    /// Set when the worker reported an incompatible no-handoff remote server; the dialog shows a
+    /// y/N restart prompt instead of the spinner/error (issue #12, macmini).
+    pub(crate) restart_confirm: Option<AddRemoteRestartConfirm>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +186,17 @@ pub(crate) struct AddRemoteDraft {
     pub(crate) target: String,
     pub(crate) name: Option<String>,
     pub(crate) keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
+    /// Set only when retrying after the user approved restarting an incompatible no-handoff remote
+    /// server (issue #12, macmini). Flows to `start_ssh_remote_bridge`.
+    pub(crate) restart_incompatible: bool,
+}
+
+/// Pending user decision: the remote runs an incompatible server that can't live-handoff, so we
+/// ask whether to restart it (interrupting its panes) before attaching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddRemoteRestartConfirm {
+    pub(crate) destination: String,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -954,6 +968,7 @@ impl ClientSupervisorModel {
             focused_field: AddRemoteField::Target,
             error: None,
             in_progress: false,
+            restart_confirm: None,
         });
     }
 
@@ -974,6 +989,43 @@ impl ClientSupervisorModel {
 
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return AddRemoteFormOutcome::Redraw;
+        }
+
+        // While the restart-confirm prompt is showing (issue #12, macmini), the form takes only the
+        // y/N decision — not field edits — so a stray keystroke can't silently dismiss it.
+        if self.add_remote_restart_confirm().is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let Some(form) = self.add_remote_form_mut() else {
+                        return AddRemoteFormOutcome::Redraw;
+                    };
+                    form.restart_confirm = None;
+                    let target = form.target.trim().to_string();
+                    if target.is_empty() {
+                        form.error = Some("target required".to_string());
+                        return AddRemoteFormOutcome::Redraw;
+                    }
+                    let name = trimmed_optional(&form.name);
+                    return AddRemoteFormOutcome::Submit(AddRemoteDraft {
+                        target,
+                        name,
+                        keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                        restart_incompatible: true,
+                    });
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let Some(form) = self.add_remote_form_mut() {
+                        let destination = form
+                            .restart_confirm
+                            .take()
+                            .map(|confirm| confirm.destination)
+                            .unwrap_or_default();
+                        form.error = Some(format!("left {destination} unchanged"));
+                    }
+                    return AddRemoteFormOutcome::Redraw;
+                }
+                _ => return AddRemoteFormOutcome::Redraw,
+            }
         }
 
         match key.code {
@@ -1005,6 +1057,7 @@ impl ClientSupervisorModel {
                     target,
                     name,
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                    restart_incompatible: false,
                 })
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1070,6 +1123,23 @@ impl ClientSupervisorModel {
 
     pub(crate) fn finish_add_remote(&mut self) {
         self.close_client_overlay();
+    }
+
+    /// Show the y/N restart prompt for an incompatible no-handoff remote server (issue #12).
+    pub(crate) fn set_add_remote_restart_confirm(&mut self, destination: String, detail: String) {
+        if let Some(form) = self.add_remote_form_mut() {
+            form.in_progress = false;
+            form.error = None;
+            form.restart_confirm = Some(AddRemoteRestartConfirm {
+                destination,
+                detail,
+            });
+        }
+    }
+
+    pub(crate) fn add_remote_restart_confirm(&self) -> Option<&AddRemoteRestartConfirm> {
+        self.add_remote_form()
+            .and_then(|form| form.restart_confirm.as_ref())
     }
 
     // ----- item 3 (Area 5): remote-management overlay -----------------------------------------
@@ -1994,6 +2064,83 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|err| err.contains("cannot reach host")));
+    }
+
+    fn add_remote_char(model: &mut ClientSupervisorModel, ch: char) {
+        model.handle_add_remote_key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+    }
+
+    fn add_remote_key(
+        model: &mut ClientSupervisorModel,
+        code: crossterm::event::KeyCode,
+    ) -> AddRemoteFormOutcome {
+        model.handle_add_remote_key(crate::input::TerminalKey::new(
+            code,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+    }
+
+    #[test]
+    fn add_remote_restart_confirm_yes_resubmits_with_restart_approval() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        for ch in "macmini".chars() {
+            add_remote_char(&mut model, ch);
+        }
+        // Worker reported an incompatible no-handoff server (issue #12, macmini).
+        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
+        assert!(model.add_remote_restart_confirm().is_some());
+        assert!(!model.add_remote_in_progress());
+
+        // 'y' retries with restart approval, preserving the typed target, and clears the prompt.
+        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            AddRemoteFormOutcome::Submit(AddRemoteDraft {
+                target: "macmini".into(),
+                name: None,
+                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                restart_incompatible: true,
+            })
+        );
+        assert!(model.add_remote_restart_confirm().is_none());
+    }
+
+    #[test]
+    fn add_remote_restart_confirm_no_dismisses_without_submitting() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        for ch in "macmini".chars() {
+            add_remote_char(&mut model, ch);
+        }
+        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
+
+        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('n'));
+        assert_eq!(outcome, AddRemoteFormOutcome::Redraw);
+        assert!(model.add_remote_restart_confirm().is_none());
+        assert!(
+            model.add_remote_form().unwrap().error.is_some(),
+            "declining should leave an explanatory message"
+        );
+    }
+
+    #[test]
+    fn add_remote_restart_confirm_ignores_field_edits() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        for ch in "macmini".chars() {
+            add_remote_char(&mut model, ch);
+        }
+        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
+
+        // A stray character must not edit the target nor dismiss the prompt.
+        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('z'));
+        assert_eq!(outcome, AddRemoteFormOutcome::Redraw);
+        assert!(model.add_remote_restart_confirm().is_some());
+        assert_eq!(model.add_remote_form().unwrap().target, "macmini");
     }
 
     #[test]
@@ -3583,6 +3730,7 @@ mod tests {
                 focused_field: AddRemoteField::Target,
                 error: None,
                 in_progress: false,
+                restart_confirm: None,
             })
         );
     }
@@ -3654,6 +3802,7 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                restart_incompatible: false,
             })
         );
     }
