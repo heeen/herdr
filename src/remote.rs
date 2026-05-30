@@ -280,44 +280,8 @@ impl SshTarget {
     /// inserted before the destination unless the user already supplied it; the herdr payload is
     /// always the trailing positional so it runs on the remote rather than being parsed as an
     /// ssh option.
-    /// Per-destination ssh ControlMaster socket. A short, stable hashed path so repeated ssh
-    /// invocations to the same host reuse one multiplexed connection (issue #13: a fresh ssh
-    /// setup costs 200-800ms, dwarfing the ~12ms data RTT and making every per-request API call —
-    /// and the latency reading derived from it — wildly slow).
-    fn control_socket_path(&self) -> PathBuf {
-        let name = format!(
-            "herdr-cm-{}.sock",
-            short_socket_hash(&self.destination, "", "cm")
-        );
-        let in_tmp = std::env::temp_dir().join(&name);
-        if fits_unix_socket_path(&in_tmp) {
-            in_tmp
-        } else {
-            Path::new("/tmp").join(&name)
-        }
-    }
-
     fn command(&self, remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
-        // Multiplex over one persistent connection per host so repeated per-request ssh calls
-        // (summaries, ping, probes) skip the 200-800ms TCP+SSH handshake and run at ~RTT. A stale
-        // control socket degrades gracefully to a fresh connection. Skip if the user manages it.
-        if !self
-            .options
-            .iter()
-            .any(|opt| opt.contains("ControlMaster") || opt.contains("ControlPath"))
-        {
-            command
-                .arg("-o")
-                .arg("ControlMaster=auto")
-                .arg("-o")
-                .arg(format!(
-                    "ControlPath={}",
-                    self.control_socket_path().display()
-                ))
-                .arg("-o")
-                .arg("ControlPersist=30");
-        }
         // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
         // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
         if !self
@@ -1913,7 +1877,11 @@ fn bridge_connection(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Never inherit the bridge ssh's stderr: this runs inside the raw-mode TUI client, so any
+        // ssh chatter (host-key notices, multiplexing notes, transient warnings) would corrupt /
+        // spam the screen. A genuine bridge failure surfaces as a dropped stream → reconnect, and
+        // connection-setup errors are already reported by the detect/install phase.
+        .stderr(Stdio::null());
 
     let mut child = command
         .spawn()
@@ -2100,44 +2068,12 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
-    fn ssh_argv_full(target: &SshTarget, remote_command: &str) -> Vec<String> {
+    fn ssh_argv(target: &SshTarget, remote_command: &str) -> Vec<String> {
         target
             .command(remote_command)
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
-    }
-
-    /// argv with the leading ControlMaster multiplexing prefix (issue #13) stripped, so the
-    /// connection-independent tests assert the meaningful tail.
-    fn ssh_argv(target: &SshTarget, remote_command: &str) -> Vec<String> {
-        let argv = ssh_argv_full(target, remote_command);
-        assert_eq!(&argv[0..3], ["-o", "ControlMaster=auto", "-o"]);
-        assert!(
-            argv[3].starts_with("ControlPath="),
-            "expected ControlPath option, got {}",
-            argv[3]
-        );
-        assert_eq!(&argv[4..6], ["-o", "ControlPersist=30"]);
-        argv[6..].to_vec()
-    }
-
-    #[test]
-    fn ssh_command_multiplexes_connections_unless_user_manages_it() {
-        let argv = ssh_argv_full(&SshTarget::bare("iq-64"), "x");
-        assert!(argv.iter().any(|a| a == "ControlMaster=auto"));
-        assert!(argv.iter().any(|a| a.starts_with("ControlPath=")));
-
-        // A user who sets their own ControlPath keeps full control (we don't add ours).
-        let managed = SshTarget::new("iq-64", vec!["-o".into(), "ControlPath=/tmp/mine".into()]);
-        let argv = ssh_argv_full(&managed, "x");
-        assert!(!argv.iter().any(|a| a == "ControlMaster=auto"));
-        assert_eq!(
-            argv.iter()
-                .filter(|a| a.starts_with("ControlPath="))
-                .count(),
-            1
-        );
     }
 
     #[test]
