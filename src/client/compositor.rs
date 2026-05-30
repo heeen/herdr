@@ -422,9 +422,9 @@ impl ClientCompositor {
     /// SAME `ClientSidebarSnapshot` + rect checks as `hit_test` so render geometry and hover
     /// geometry cannot drift. Returns `None` (no highlight) for:
     /// - a collapsed/zero-width sidebar (`effective_sidebar_width == 0`),
-    /// - an open add-remote form / global menu / manage overlay — those own their own hover, so
-    ///   the sidebar must not fight them (the `Moved` still reaches this fn via the unguarded
-    ///   overlay mouse arm),
+    /// - an open add-remote form / global menu / manage overlay — those own their own hover (the
+    ///   global menu moves its highlight on motion via `client_global_menu_item_at`, handled in the
+    ///   client `Moved` arm before this fn), so the sidebar must not fight them,
     /// - positions outside the sidebar content,
     /// - disabled remote rows and `None`-`workspace_id` placeholders (matches `hit_test`),
     /// - non-selectable layout rows (divider/banner-skip + headers/separator — they produce no
@@ -449,7 +449,8 @@ impl ClientCompositor {
         }
 
         // An open add-remote form / global menu / manage overlay owns input; the sidebar hover
-        // must yield so the existing overlay hover is authoritative.
+        // must yield so the existing overlay hover is authoritative. The global menu moves its
+        // highlight on motion (`client_global_menu_item_at`), handled in the client `Moved` arm.
         if model.client_global_menu_highlighted().is_some()
             || model.add_remote_form().is_some()
             || model.remote_manage_overlay().is_some()
@@ -536,6 +537,37 @@ impl ClientCompositor {
         }
 
         hover_test_agent_panel(&snapshot, x, y)
+    }
+
+    /// item 7: resolve a mouse-motion position to a 0-based item index in the open client global
+    /// menu, or `None` when the menu is closed / the position misses it. Shares the SAME snapshot +
+    /// `global_menu_item_index_at` geometry as `hit_test`, so motion-driven highlight and click
+    /// resolve identical rows. The client `Moved` arm feeds the result to
+    /// `model.hover_client_global_menu_item`, mirroring the monolithic host's `global_menu.hover`.
+    pub(crate) fn client_global_menu_item_at(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        x: u16,
+        y: u16,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<usize> {
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0
+            || host_height == 0
+            || model.client_global_menu_highlighted().is_none()
+        {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        global_menu_item_index_at(&snapshot.app, x, y)
     }
 }
 
@@ -1076,7 +1108,11 @@ fn hit_test_remote_manage(
     None
 }
 
-fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<SidebarHitTarget> {
+/// Shared geometry for the open global launcher menu: resolve a position to a 0-based item index,
+/// or `None` when the menu is closed or the position misses the menu's inner item rows. Both
+/// `hit_test_global_menu` (click) and `client_global_menu_item_at` (motion) resolve through this so
+/// click and hover geometry cannot drift from the `render_global_launcher_menu` row layout.
+fn global_menu_item_index_at(app: &crate::app::AppState, x: u16, y: u16) -> Option<usize> {
     if !matches!(app.mode, Mode::GlobalMenu) {
         return None;
     }
@@ -1089,8 +1125,12 @@ fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<Si
         return None;
     }
     let index = (y - inner_y) as usize;
-    (index < app.global_menu_labels().len())
-        .then_some(SidebarHitTarget::ClientGlobalMenuItem { index })
+    (index < app.global_menu_labels().len()).then_some(index)
+}
+
+fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<SidebarHitTarget> {
+    global_menu_item_index_at(app, x, y)
+        .map(|index| SidebarHitTarget::ClientGlobalMenuItem { index })
 }
 
 fn hit_test_agent_panel(
@@ -2108,6 +2148,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_global_menu_hover_moves_highlight_render() {
+        // item 7: moving the highlight (as a hover `Moved` does via `hover_client_global_menu_item`)
+        // repaints the accent bg onto the newly highlighted row and clears it from the old one — the
+        // shared launcher-menu surface renders `highlighted` identically to the monolithic host.
+        let compositor = ClientCompositor::new(26);
+        let content = frame(8, 3, &["content", "frame"]);
+
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_client_global_menu(); // highlighted defaults to index 0.
+        let before = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+
+        assert!(model.hover_client_global_menu_item(Some(2)));
+        let after = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            60,
+            16,
+            std::time::Instant::now(),
+        );
+        let rect = snapshot.app.global_menu_rect();
+        let row0 = rect.y + 1; // item index 0 ("settings").
+        let row1 = rect.y + 2; // item index 1 ("keybinds"): never highlighted in this test.
+        let row2 = rect.y + 3; // item index 2 ("reload config").
+
+        let bgs = |frame: &FrameData, row: u16| -> Vec<u32> {
+            (0..frame.width)
+                .map(|x| cell_at(frame, x, row).bg)
+                .collect()
+        };
+        // before: index 0 is highlighted, so its bg differs from the unhighlighted neighbour row 1
+        // (same-width label, so an unhighlighted row 0 would match row 1 exactly).
+        assert_ne!(
+            bgs(&before, row0),
+            bgs(&before, row1),
+            "row 0 starts highlighted"
+        );
+        // after moving the highlight to index 2: row 0 reverts to an unhighlighted row (matches the
+        // unhighlighted row 1), and row 2 now carries a highlight bg row 1 lacks.
+        assert_eq!(
+            bgs(&after, row0),
+            bgs(&after, row1),
+            "row 0 reverts to unhighlighted"
+        );
+        assert_ne!(
+            bgs(&after, row2),
+            bgs(&after, row1),
+            "row 2 becomes highlighted"
+        );
+    }
+
     /// Read the cell at (x, y) of a composited frame.
     fn cell_at(frame: &FrameData, x: u16, y: u16) -> &CellData {
         &frame.cells[(y as usize) * (frame.width as usize) + (x as usize)]
@@ -2866,7 +2960,8 @@ mod tests {
     #[test]
     fn hover_test_suppressed_when_overlay_open() {
         // with the add-remote form open OR the client global menu highlighted, sidebar hover_test
-        // returns None (the overlay owns its own hover).
+        // returns None (the overlay owns its own hover; the global menu moves its highlight via the
+        // separate `client_global_menu_item_at` path in the client `Moved` arm).
         let (mut model, _remote_id) = mixed_supervisor_model();
         model.open_add_remote_form();
         for y in 0..16u16 {
@@ -2879,6 +2974,47 @@ mod tests {
         for y in 0..16u16 {
             assert_eq!(model_hover_anywhere(&model, y), None);
         }
+    }
+
+    #[test]
+    fn client_global_menu_item_at_resolves_hovered_row() {
+        // item 7: motion over the open menu resolves to the row index under the cursor (same
+        // geometry `hit_test` uses); a far-left column off the right-anchored menu resolves to None;
+        // a closed menu resolves to None.
+        let (mut model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+        // closed menu → None.
+        assert_eq!(
+            compositor.client_global_menu_item_at(&model, 21, 1, host.0, host.1),
+            None
+        );
+
+        model.open_client_global_menu();
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let rect = snapshot.app.global_menu_rect();
+        // the first item row sits one cell inside the menu's top-left border.
+        assert_eq!(
+            compositor.client_global_menu_item_at(&model, rect.x + 1, rect.y + 1, host.0, host.1),
+            Some(0)
+        );
+        // a deeper row resolves to its index.
+        assert_eq!(
+            compositor.client_global_menu_item_at(&model, rect.x + 1, rect.y + 3, host.0, host.1),
+            Some(2)
+        );
+        // the far-left sidebar column misses the right-anchored menu → None.
+        assert_eq!(
+            compositor.client_global_menu_item_at(&model, 0, rect.y + 1, host.0, host.1),
+            None
+        );
     }
 
     fn model_hover_anywhere(model: &ClientSupervisorModel, y: u16) -> Option<SidebarHoverTarget> {

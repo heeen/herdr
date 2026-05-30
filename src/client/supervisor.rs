@@ -865,6 +865,25 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// item 7: motion over an open global menu moves the highlight to the hovered row (mirrors the
+    /// monolithic host's `MenuListState::hover`): `Some(idx)` snaps the highlight there, `None`
+    /// (off the menu) leaves it put. Returns whether the highlight changed, so the client `Moved`
+    /// arm can repaint only on a real move. A no-op when the menu is closed.
+    pub(crate) fn hover_client_global_menu_item(&mut self, idx: Option<usize>) -> bool {
+        let Some(idx) = idx else {
+            return false;
+        };
+        let item_count = self.client_global_menu_items().len();
+        if let ClientOverlayState::GlobalMenu { highlighted } = &mut self.client_overlay {
+            let next = idx.min(item_count.saturating_sub(1));
+            if *highlighted != next {
+                *highlighted = next;
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn accept_client_global_menu_item(&mut self) -> Option<ClientGlobalMenuAction> {
         let highlighted = self.client_global_menu_highlighted()?;
         self.select_client_global_menu_item(highlighted)
@@ -3425,6 +3444,33 @@ mod tests {
                 focused_field: AddRemoteField::Target,
                 error: None,
             })
+        );
+    }
+
+    #[test]
+    fn hover_client_global_menu_item_moves_highlight() {
+        let mut model = ClientSupervisorModel::new("local");
+        // a no-op when the menu is closed (and reports no change).
+        assert!(!model.hover_client_global_menu_item(Some(2)));
+        assert_eq!(model.client_global_menu_highlighted(), None);
+
+        model.open_client_global_menu();
+        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+
+        // Some(idx) snaps the highlight and reports the change; re-hovering the same row is a no-op.
+        assert!(model.hover_client_global_menu_item(Some(2)));
+        assert_eq!(model.client_global_menu_highlighted(), Some(2));
+        assert!(!model.hover_client_global_menu_item(Some(2)));
+
+        // None (off the menu) leaves the highlight put.
+        assert!(!model.hover_client_global_menu_item(None));
+        assert_eq!(model.client_global_menu_highlighted(), Some(2));
+
+        // an out-of-range index clamps to the last item (and reports the change from row 2).
+        assert!(model.hover_client_global_menu_item(Some(99)));
+        assert_eq!(
+            model.client_global_menu_highlighted(),
+            Some(model.client_global_menu_items().len() - 1)
         );
     }
 

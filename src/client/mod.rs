@@ -566,6 +566,23 @@ fn dispatch_composited_mouse_input(
     // through so a content `Moved` still forwards its bytes via `translate_content_mouse_input`.
     // The `Redraw` arm recomposes locally (commit 3d47acd: no supervisor request, no server I/O).
     if matches!(mouse.kind, MouseEventKind::Moved) {
+        // item 7: while the global menu is open, motion moves its highlight to the hovered row
+        // (mirrors the monolithic host's `global_menu.hover`); the same shared launcher-menu surface
+        // then renders it. The overlay mouse arm routes the `Moved` here regardless of column.
+        if model.client_global_menu_highlighted().is_some() {
+            let hovered = compositor.client_global_menu_item_at(
+                model,
+                mouse.column,
+                mouse.row,
+                host_size.0,
+                host_size.1,
+            );
+            return if model.hover_client_global_menu_item(hovered) {
+                ClientInputDispatch::Redraw
+            } else {
+                ClientInputDispatch::Consumed
+            };
+        }
         let sidebar_width = compositor.sidebar_width().min(host_size.0);
         if mouse.column < sidebar_width || compositor.hover().is_some() {
             let next =
@@ -5745,6 +5762,42 @@ mod tests {
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
         assert_eq!(model.client_global_menu_highlighted(), Some(0));
+    }
+
+    #[test]
+    fn composited_moved_over_open_global_menu_moves_highlight() {
+        // item 7: motion over the open client menu moves the highlight to the hovered row (mirrors
+        // the monolithic host) and repaints; identical motion coalesces; motion off the menu leaves
+        // the highlight put. The menu stays open throughout (motion never activates or closes it).
+        let (mut model, _) = mixed_remote_model();
+        model.open_client_global_menu();
+        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+
+        // motion onto menu row index 1 moves the highlight 0 → 1 and repaints.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        assert_eq!(model.client_global_menu_highlighted(), Some(1));
+        // a second identical motion is coalesced (no change) → Consumed.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
+            ClientInputDispatch::Consumed
+        );
+        // motion onto row index 2 moves the highlight 1 → 2.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        assert_eq!(model.client_global_menu_highlighted(), Some(2));
+        // motion off the right-anchored menu (far-left column) leaves the highlight put → Consumed.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(1, 2), &mut compositor, &mut model, host),
+            ClientInputDispatch::Consumed
+        );
+        assert_eq!(model.client_global_menu_highlighted(), Some(2));
     }
 
     #[test]
