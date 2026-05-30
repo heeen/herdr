@@ -98,6 +98,8 @@ pub(crate) enum ServerEvent {
     ClientOpenSettings { client_id: u64 },
     /// A client requested the server-rendered keybind help UI.
     ClientOpenKeybindHelp { client_id: u64 },
+    /// A latency probe from a client; the server echoes `nonce` back in a `Pong` (issue #13).
+    ClientPing { client_id: u64, nonce: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
@@ -475,6 +477,7 @@ fn client_read_loop(
             },
             ClientMessage::OpenSettings => ServerEvent::ClientOpenSettings { client_id },
             ClientMessage::OpenKeybindHelp => ServerEvent::ClientOpenKeybindHelp { client_id },
+            ClientMessage::Ping { nonce } => ServerEvent::ClientPing { client_id, nonce },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;

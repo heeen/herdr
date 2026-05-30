@@ -1961,17 +1961,6 @@ fn request_server_summary(api: &mut impl SupervisorApi) -> Result<ServerSummary,
     Ok(ServerSummary::from_api(workspaces, agents))
 }
 
-/// Round-trip latency to a server via a single lightweight `Method::Ping` (issue #13). This is the
-/// host-banner ping reading — NOT the multi-request summary, which over-reports, and (now that ssh
-/// connections are multiplexed) reflects the real ~RTT rather than per-request ssh setup.
-pub(crate) fn measure_ping(
-    target: &crate::api::client::ConnectionTarget,
-) -> Option<std::time::Duration> {
-    let api = crate::api::client::ApiClient::for_target(target.clone());
-    let started = std::time::Instant::now();
-    api.status().ok().map(|_| started.elapsed())
-}
-
 pub(crate) fn fetch_server_summary_from_api_target(
     target: crate::api::client::ConnectionTarget,
 ) -> Result<ServerSummary, ConnectionState> {

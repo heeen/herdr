@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -142,6 +142,14 @@ pub enum ClientMessage {
 
     /// Open the server-rendered keybind help UI for this client.
     OpenKeybindHelp,
+
+    /// Latency probe over the persistent client stream (issue #13). The server echoes `nonce` in a
+    /// `ServerMessage::Pong`, so the client measures true round-trip time without the per-request
+    /// bridge-connection + remote-process-spawn overhead. Appended last to keep wire tags stable.
+    Ping {
+        /// Opaque token echoed back in the matching Pong.
+        nonce: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +508,19 @@ pub enum ServerMessage {
     /// first and whenever a delta would not be smaller / dimensions change. Placed last so the
     /// existing variant indices (and their bincode wire tags) stay stable.
     FrameDelta(FrameDelta),
+
+    /// Reply to `ClientMessage::Ping`, echoing its `nonce` so the client can compute round-trip
+    /// latency over the persistent stream (issue #13).
+    Pong {
+        /// The nonce from the matching Ping.
+        nonce: u64,
+    },
+
+    /// A deflate-compressed inner `ServerMessage` (issue #13). Wraps the verbose semantic
+    /// Frame/FrameDelta payloads (a full screen is ~hundreds of KB of per-cell data that
+    /// compresses ~10-30x) so remote bandwidth — and the host-banner download readout — reflect
+    /// reality. The client inflates and dispatches the inner message.
+    Compressed(Vec<u8>),
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +660,39 @@ impl From<io::Error> for FramingError {
 ///
 /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
 /// (would be truncated by the length prefix cast).
+/// Server-message payloads larger than this are worth deflating (issue #13); tiny deltas don't
+/// benefit and the wrapper would only add overhead.
+pub const FRAME_COMPRESSION_THRESHOLD: usize = 256;
+
+/// Wrap a server message in `ServerMessage::Compressed` when its serialized form exceeds
+/// [`FRAME_COMPRESSION_THRESHOLD`]; otherwise return it unchanged. Deflate level 1 stays cheap on
+/// the render path while cutting verbose full frames ~10-30x. Returns the original on any encode
+/// hiccup (never blocks a frame).
+pub fn compress_server_message(message: ServerMessage) -> ServerMessage {
+    let Ok(raw) = bincode::serde::encode_to_vec(&message, bincode::config::standard()) else {
+        return message;
+    };
+    if raw.len() <= FRAME_COMPRESSION_THRESHOLD {
+        return message;
+    }
+    ServerMessage::Compressed(miniz_oxide::deflate::compress_to_vec(&raw, 1))
+}
+
+/// Inflate a `ServerMessage::Compressed` into its inner message; other messages pass through. On
+/// inflate/parse failure the (still-`Compressed`) message is returned so the caller can detect it.
+pub fn decompress_server_message(message: ServerMessage) -> ServerMessage {
+    let ServerMessage::Compressed(bytes) = &message else {
+        return message;
+    };
+    let Ok(raw) = miniz_oxide::inflate::decompress_to_vec(bytes) else {
+        return message;
+    };
+    match bincode::serde::decode_from_slice::<ServerMessage, _>(&raw, bincode::config::standard()) {
+        Ok((inner, _)) => inner,
+        Err(_) => message,
+    }
+}
+
 pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
     let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .map_err(|e| FramingError::Bincode(e.to_string()))?;

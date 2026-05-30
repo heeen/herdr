@@ -1893,6 +1893,12 @@ impl HeadlessServer {
                 self.app.open_keybind_help();
                 true
             }
+            ServerEvent::ClientPing { client_id, nonce } => {
+                // issue #13: echo the latency probe so the client measures real round-trip time
+                // over the persistent stream. No re-render needed.
+                self.send_to_client(client_id, ServerMessage::Pong { nonce });
+                false
+            }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
                 self.remove_client_and_resize_if_needed(client_id);
@@ -2923,7 +2929,8 @@ mod tests {
     }
 
     fn read_server_frame(bytes: Vec<u8>) -> FrameData {
-        match read_server_message(bytes) {
+        // issue #13: frames may arrive deflate-wrapped; inflate before matching.
+        match crate::protocol::decompress_server_message(read_server_message(bytes)) {
             ServerMessage::Frame(frame) => frame,
             other => panic!("expected frame, got {other:?}"),
         }

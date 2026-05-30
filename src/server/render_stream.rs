@@ -56,8 +56,10 @@ impl ClientRenderState {
                     }
                     _ => ServerMessage::Frame(frame.clone()),
                 };
+                // issue #13: deflate the verbose semantic payload on the wire (full frames are
+                // ~hundreds of KB of per-cell data). The client inflates before dispatching.
                 Some(PreparedRender {
-                    message,
+                    message: crate::protocol::compress_server_message(message),
                     encoded: None,
                 })
             }

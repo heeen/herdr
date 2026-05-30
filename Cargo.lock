@@ -539,6 +539,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "libc",
+ "miniz_oxide",
  "png",
  "portable-pty",
  "ratatui",

@@ -101,6 +101,12 @@ struct ClientState {
     server_rx_sample: HashMap<supervisor::ServerId, (u64, Instant)>,
     /// issue #13: last time the downstream-rate sampler ran.
     last_rx_sample_at: Instant,
+    /// issue #13: monotonic nonce for stream latency probes.
+    ping_nonce: u64,
+    /// issue #13: outstanding ping per server (nonce + send time) awaiting a Pong.
+    pending_pings: HashMap<supervisor::ServerId, (u64, Instant)>,
+    /// issue #13: last time stream latency probes were sent.
+    last_ping_at: Instant,
     /// Servers with active summary-event subscription workers.
     summary_subscription_server_ids: HashSet<supervisor::ServerId>,
     /// Secondary servers with a summary refresh already running off the UI loop.
@@ -1174,11 +1180,6 @@ enum ClientLoopEvent {
         server_id: supervisor::ServerId,
         result: Result<supervisor::ServerSummary, supervisor::ConnectionState>,
         elapsed: Duration,
-    },
-    /// A single-Ping round-trip measurement for the host-banner latency reading (issue #13).
-    ServerPingMeasured {
-        server_id: supervisor::ServerId,
-        rtt: Duration,
     },
     /// A sidebar-summary subscription worker ended and should be eligible to restart.
     SupervisorSummarySubscriptionEnded(supervisor::ServerId),
@@ -2294,16 +2295,9 @@ fn start_secondary_supervisor_summary_refreshes(
         pending_summary_refresh_server_ids.insert(server_id.clone());
         let event_tx = event_tx.clone();
         std::thread::spawn(move || {
-            let ping = supervisor::measure_ping(&target);
             let started_at = Instant::now();
             let result = supervisor::fetch_server_summary_from_api_target(target);
             let elapsed = started_at.elapsed();
-            if let Some(rtt) = ping {
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerPingMeasured {
-                    server_id: server_id.clone(),
-                    rtt,
-                });
-            }
             let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
                 server_id,
                 result,
@@ -2351,16 +2345,9 @@ fn start_single_secondary_summary_refresh(
     let server_id = server_id.clone();
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
-        let ping = supervisor::measure_ping(&api_target);
         let started_at = Instant::now();
         let result = supervisor::fetch_server_summary_from_api_target(api_target);
         let elapsed = started_at.elapsed();
-        if let Some(rtt) = ping {
-            let _ = event_tx.blocking_send(ClientLoopEvent::ServerPingMeasured {
-                server_id: server_id.clone(),
-                rtt,
-            });
-        }
         let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
             server_id,
             result,
@@ -2815,6 +2802,10 @@ fn render_incoming_server_frame(
 /// bytes/sec rate for the host banner (issue #13). ~1s gives a steady, readable number.
 const RX_RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Cadence for stream latency probes (issue #13). A Ping over the persistent stream measures true
+/// round-trip time without the per-request bridge-connection / remote-process-spawn cost.
+const SERVER_PING_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// Derive each server's recent downstream bytes/sec from the cumulative reader counters and push
 /// it into the supervisor model for the host banner. Rate-limited to [`RX_RATE_SAMPLE_INTERVAL`].
 fn sample_download_rates(state: &mut ClientState, now: Instant) {
@@ -2902,6 +2893,9 @@ async fn run_client_loop(
         rx_counters: RxByteCounters::default(),
         server_rx_sample: HashMap::new(),
         last_rx_sample_at: Instant::now(),
+        ping_nonce: 0,
+        pending_pings: HashMap::new(),
+        last_ping_at: Instant::now(),
         summary_subscription_server_ids: HashSet::new(),
         pending_summary_refresh_server_ids: HashSet::new(),
         pending_secondary_connect_server_ids: HashSet::new(),
@@ -3300,100 +3294,125 @@ async fn run_client_loop(
                     }
                 }
             }
-            ClientLoopEvent::ServerMessage { server_id, message } => match message {
-                ServerMessage::Frame(frame_data) => {
-                    render_incoming_server_frame(&mut state, &server_id, frame_data);
-                }
-                ServerMessage::FrameDelta(delta) => {
-                    // issue #13: reconstruct the full frame from this server's cached baseline.
-                    // If we have no baseline yet (shouldn't happen — the server sends a full frame
-                    // first), drop it and wait for the next full re-baseline frame.
-                    match state
-                        .frame_cache
-                        .get(&server_id)
-                        .and_then(|prev| prev.with_delta(&delta))
-                    {
-                        Some(full) => render_incoming_server_frame(&mut state, &server_id, full),
-                        None => {
-                            debug!(
-                                server_id = ?server_id,
-                                "dropping frame delta with no matching baseline; awaiting full frame"
-                            );
+            ClientLoopEvent::ServerMessage { server_id, message } => {
+                match protocol::decompress_server_message(message) {
+                    ServerMessage::Frame(frame_data) => {
+                        render_incoming_server_frame(&mut state, &server_id, frame_data);
+                    }
+                    ServerMessage::Pong { nonce } => {
+                        // issue #13: true round-trip latency over the persistent stream (no per-ping
+                        // connection/process-spawn overhead). Only the matching outstanding nonce counts.
+                        if let Some((pending_nonce, sent_at)) =
+                            state.pending_pings.remove(&server_id)
+                        {
+                            if pending_nonce == nonce {
+                                if let Some(model) = &mut state.supervisor_model {
+                                    let rtt =
+                                        sent_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                                    model.record_server_ping(&server_id, rtt);
+                                    state.request_full_redraw();
+                                }
+                            }
                         }
                     }
-                }
-                ServerMessage::Terminal(frame) => {
-                    if server_id != active_server_id(&state) {
-                        continue;
+                    ServerMessage::Compressed(_) => {
+                        debug!(server_id = ?server_id, "failed to inflate a compressed server frame; skipping");
                     }
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-                        record_received_kitty_graphics(&frame.bytes);
+                    ServerMessage::FrameDelta(delta) => {
+                        // issue #13: reconstruct the full frame from this server's cached baseline.
+                        // If we have no baseline yet (shouldn't happen — the server sends a full frame
+                        // first), drop it and wait for the next full re-baseline frame.
+                        match state
+                            .frame_cache
+                            .get(&server_id)
+                            .and_then(|prev| prev.with_delta(&delta))
+                        {
+                            Some(full) => {
+                                render_incoming_server_frame(&mut state, &server_id, full)
+                            }
+                            None => {
+                                debug!(
+                                    server_id = ?server_id,
+                                    "dropping frame delta with no matching baseline; awaiting full frame"
+                                );
+                            }
+                        }
                     }
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
-                    let _ = stdout.flush();
-                }
-                ServerMessage::Graphics { bytes } => {
-                    if server_id != active_server_id(&state) {
-                        continue;
-                    }
-                    if state.kitty_graphics_enabled {
-                        record_received_kitty_graphics(&bytes);
+                    ServerMessage::Terminal(frame) => {
+                        if server_id != active_server_id(&state) {
+                            continue;
+                        }
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            record_received_kitty_graphics(&frame.bytes);
+                        }
                         let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&bytes);
+                        let _ = stdout.write_all(&frame.bytes);
                         let _ = stdout.flush();
                     }
-                }
-                ServerMessage::ServerShutdown { reason } => {
-                    if server_id != supervisor::ServerId::main() {
-                        server_writes.remove(&server_id);
-                        state.frame_cache.remove(&server_id);
-                        state.summary_subscription_server_ids.remove(&server_id);
-                        state.pending_summary_refresh_server_ids.remove(&server_id);
-                        state
-                            .pending_secondary_connect_server_ids
-                            .remove(&server_id);
-                        state.ssh_bridges.remove(&server_id);
-                        if let Some(model) = &mut state.supervisor_model {
-                            let _ = model.set_connection_state(
-                                &server_id,
-                                supervisor::ConnectionState::Disconnected,
-                            );
-                            state.request_full_redraw();
+                    ServerMessage::Graphics { bytes } => {
+                        if server_id != active_server_id(&state) {
+                            continue;
                         }
-                        schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
-                        render_cached_composited_frame(&mut state);
-                        continue;
+                        if state.kitty_graphics_enabled {
+                            record_received_kitty_graphics(&bytes);
+                            let mut stdout = io::stdout();
+                            let _ = stdout.write_all(&bytes);
+                            let _ = stdout.flush();
+                        }
                     }
-                    return Err(ClientError::ServerShutdown { reason });
-                }
-                ServerMessage::Notify { kind, message } => {
-                    handle_notify(kind, &message, &state.sound_config);
-                }
-                ServerMessage::Clipboard { data } => {
-                    forward_clipboard(&data);
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::ReloadSoundConfig => {
-                    reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                    );
-                }
-                ServerMessage::MouseCapture { enabled } => {
-                    if server_id != active_server_id(&state) {
-                        continue;
+                    ServerMessage::ServerShutdown { reason } => {
+                        if server_id != supervisor::ServerId::main() {
+                            server_writes.remove(&server_id);
+                            state.frame_cache.remove(&server_id);
+                            state.summary_subscription_server_ids.remove(&server_id);
+                            state.pending_summary_refresh_server_ids.remove(&server_id);
+                            state
+                                .pending_secondary_connect_server_ids
+                                .remove(&server_id);
+                            state.ssh_bridges.remove(&server_id);
+                            if let Some(model) = &mut state.supervisor_model {
+                                let _ = model.set_connection_state(
+                                    &server_id,
+                                    supervisor::ConnectionState::Disconnected,
+                                );
+                                state.request_full_redraw();
+                            }
+                            schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
+                            render_cached_composited_frame(&mut state);
+                            continue;
+                        }
+                        return Err(ClientError::ServerShutdown { reason });
                     }
-                    let desired = desired_mouse_capture(enabled, state.compositor.is_some());
-                    if desired != state.mouse_capture_active {
-                        set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
-                        state.mouse_capture_active = desired;
+                    ServerMessage::Notify { kind, message } => {
+                        handle_notify(kind, &message, &state.sound_config);
+                    }
+                    ServerMessage::Clipboard { data } => {
+                        forward_clipboard(&data);
+                        let _ = io::stdout().flush();
+                    }
+                    ServerMessage::ReloadSoundConfig => {
+                        reload_local_client_config(
+                            &mut state.sound_config,
+                            &mut state.redraw_on_focus_gained,
+                        );
+                    }
+                    ServerMessage::MouseCapture { enabled } => {
+                        if server_id != active_server_id(&state) {
+                            continue;
+                        }
+                        let desired = desired_mouse_capture(enabled, state.compositor.is_some());
+                        if desired != state.mouse_capture_active {
+                            set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
+                            state.mouse_capture_active = desired;
+                        }
+                    }
+                    ServerMessage::Welcome { .. } => {
+                        debug!("received unexpected Welcome in main loop");
                     }
                 }
-                ServerMessage::Welcome { .. } => {
-                    debug!("received unexpected Welcome in main loop");
-                }
-            },
+            }
             ClientLoopEvent::SupervisorSummaryChanged(server_id) => {
                 debug!(
                     server_id = ?server_id,
@@ -3477,16 +3496,6 @@ async fn run_client_loop(
                     );
                 }
                 render_cached_composited_frame(&mut state);
-            }
-            ClientLoopEvent::ServerPingMeasured { server_id, rtt } => {
-                // issue #13: feed the single-Ping round-trip into the host-banner ping average.
-                if let Some(model) = &mut state.supervisor_model {
-                    model.record_server_ping(
-                        &server_id,
-                        rtt.as_millis().min(u32::MAX as u128) as u32,
-                    );
-                    state.request_full_redraw();
-                }
             }
             ClientLoopEvent::SupervisorSummarySubscriptionEnded(server_id) => {
                 state.summary_subscription_server_ids.remove(&server_id);
@@ -3843,6 +3852,17 @@ async fn run_client_loop(
                 // Check if we should quit.
                 let now = Instant::now();
                 sample_download_rates(&mut state, now);
+                // issue #13: probe each connected server's latency over its persistent stream.
+                if now.duration_since(state.last_ping_at) >= SERVER_PING_INTERVAL {
+                    state.last_ping_at = now;
+                    for (server_id, handle) in &server_writes {
+                        state.ping_nonce = state.ping_nonce.wrapping_add(1);
+                        let nonce = state.ping_nonce;
+                        if queue_to_server(handle, ClientMessage::Ping { nonce }).is_ok() {
+                            state.pending_pings.insert(server_id.clone(), (nonce, now));
+                        }
+                    }
+                }
                 retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
 
                 // item 6 (Area 6): adaptive secondary cadence (400ms active / 2s background). Each
@@ -4528,6 +4548,9 @@ mod tests {
             rx_counters: RxByteCounters::default(),
             server_rx_sample: HashMap::new(),
             last_rx_sample_at: Instant::now(),
+            ping_nonce: 0,
+            pending_pings: HashMap::new(),
+            last_ping_at: Instant::now(),
             summary_subscription_server_ids: HashSet::new(),
             pending_summary_refresh_server_ids: HashSet::new(),
             pending_secondary_connect_server_ids: HashSet::new(),
@@ -6518,14 +6541,12 @@ mod tests {
         assert!(pending.contains(&remote_id));
         assert!(event_rx.try_recv().is_err());
 
-        // issue #13: the refresh now measures latency with a single Ping first (off the UI loop),
-        // so the first async event is the ping measurement, then the summary result follows.
         let event = event_rx.blocking_recv().unwrap();
         match event {
-            ClientLoopEvent::ServerPingMeasured { server_id, .. } => {
+            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } => {
                 assert_eq!(server_id, remote_id);
             }
-            _ => panic!("expected async ping measurement"),
+            _ => panic!("expected async summary result"),
         }
 
         api_thread.join().unwrap();

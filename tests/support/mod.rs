@@ -156,6 +156,23 @@ pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), 
     }
 }
 
+/// issue #13: frames are deflate-wrapped in `ServerMessage::Compressed` (variant 11). Given a read
+/// `(variant, payload_after_variant)`, return the effective frame `(variant, payload)` — inflating
+/// the inner message when compressed, or passing through otherwise. Lets frame-reading tests stay
+/// variant-based without each re-implementing inflate.
+pub fn inflate_compressed_frame(variant: u32, payload: &[u8]) -> (u32, Vec<u8>) {
+    if variant != 11 {
+        return (variant, payload.to_vec());
+    }
+    // payload is a bincode `Vec<u8>`: varint length, then the deflate bytes.
+    let (len, consumed) = decode_varint_u32(payload, 0).expect("compressed payload length");
+    let bytes = &payload[consumed..consumed + len as usize];
+    let raw = miniz_oxide::inflate::decompress_to_vec(bytes).expect("inflate compressed frame");
+    let (inner_variant, inner_consumed) =
+        decode_varint_u32(&raw, 0).expect("inner message variant");
+    (inner_variant, raw[inner_consumed..].to_vec())
+}
+
 fn encode_varint_enum(variant_idx: u32, fields: &[&[u8]]) -> Vec<u8> {
     let mut buf = encode_varint_u32(variant_idx);
     for field in fields {
@@ -320,8 +337,14 @@ pub fn wait_for_message_variant(
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
-            Ok((got, _)) if got == variant => return Ok(true),
-            Ok(_) => continue,
+            // issue #13: a compressed frame (variant 11) inflates to its inner variant; match on that
+            // so callers waiting for a Frame (1) still see a deflate-wrapped one.
+            Ok((got, payload)) => {
+                let (got, _) = inflate_compressed_frame(got, &payload);
+                if got == variant {
+                    return Ok(true);
+                }
+            }
             Err(_) => continue,
         }
     }

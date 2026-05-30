@@ -747,7 +747,7 @@ fn client_handshake(
 
 fn connect_raw_client(client_socket: &Path, cols: u16, rows: u16) -> UnixStream {
     let mut stream = UnixStream::connect(client_socket).expect("should connect to client socket");
-    client_handshake(&mut stream, 12, cols, rows).expect("handshake should succeed");
+    client_handshake(&mut stream, 13, cols, rows).expect("handshake should succeed");
     stream
 }
 
@@ -860,7 +860,8 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let slice = remaining.min(Duration::from_millis(75));
         match read_server_variant(stream, slice) {
-            Ok(1) => return true, // ServerMessage::Frame
+            // Frame (1), FrameDelta (9), or Compressed frame (11) — issue #13.
+            Ok(1) | Ok(9) | Ok(11) => return true,
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,
@@ -880,13 +881,16 @@ fn wait_for_frame_matching(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_message_payload(stream, slice) {
-            Ok((1, frame_payload)) => {
-                let frame = decode_frame_payload(&frame_payload)?;
-                if predicate(&frame) {
-                    return Ok(true);
+            Ok((variant, payload)) => {
+                // issue #13: inflate deflate-wrapped frames before decoding.
+                let (variant, payload) = support::inflate_compressed_frame(variant, &payload);
+                if variant == 1 {
+                    let frame = decode_frame_payload(&payload)?;
+                    if predicate(&frame) {
+                        return Ok(true);
+                    }
                 }
             }
-            Ok((_variant, _payload)) => {}
             Err(err) if is_timeout(&err) => {}
             Err(err) => return Err(err),
         }
