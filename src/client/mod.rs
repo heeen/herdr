@@ -1175,6 +1175,11 @@ enum ClientLoopEvent {
         result: Result<supervisor::ServerSummary, supervisor::ConnectionState>,
         elapsed: Duration,
     },
+    /// A single-Ping round-trip measurement for the host-banner latency reading (issue #13).
+    ServerPingMeasured {
+        server_id: supervisor::ServerId,
+        rtt: Duration,
+    },
     /// A sidebar-summary subscription worker ended and should be eligible to restart.
     SupervisorSummarySubscriptionEnded(supervisor::ServerId),
     /// A sidebar API request completed off the UI loop.
@@ -2289,9 +2294,16 @@ fn start_secondary_supervisor_summary_refreshes(
         pending_summary_refresh_server_ids.insert(server_id.clone());
         let event_tx = event_tx.clone();
         std::thread::spawn(move || {
+            let ping = supervisor::measure_ping(&target);
             let started_at = Instant::now();
             let result = supervisor::fetch_server_summary_from_api_target(target);
             let elapsed = started_at.elapsed();
+            if let Some(rtt) = ping {
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerPingMeasured {
+                    server_id: server_id.clone(),
+                    rtt,
+                });
+            }
             let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
                 server_id,
                 result,
@@ -2339,9 +2351,16 @@ fn start_single_secondary_summary_refresh(
     let server_id = server_id.clone();
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
+        let ping = supervisor::measure_ping(&api_target);
         let started_at = Instant::now();
         let result = supervisor::fetch_server_summary_from_api_target(api_target);
         let elapsed = started_at.elapsed();
+        if let Some(rtt) = ping {
+            let _ = event_tx.blocking_send(ClientLoopEvent::ServerPingMeasured {
+                server_id: server_id.clone(),
+                rtt,
+            });
+        }
         let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
             server_id,
             result,
@@ -3440,14 +3459,6 @@ async fn run_client_loop(
                     );
                 }
                 if let Some(model) = &mut state.supervisor_model {
-                    // issue #13: the summary refresh is a real round-trip to the host; feed its
-                    // latency into the banner ping average (success only — failures aren't latency).
-                    if result.is_ok() {
-                        model.record_server_ping(
-                            &server_id,
-                            elapsed.as_millis().min(u32::MAX as u128) as u32,
-                        );
-                    }
                     model.apply_secondary_summary_results([(server_id.clone(), result)]);
                     state.request_full_redraw();
                 }
@@ -3466,6 +3477,16 @@ async fn run_client_loop(
                     );
                 }
                 render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::ServerPingMeasured { server_id, rtt } => {
+                // issue #13: feed the single-Ping round-trip into the host-banner ping average.
+                if let Some(model) = &mut state.supervisor_model {
+                    model.record_server_ping(
+                        &server_id,
+                        rtt.as_millis().min(u32::MAX as u128) as u32,
+                    );
+                    state.request_full_redraw();
+                }
             }
             ClientLoopEvent::SupervisorSummarySubscriptionEnded(server_id) => {
                 state.summary_subscription_server_ids.remove(&server_id);
@@ -6497,12 +6518,14 @@ mod tests {
         assert!(pending.contains(&remote_id));
         assert!(event_rx.try_recv().is_err());
 
+        // issue #13: the refresh now measures latency with a single Ping first (off the UI loop),
+        // so the first async event is the ping measurement, then the summary result follows.
         let event = event_rx.blocking_recv().unwrap();
         match event {
-            ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } => {
+            ClientLoopEvent::ServerPingMeasured { server_id, .. } => {
                 assert_eq!(server_id, remote_id);
             }
-            _ => panic!("expected async summary result"),
+            _ => panic!("expected async ping measurement"),
         }
 
         api_thread.join().unwrap();
