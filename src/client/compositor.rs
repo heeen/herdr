@@ -292,7 +292,21 @@ impl ClientCompositor {
             host_height,
             now,
         );
-        let global_menu_rect = snapshot.global_menu_rect();
+        // A composited modal (add-remote / new-workspace picker / manage-remotes) calls
+        // `dim_background` over the WHOLE host rect and draws a centered box inside
+        // `render_client_shell`. Copying the server content over the content columns would erase
+        // that dim + box (only the sidebar columns the copy skips survived — which is why the modal
+        // looked invisible and just the sidebar dimmed). While a modal is open, exclude the entire
+        // host rect from the content copy so the dim + modal render stands. Otherwise fall back to
+        // excluding just the open global-menu rect (so the launcher menu isn't overwritten).
+        let modal_open = model.add_remote_form().is_some()
+            || model.new_workspace_picker().is_some()
+            || model.remote_manage_overlay().is_some();
+        let excluded_rect = if modal_open {
+            Some(Rect::new(0, 0, host_width, host_height))
+        } else {
+            snapshot.global_menu_rect()
+        };
         let mut frame = render_client_shell(&snapshot, host_width, host_height);
 
         copy_active_content_excluding(
@@ -300,7 +314,7 @@ impl ClientCompositor {
             &mut frame,
             sidebar_width,
             content_width,
-            global_menu_rect,
+            excluded_rect,
         );
 
         // item 1/3: the add-remote / new-workspace-picker / manage modals are rendered as ratatui
@@ -2243,6 +2257,43 @@ mod tests {
         // legacy ASCII art / raw markers / the old footer literal are ABSENT.
         assert!(!rows.iter().any(|row| row.contains("+---")));
         assert!(!rows.iter().any(|row| row.contains("enter add   esc close")));
+    }
+
+    #[test]
+    fn modal_survives_full_screen_content_overwrite() {
+        // Regression: a composited modal must stay visible even when the server content frame fills
+        // the ENTIRE content area (a real pane full of text). Previously the content copy only
+        // spared the global-menu rect, so the content overwrote the centered modal — leaving only
+        // the sidebar dimmed and the dialog invisible (esc still closed it). The fix excludes the
+        // whole host rect from the content copy while a modal is open.
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        // content frame that fills the whole content area with a sentinel (like a busy pane).
+        let filled = "#".repeat(54);
+        let rows: Vec<&str> = vec![filled.as_str(); 24];
+        let content = frame(54, 24, &rows);
+
+        let compositor = ClientCompositor::new(26);
+        let composed =
+            compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
+        let texts: Vec<String> = (0..composed.height)
+            .map(|r| row_text(&composed, r))
+            .collect();
+
+        // the modal (header, a field label, the cancel button) must survive — these sit in the
+        // content columns and would be overwritten by the '#' fill without the fix.
+        assert!(
+            texts.iter().any(|t| t.contains("add remote")),
+            "modal header overwritten by content; rows={texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("target")),
+            "modal field overwritten by content"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("cancel")),
+            "modal action button overwritten by content"
+        );
     }
 
     #[test]
