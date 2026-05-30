@@ -47,8 +47,17 @@ impl ClientRenderState {
                 if last_frame.as_ref() == Some(frame) {
                     return None;
                 }
+                // issue #13: stream only the changed cells when a delta against the client's last
+                // full frame is meaningfully smaller; otherwise (first frame / resize / near-full
+                // repaint) send a full frame to re-baseline. The client reconstructs from its cache.
+                let message = match last_frame.as_ref().and_then(|prev| frame.delta_from(prev)) {
+                    Some(delta) if delta.cells.len() * 4 <= frame.cells.len() * 3 => {
+                        ServerMessage::FrameDelta(delta)
+                    }
+                    _ => ServerMessage::Frame(frame.clone()),
+                };
                 Some(PreparedRender {
-                    message: ServerMessage::Frame(frame.clone()),
+                    message,
                     encoded: None,
                 })
             }

@@ -2755,6 +2755,43 @@ fn render_cached_composited_frame(state: &mut ClientState) {
     record_client_frame_sample(state, render_started_at.elapsed());
 }
 
+/// Cache a server's freshly-received full frame and, if it is the active server, composite + flush
+/// it. Shared by the `Frame` and (reconstructed) `FrameDelta` paths (issue #13).
+fn render_incoming_server_frame(
+    state: &mut ClientState,
+    server_id: &supervisor::ServerId,
+    mut frame_data: protocol::FrameData,
+) {
+    if let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) {
+        state.frame_cache.insert(server_id.clone(), frame_data);
+        let active_server_id = model.active_server_id().clone();
+        let Some(active_frame) =
+            select_composited_render_frame(&state.frame_cache, &active_server_id, server_id)
+        else {
+            return;
+        };
+        frame_data = compositor.compose_frame(
+            model,
+            active_frame,
+            state.host_size.0,
+            state.host_size.1,
+            Instant::now(),
+        );
+    }
+    let render_started_at = Instant::now();
+    let encoded = state.blit_encoder.encode(&frame_data, false);
+    let mut stdout = io::stdout();
+    let graphics = if state.kitty_graphics_enabled {
+        frame_data.graphics.as_slice()
+    } else {
+        &[]
+    };
+    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+    let _ = stdout.flush();
+    state.blit_encoder.commit(frame_data, encoded);
+    record_client_frame_sample(state, render_started_at.elapsed());
+}
+
 /// How often the downstream-throughput sampler converts cumulative byte counters into a
 /// bytes/sec rate for the host banner (issue #13). ~1s gives a steady, readable number.
 const RX_RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
@@ -3245,40 +3282,26 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::ServerMessage { server_id, message } => match message {
-                ServerMessage::Frame(mut frame_data) => {
-                    if let (Some(compositor), Some(model)) =
-                        (&state.compositor, &state.supervisor_model)
+                ServerMessage::Frame(frame_data) => {
+                    render_incoming_server_frame(&mut state, &server_id, frame_data);
+                }
+                ServerMessage::FrameDelta(delta) => {
+                    // issue #13: reconstruct the full frame from this server's cached baseline.
+                    // If we have no baseline yet (shouldn't happen — the server sends a full frame
+                    // first), drop it and wait for the next full re-baseline frame.
+                    match state
+                        .frame_cache
+                        .get(&server_id)
+                        .and_then(|prev| prev.with_delta(&delta))
                     {
-                        state.frame_cache.insert(server_id.clone(), frame_data);
-                        let active_server_id = model.active_server_id().clone();
-                        let Some(active_frame) = select_composited_render_frame(
-                            &state.frame_cache,
-                            &active_server_id,
-                            &server_id,
-                        ) else {
-                            continue;
-                        };
-                        frame_data = compositor.compose_frame(
-                            model,
-                            active_frame,
-                            state.host_size.0,
-                            state.host_size.1,
-                            Instant::now(),
-                        );
+                        Some(full) => render_incoming_server_frame(&mut state, &server_id, full),
+                        None => {
+                            debug!(
+                                server_id = ?server_id,
+                                "dropping frame delta with no matching baseline; awaiting full frame"
+                            );
+                        }
                     }
-                    let render_started_at = Instant::now();
-                    let encoded = state.blit_encoder.encode(&frame_data, false);
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                    record_client_frame_sample(&mut state, render_started_at.elapsed());
                 }
                 ServerMessage::Terminal(frame) => {
                     if server_id != active_server_id(&state) {

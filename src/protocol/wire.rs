@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -202,6 +202,25 @@ pub struct CursorState {
     pub shape: CursorShapeParam,
 }
 
+/// A delta against the client's last full frame for a semantic-frame client (issue #13): only the
+/// changed cells travel the wire, cutting remote bandwidth by 1–2 orders of magnitude for typical
+/// edits so a low-ping ssh link is no longer full-frame-bandwidth-bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameDelta {
+    /// Frame width in columns (must match the baseline being updated).
+    pub width: u16,
+    /// Frame height in rows.
+    pub height: u16,
+    /// Changed cells as `(row-major index, new cell)`.
+    pub cells: Vec<(u32, CellData)>,
+    /// Cursor state for this frame.
+    pub cursor: Option<CursorState>,
+    /// OSC 8 hyperlink URIs referenced by the (full reconstructed) frame.
+    pub hyperlinks: Vec<String>,
+    /// Kitty graphics bytes to apply after the text frame.
+    pub graphics: Vec<u8>,
+}
+
 /// A rendered frame to be displayed by the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameData {
@@ -283,6 +302,61 @@ impl FrameData {
             hyperlinks: hyperlink_uris,
             graphics: Vec::new(),
         }
+    }
+
+    /// Compute a delta from `prev` to `self` for semantic-frame streaming (issue #13): the changed
+    /// cells (row-major index + new value) plus the cursor/hyperlinks/graphics. Returns `None` when
+    /// the dimensions differ (the caller must send a full frame to re-baseline).
+    pub fn delta_from(&self, prev: &FrameData) -> Option<FrameDelta> {
+        if self.width != prev.width
+            || self.height != prev.height
+            || self.cells.len() != prev.cells.len()
+        {
+            return None;
+        }
+        let cells: Vec<(u32, CellData)> = self
+            .cells
+            .iter()
+            .zip(prev.cells.iter())
+            .enumerate()
+            .filter(|(_, (new, old))| new != old)
+            .map(|(index, (new, _))| (index as u32, new.clone()))
+            .collect();
+        Some(FrameDelta {
+            width: self.width,
+            height: self.height,
+            cells,
+            cursor: self.cursor.clone(),
+            hyperlinks: self.hyperlinks.clone(),
+            graphics: self.graphics.clone(),
+        })
+    }
+
+    /// Reconstruct the full frame produced by applying `delta` on top of `self` (the previous full
+    /// frame). Returns `None` if the baseline doesn't match the delta's dimensions or an index is
+    /// out of range, signaling the client to wait for a full re-baseline frame.
+    pub fn with_delta(&self, delta: &FrameDelta) -> Option<FrameData> {
+        let expected = (delta.width as usize) * (delta.height as usize);
+        if self.width != delta.width || self.height != delta.height || self.cells.len() != expected
+        {
+            return None;
+        }
+        let mut cells = self.cells.clone();
+        for (index, cell) in &delta.cells {
+            let i = *index as usize;
+            if i >= cells.len() {
+                return None;
+            }
+            cells[i] = cell.clone();
+        }
+        Some(FrameData {
+            cells,
+            width: delta.width,
+            height: delta.height,
+            cursor: delta.cursor.clone(),
+            hyperlinks: delta.hyperlinks.clone(),
+            graphics: delta.graphics.clone(),
+        })
     }
 
     /// A blank frame of `width`×`height` reset/space cells. Used as an instant placeholder when
@@ -420,6 +494,12 @@ pub enum ServerMessage {
         /// True when Herdr mouse UI is enabled or the focused pane app requests mouse reporting.
         enabled: bool,
     },
+
+    /// A delta against the client's last full frame for a semantic-frame client (issue #13). The
+    /// client reconstructs the full frame from its cached baseline; servers send a full `Frame`
+    /// first and whenever a delta would not be smaller / dimensions change. Placed last so the
+    /// existing variant indices (and their bincode wire tags) stay stable.
+    FrameDelta(FrameDelta),
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +760,55 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
+
+    fn frame_of(symbols: &[&str]) -> FrameData {
+        FrameData {
+            cells: symbols
+                .iter()
+                .map(|s| CellData {
+                    symbol: (*s).to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                })
+                .collect(),
+            width: symbols.len() as u16,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frame_delta_round_trips_to_the_new_frame() {
+        let prev = frame_of(&["a", "b", "c", "d"]);
+        let next = frame_of(&["a", "X", "c", "Y"]);
+        let delta = next.delta_from(&prev).expect("same dims yield a delta");
+        // Only the two changed cells travel.
+        assert_eq!(delta.cells.len(), 2);
+        assert_eq!(delta.cells[0].0, 1);
+        assert_eq!(delta.cells[1].0, 3);
+        // Applying the delta to the baseline reconstructs the new frame exactly.
+        assert_eq!(prev.with_delta(&delta), Some(next));
+    }
+
+    #[test]
+    fn frame_delta_is_none_on_dimension_change() {
+        let prev = frame_of(&["a", "b"]);
+        let next = frame_of(&["a", "b", "c"]);
+        assert!(next.delta_from(&prev).is_none());
+    }
+
+    #[test]
+    fn frame_delta_apply_rejects_mismatched_baseline() {
+        let next = frame_of(&["a", "X"]);
+        let delta = next.delta_from(&frame_of(&["a", "b"])).unwrap();
+        // A baseline of the wrong size can't be updated by this delta.
+        assert!(frame_of(&["a", "b", "c"]).with_delta(&delta).is_none());
+    }
 
     // ---- Round-trip: ClientMessage ----
 
