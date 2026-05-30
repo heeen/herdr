@@ -118,7 +118,15 @@ pub(crate) struct ManagedServer {
     pub(crate) connection_state: ConnectionState,
     pub(crate) summaries: ServerSummary,
     pub(crate) disabled: bool, // item 3 (serde-driven via registry; default false)
+    /// Recent round-trip samples (ms) for the host banner readout; capped at the last
+    /// [`HOST_PING_SAMPLE_WINDOW`] (issue #13). The banner shows their average.
+    pub(crate) ping_samples: std::collections::VecDeque<u32>,
+    /// Most recent downstream frame throughput from this host in bytes/sec, if measured.
+    pub(crate) download_bps: Option<u64>,
 }
+
+/// How many recent round-trip samples feed the host-banner ping average.
+pub(crate) const HOST_PING_SAMPLE_WINDOW: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerDestination {
@@ -451,6 +459,8 @@ impl ClientSupervisorModel {
                 connection_state: ConnectionState::Connected,
                 summaries: ServerSummary::default(),
                 disabled: false,
+                ping_samples: std::collections::VecDeque::new(),
+                download_bps: None,
             }],
             filter: ServerFilter::All,
             active_server_id: ServerId::main(),
@@ -631,6 +641,24 @@ impl ClientSupervisorModel {
         }
         self.reconcile_new_workspace_picker();
         Ok(())
+    }
+
+    /// Record a round-trip latency sample (ms) for the host-banner ping average (issue #13),
+    /// keeping only the most recent [`HOST_PING_SAMPLE_WINDOW`] samples.
+    pub(crate) fn record_server_ping(&mut self, id: &ServerId, latency_ms: u32) {
+        if let Some(server) = self.server_mut(id) {
+            if server.ping_samples.len() >= HOST_PING_SAMPLE_WINDOW {
+                server.ping_samples.pop_front();
+            }
+            server.ping_samples.push_back(latency_ms);
+        }
+    }
+
+    /// Record the latest downstream throughput (bytes/sec) from a host for its banner readout.
+    pub(crate) fn set_server_download_bps(&mut self, id: &ServerId, bps: u64) {
+        if let Some(server) = self.server_mut(id) {
+            server.download_bps = Some(bps);
+        }
     }
 
     pub(crate) fn set_summary(&mut self, id: &ServerId, summary: ServerSummary) -> Result<(), ()> {
@@ -1566,6 +1594,8 @@ impl ClientSupervisorModel {
                         display_name: server.display_name.clone(),
                         connection_state: host_banner_state(server),
                         space_count,
+                        latency_ms: server.avg_ping_ms(),
+                        download_bps: server.download_bps,
                     },
                 ));
             }
@@ -1866,6 +1896,19 @@ fn managed_secondary(
         connection_state,
         summaries: ServerSummary::default(),
         disabled: definition.disabled, // item 3 (Area 5): gate input from the registry.
+        ping_samples: std::collections::VecDeque::new(),
+        download_bps: None,
+    }
+}
+
+impl ManagedServer {
+    /// Average of the recent round-trip samples (ms), or `None` until the first sample lands.
+    pub(crate) fn avg_ping_ms(&self) -> Option<u32> {
+        if self.ping_samples.is_empty() {
+            return None;
+        }
+        let sum: u64 = self.ping_samples.iter().map(|ms| *ms as u64).sum();
+        Some((sum / self.ping_samples.len() as u64) as u32)
     }
 }
 
@@ -2141,6 +2184,25 @@ mod tests {
         assert_eq!(outcome, AddRemoteFormOutcome::Redraw);
         assert!(model.add_remote_restart_confirm().is_some());
         assert_eq!(model.add_remote_form().unwrap().target, "macmini");
+    }
+
+    #[test]
+    fn host_banner_ping_average_caps_at_window_and_reports_rate() {
+        let mut model = ClientSupervisorModel::new("local");
+        let id = model.add_secondary(local_remote("m", "macmini", Some("macmini")));
+        // 11 samples; only the last 10 count: nine 100s + one 40 → (900+40)/10 = 94.
+        for ms in [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 40] {
+            model.record_server_ping(&id, ms);
+        }
+        model.set_server_download_bps(&id, 312_000);
+
+        let specs = model.host_banner_specs();
+        let (_, spec) = specs
+            .iter()
+            .find(|(_, spec)| spec.display_name == "macmini")
+            .expect("macmini banner spec");
+        assert_eq!(spec.latency_ms, Some(94));
+        assert_eq!(spec.download_bps, Some(312_000));
     }
 
     #[test]

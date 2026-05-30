@@ -606,6 +606,10 @@ pub struct HostBannerSpec {
     pub display_name: String,
     pub connection_state: HostBannerState,
     pub space_count: usize,
+    /// Rolling average round-trip latency to this host in ms (issue #13), if measured.
+    pub latency_ms: Option<u32>,
+    /// Recent downstream frame throughput from this host in bytes/sec, if measured.
+    pub download_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2211,6 +2215,8 @@ mod tests {
             display_name: "prod".into(),
             connection_state: HostBannerState::Connected,
             space_count: 2,
+            latency_ms: None,
+            download_bps: None,
         };
         assert_eq!(spec.display_name, "prod");
         assert_eq!(spec.space_count, 2);
@@ -2227,6 +2233,8 @@ mod tests {
                     display_name: spec.display_name.clone(),
                     connection_state: state,
                     space_count: spec.space_count,
+                    latency_ms: None,
+                    download_bps: None,
                 }
                 .connection_state,
                 state

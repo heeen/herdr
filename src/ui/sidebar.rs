@@ -660,6 +660,73 @@ fn host_banner_suffix(
     }
 }
 
+/// Human-readable downstream rate for the host banner, e.g. `312kb/s`, `1.2mb/s` (issue #13).
+fn format_download_rate(bps: u64) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1}mb/s", bps as f64 / 1_000_000.0)
+    } else if bps >= 1_000 {
+        format!("{}kb/s", bps / 1_000)
+    } else {
+        format!("{bps}b/s")
+    }
+}
+
+/// Color-grade a host by health: green when smooth, yellow when warming, peach when laggy, red
+/// when down/incompatible, dim until the first latency sample (issue #13).
+fn host_health_color(
+    latency_ms: Option<u32>,
+    state: crate::app::state::HostBannerState,
+    p: &Palette,
+) -> Color {
+    use crate::app::state::HostBannerState;
+    match state {
+        HostBannerState::Disconnected | HostBannerState::ProtocolMismatch => return p.red,
+        HostBannerState::Disabled => return p.overlay0,
+        _ => {}
+    }
+    match latency_ms {
+        None => p.overlay0,
+        Some(ms) if ms <= 80 => p.green,
+        Some(ms) if ms <= 200 => p.yellow,
+        Some(_) => p.peach,
+    }
+}
+
+/// Build the right-aligned banner metric spans (`↓312kb/s 50ms`) and their display width. Empty
+/// when nothing has been measured yet. The download rate is dim; the ping is health-graded so a
+/// glance reads green=smooth … red=laggy (issue #13).
+fn host_banner_metric_spans(
+    spec: &crate::app::state::HostBannerSpec,
+    p: &Palette,
+) -> (Vec<Span<'static>>, usize) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let health = host_health_color(spec.latency_ms, spec.connection_state, p);
+
+    if let Some(bps) = spec.download_bps.filter(|bps| *bps > 0) {
+        let rate = format_download_rate(bps);
+        spans.push(Span::styled("↓", Style::default().fg(p.teal)));
+        spans.push(Span::styled(rate.clone(), Style::default().fg(p.overlay1)));
+        text.push('↓');
+        text.push_str(&rate);
+    }
+
+    if let Some(ms) = spec.latency_ms {
+        if !text.is_empty() {
+            spans.push(Span::raw(" "));
+            text.push(' ');
+        }
+        let ping = format!("{ms}ms");
+        spans.push(Span::styled(
+            ping.clone(),
+            Style::default().fg(health).add_modifier(Modifier::BOLD),
+        ));
+        text.push_str(&ping);
+    }
+
+    (spans, UnicodeWidthStr::width(text.as_str()))
+}
+
 fn spans_with_sidebar_color(
     spans: Vec<Span<'static>>,
     preset: SidebarColorPreset,
@@ -1738,10 +1805,28 @@ fn render_workspace_list(
         ) {
             spans.push(Span::styled(suffix, Style::default().fg(p.overlay0)));
         }
+        // Left side (glyph + rainbow name + suffix): its display width gates whether the metric fits.
+        let name_width: usize = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect::new(banner_area.rect.x, row_y, banner_area.rect.width, 1),
         );
+
+        // item (issue #13): right-aligned `↓rate ping` health readout. Drawn in its own sub-rect at
+        // the right edge so it never erases the name; skipped when the row is too narrow to fit it
+        // with at least one column of breathing room.
+        let (metric_spans, metric_width) = host_banner_metric_spans(spec, p);
+        let banner_width = banner_area.rect.width as usize;
+        if metric_width > 0 && banner_width > name_width + metric_width {
+            let metric_x = banner_area.rect.x + banner_area.rect.width - metric_width as u16;
+            frame.render_widget(
+                Paragraph::new(Line::from(metric_spans)),
+                Rect::new(metric_x, row_y, metric_width as u16, 1),
+            );
+        }
     }
 
     // item 4: draw the local→remote divider rule at each `y` from `app.view.divider_rows`.
@@ -2541,6 +2626,55 @@ fn render_sidebar_toggle(
 mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
+
+    #[test]
+    fn format_download_rate_scales_units() {
+        assert_eq!(format_download_rate(512), "512b/s");
+        assert_eq!(format_download_rate(312_000), "312kb/s");
+        assert_eq!(format_download_rate(1_500_000), "1.5mb/s");
+    }
+
+    #[test]
+    fn host_health_color_grades_by_latency() {
+        let p = Palette::catppuccin();
+        use crate::app::state::HostBannerState::Connected;
+        assert_eq!(host_health_color(None, Connected, &p), p.overlay0);
+        assert_eq!(host_health_color(Some(40), Connected, &p), p.green);
+        assert_eq!(host_health_color(Some(120), Connected, &p), p.yellow);
+        assert_eq!(host_health_color(Some(400), Connected, &p), p.peach);
+        // A down host is always red regardless of any stale latency sample.
+        assert_eq!(
+            host_health_color(
+                Some(5),
+                crate::app::state::HostBannerState::Disconnected,
+                &p
+            ),
+            p.red
+        );
+    }
+
+    #[test]
+    fn host_banner_metric_spans_combine_rate_and_ping() {
+        let p = Palette::catppuccin();
+        let spec = crate::app::state::HostBannerSpec {
+            display_name: "macmini".into(),
+            connection_state: crate::app::state::HostBannerState::Connected,
+            space_count: 1,
+            latency_ms: Some(50),
+            download_bps: Some(312_000),
+        };
+        let (spans, width) = host_banner_metric_spans(&spec, &p);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "↓312kb/s 50ms");
+        assert!(width > 0);
+        // Nothing measured → no metric.
+        let empty = crate::app::state::HostBannerSpec {
+            latency_ms: None,
+            download_bps: None,
+            ..spec
+        };
+        assert_eq!(host_banner_metric_spans(&empty, &p).1, 0);
+    }
 
     fn agent_entry_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
         (0..width)
@@ -4643,6 +4777,8 @@ lines = [
                 display_name: format!("host{i}"),
                 connection_state: *state,
                 space_count: 1,
+                latency_ms: None,
+                download_bps: None,
             })
             .collect();
         app.host_banner_active = !banner_rows.is_empty();

@@ -285,6 +285,31 @@ impl FrameData {
         }
     }
 
+    /// A blank frame of `width`×`height` reset/space cells. Used as an instant placeholder when
+    /// switching to a server whose content has not been received yet, so the UI repaints the new
+    /// shell immediately instead of holding the previous server's screen (issue #13).
+    pub fn blank(width: u16, height: u16) -> Self {
+        let count = (width as usize) * (height as usize);
+        FrameData {
+            cells: vec![
+                CellData {
+                    symbol: " ".to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                count
+            ],
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
