@@ -5664,18 +5664,19 @@ mod tests {
         model.open_new_workspace_picker();
         let mut compositor = compositor::ClientCompositor::new(26);
 
-        // item 1: click the CENTERED remote destination row (index 1), using the same shared
-        // geometry the renderer uses (NOT the old bottom-anchored rows 13/14).
-        let full_rect = ratatui::layout::Rect::new(0, 0, 60, 16);
-        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        // item 1: click the FOOTER-ANCHORED remote destination row (index 1), using the same
+        // shared geometry + anchor_area the renderer/hit-test use (the popup floats over the live
+        // content at the sidebar footer, not centered).
+        let anchor = compositor.overlay_anchor_area(&model, 60, 20);
+        let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
-        assert_ne!(row1.y, 14);
+        assert!(row1.y > 0);
 
         let dispatch = dispatch_composited_input(
             sgr_left_down(row1.x, row1.y),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (60, 20),
         );
 
         assert_eq!(

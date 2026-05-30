@@ -1324,12 +1324,14 @@ fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survi
 
     // 80x24 host: the server sidebar places the footer/`new` affordance at the
     // bottom of the workspace section, y=11 (SGR row 12). Clicking it opens the
-    // destination picker, now a CENTERED ratatui modal (item 1 / Area 3): for two
-    // destinations the popup is 44x7 at (18,8), inner rect (19,9,42,5), with the
-    // "new workspace" header on inner row 0, the " create on" sub-label on inner
-    // row 1, and the destination rows starting two lines below — so the second
-    // destination ("dev", row index 1) renders at y=12 (SGR row 13), spanning the
-    // inner width [19,61). The old bottom-anchored `+ dev` row at SGR row 23 is gone.
+    // destination picker, now a FOOTER-ANCHORED ratatui popup that floats over the
+    // live content (item 1 / Area 3) — it opens UPWARD from the footer instead of
+    // dead-centered. `anchor_area` spans the host top down to the footer row
+    // (80x11), so for two destinations the popup is 44x7 at (0,4), inner rect
+    // (1,5,42,5), with the "new workspace" header on inner row 0, the " create on"
+    // sub-label on inner row 1, and the destination rows starting two lines below —
+    // so the second destination ("dev", row index 1) renders at y=8 (SGR row 9),
+    // spanning the inner width [1,43).
     let mut client_writer = client._master.take_writer().expect("open PTY writer");
     write_sgr_mouse_click(client_writer.as_mut(), 2, 12);
     // The blit diff (and `strip_ansi_for_test`, which drops cursor-positioning escapes)
@@ -1343,7 +1345,7 @@ fn mixed_local_remote_client_picker_creates_on_selected_secondary_and_main_survi
         ),
         "clicking new in all-server mode should open the destination picker"
     );
-    write_sgr_mouse_click(client_writer.as_mut(), 21, 13);
+    write_sgr_mouse_click(client_writer.as_mut(), 21, 9);
 
     assert!(
         wait_for_workspace_count(

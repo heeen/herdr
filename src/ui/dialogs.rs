@@ -7,8 +7,9 @@ use ratatui::{
 };
 
 use super::widgets::{
-    action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
-    render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
+    action_button_row_rects, bottom_left_popup_rect, centered_popup_rect, panel_contrast_fg,
+    render_action_button, render_modal_header, render_modal_shell, render_panel_shell,
+    ActionButtonSpec,
 };
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
@@ -721,10 +722,17 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 // modals. Both render and `ClientCompositor::hit_test` derive every row/button rect from these
 // helpers, so render geometry == hit-test geometry.
 
-/// Fixed inner rect for the add-remote modal (`render_modal_shell(area, 54, 9, palette)`). Returns
-/// `None` when the host is too small to fit the modal, in which case render and hit-test both no-op.
+/// The outer popup rect for the add-remote overlay — footer-anchored (bottom-left of `area`,
+/// opening upward) so it floats over the live content like the global launcher menu. Used by BOTH
+/// the renderer and the compositor's content-copy exclusion / hit-test.
+pub(crate) fn add_remote_popup_rect(area: Rect) -> Option<Rect> {
+    bottom_left_popup_rect(area, 54, 9)
+}
+
+/// Fixed inner rect for the add-remote overlay. Returns `None` when the host is too small to fit
+/// the overlay, in which case render and hit-test both no-op.
 pub(crate) fn add_remote_inner_rect(area: Rect) -> Option<Rect> {
-    centered_popup_rect(area, 54, 9).map(|popup| {
+    add_remote_popup_rect(area).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -760,11 +768,18 @@ fn picker_popup_height(count: usize) -> u16 {
     (count as u16).saturating_add(5).clamp(7, 18)
 }
 
-/// Shared inner rect for the new-workspace picker modal. The popup height is derived from the
+/// The outer popup rect for the new-workspace picker — footer-anchored (bottom-left of `area`,
+/// opening upward) so it floats over the live content like the global launcher menu. Used by BOTH
+/// the renderer and the compositor's content-copy exclusion / hit-test.
+pub(crate) fn new_workspace_picker_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+    bottom_left_popup_rect(area, 44, picker_popup_height(count))
+}
+
+/// Shared inner rect for the new-workspace picker overlay. The popup height is derived from the
 /// destination `count` exactly the way `render_new_workspace_picker_overlay` sizes it, mirroring
 /// `open_existing_worktree_inner_rect`.
 pub(crate) fn new_workspace_picker_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    centered_popup_rect(area, 44, picker_popup_height(count)).map(|popup| {
+    new_workspace_picker_popup_rect(area, count).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -810,11 +825,17 @@ pub(crate) fn render_add_remote_overlay(
     frame: &mut Frame,
     area: Rect,
 ) {
-    super::dim_background(frame, area);
-
-    let Some(inner) = render_modal_shell(frame, area, 54, 9, palette) else {
+    let Some(popup) = add_remote_popup_rect(area) else {
         return;
     };
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    debug_assert_eq!(
+        Some(inner),
+        add_remote_inner_rect(area),
+        "add-remote render and hit-test geometry diverged"
+    );
     if inner.height < 5 {
         return;
     }
@@ -924,13 +945,13 @@ pub(crate) fn render_new_workspace_picker_overlay(
     frame: &mut Frame,
     area: Rect,
 ) {
-    super::dim_background(frame, area);
-
-    // Draw the accent-bordered modal shell. Its inner rect is identical to
+    // Draw the accent-bordered panel shell. Its inner rect is identical to
     // `new_workspace_picker_inner_rect(area, count)` (both derive from the same
-    // `centered_popup_rect(area, 44, height)`), so render geometry == hit-test geometry.
-    let height = picker_popup_height(destinations.len());
-    let Some(inner) = render_modal_shell(frame, area, 44, height, palette) else {
+    // `new_workspace_picker_popup_rect(area, count)`), so render geometry == hit-test geometry.
+    let Some(popup) = new_workspace_picker_popup_rect(area, destinations.len()) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
     debug_assert_eq!(
@@ -1011,11 +1032,19 @@ fn remote_manage_popup_height(count: usize) -> u16 {
     (count as u16).saturating_add(5).clamp(8, 20)
 }
 
+/// item 3 (Area 3/5): the outer popup rect for the management overlay — footer-anchored
+/// (bottom-left of `area`, opening upward) so it floats over the live content like the global
+/// launcher menu. Width 64, height derived from `count`. Used by BOTH the renderer and the
+/// compositor's content-copy exclusion / hit-test.
+pub(crate) fn remote_manage_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+    bottom_left_popup_rect(area, 64, remote_manage_popup_height(count))
+}
+
 /// item 3 (Area 3/5): the SHARED inner rect for the management overlay (render + hit-test). The
-/// popup is centered, width 64, height derived from `count` exactly the way
-/// `render_remote_manage_overlay` sizes it. Returns `None` when the host is too small to fit.
+/// popup width is 64, height derived from `count` exactly the way `render_remote_manage_overlay`
+/// sizes it. Returns `None` when the host is too small to fit.
 pub(crate) fn remote_manage_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    centered_popup_rect(area, 64, remote_manage_popup_height(count)).map(|popup| {
+    remote_manage_popup_rect(area, count).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -1072,10 +1101,10 @@ pub(crate) fn render_remote_manage_overlay(
     frame: &mut Frame,
     area: Rect,
 ) {
-    super::dim_background(frame, area);
-
-    let height = remote_manage_popup_height(rows.len());
-    let Some(inner) = render_modal_shell(frame, area, 64, height, palette) else {
+    let Some(popup) = remote_manage_popup_rect(area, rows.len()) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
     debug_assert_eq!(

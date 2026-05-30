@@ -292,21 +292,30 @@ impl ClientCompositor {
             host_height,
             now,
         );
-        // A composited modal (add-remote / new-workspace picker / manage-remotes) calls
-        // `dim_background` over the WHOLE host rect and draws a centered box inside
-        // `render_client_shell`. Copying the server content over the content columns would erase
-        // that dim + box (only the sidebar columns the copy skips survived — which is why the modal
-        // looked invisible and just the sidebar dimmed). While a modal is open, exclude the entire
-        // host rect from the content copy so the dim + modal render stands. Otherwise fall back to
-        // excluding just the open global-menu rect (so the launcher menu isn't overwritten).
-        let modal_open = model.add_remote_form().is_some()
-            || model.new_workspace_picker().is_some()
-            || model.remote_manage_overlay().is_some();
-        let excluded_rect = if modal_open {
-            Some(Rect::new(0, 0, host_width, host_height))
+        // The composited client overlays (add-remote / new-workspace picker / manage-remotes) float
+        // over the live content like the global launcher menu: they are footer-anchored popups (NOT
+        // centered, full-screen-dimmed modals). The content copy must protect EXACTLY the open
+        // popup's rect(s) — so the overlay stays visible AND the rest of the content shows around
+        // it. Both render and these exclusion rects derive from the SAME `*_popup_rect(anchor_area)`
+        // helpers, so what we protect lines up cell-for-cell with what gets drawn. Without an open
+        // overlay we fall back to protecting just the open global-menu rect.
+        let anchor_area = self.overlay_anchor_area(model, host_width, host_height);
+        let mut excluded_rects: Vec<Rect> = Vec::new();
+        if model.add_remote_form().is_some() {
+            excluded_rects.extend(crate::ui::add_remote_popup_rect(anchor_area));
+        } else if let Some((dests, _)) = snapshot.new_workspace_picker.as_ref() {
+            excluded_rects.extend(crate::ui::new_workspace_picker_popup_rect(
+                anchor_area,
+                dests.len(),
+            ));
+        } else if let Some((overlay, rows)) = snapshot.remote_manage.as_ref() {
+            excluded_rects.extend(crate::ui::remote_manage_popup_rect(anchor_area, rows.len()));
+            if overlay.confirm_delete.is_some() {
+                excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
+            }
         } else {
-            snapshot.global_menu_rect()
-        };
+            excluded_rects.extend(snapshot.global_menu_rect());
+        }
         let mut frame = render_client_shell(&snapshot, host_width, host_height);
 
         copy_active_content_excluding(
@@ -314,7 +323,7 @@ impl ClientCompositor {
             &mut frame,
             sidebar_width,
             content_width,
-            excluded_rect,
+            &excluded_rects,
         );
 
         // item 1/3: the add-remote / new-workspace-picker / manage modals are rendered as ratatui
@@ -335,6 +344,29 @@ impl ClientCompositor {
         }
 
         frame
+    }
+
+    /// The footer-anchored `anchor_area` the composited client overlays (add-remote /
+    /// new-workspace picker / manage-remotes) are positioned within: it spans the host top down to
+    /// the sidebar footer row, so the popups open upward from the footer like the global launcher
+    /// menu (instead of dead-centered). Render, content-copy exclusion, hit-test and hover-test all
+    /// derive overlay geometry from this SAME rect, so they cannot drift.
+    pub(crate) fn overlay_anchor_area(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+    ) -> Rect {
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y)
     }
 
     pub(crate) fn content_size(&self, host_width: u16, host_height: u16) -> (u16, u16) {
@@ -379,21 +411,22 @@ impl ClientCompositor {
             return Some(target);
         }
 
-        // item 1: the composited modals are centered over the WHOLE host rect, so their hit-test
-        // runs before the sidebar-width guard. Geometry is derived from the SAME shared helpers
-        // the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`/`add_remote_inner_rect`
-        // + the button-rect helpers), guaranteeing render == hit_test.
-        let full_rect = Rect::new(0, 0, host_width, host_height);
-        if let Some(target) = hit_test_new_workspace_picker(&snapshot, full_rect, x, y) {
+        // item 1: the composited overlays are footer-anchored popups that float over the live
+        // content, so their hit-test runs before the sidebar-width guard. Geometry is derived from
+        // the SAME shared helpers the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`/
+        // `add_remote_inner_rect` + the button-rect helpers) over the SAME `anchor_area`,
+        // guaranteeing render == hit_test.
+        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+        if let Some(target) = hit_test_new_workspace_picker(&snapshot, anchor_area, x, y) {
             return Some(target);
         }
-        if let Some(target) = hit_test_add_remote(&snapshot, full_rect, x, y) {
+        if let Some(target) = hit_test_add_remote(&snapshot, anchor_area, x, y) {
             return Some(target);
         }
         // item 3 (Area 5): the manage overlay intercepts the whole host rect first (so a click on
         // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
         if snapshot.remote_manage.is_some() {
-            return hit_test_remote_manage(&snapshot, full_rect, x, y);
+            return hit_test_remote_manage(&snapshot, anchor_area, x, y);
         }
 
         if x >= sidebar_width {
@@ -481,14 +514,10 @@ impl ClientCompositor {
             Instant::now(),
         );
 
-        // The new-workspace picker is centered over the WHOLE host rect (item 1), so it hovers
-        // before the sidebar-width guard — the SAME order/geometry `hit_test` uses for it.
-        if let Some(target) = hover_test_new_workspace_picker(
-            &snapshot,
-            Rect::new(0, 0, host_width, host_height),
-            x,
-            y,
-        ) {
+        // The new-workspace picker is a footer-anchored popup (item 1), so it hovers before the
+        // sidebar-width guard — the SAME order/geometry `hit_test` uses for it.
+        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+        if let Some(target) = hover_test_new_workspace_picker(&snapshot, anchor_area, x, y) {
             return Some(target);
         }
         // While the picker is open the dimmed sidebar beneath is inert (matches `hit_test`).
@@ -819,10 +848,13 @@ fn render_client_shell(
             if matches!(snapshot.app.mode, Mode::GlobalMenu) {
                 crate::ui::render_global_launcher_menu(&snapshot.app, frame);
             }
-            // item 1: render the composited client modals over the whole host rect — the proven
-            // `render_global_launcher_menu` compositing path. The compositor maps the ui-owned
-            // snapshot carriers into ui view structs here (no supervisor types reach `ui`).
-            let full_rect = Rect::new(0, 0, host_width, host_height);
+            // item 1: render the composited client overlays as footer-anchored popups that float
+            // over the live content — the proven `render_global_launcher_menu` compositing path.
+            // `anchor_area` spans the host top down to the sidebar footer row so the popups open
+            // upward from the footer (matching the launcher menu), NOT dead-centered. The
+            // compositor maps the ui-owned snapshot carriers into ui view structs here (no
+            // supervisor types reach `ui`).
+            let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
             if let Some((dests, selected)) = &snapshot.new_workspace_picker {
                 let views: Vec<crate::ui::DestinationView> = dests
                     .iter()
@@ -844,7 +876,7 @@ fn render_client_shell(
                     *selected,
                     hovered_row,
                     frame,
-                    full_rect,
+                    anchor_area,
                 );
             }
             if let Some(form) = &snapshot.add_remote_form {
@@ -859,10 +891,10 @@ fn render_client_shell(
                     &snapshot.app.palette,
                     &view,
                     frame,
-                    full_rect,
+                    anchor_area,
                 );
             }
-            // item 3 (Area 5): render the remote-management overlay over the whole host rect. The
+            // item 3 (Area 5): render the remote-management overlay as a footer-anchored popup. The
             // compositor maps the supervisor rows into ui-owned views here (no supervisor types
             // reach `ui`).
             if let Some((overlay, rows)) = &snapshot.remote_manage {
@@ -874,7 +906,7 @@ fn render_client_shell(
                     overlay.scroll,
                     overlay.confirm_delete.as_deref(),
                     frame,
-                    full_rect,
+                    anchor_area,
                 );
             }
         })
@@ -1256,7 +1288,7 @@ fn copy_active_content_excluding(
     target: &mut FrameData,
     target_x: u16,
     target_width: u16,
-    excluded_rect: Option<Rect>,
+    excluded_rects: &[Rect],
 ) {
     let copy_width = target_width.min(active_frame.width);
     let copy_height = target.height.min(active_frame.height);
@@ -1264,7 +1296,10 @@ fn copy_active_content_excluding(
         for col in 0..copy_width {
             let source_idx = (row as usize) * (active_frame.width as usize) + (col as usize);
             let target_col = target_x + col;
-            if excluded_rect.is_some_and(|rect| rect_contains(rect, target_col, row)) {
+            if excluded_rects
+                .iter()
+                .any(|rect| rect_contains(*rect, target_col, row))
+            {
                 continue;
             }
             let target_idx = (row as usize) * (target.width as usize) + (target_col as usize);
@@ -1342,6 +1377,18 @@ mod tests {
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
         }
+    }
+
+    /// The footer-anchored `anchor_area` the renderer/hit-test derive the composited client
+    /// overlays from: spans the host top down to the sidebar footer row. Tests derive their
+    /// expected popup coordinates from this SAME rect so render geometry == hit-test geometry.
+    fn anchor_area(
+        model: &ClientSupervisorModel,
+        compositor: &ClientCompositor,
+        host_w: u16,
+        host_h: u16,
+    ) -> Rect {
+        compositor.overlay_anchor_area(model, host_w, host_h)
     }
 
     fn row_text(frame: &FrameData, row: u16) -> String {
@@ -2046,18 +2093,19 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_picker_renders_centered_selectable_list() {
+    fn new_workspace_picker_renders_footer_anchored_selectable_list() {
         let (model, _) = two_destination_picker_model();
 
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
         let composed =
-            compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+            compositor.compose_frame(&model, &content, 60, 20, std::time::Instant::now());
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
             .collect();
 
-        // centered ratatui modal: square corner, header, sub-label, both destinations, buttons.
+        // footer-anchored ratatui popup: square corner, header, sub-label, both destinations,
+        // buttons.
         assert!(rows.iter().any(|row| row.contains("┌")));
         assert!(rows.iter().any(|row| row.contains("new workspace")));
         assert!(rows.iter().any(|row| row.contains("create on")));
@@ -2067,35 +2115,44 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("›")));
         assert!(rows.iter().any(|row| row.contains("create")));
         assert!(rows.iter().any(|row| row.contains("cancel")));
-        // the OLD bottom-anchored picker literals on rows 12-14 are GONE.
-        assert!(!row_text(&composed, 12).starts_with("create on"));
-        assert!(!row_text(&composed, 13).starts_with("+ local"));
-        assert!(!row_text(&composed, 14).starts_with("+ x"));
+
+        // the popup is footer-anchored (opens upward from the sidebar footer), NOT centered: its
+        // top border sits below the host top, and it never reaches the bottom rows.
+        let popup =
+            crate::ui::new_workspace_picker_popup_rect(anchor_area(&model, &compositor, 60, 20), 2)
+                .expect("popup fits");
+        assert!(popup.y > 0, "popup is not flush to host top");
+        assert!(rows[popup.y as usize].contains("┌"), "top border row");
+        // rows below the popup show server content / blanks, not the picker.
+        for row in &rows[(popup.y + popup.height) as usize..] {
+            assert!(!row.contains("new workspace"));
+        }
     }
 
     #[test]
-    fn new_workspace_picker_mouse_click_hit_tests_centered_rows() {
+    fn new_workspace_picker_mouse_click_hit_tests_footer_anchored_rows() {
         let (model, remote_id) = two_destination_picker_model();
         let compositor = ClientCompositor::new(26);
 
-        // derive the CENTERED row coordinates from the SAME shared geometry the renderer uses.
-        let full_rect = Rect::new(0, 0, 60, 16);
-        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        // derive the FOOTER-ANCHORED row coordinates from the SAME shared geometry + anchor_area
+        // the renderer/hit-test use.
+        let anchor = anchor_area(&model, &compositor, 60, 20);
+        let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row0 = crate::ui::new_workspace_picker_row_rect(inner, 0);
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
 
-        // explicitly NOT rows 13/14 (the old bottom-anchored geometry).
-        assert_ne!(row0.y, 13);
-        assert_ne!(row1.y, 14);
+        // the popup is footer-anchored, so its rows sit below the host top (not centered, not the
+        // old bottom-anchored geometry).
+        assert!(row0.y > 0);
 
         assert_eq!(
-            compositor.hit_test(&model, row0.x, row0.y, 60, 16),
+            compositor.hit_test(&model, row0.x, row0.y, 60, 20),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: ServerId::main(),
             })
         );
         assert_eq!(
-            compositor.hit_test(&model, row1.x, row1.y, 60, 16),
+            compositor.hit_test(&model, row1.x, row1.y, 60, 20),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: remote_id,
             })
@@ -2119,16 +2176,16 @@ mod tests {
         let (model, _) = two_destination_picker_model();
         let compositor = ClientCompositor::new(26);
 
-        let full_rect = Rect::new(0, 0, 60, 16);
-        let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, 2).expect("modal fits");
+        let anchor = anchor_area(&model, &compositor, 60, 20);
+        let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let (confirm, cancel) = crate::ui::new_workspace_picker_button_rects(inner);
 
         assert_eq!(
-            compositor.hit_test(&model, confirm.x, confirm.y, 60, 16),
+            compositor.hit_test(&model, confirm.x, confirm.y, 60, 20),
             Some(SidebarHitTarget::NewWorkspacePickerConfirm)
         );
         assert_eq!(
-            compositor.hit_test(&model, cancel.x, cancel.y, 60, 16),
+            compositor.hit_test(&model, cancel.x, cancel.y, 60, 20),
             Some(SidebarHitTarget::NewWorkspacePickerCancel)
         );
     }
@@ -2261,11 +2318,10 @@ mod tests {
 
     #[test]
     fn modal_survives_full_screen_content_overwrite() {
-        // Regression: a composited modal must stay visible even when the server content frame fills
-        // the ENTIRE content area (a real pane full of text). Previously the content copy only
-        // spared the global-menu rect, so the content overwrote the centered modal — leaving only
-        // the sidebar dimmed and the dialog invisible (esc still closed it). The fix excludes the
-        // whole host rect from the content copy while a modal is open.
+        // Regression: a composited overlay must stay visible even when the server content frame
+        // fills the ENTIRE content area (a real pane full of text). The content copy protects
+        // EXACTLY the open popup's rect, so the overlay survives AND the rest of the content stays
+        // visible around it (the popup is footer-anchored, NOT a full-screen-dimmed centered modal).
         let mut model = ClientSupervisorModel::new("local");
         model.open_add_remote_form();
         // content frame that fills the whole content area with a sentinel (like a busy pane).
@@ -2280,19 +2336,40 @@ mod tests {
             .map(|r| row_text(&composed, r))
             .collect();
 
-        // the modal (header, a field label, the cancel button) must survive — these sit in the
-        // content columns and would be overwritten by the '#' fill without the fix.
+        // the overlay (header, a field label, the cancel button) must survive — these sit in the
+        // content columns and would be overwritten by the '#' fill without the popup-rect exclusion.
         assert!(
             texts.iter().any(|t| t.contains("add remote")),
-            "modal header overwritten by content; rows={texts:?}"
+            "overlay header overwritten by content; rows={texts:?}"
         );
         assert!(
             texts.iter().any(|t| t.contains("target")),
-            "modal field overwritten by content"
+            "overlay field overwritten by content"
         );
         assert!(
             texts.iter().any(|t| t.contains("cancel")),
-            "modal action button overwritten by content"
+            "overlay action button overwritten by content"
+        );
+
+        // ...AND the content sentinel must STILL be visible somewhere in the content area OUTSIDE
+        // the popup rect — proving the fix protects only the popup, not the whole screen (the old
+        // bug blanked everything).
+        let popup =
+            crate::ui::add_remote_popup_rect(compositor.overlay_anchor_area(&model, 80, 24))
+                .expect("popup fits");
+        let sidebar_width = 26u16;
+        let sentinel_outside_popup = (0..composed.height).any(|row| {
+            (sidebar_width..composed.width).any(|col| {
+                let inside_popup = col >= popup.x
+                    && col < popup.x + popup.width
+                    && row >= popup.y
+                    && row < popup.y + popup.height;
+                !inside_popup && cell_at(&composed, col, row).symbol == "#"
+            })
+        });
+        assert!(
+            sentinel_outside_popup,
+            "content '#' fully blanked; only the popup rect should be protected; rows={texts:?}"
         );
     }
 
@@ -2306,8 +2383,9 @@ mod tests {
         let composed =
             compositor.compose_frame(&model, &content, 80, 24, std::time::Instant::now());
 
-        // inner rect for host 80x24: rows[1] (target) and rows[2] (name).
-        let inner = crate::ui::add_remote_inner_rect(Rect::new(0, 0, 80, 24)).expect("modal fits");
+        // inner rect for the footer-anchored overlay: rows[1] (target) and rows[2] (name).
+        let inner = crate::ui::add_remote_inner_rect(anchor_area(&model, &compositor, 80, 24))
+            .expect("modal fits");
         let target_row = inner.y.saturating_add(1);
         let name_row = inner.y.saturating_add(2);
 
@@ -2368,7 +2446,8 @@ mod tests {
         model.open_add_remote_form();
         let compositor = ClientCompositor::new(26);
 
-        let inner = crate::ui::add_remote_inner_rect(Rect::new(0, 0, 80, 24)).expect("modal fits");
+        let inner = crate::ui::add_remote_inner_rect(anchor_area(&model, &compositor, 80, 24))
+            .expect("modal fits");
         let (submit, cancel) = crate::ui::add_remote_button_rects(inner);
 
         assert_eq!(
@@ -2626,10 +2705,10 @@ mod tests {
     fn remote_manage_render_equals_hit_test_geometry() {
         let model = manage_overlay_model();
         let compositor = ClientCompositor::new(26);
-        let full = Rect::new(0, 0, 80, 24);
+        let anchor = anchor_area(&model, &compositor, 80, 24);
 
         // the rect the renderer draws row N into is the rect hit_test checks.
-        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+        let inner = crate::ui::remote_manage_inner_rect(anchor, 2).expect("modal fits");
         let row0 = crate::ui::remote_manage_row_rect(inner, 0);
         let row1 = crate::ui::remote_manage_row_rect(inner, 1);
         assert_eq!(
@@ -2646,8 +2725,8 @@ mod tests {
     fn hit_test_returns_manage_targets() {
         let model = manage_overlay_model();
         let compositor = ClientCompositor::new(26);
-        let full = Rect::new(0, 0, 80, 24);
-        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+        let anchor = anchor_area(&model, &compositor, 80, 24);
+        let inner = crate::ui::remote_manage_inner_rect(anchor, 2).expect("modal fits");
 
         // row click selects.
         let row0 = crate::ui::remote_manage_row_rect(inner, 0);
@@ -2705,14 +2784,14 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("cancel")));
 
         // while confirm is active the list rows are NOT hit-testable; only the popup buttons are.
-        let full = Rect::new(0, 0, 80, 24);
-        let inner = crate::ui::remote_manage_inner_rect(full, 2).expect("modal fits");
+        let anchor = anchor_area(&model, &compositor, 80, 24);
+        let inner = crate::ui::remote_manage_inner_rect(anchor, 2).expect("modal fits");
         let row0 = crate::ui::remote_manage_row_rect(inner, 0);
         assert!(!matches!(
             compositor.hit_test(&model, row0.x, row0.y, 80, 24),
             Some(SidebarHitTarget::RemoteManageRow { .. })
         ));
-        let popup = crate::ui::remote_manage_confirm_popup_rect(full).expect("popup fits");
+        let popup = crate::ui::remote_manage_confirm_popup_rect(anchor).expect("popup fits");
         let pinner = Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -3082,12 +3161,13 @@ mod tests {
 
     #[test]
     fn hover_test_resolves_new_workspace_picker_destination_row() {
-        // the centered picker modal hovers its destination rows to NewWorkspaceDestination { row }.
+        // the footer-anchored picker popup hovers its destination rows to
+        // NewWorkspaceDestination { row }.
         let (model, _remote_id) = two_destination_picker_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 16u16);
-        let full = Rect::new(0, 0, host.0, host.1);
-        let inner = crate::ui::new_workspace_picker_inner_rect(full, 2).expect("modal fits");
+        let host = (60u16, 20u16);
+        let anchor = anchor_area(&model, &compositor, host.0, host.1);
+        let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
         assert_eq!(
             compositor.hover_test(&model, row1.x, row1.y, host.0, host.1),
