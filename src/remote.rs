@@ -659,11 +659,13 @@ fn prepare_remote_herdr(
     source.cleanup();
     install_result?;
 
-    if !remote_binary_matches(target, &remote_herdr)? {
-        return Err(io::Error::other(format!(
-            "installed remote herdr at {}, but it did not report version {CURRENT_VERSION}",
-            remote_herdr.shell_path
-        )));
+    match check_remote_binary(target, &remote_herdr)? {
+        RemoteBinaryCheck::Compatible => {}
+        other => {
+            return Err(io::Error::other(
+                other.install_failure_message(&remote_herdr.shell_path),
+            ))
+        }
     }
     warn_if_remote_bin_not_on_path(target)?;
 
@@ -785,6 +787,130 @@ fn remote_binary_match_command(remote_herdr: &RemoteHerdr) -> String {
         "test -x {0} && {0} --version && {0} status client --json && {1}=1 {0} remote-client-bridge && {1}=1 {0} remote-api-bridge",
         remote_herdr.shell_path, REMOTE_BRIDGE_PROBE_ENV_VAR
     )
+}
+
+/// Why a freshly-installed remote herdr is not usable by this client. Unlike the boolean
+/// `remote_binary_matches`, this distinguishes the failure so the user gets a truthful, actionable
+/// message instead of the old catch-all "did not report version" (which lied when the version
+/// actually matched but the protocol/bridge support did not — see issue #12, dev2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteBinaryCheck {
+    Compatible,
+    NotExecutable,
+    /// Ran, but reported a different herdr version than this client.
+    VersionMismatch {
+        reported: String,
+    },
+    /// Version matched, but the wire protocol differs (e.g. an older same-version release asset).
+    ProtocolMismatch {
+        reported: Option<u32>,
+    },
+    /// Version + protocol look right, but the binary lacks the remote-bridge subcommands.
+    MissingBridgeSupport,
+    /// Probe output could not be understood (binary did not respond to --version/status).
+    Unintelligible,
+}
+
+/// A diagnostic probe that reports each capability on its own marker line (instead of the
+/// short-circuiting `&&` chain in `remote_binary_match_command`), so we can tell *which* check
+/// failed. The script always exits 0 and emits exactly one terminal marker per stage.
+fn remote_binary_diagnose_command(remote_herdr: &RemoteHerdr) -> String {
+    format!(
+        "P={0}\n\
+         if ! test -x \"$P\"; then echo HERDR_PROBE_NOT_EXECUTABLE; exit 0; fi\n\
+         v=$(\"$P\" --version 2>/dev/null) || {{ echo HERDR_PROBE_NO_VERSION; exit 0; }}\n\
+         echo \"HERDR_PROBE_VERSION $v\"\n\
+         s=$(\"$P\" status client --json 2>/dev/null) || {{ echo HERDR_PROBE_NO_STATUS; exit 0; }}\n\
+         echo \"HERDR_PROBE_STATUS $s\"\n\
+         if {1}=1 \"$P\" remote-client-bridge >/dev/null 2>&1 && {1}=1 \"$P\" remote-api-bridge >/dev/null 2>&1; then echo HERDR_PROBE_BRIDGE_OK; else echo HERDR_PROBE_BRIDGE_MISSING; fi\n",
+        remote_herdr.shell_path, REMOTE_BRIDGE_PROBE_ENV_VAR
+    )
+}
+
+fn interpret_remote_binary_probe(stdout: &str) -> RemoteBinaryCheck {
+    let mut version = None;
+    let mut status = None;
+    let mut bridge_ok = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == "HERDR_PROBE_NOT_EXECUTABLE" {
+            return RemoteBinaryCheck::NotExecutable;
+        } else if line == "HERDR_PROBE_NO_VERSION" || line == "HERDR_PROBE_NO_STATUS" {
+            return RemoteBinaryCheck::Unintelligible;
+        } else if let Some(rest) = line.strip_prefix("HERDR_PROBE_VERSION ") {
+            version = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("HERDR_PROBE_STATUS ") {
+            status = Some(rest.trim().to_string());
+        } else if line == "HERDR_PROBE_BRIDGE_OK" {
+            bridge_ok = Some(true);
+        } else if line == "HERDR_PROBE_BRIDGE_MISSING" {
+            bridge_ok = Some(false);
+        }
+    }
+
+    let Some(version) = version else {
+        return RemoteBinaryCheck::Unintelligible;
+    };
+    if !crate::version::version_line_matches_current(&version) {
+        return RemoteBinaryCheck::VersionMismatch { reported: version };
+    }
+    let protocol = status
+        .as_deref()
+        .and_then(parse_client_status_json)
+        .map(|status| status.protocol);
+    if protocol != Some(CURRENT_PROTOCOL) {
+        return RemoteBinaryCheck::ProtocolMismatch { reported: protocol };
+    }
+    if bridge_ok != Some(true) {
+        return RemoteBinaryCheck::MissingBridgeSupport;
+    }
+    RemoteBinaryCheck::Compatible
+}
+
+impl RemoteBinaryCheck {
+    /// Message for the case where we just installed a binary but it is not usable. Points the user
+    /// at `HERDR_REMOTE_BINARY` for the common cross-platform / dev-build cause.
+    fn install_failure_message(&self, shell_path: &str) -> String {
+        let seed = format!(
+            "Build herdr for the remote platform and set {REMOTE_BINARY_ENV_VAR}=<path>, or install a matching herdr on the remote host manually."
+        );
+        match self {
+            RemoteBinaryCheck::Compatible => {
+                format!("remote herdr at {shell_path} is compatible")
+            }
+            RemoteBinaryCheck::NotExecutable => format!(
+                "installed remote herdr at {shell_path}, but it is not executable on the remote host (most likely a wrong-architecture binary). {seed}"
+            ),
+            RemoteBinaryCheck::VersionMismatch { reported } => format!(
+                "installed remote herdr at {shell_path}, but it reports `{reported}`, not version {CURRENT_VERSION}. {seed}"
+            ),
+            RemoteBinaryCheck::ProtocolMismatch { reported } => format!(
+                "installed remote herdr at {shell_path} runs protocol {}, but this client needs protocol {CURRENT_PROTOCOL}. The version matched, so this is an older {CURRENT_VERSION} build (e.g. the published release asset for the remote platform predates protocol {CURRENT_PROTOCOL}). {seed}",
+                protocol_label(*reported)
+            ),
+            RemoteBinaryCheck::MissingBridgeSupport => format!(
+                "installed remote herdr at {shell_path} does not support the remote-bridge subcommands this client needs (an older {CURRENT_VERSION} build). {seed}"
+            ),
+            RemoteBinaryCheck::Unintelligible => format!(
+                "installed remote herdr at {shell_path}, but it did not respond to --version/status probes. {seed}"
+            ),
+        }
+    }
+}
+
+/// Diagnose the installed remote binary, distinguishing version/protocol/bridge failures. Used on
+/// the post-install error path; the hot path still uses the cheaper boolean `remote_binary_matches`.
+fn check_remote_binary(
+    target: &SshTarget,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<RemoteBinaryCheck> {
+    let output = ssh_output(target, &remote_binary_diagnose_command(remote_herdr))?;
+    if !output.status.success() {
+        return Ok(RemoteBinaryCheck::Unintelligible);
+    }
+    Ok(interpret_remote_binary_probe(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn remote_binary_exists(target: &SshTarget, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -1951,6 +2077,84 @@ mod tests {
         assert_eq!(
             ssh_argv(&target, "x"),
             ["-o", "ConnectTimeout=3", "-T", "iq-64", "x"]
+        );
+    }
+
+    fn probe_lines(version: &str, protocol: u32, bridge_ok: bool) -> String {
+        format!(
+            "HERDR_PROBE_VERSION {version}\nHERDR_PROBE_STATUS {{\"protocol\":{protocol}}}\n{}\n",
+            if bridge_ok {
+                "HERDR_PROBE_BRIDGE_OK"
+            } else {
+                "HERDR_PROBE_BRIDGE_MISSING"
+            }
+        )
+    }
+
+    #[test]
+    fn probe_reports_compatible_for_matching_binary() {
+        let stdout = probe_lines(&format!("herdr {CURRENT_VERSION}"), CURRENT_PROTOCOL, true);
+        assert_eq!(
+            interpret_remote_binary_probe(&stdout),
+            RemoteBinaryCheck::Compatible
+        );
+    }
+
+    #[test]
+    fn probe_reports_protocol_mismatch_when_version_matches_but_protocol_is_old() {
+        // The dev2 case: version 0.6.4 matched, but the installed asset spoke protocol 6.
+        let stdout = probe_lines(&format!("herdr {CURRENT_VERSION}"), 6, true);
+        assert_eq!(
+            interpret_remote_binary_probe(&stdout),
+            RemoteBinaryCheck::ProtocolMismatch { reported: Some(6) }
+        );
+    }
+
+    #[test]
+    fn probe_reports_missing_bridge_when_subcommands_absent() {
+        let stdout = probe_lines(&format!("herdr {CURRENT_VERSION}"), CURRENT_PROTOCOL, false);
+        assert_eq!(
+            interpret_remote_binary_probe(&stdout),
+            RemoteBinaryCheck::MissingBridgeSupport
+        );
+    }
+
+    #[test]
+    fn probe_reports_version_mismatch_before_protocol() {
+        let stdout = probe_lines("herdr 0.5.10", 6, true);
+        assert_eq!(
+            interpret_remote_binary_probe(&stdout),
+            RemoteBinaryCheck::VersionMismatch {
+                reported: "herdr 0.5.10".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn probe_reports_not_executable_and_unintelligible() {
+        assert_eq!(
+            interpret_remote_binary_probe("HERDR_PROBE_NOT_EXECUTABLE\n"),
+            RemoteBinaryCheck::NotExecutable
+        );
+        assert_eq!(
+            interpret_remote_binary_probe("HERDR_PROBE_NO_VERSION\n"),
+            RemoteBinaryCheck::Unintelligible
+        );
+        assert_eq!(
+            interpret_remote_binary_probe(""),
+            RemoteBinaryCheck::Unintelligible
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_install_message_is_actionable_and_not_about_version() {
+        let msg = RemoteBinaryCheck::ProtocolMismatch { reported: Some(6) }
+            .install_failure_message("$HOME/.local/bin/herdr");
+        assert!(msg.contains("protocol 6"));
+        assert!(msg.contains("HERDR_REMOTE_BINARY"));
+        assert!(
+            !msg.contains("did not report version"),
+            "protocol mismatch must not be reported as a version problem: {msg}"
         );
     }
 
