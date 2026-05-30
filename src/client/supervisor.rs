@@ -83,20 +83,6 @@ impl ServerConnectionTarget {
             ServerConnectionTarget::Ssh { destination, .. } => destination.clone(),
         }
     }
-
-    /// The resolved ssh connection (destination + options) for an ssh target, or `None` otherwise.
-    pub(crate) fn ssh_target(&self) -> Option<crate::remote::SshTarget> {
-        match self {
-            ServerConnectionTarget::Ssh {
-                destination,
-                options,
-            } => Some(crate::remote::SshTarget::new(
-                destination.clone(),
-                options.clone(),
-            )),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
