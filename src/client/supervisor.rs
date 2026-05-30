@@ -385,8 +385,20 @@ pub(crate) fn bootstrap_from_main_api(
     main_display_name: impl Into<String>,
 ) -> Result<ClientSupervisorModel, String> {
     let mut model = ClientSupervisorModel::new(main_display_name);
-    let remotes = request_remote_list(api)?;
-    model.sync_remote_registry(remotes);
+    // A missing/older-server `remote.list` MUST NOT abort the whole supervisor bootstrap: a hard
+    // failure here silently drops the client into the server's pass-through sidebar, which has no
+    // "add remote"/"manage remotes" affordances — leaving no way to add a first remote. Degrade to
+    // an empty registry (the client still owns the sidebar + remote menu), mirroring the UI-settings
+    // fallback below. This is the common case while developing: a newer client attaches to an older
+    // server that doesn't yet know the `remote.list` method.
+    match request_remote_list(api) {
+        Ok(remotes) => model.sync_remote_registry(remotes),
+        Err(err) => tracing::warn!(
+            err = %err,
+            "failed to fetch remote registry from main server (older/mismatched server?); \
+             continuing with no remotes so the client sidebar and add/manage-remote menu stay available"
+        ),
+    }
     let summary = request_server_summary(api)?;
     model
         .set_summary(&ServerId::main(), summary)
@@ -2082,6 +2094,7 @@ mod tests {
         agents: Vec<crate::api::schema::AgentInfo>,
         ui_settings: crate::api::schema::UiSettingsInfo,
         fail_ui_settings: bool,
+        fail_remote_list: bool,
     }
 
     impl SupervisorApi for FakeSupervisorApi {
@@ -2092,6 +2105,10 @@ mod tests {
             let result = match request.method {
                 crate::api::schema::Method::RemoteList(_) => {
                     self.requests.push("remote.list");
+                    if self.fail_remote_list {
+                        // mimic an older server that doesn't know the `remote.list` variant.
+                        return Err("invalid request: unknown variant `remote.list`".into());
+                    }
                     crate::api::schema::ResponseResult::RemoteList {
                         remotes: self.remotes.clone(),
                     }
@@ -2125,6 +2142,58 @@ mod tests {
                 result,
             })
         }
+    }
+
+    #[test]
+    fn bootstrap_survives_remote_list_failure_so_remote_menu_stays_available() {
+        // An older/mismatched server that doesn't know `remote.list` must NOT disable the client
+        // sidebar: bootstrap degrades to an empty registry, the supervisor still builds, and the
+        // global menu (incl. add remote / manage remotes) stays available so a first remote can be
+        // added. Regression guard for the silent pass-through fallback that hid the remote menus.
+        let mut api = FakeSupervisorApi {
+            fail_remote_list: true,
+            workspaces: vec![workspace_info("main-workspace", "herdr", true)],
+            ..FakeSupervisorApi::default()
+        };
+
+        let model = bootstrap_from_main_api(&mut api, "local")
+            .expect("bootstrap must succeed despite remote.list failing");
+
+        // remote.list was attempted, then bootstrap CONTINUED to summary + ui settings.
+        assert_eq!(
+            api.requests,
+            vec![
+                "remote.list",
+                "workspace.list",
+                "agent.list",
+                "server.ui_settings"
+            ]
+        );
+        // empty registry → only the main server row, no secondaries.
+        assert_eq!(
+            model.workspace_rows(),
+            vec![WorkspaceSidebarRow {
+                server_id: ServerId::main(),
+                workspace_id: Some("main-workspace".into()),
+                label: "herdr".into(),
+                branch: None,
+                focused: true,
+                disabled: false,
+                is_remote: false,
+            }]
+        );
+        // the client-owned global menu still offers add remote / manage remotes.
+        assert_eq!(
+            model.client_global_menu_items(),
+            [
+                "settings",
+                "keybinds",
+                "reload config",
+                "detach",
+                "add remote",
+                "manage remotes"
+            ]
+        );
     }
 
     #[test]
