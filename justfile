@@ -29,6 +29,11 @@ install-hooks:
 build:
     cargo build --release --locked
 
+# Build an opt-in multi-platform "fat" herdr that can seed remotes of any supported
+# OS/arch offline (issue #28). Needs cargo-zigbuild and Zig 0.15 (set ZIG=...).
+bundle:
+    scripts/build_bundle.sh
+
 # Build the website and documentation
 website-build:
     cd website && bun install --frozen-lockfile && bun run build

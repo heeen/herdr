@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added an opt-in multi-platform "fat" build (`just bundle`) that appends macOS and Linux binaries (x86_64 and aarch64; Linux as static musl) to the native binary as compressed, indexed data. `herdr --remote <host>` then seeds a different-OS host offline at exact version parity by extracting the matching binary from itself, instead of needing a release download on the remote. Released/Homebrew/Nix artifacts and `herdr update` are unchanged. Adds `herdr bundle list` and `herdr bundle pack`, with a clean fallback to the download path when a build does not carry the remote platform. (#28)
+
 ## [0.6.4] - 2026-05-27
 
 ### Fixed

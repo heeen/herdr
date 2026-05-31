@@ -21,6 +21,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 mod agent_resume;
 mod api;
 mod app;
+mod bundle;
 mod cli;
 mod client;
 mod config;
@@ -421,6 +422,7 @@ fn main() -> io::Result<()> {
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
         println!("       herdr update [--handoff]");
+        println!("       herdr bundle list [path] [--json]");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
         println!("       herdr config <subcommand> ...");
@@ -481,6 +483,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr integration <subcommand>",
                 "Manage built-in agent integrations",
+            ),
+            (
+                "herdr bundle <subcommand>",
+                "Inspect/build multi-platform binaries (cross-OS remote seeding)",
             ),
         ] {
             println!("  {command:<32} {description}");

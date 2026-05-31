@@ -682,12 +682,18 @@ fn prepare_remote_herdr(
             policy,
         )?;
     }
+    let source_description =
+        install_source_description(&remote_herdr.platform, override_binary.as_deref());
     confirm_remote_install(
         target.destination(),
         &remote_herdr,
-        &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
+        &source_description,
         policy,
     )?;
+    eprintln!(
+        "herdr: seeding {} from {source_description}",
+        target.destination()
+    );
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
     let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
     source.cleanup();
@@ -986,31 +992,65 @@ fn remote_binary_override_path() -> io::Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Which non-override source `prepare_remote_herdr` seeds the remote from. Tiers are
+/// tried in order: the running executable itself, then a sibling-platform binary
+/// carried inside this multi-platform build (issue #28), then a release download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonOverrideSeed {
+    /// The running executable itself (same platform, from-source build).
+    LocalExe,
+    /// A sibling-platform binary carried inside this multi-platform build.
+    Bundle,
+    /// Download the matching release asset (the pre-#28 fallback).
+    Download,
+}
+
 fn install_source_description(platform: &RemotePlatform, override_binary: Option<&Path>) -> String {
-    install_source_description_for(
-        platform,
-        override_binary,
-        local_binary_can_seed_remote(platform),
-    )
+    if let Some(path) = override_binary {
+        return install_source_description_for(platform, Some(path), NonOverrideSeed::Download);
+    }
+    install_source_description_for(platform, None, classify_seed_source(platform))
 }
 
 fn install_source_description_for(
     platform: &RemotePlatform,
     override_binary: Option<&Path>,
-    local_binary_can_seed_remote: bool,
+    seed: NonOverrideSeed,
 ) -> String {
     if let Some(path) = override_binary {
         return format!("{REMOTE_BINARY_ENV_VAR} ({})", path.display());
     }
 
-    if local_binary_can_seed_remote {
-        "the current local herdr binary".to_string()
-    } else {
-        format!(
+    match seed {
+        NonOverrideSeed::LocalExe => "the current local herdr binary".to_string(),
+        NonOverrideSeed::Bundle => format!(
+            "the bundled {} binary from this multi-platform build",
+            platform.asset_key()
+        ),
+        NonOverrideSeed::Download => format!(
             "the {CURRENT_VERSION} release asset for {}",
             platform.asset_key()
-        )
+        ),
     }
+}
+
+/// Decide, from cheap pre-checks, which non-override source to seed from. Pure so the
+/// tier order (local exe > carried bundle > download) is unit-testable.
+fn choose_seed_source(has_local_exe_seed: bool, has_bundled_match: bool) -> NonOverrideSeed {
+    if has_local_exe_seed {
+        NonOverrideSeed::LocalExe
+    } else if has_bundled_match {
+        NonOverrideSeed::Bundle
+    } else {
+        NonOverrideSeed::Download
+    }
+}
+
+fn classify_seed_source(platform: &RemotePlatform) -> NonOverrideSeed {
+    choose_seed_source(
+        local_binary_can_seed_remote(platform),
+        self_bundle_seeds_platform(platform),
+    )
 }
 
 fn resolve_install_source(
@@ -1021,14 +1061,11 @@ fn resolve_install_source(
         return Ok(InstallSource::persistent(path));
     }
 
-    if *platform == RemotePlatform::local() {
-        let path = std::env::current_exe()?;
-        if !crate::update::is_package_manager_managed_exe_path(&path) {
-            return Ok(InstallSource::persistent(path));
-        }
+    match classify_seed_source(platform) {
+        NonOverrideSeed::LocalExe => Ok(InstallSource::persistent(std::env::current_exe()?)),
+        NonOverrideSeed::Bundle => extract_bundle_install_source(platform),
+        NonOverrideSeed::Download => download_release_asset(platform),
     }
-
-    download_release_asset(platform)
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
@@ -1039,6 +1076,65 @@ fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
     std::env::current_exe()
         .map(|path| !crate::update::is_package_manager_managed_exe_path(&path))
         .unwrap_or(false)
+}
+
+/// Does this build's appended payload carry a usable binary for `platform`? Pure
+/// matching logic: exact version (and commit, when both are known) plus an entry for
+/// the remote os/arch. Kept separate from the I/O wrapper so it is unit-testable.
+fn bundle_seeds_platform(
+    index: &crate::bundle::BundleIndex,
+    platform: &RemotePlatform,
+    expected_version: &str,
+    expected_commit: Option<&str>,
+) -> bool {
+    if index.herdr_version != expected_version {
+        return false;
+    }
+    // When both sides know their build commit, require an exact match so a stale
+    // bundle from a different commit is never silently seeded (exact version parity).
+    if let (Some(bundle_commit), Some(expected)) = (index.build_commit.as_deref(), expected_commit)
+    {
+        if bundle_commit != expected {
+            return false;
+        }
+    }
+    index.entry_for(platform.os, platform.arch).is_some()
+}
+
+/// I/O wrapper around [`bundle_seeds_platform`] for the running binary. Any read or
+/// parse problem is treated as "no usable bundle" so add-remote falls back cleanly.
+fn self_bundle_seeds_platform(platform: &RemotePlatform) -> bool {
+    match crate::bundle::read_self_index() {
+        Ok(Some(index)) => bundle_seeds_platform(
+            &index,
+            platform,
+            CURRENT_VERSION,
+            option_env!("HERDR_BUILD_COMMIT"),
+        ),
+        _ => false,
+    }
+}
+
+/// Extract the carried `platform` binary from this build into a private temp file.
+/// Falls back to the download path if the entry is unexpectedly absent.
+fn extract_bundle_install_source(platform: &RemotePlatform) -> io::Result<InstallSource> {
+    let exe = std::env::current_exe()?;
+    let Some(index) = crate::bundle::read_self_index()? else {
+        return download_release_asset(platform);
+    };
+    let Some(entry) = index.entry_for(platform.os, platform.arch) else {
+        return download_release_asset(platform);
+    };
+    let bytes = crate::bundle::extract_entry(&exe, entry)?;
+
+    let asset_key = platform.asset_key();
+    let dir = private_download_dir(&asset_key)?;
+    let path = dir.join("herdr.bundled");
+    if let Err(err) = fs::write(&path, &bytes) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(err);
+    }
+    Ok(InstallSource::temporary(path, dir))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2919,7 +3015,11 @@ mod tests {
             arch: "aarch64",
         };
         assert_eq!(
-            install_source_description_for(&platform, Some(Path::new("/tmp/herdr-aarch64")), false),
+            install_source_description_for(
+                &platform,
+                Some(Path::new("/tmp/herdr-aarch64")),
+                NonOverrideSeed::Download
+            ),
             "HERDR_REMOTE_BINARY (/tmp/herdr-aarch64)"
         );
     }
@@ -2929,7 +3029,7 @@ mod tests {
         let platform = RemotePlatform::local();
 
         assert_eq!(
-            install_source_description_for(&platform, None, true),
+            install_source_description_for(&platform, None, NonOverrideSeed::LocalExe),
             "the current local herdr binary"
         );
     }
@@ -2939,12 +3039,124 @@ mod tests {
         let platform = RemotePlatform::local();
 
         assert_eq!(
-            install_source_description_for(&platform, None, false),
+            install_source_description_for(&platform, None, NonOverrideSeed::Download),
             format!(
                 "the {CURRENT_VERSION} release asset for {}",
                 platform.asset_key()
             )
         );
+    }
+
+    #[test]
+    fn install_source_description_uses_bundled_binary_for_cross_platform_build() {
+        let platform = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        assert_eq!(
+            install_source_description_for(&platform, None, NonOverrideSeed::Bundle),
+            "the bundled linux-x86_64 binary from this multi-platform build"
+        );
+    }
+
+    fn test_bundle_index(
+        version: &str,
+        commit: Option<&str>,
+        entries: &[(&str, &str)],
+    ) -> crate::bundle::BundleIndex {
+        crate::bundle::BundleIndex {
+            format: 1,
+            herdr_version: version.to_string(),
+            build_commit: commit.map(str::to_string),
+            image_len: 0,
+            entries: entries
+                .iter()
+                .map(|(os, arch)| crate::bundle::BundleEntry {
+                    os: (*os).to_string(),
+                    arch: (*arch).to_string(),
+                    offset: 0,
+                    compressed_len: 0,
+                    uncompressed_len: 0,
+                    crc32: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bundle_seeds_platform_requires_version_match_and_entry() {
+        let platform = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let index = test_bundle_index(
+            CURRENT_VERSION,
+            None,
+            &[("linux", "x86_64"), ("macos", "aarch64")],
+        );
+        assert!(bundle_seeds_platform(
+            &index,
+            &platform,
+            CURRENT_VERSION,
+            None
+        ));
+
+        // A bundle built at a different version is never usable.
+        assert!(!bundle_seeds_platform(
+            &index,
+            &platform,
+            "0.0.0-other",
+            None
+        ));
+
+        // No carried entry for the requested os/arch.
+        let missing = RemotePlatform {
+            os: "linux",
+            arch: "aarch64",
+        };
+        assert!(!bundle_seeds_platform(
+            &index,
+            &missing,
+            CURRENT_VERSION,
+            None
+        ));
+    }
+
+    #[test]
+    fn bundle_seeds_platform_enforces_commit_when_both_known() {
+        let platform = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let index = test_bundle_index(CURRENT_VERSION, Some("abc123"), &[("linux", "x86_64")]);
+        assert!(bundle_seeds_platform(
+            &index,
+            &platform,
+            CURRENT_VERSION,
+            Some("abc123")
+        ));
+        // Same version but a different commit must not be silently seeded.
+        assert!(!bundle_seeds_platform(
+            &index,
+            &platform,
+            CURRENT_VERSION,
+            Some("def456")
+        ));
+        // Commit unknown on one side falls back to a version-only match.
+        assert!(bundle_seeds_platform(
+            &index,
+            &platform,
+            CURRENT_VERSION,
+            None
+        ));
+    }
+
+    #[test]
+    fn choose_seed_source_prefers_local_then_bundle_then_download() {
+        assert_eq!(choose_seed_source(true, true), NonOverrideSeed::LocalExe);
+        assert_eq!(choose_seed_source(true, false), NonOverrideSeed::LocalExe);
+        assert_eq!(choose_seed_source(false, true), NonOverrideSeed::Bundle);
+        assert_eq!(choose_seed_source(false, false), NonOverrideSeed::Download);
     }
 
     #[test]
