@@ -1306,22 +1306,46 @@ fn workspace_context_menu_popup_height(count: usize) -> u16 {
     (count as u16).saturating_add(4).clamp(6, 12)
 }
 
-/// The outer popup rect for the workspace context menu — footer-anchored (bottom-left of `area`,
-/// opening upward) like the other client overlays. Used by BOTH render and hit-test.
-pub(crate) fn workspace_context_menu_popup_rect(area: Rect, count: usize) -> Option<Rect> {
-    bottom_left_popup_rect(area, 34, workspace_context_menu_popup_height(count))
+/// #33: the outer popup rect for the workspace context menu — cursor-anchored, clamped to the full
+/// screen. The popup's top-left sits at the right-click cursor, shifting left/up near the
+/// right/bottom edges so it stays fully visible (matching the server-rendered menu's
+/// clamp-to-screen behaviour). Used by BOTH render and hit-test so their geometry stays in lockstep.
+pub(crate) fn workspace_context_menu_popup_rect_at(
+    anchor_col: u16,
+    anchor_row: u16,
+    count: usize,
+    host_width: u16,
+    host_height: u16,
+) -> Option<Rect> {
+    let popup_w = 34u16.min(host_width.saturating_sub(2));
+    let popup_h = workspace_context_menu_popup_height(count).min(host_height.saturating_sub(1));
+    if popup_w < 4 || popup_h < 4 {
+        return None;
+    }
+    let popup_x = anchor_col.min(host_width.saturating_sub(popup_w));
+    let popup_y = anchor_row.min(host_height.saturating_sub(popup_h));
+    Some(Rect::new(popup_x, popup_y, popup_w, popup_h))
 }
 
-/// Shared inner rect for the workspace context menu. Returns `None` when the host is too small.
-pub(crate) fn workspace_context_menu_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    workspace_context_menu_popup_rect(area, count).map(|popup| {
-        Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        )
-    })
+/// #33: shared inner rect for the cursor-anchored context menu. Returns `None` when the host is too
+/// small for the popup.
+pub(crate) fn workspace_context_menu_inner_rect_at(
+    anchor_col: u16,
+    anchor_row: u16,
+    count: usize,
+    host_width: u16,
+    host_height: u16,
+) -> Option<Rect> {
+    workspace_context_menu_popup_rect_at(anchor_col, anchor_row, count, host_width, host_height).map(
+        |popup| {
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            )
+        },
+    )
 }
 
 /// The rect for menu row `row_index` inside the context menu's inner rect. Rows start two lines
@@ -1403,19 +1427,11 @@ pub(crate) fn render_workspace_context_menu_overlay(
     view: &WorkspaceContextMenuView,
     selected: usize,
     frame: &mut Frame,
-    area: Rect,
+    popup: Rect,
 ) {
-    let Some(popup) = workspace_context_menu_popup_rect(area, view.rows.len()) else {
-        return;
-    };
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    debug_assert_eq!(
-        Some(inner),
-        workspace_context_menu_inner_rect(area, view.rows.len()),
-        "context menu render and hit-test geometry diverged"
-    );
     if inner.height < 4 {
         return;
     }
@@ -1587,11 +1603,61 @@ mod tests {
     use super::{
         add_remote_button_rects, add_remote_inner_rect, confirm_close_overlay_text,
         new_workspace_picker_button_rects, new_workspace_picker_inner_rect,
-        new_workspace_picker_row_rect,
+        new_workspace_picker_row_rect, workspace_context_menu_inner_rect_at,
+        workspace_context_menu_popup_rect_at,
     };
 
     fn rects_are_disjoint(a: Rect, b: Rect) -> bool {
         a.x + a.width <= b.x || b.x + b.width <= a.x
+    }
+
+    #[test]
+    fn workspace_context_menu_anchors_at_cursor() {
+        // #33: the popup's top-left sits at the right-click cursor when it fits on screen.
+        let popup = workspace_context_menu_popup_rect_at(10, 4, 2, 80, 24)
+            .expect("popup fits on an 80x24 host");
+        assert_eq!((popup.x, popup.y), (10, 4), "anchored at the cursor");
+    }
+
+    #[test]
+    fn workspace_context_menu_clamps_to_screen_near_edges() {
+        // #33: a cursor near the right/bottom edge shifts the popup left/up so it stays fully
+        // on-screen (matching the server-rendered menu's clamp-to-screen behaviour).
+        let popup = workspace_context_menu_popup_rect_at(79, 23, 2, 80, 24)
+            .expect("popup fits on an 80x24 host");
+        assert!(
+            popup.x + popup.width <= 80,
+            "right edge clamped on-screen: {popup:?}"
+        );
+        assert!(
+            popup.y + popup.height <= 24,
+            "bottom edge clamped on-screen: {popup:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_context_menu_inner_matches_panel_border_inset() {
+        // #33: render and hit-test both derive the inner rect from the SAME popup-at helper, so the
+        // inner rect must be exactly the bordered-panel inset (popup + 1 / - 2) — keeping render and
+        // hit-test geometry in lockstep now that the divergence debug_assert is gone.
+        let popup = workspace_context_menu_popup_rect_at(10, 4, 2, 80, 24).unwrap();
+        let inner = workspace_context_menu_inner_rect_at(10, 4, 2, 80, 24).unwrap();
+        assert_eq!(
+            inner,
+            Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            ),
+        );
+    }
+
+    #[test]
+    fn workspace_context_menu_returns_none_on_tiny_host() {
+        // #33: a host too small for the popup yields None, so render draws nothing and hit-test
+        // resolves nothing (no clicks land on an unpainted menu).
+        assert!(workspace_context_menu_popup_rect_at(0, 0, 2, 4, 4).is_none());
     }
 
     fn rect_within(child: Rect, parent: Rect) -> bool {

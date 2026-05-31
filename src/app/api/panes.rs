@@ -176,11 +176,40 @@ impl App {
         params: PaneReportAgentParams,
     ) -> String {
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            // #37: a hook reporting to an unresolvable pane id never lands its authoritative state,
+            // so the sidebar silently falls back to heuristic detection (the false-positive source).
+            // Log the exact id + source so the failing format is visible in the server log instead of
+            // a bare `outcome="error"` (e.g. a stale HERDR_PANE_ID after a restart/handoff).
+            tracing::warn!(
+                subsystem = "agent",
+                event = "pane.report_agent.unresolved_pane",
+                pane_id = %params.pane_id,
+                source = %params.source,
+                agent = %params.agent,
+                "pane.report_agent could not resolve its pane id; authoritative hook state dropped"
+            );
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
+            tracing::warn!(
+                subsystem = "agent",
+                event = "pane.report_agent.invalid_label",
+                pane_id = %params.pane_id,
+                source = %params.source,
+                agent = %params.agent,
+                "pane.report_agent rejected an empty/invalid agent label"
+            );
             return invalid_agent(id);
         };
+        tracing::debug!(
+            subsystem = "agent",
+            event = "pane.report_agent.accepted",
+            pane_id = %params.pane_id,
+            source = %params.source,
+            agent = %agent_label,
+            state = ?params.state,
+            "pane.report_agent applied authoritative hook state"
+        );
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(

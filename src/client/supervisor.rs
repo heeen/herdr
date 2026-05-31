@@ -246,6 +246,10 @@ pub(crate) struct WorkspaceContextMenu {
     pub(crate) workspace_id: String,
     pub(crate) label: String,
     pub(crate) selected: usize,
+    // #33: the right-click cursor position, so the popup anchors at the cursor (clamped to screen)
+    // instead of a fixed footer corner. Render and hit-test both derive geometry from this.
+    pub(crate) anchor_col: u16,
+    pub(crate) anchor_row: u16,
 }
 
 /// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
@@ -1535,6 +1539,8 @@ impl ClientSupervisorModel {
         server_id: ServerId,
         workspace_id: String,
         label: String,
+        anchor_col: u16,
+        anchor_row: u16,
     ) {
         self.new_workspace_picker = None;
         self.client_overlay = ClientOverlayState::WorkspaceContextMenu(WorkspaceContextMenu {
@@ -1542,6 +1548,8 @@ impl ClientSupervisorModel {
             workspace_id,
             label,
             selected: 0,
+            anchor_col,
+            anchor_row,
         });
     }
 
@@ -4887,7 +4895,7 @@ mod tests {
         let label = model.workspace_label(&server_id, "ws-1").unwrap();
         assert_eq!(label, "feature");
 
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label);
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label, 0, 0);
 
         let menu = model.workspace_context_menu().expect("menu open");
         assert_eq!(menu.server_id, server_id);
@@ -4905,7 +4913,7 @@ mod tests {
     fn context_menu_nav_and_esc_dismiss() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
 
         // Down moves to "close", k clamps back to "rename".
         assert_eq!(
@@ -4925,7 +4933,7 @@ mod tests {
     fn context_menu_enter_on_rename_opens_prefilled_rename_overlay() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into());
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
 
         assert_eq!(
             model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
@@ -4942,7 +4950,7 @@ mod tests {
     fn rename_typing_builds_label_and_enter_submits_rename() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), String::new());
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), String::new(), 0, 0);
         model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         for ch in "next".chars() {
@@ -4965,7 +4973,7 @@ mod tests {
     fn rename_empty_label_does_not_submit() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
         model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         // clear the prefilled label with Ctrl-U, then Enter must NOT submit.
@@ -4988,7 +4996,7 @@ mod tests {
     fn context_menu_close_opens_confirm_and_enter_confirms_close() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into());
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
         // select "close" (index 1) then Enter -> confirm overlay.
         model.handle_workspace_context_menu_key(press(KeyCode::Down));
         assert_eq!(
@@ -5016,7 +5024,7 @@ mod tests {
     fn confirm_close_cancel_dismisses_without_request() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
         model.handle_workspace_context_menu_key(press(KeyCode::Down));
         model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> confirm overlay
 

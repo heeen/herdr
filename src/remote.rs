@@ -1737,10 +1737,22 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
             platform.asset_key()
         ))
     })?;
-    if let Some(protocol) = release.protocol {
-        if protocol != CURRENT_PROTOCOL {
+    // #32: never seed a binary the remote can't actually run. Published release assets lag the dev
+    // protocol, so a fresh host (commonly linux-aarch64 / Graviton, which has no bundled payload)
+    // that falls to this Download tier would otherwise install an older protocol build and only
+    // fail the post-install protocol check — after a long opaque download. Fail fast with the same
+    // actionable guidance whether the manifest reports a mismatching protocol or omits it entirely
+    // (an omitted protocol means the asset predates protocol versioning, i.e. definitely too old).
+    match release.protocol {
+        Some(protocol) if protocol == CURRENT_PROTOCOL => {}
+        Some(protocol) => {
             return Err(io::Error::other(format!(
                 "release manifest has herdr {CURRENT_VERSION} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching herdr on the remote host manually"
+            )));
+        }
+        None => {
+            return Err(io::Error::other(format!(
+                "the published {asset_key} release for herdr {CURRENT_VERSION} predates protocol versioning and is too old for this client (needs protocol {CURRENT_PROTOCOL}); build herdr for {asset_key} and set {REMOTE_BINARY_ENV_VAR}=<path>, or install a matching herdr on the remote host manually"
             )));
         }
     }

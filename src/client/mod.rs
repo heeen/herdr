@@ -704,7 +704,9 @@ fn open_focused_workspace_overlay(
     let label = model
         .workspace_label(&server_id, &workspace_id)
         .unwrap_or_else(|| workspace_id.clone());
-    model.open_workspace_context_menu(server_id, workspace_id, label);
+    // #24/#33: keyboard-opened (no cursor); the menu is immediately promoted to rename/close below
+    // and never shown, so the anchor is irrelevant — use (0, 0).
+    model.open_workspace_context_menu(server_id, workspace_id, label, 0, 0);
     match overlay {
         FocusedWorkspaceOverlay::Rename => model.open_rename_workspace(),
         FocusedWorkspaceOverlay::Close => model.open_confirm_close_workspace(),
@@ -983,7 +985,7 @@ fn dispatch_composited_mouse_input(
             let label = model
                 .workspace_label(&server_id, &workspace_id)
                 .unwrap_or_else(|| workspace_id.clone());
-            model.open_workspace_context_menu(server_id, workspace_id, label);
+            model.open_workspace_context_menu(server_id, workspace_id, label, mouse.column, mouse.row);
             return ClientInputDispatch::Redraw;
         }
     }

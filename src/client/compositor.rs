@@ -1078,12 +1078,15 @@ impl ClientCompositor {
             if overlay.confirm_delete.is_some() {
                 excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
             }
-        } else if snapshot.workspace_context_menu.is_some() {
-            // #23: protect the context-menu popup rect (same `*_popup_rect(anchor_area)` the
+        } else if let Some(menu) = snapshot.workspace_context_menu.as_ref() {
+            // #23/#33: protect the cursor-anchored context-menu popup rect (the SAME geometry the
             // renderer uses), so the menu floats over the content cell-for-cell.
-            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect(
-                anchor_area,
+            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect_at(
+                menu.anchor_col,
+                menu.anchor_row,
                 WORKSPACE_CONTEXT_MENU_ITEMS.len(),
+                host_width,
+                host_height,
             ));
         } else if snapshot.rename_workspace.is_some() {
             excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
@@ -1216,7 +1219,7 @@ impl ClientCompositor {
         // row beneath never resolves to a `Workspace` hit. Geometry comes from the SAME shared `ui`
         // helpers the renderer uses, so render == hit_test.
         if snapshot.workspace_context_menu.is_some() {
-            return hit_test_workspace_context_menu(&snapshot, anchor_area, x, y);
+            return hit_test_workspace_context_menu(&snapshot, host_width, host_height, x, y);
         }
         if snapshot.rename_workspace.is_some() {
             return hit_test_rename_workspace(&snapshot, anchor_area, x, y);
@@ -1582,16 +1585,27 @@ impl ClientSidebarSnapshot {
             } else {
                 0
             };
-            // Strictly higher rank always wins; an equal-rank row only overrides when nothing is
-            // selected yet or it belongs to the active server (so a single-server fleet — where every
-            // focused row is on the active server — keeps the prior last-wins behaviour exactly).
+            // #39: the highlight must follow the ACTIVE content — the active server's focused row —
+            // not a background host that merely reports a focused agent. A bare `row_rank` let a
+            // background server's agent-focused row (rank 2) outrank the active server's
+            // workspace-focused row (rank 1), so the wrong host's space stayed highlighted while the
+            // content switched correctly. Make active-server membership dominate the focus kind by
+            // boosting on-active-server rows above any off-server row; within the same membership
+            // tier agent-focus still beats workspace-focus, and an exact tie keeps the prior
+            // last-wins so a single-server fleet (every focused row on the active server) is
+            // unchanged.
             let on_active_server = row.server_id == active_server;
-            if row_rank > 0
-                && (row_rank > active_rank
-                    || (row_rank == active_rank && (active_idx.is_none() || on_active_server)))
+            let effective_rank = if row_rank == 0 {
+                0
+            } else {
+                row_rank + if on_active_server { 10 } else { 0 }
+            };
+            if effective_rank > 0
+                && (effective_rank > active_rank
+                    || (effective_rank == active_rank && on_active_server))
             {
                 active_idx = Some(idx);
-                active_rank = row_rank;
+                active_rank = effective_rank;
             }
 
             let mut pane_terminals = Vec::new();
@@ -1953,17 +1967,27 @@ fn render_client_shell(
             // reach `ui`). At most one is ever open (single `client_overlay` slot).
             if let Some(menu) = &snapshot.workspace_context_menu {
                 let rows: Vec<&str> = WORKSPACE_CONTEXT_MENU_ITEMS.to_vec();
-                let view = crate::ui::WorkspaceContextMenuView {
-                    label: &menu.label,
-                    rows: &rows,
-                };
-                crate::ui::render_workspace_context_menu_overlay(
-                    &snapshot.app.palette,
-                    &view,
-                    menu.selected,
-                    frame,
-                    anchor_area,
-                );
+                // #33: anchor the popup at the stored right-click cursor (clamped to screen), and
+                // render only when it fits. Hit-test derives the same rect from the same anchor.
+                if let Some(popup) = crate::ui::workspace_context_menu_popup_rect_at(
+                    menu.anchor_col,
+                    menu.anchor_row,
+                    rows.len(),
+                    host_width,
+                    host_height,
+                ) {
+                    let view = crate::ui::WorkspaceContextMenuView {
+                        label: &menu.label,
+                        rows: &rows,
+                    };
+                    crate::ui::render_workspace_context_menu_overlay(
+                        &snapshot.app.palette,
+                        &view,
+                        menu.selected,
+                        frame,
+                        popup,
+                    );
+                }
             }
             if let Some(form) = &snapshot.rename_workspace {
                 crate::ui::render_rename_workspace_overlay(
@@ -2234,13 +2258,28 @@ fn hit_test_remote_manage(
 /// row returns `None` (the dimmed sidebar beneath never hit-tests).
 fn hit_test_workspace_context_menu(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    host_width: u16,
+    host_height: u16,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
-    snapshot.workspace_context_menu.as_ref()?;
+    let menu = snapshot.workspace_context_menu.as_ref()?;
     let count = WORKSPACE_CONTEXT_MENU_ITEMS.len();
-    let inner = crate::ui::workspace_context_menu_inner_rect(full_rect, count)?;
+    // #33: derive the menu geometry from the stored right-click anchor + host dims so the hit
+    // regions match exactly where the popup was rendered (cursor-anchored, clamped to screen).
+    let inner = crate::ui::workspace_context_menu_inner_rect_at(
+        menu.anchor_col,
+        menu.anchor_row,
+        count,
+        host_width,
+        host_height,
+    )?;
+    // #33: mirror the renderer's `inner.height < 4` bail (render_workspace_context_menu_overlay) so
+    // a host too short to actually draw the rows also hit-tests to nothing — otherwise a tiny
+    // terminal would map clicks to invisible rows that were never painted.
+    if inner.height < 4 {
+        return None;
+    }
     for index in 0..count {
         let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
         if rect_contains(rect, x, y) {

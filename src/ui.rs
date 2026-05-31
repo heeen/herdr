@@ -72,7 +72,7 @@ pub(crate) use self::{
         render_add_remote_overlay, render_confirm_close_workspace_overlay,
         render_new_workspace_picker_overlay, render_remote_manage_overlay,
         render_rename_workspace_overlay, render_workspace_context_menu_overlay,
-        workspace_context_menu_inner_rect, workspace_context_menu_popup_rect,
+        workspace_context_menu_inner_rect_at, workspace_context_menu_popup_rect_at,
         workspace_context_menu_row_rect, AddRemoteOverlayView, DestinationView,
         RemoteManageRowView, RemoteStateGlyph, WorkspaceContextMenuView,
     },

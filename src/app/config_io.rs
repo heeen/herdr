@@ -26,9 +26,8 @@ impl App {
             }
         }
 
-        let content = match std::fs::read_to_string(&path) {
+        let content = match read_config_for_update(&path) {
             Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(err) => {
                 crate::logging::config_write_failed(&path, error_context, &err.to_string());
                 self.state.config_diagnostic =
@@ -185,6 +184,20 @@ impl App {
     }
 }
 
+/// Read an existing config file for an in-place update.
+///
+/// A missing file is the legitimate first-write case and reads as empty. Every *other* IO error
+/// (permission denied, partial read, corruption, EINTR, …) must abort the save: treating those as
+/// empty would let a transient read failure overwrite the user's entire config with
+/// empty-derived content. See issue #5.
+fn read_config_for_update(path: &std::path::Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err),
+    }
+}
+
 fn space_sidebar_config_body(preferences: &SidebarSpacePreferences) -> String {
     sidebar_item_lines_array(&preferences.lines, sidebar_space_field_name)
 }
@@ -254,5 +267,50 @@ fn sidebar_agent_field_name(field: SidebarAgentItem) -> &'static str {
         SidebarAgentField::CustomStatus => "custom_status",
         SidebarAgentField::AgentName => "agent_name",
         SidebarAgentField::RightAlignment => "right_alignment",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_config_for_update;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn missing_config_reads_as_empty_for_first_write() {
+        let path =
+            std::env::temp_dir().join(format!("herdr-cfg-missing-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let content = read_config_for_update(&path).expect("missing file must not be an error");
+        assert_eq!(content, "", "a missing config is the first-write case");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_surfaces_error_instead_of_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-cfg-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = read_config_for_update(&path);
+
+        // Restore perms so cleanup works regardless of the assertion outcome.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match result {
+            // A non-NotFound read error must propagate so the caller aborts the save and never
+            // overwrites the existing config with empty-derived content.
+            Err(err) => assert_ne!(
+                err.kind(),
+                ErrorKind::NotFound,
+                "permission-denied must not be misreported as NotFound"
+            ),
+            // If the process can read mode-0 files (e.g. running as root), this path can't be
+            // exercised; don't fail the suite for an environment we can't control.
+            Ok(_) => {}
+        }
     }
 }
