@@ -190,6 +190,10 @@ pub(crate) struct AddRemoteForm {
     /// animated status line (distinct from `error`) so a slow connect reads as progress, not as a
     /// failure, and never as the old static red "adding remote..." string.
     pub(crate) in_progress: bool,
+    /// Latest provisioning stage the worker reported (e.g. "installing herdr on the remote…"), shown
+    /// on the in-progress status row in place of the static "connecting to remote…" so seeding a
+    /// fresh machine reads as live progress (issue #32). `None` until the first stage arrives.
+    pub(crate) progress: Option<String>,
     /// Set when the worker reported an incompatible no-handoff remote server; the dialog shows a
     /// y/N restart prompt instead of the spinner/error (issue #12, macmini).
     pub(crate) restart_confirm: Option<AddRemoteRestartConfirm>,
@@ -1079,6 +1083,7 @@ impl ClientSupervisorModel {
             focused_field: AddRemoteField::Target,
             error: None,
             in_progress: false,
+            progress: None,
             restart_confirm: None,
         });
     }
@@ -1219,15 +1224,27 @@ impl ClientSupervisorModel {
         if let Some(form) = self.add_remote_form_mut() {
             form.error = Some(error.into());
             form.in_progress = false;
+            form.progress = None;
         }
     }
 
-    /// Mark the add-remote submission as in flight: clears any prior error and switches the status
-    /// row to the animated progress line.
+    /// Mark the add-remote submission as in flight: clears any prior error/progress and switches the
+    /// status row to the animated progress line.
     pub(crate) fn set_add_remote_in_progress(&mut self) {
         if let Some(form) = self.add_remote_form_mut() {
             form.error = None;
+            form.progress = None;
             form.in_progress = true;
+        }
+    }
+
+    /// Update the in-flight provisioning line with the worker's latest stage (issue #32). Ignored if
+    /// the form is gone or no longer in progress (a terminal error/finish already won the race).
+    pub(crate) fn set_add_remote_progress(&mut self, message: impl Into<String>) {
+        if let Some(form) = self.add_remote_form_mut() {
+            if form.in_progress {
+                form.progress = Some(message.into());
+            }
         }
     }
 
@@ -2583,6 +2600,33 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|err| err.contains("cannot reach host")));
+    }
+
+    #[test]
+    fn add_remote_progress_updates_in_flight_line_and_resets_on_resubmit() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+
+        // Progress before the worker starts is ignored (not in progress yet).
+        model.set_add_remote_progress("detecting remote platform…");
+        assert_eq!(model.add_remote_form().unwrap().progress, None);
+
+        model.set_add_remote_in_progress();
+        model.set_add_remote_progress("detecting remote platform…");
+        model.set_add_remote_progress("installing herdr on the remote…");
+        assert_eq!(
+            model.add_remote_form().unwrap().progress.as_deref(),
+            Some("installing herdr on the remote…"),
+            "the latest provisioning stage should be shown"
+        );
+
+        // A terminal error clears the live line so a stale stage never lingers under the error.
+        model.set_add_remote_error("boom");
+        assert_eq!(model.add_remote_form().unwrap().progress, None);
+
+        // Re-submitting (e.g. after the restart y/N) starts the progress fresh.
+        model.set_add_remote_in_progress();
+        assert_eq!(model.add_remote_form().unwrap().progress, None);
     }
 
     fn add_remote_char(model: &mut ClientSupervisorModel, ch: char) {
@@ -4315,6 +4359,7 @@ mod tests {
                 focused_field: AddRemoteField::Target,
                 error: None,
                 in_progress: false,
+                progress: None,
                 restart_confirm: None,
             })
         );

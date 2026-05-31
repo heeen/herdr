@@ -1919,6 +1919,7 @@ fn render_client_shell(
                         == crate::client::supervisor::AddRemoteField::Target,
                     error: form.error.as_deref(),
                     in_progress: form.in_progress,
+                    progress: form.progress.as_deref(),
                     spinner: crate::ui::spinner_frame(snapshot.app.spinner_tick),
                     restart_confirm_destination: form
                         .restart_confirm

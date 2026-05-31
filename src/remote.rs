@@ -221,11 +221,15 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // The CLI `--remote <host>` path is always a bare destination (leading-`-` is rejected by
     // `validate_remote_target`), so there are no extra ssh options to carry.
     let ssh_target = SshTarget::bare(&remote.target);
+    // CLI path: echo each provisioning stage to stderr so a slow seed reads as progress.
+    let progress = |stage: RemoteProvisionStage| eprintln!("herdr: {}", stage.label());
     let prepared_remote = prepare_remote_herdr(
         &ssh_target,
         remote.live_handoff,
         RemotePrepPolicy::Interactive,
+        &progress,
     )?;
+    progress(RemoteProvisionStage::StartingServer);
     ensure_remote_server_ready(
         &ssh_target,
         &prepared_remote.remote_herdr,
@@ -234,6 +238,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         RemotePrepPolicy::Interactive,
     )?;
 
+    progress(RemoteProvisionStage::Attaching);
     let bridge = start_ssh_remote_bridge_with_prepared(
         &ssh_target,
         &session_name,
@@ -345,10 +350,54 @@ pub(crate) fn restart_confirm_needed(err: &io::Error) -> Option<&RestartConfirmN
         .and_then(|inner| inner.downcast_ref::<RestartConfirmNeeded>())
 }
 
+/// Coarse step of preparing a remote host for attach, surfaced to the user while add-remote runs.
+/// The in-client dialog turns each stage into a live progress line (so seeding/installing a fresh
+/// machine reads as forward motion, not a hung "connecting…"); the `herdr --remote` CLI prints the
+/// same labels to stderr. Ordered by typical occurrence. See issue #32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteProvisionStage {
+    Connecting,
+    DetectingPlatform,
+    AlreadyInstalled,
+    Seeding { source: String },
+    Installing,
+    Verifying,
+    StartingServer,
+    Attaching,
+}
+
+impl RemoteProvisionStage {
+    /// Present-tense status text for the add-remote progress line / CLI stderr.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            RemoteProvisionStage::Connecting => "connecting to remote…".to_string(),
+            RemoteProvisionStage::DetectingPlatform => "detecting remote platform…".to_string(),
+            RemoteProvisionStage::AlreadyInstalled => {
+                "herdr already installed — attaching…".to_string()
+            }
+            RemoteProvisionStage::Seeding { source } => format!("provisioning herdr from {source}…"),
+            RemoteProvisionStage::Installing => "installing herdr on the remote…".to_string(),
+            RemoteProvisionStage::Verifying => "verifying the installed binary…".to_string(),
+            RemoteProvisionStage::StartingServer => "starting the remote server…".to_string(),
+            RemoteProvisionStage::Attaching => "attaching to the remote server…".to_string(),
+        }
+    }
+}
+
+/// Sink for [`RemoteProvisionStage`] updates emitted during `prepare_remote_herdr` /
+/// `start_ssh_remote_bridge`. Called synchronously on whatever thread drives the prep, so it needs
+/// no `Send`/`Sync` bound; the client wraps it to forward stages onto the UI event channel while
+/// resetting its idle timeout (issue #32).
+pub(crate) type ProgressSink<'a> = dyn Fn(RemoteProvisionStage) + 'a;
+
+/// A [`ProgressSink`] that drops every stage — for paths with no UI to update (silent reconnect).
+pub(crate) fn ignore_progress(_: RemoteProvisionStage) {}
+
 pub(crate) fn start_ssh_remote_bridge(
     target: SshTarget,
     restart_incompatible: bool,
     session_name: Option<&str>,
+    progress: &ProgressSink,
 ) -> io::Result<RemoteBridge> {
     let session_name = session_name.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
     // Client-driven attach: never block on stdin, and prefer live-handoff so an out-of-date
@@ -356,7 +405,8 @@ pub(crate) fn start_ssh_remote_bridge(
     let policy = RemotePrepPolicy::NonInteractive {
         restart_incompatible,
     };
-    let prepared_remote = prepare_remote_herdr(&target, true, policy)?;
+    let prepared_remote = prepare_remote_herdr(&target, true, policy, progress)?;
+    progress(RemoteProvisionStage::StartingServer);
     ensure_remote_server_ready(
         &target,
         &prepared_remote.remote_herdr,
@@ -364,6 +414,7 @@ pub(crate) fn start_ssh_remote_bridge(
         true,
         policy,
     )?;
+    progress(RemoteProvisionStage::Attaching);
     start_ssh_remote_bridge_with_prepared(&target, session_name, prepared_remote.remote_herdr)
 }
 
@@ -636,7 +687,10 @@ fn prepare_remote_herdr(
     target: &SshTarget,
     live_handoff_enabled: bool,
     policy: RemotePrepPolicy,
+    progress: &ProgressSink,
 ) -> io::Result<PreparedRemoteHerdr> {
+    progress(RemoteProvisionStage::Connecting);
+    progress(RemoteProvisionStage::DetectingPlatform);
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
@@ -648,6 +702,7 @@ fn prepare_remote_herdr(
             .as_ref()
             .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
         {
+            progress(RemoteProvisionStage::AlreadyInstalled);
             return Ok(PreparedRemoteHerdr {
                 remote_herdr: path_remote_herdr.clone(),
                 installed_or_replaced: false,
@@ -657,12 +712,14 @@ fn prepare_remote_herdr(
             .as_ref()
             .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
         {
+            progress(RemoteProvisionStage::AlreadyInstalled);
             return Ok(PreparedRemoteHerdr {
                 remote_herdr: exe_name_remote_herdr.clone(),
                 installed_or_replaced: false,
             });
         }
         if remote_binary_matches(target, &remote_herdr)? {
+            progress(RemoteProvisionStage::AlreadyInstalled);
             return Ok(PreparedRemoteHerdr {
                 remote_herdr,
                 installed_or_replaced: false,
@@ -690,15 +747,16 @@ fn prepare_remote_herdr(
         &source_description,
         policy,
     )?;
-    eprintln!(
-        "herdr: seeding {} from {source_description}",
-        target.destination()
-    );
+    progress(RemoteProvisionStage::Seeding {
+        source: source_description.clone(),
+    });
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
+    progress(RemoteProvisionStage::Installing);
     let install_result = install_remote_herdr(target, &remote_herdr, &source.path);
     source.cleanup();
     install_result?;
 
+    progress(RemoteProvisionStage::Verifying);
     match check_remote_binary(target, &remote_herdr)? {
         RemoteBinaryCheck::Compatible => {}
         other => {
@@ -3300,5 +3358,24 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn provision_stage_labels_are_present_tense_and_name_the_source() {
+        assert_eq!(
+            RemoteProvisionStage::Connecting.label(),
+            "connecting to remote…"
+        );
+        assert_eq!(
+            RemoteProvisionStage::Installing.label(),
+            "installing herdr on the remote…"
+        );
+        assert_eq!(
+            RemoteProvisionStage::Seeding {
+                source: "the bundled linux-aarch64 binary from this multi-platform build".into(),
+            }
+            .label(),
+            "provisioning herdr from the bundled linux-aarch64 binary from this multi-platform build…"
+        );
     }
 }

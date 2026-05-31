@@ -53,11 +53,13 @@ const CLIENT_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 const CLIENT_ANIMATION_TICK_STEP: u32 = 8;
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
-// Hard ceiling for bringing up an ssh remote bridge (connect + detect + auto-install + server
-// start). Without this an unreachable/slow/auth-prompting host would block the add-remote worker
-// forever, leaving the dialog stuck on its in-progress state with no error. Generous enough to
-// cover a real binary install over ssh; the ssh `ConnectTimeout` bounds the unreachable case.
-const ADD_REMOTE_BRIDGE_TIMEOUT: Duration = Duration::from_secs(90);
+// Idle ceiling for bringing up an ssh remote bridge: the maximum time a SINGLE provisioning stage
+// (connect / detect / seed / install / verify / server-start) may run without emitting progress
+// before we give up. The deadline RESETS on every `RemoteProvisionStage` the worker reports, so a
+// legitimately-progressing fresh-host install (which can take minutes overall) is never killed,
+// while a stuck/unreachable/auth-prompting host still fails within one idle window (issue #32). The
+// ssh `ConnectTimeout` bounds the unreachable case to ~10s inside the first stage.
+const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -1806,6 +1808,10 @@ enum ClientLoopEvent {
         result: Result<SecondaryConnectionAttempt, ClientError>,
         elapsed: Duration,
     },
+    /// A provisioning stage of an in-flight add-remote submission (connecting / detecting / seeding
+    /// / installing / …). Updates the dialog's live progress line so a fresh-host install reads as
+    /// forward motion instead of a hung "connecting…" (issue #32).
+    AddRemoteProgress { message: String },
     /// Add-remote validation and setup completed off the UI loop.
     AddRemoteFinished {
         result: Result<ClientAddRemoteSuccess, AddRemoteFailure>,
@@ -2195,8 +2201,14 @@ fn connect_secondary_client_stream_for_plan_detached(
                 let ssh_target =
                     crate::remote::SshTarget::new(destination.clone(), options.clone());
                 // Reconnect path: can't prompt, so never auto-restart an incompatible server.
-                let bridge = crate::remote::start_ssh_remote_bridge(ssh_target, false, None)
-                    .map_err(ClientError::ConnectionFailed)?;
+                // No dialog to update on a background reconnect, so progress is dropped.
+                let bridge = crate::remote::start_ssh_remote_bridge(
+                    ssh_target,
+                    false,
+                    None,
+                    &crate::remote::ignore_progress,
+                )
+                .map_err(ClientError::ConnectionFailed)?;
                 let socket_path = bridge.client_socket_path().to_path_buf();
                 return connect_secondary_client_stream(
                     &socket_path,
@@ -2642,17 +2654,31 @@ fn spawn_client_add_remote_submission(
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
         let started_at = Instant::now();
-        let result = prepare_client_add_remote_submission(draft, server_size, cell_size_px);
+        // Forward each provisioning stage to the dialog's live progress line. blocking_send is fine
+        // off the UI loop; a dropped receiver (shutdown) just means the stage is discarded.
+        let progress_tx = event_tx.clone();
+        let on_progress = move |stage: crate::remote::RemoteProvisionStage| {
+            let _ = progress_tx.blocking_send(ClientLoopEvent::AddRemoteProgress {
+                message: stage.label(),
+            });
+        };
+        let result =
+            prepare_client_add_remote_submission(draft, server_size, cell_size_px, &on_progress);
         let elapsed = started_at.elapsed();
         let _ = event_tx.blocking_send(ClientLoopEvent::AddRemoteFinished { result, elapsed });
     });
 }
 
-/// Outcome of a bounded remote op (see [`run_remote_op_with_timeout`]). Preserves the underlying
+/// Outcome of a bounded remote op (see [`run_ssh_bridge_with_progress`]). Preserves the underlying
 /// `io::Error` so callers can downcast typed signals (e.g. [`crate::remote::RestartConfirmNeeded`]).
 #[derive(Debug)]
 enum RemoteOpError {
-    TimedOut(Duration),
+    /// No progress for a whole idle window. `stage` names the last reported stage, so the message
+    /// can say *what* stalled (e.g. "while installing") instead of always blaming the connect.
+    TimedOut {
+        idle: Duration,
+        stage: Option<String>,
+    },
     WorkerGone,
     Failed(io::Error),
 }
@@ -2674,23 +2700,53 @@ impl From<String> for AddRemoteFailure {
     }
 }
 
-/// Run a blocking remote operation on a helper thread, failing if it does not finish within
-/// `timeout`. Bounds ssh bridge setup so the add-remote worker can never wedge the dialog on an
-/// unreachable/slow/auth-prompting host (see [`ADD_REMOTE_BRIDGE_TIMEOUT`]).
-fn run_remote_op_with_timeout<T, F>(timeout: Duration, op: F) -> Result<T, RemoteOpError>
+/// Run a blocking remote op on a helper thread, bounded by an *idle* timeout that resets every time
+/// `op` reports a [`RemoteProvisionStage`]. This lets a slow-but-progressing fresh-host install run
+/// as long as it keeps advancing, while a stuck/unreachable/auth-prompting host still fails within
+/// one idle window. Reported stages are forwarded to `on_progress` (the dialog's live line); `op`
+/// receives a [`ProgressSink`] it must call as it advances (issue #32).
+fn run_remote_op_with_progress<T, F>(
+    idle_timeout: Duration,
+    on_progress: &dyn Fn(crate::remote::RemoteProvisionStage),
+    op: F,
+) -> Result<T, RemoteOpError>
 where
     T: Send + 'static,
-    F: FnOnce() -> io::Result<T> + Send + 'static,
+    F: FnOnce(&crate::remote::ProgressSink) -> io::Result<T> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
+    enum Msg<T> {
+        Progress(crate::remote::RemoteProvisionStage),
+        Done(io::Result<T>),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Msg<T>>();
+    let progress_tx = tx.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(op());
+        let sink = move |stage| {
+            let _ = progress_tx.send(Msg::Progress(stage));
+        };
+        let result = op(&sink);
+        let _ = tx.send(Msg::Done(result));
     });
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(RemoteOpError::Failed(err)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RemoteOpError::TimedOut(timeout)),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RemoteOpError::WorkerGone),
+
+    let mut last_stage: Option<String> = None;
+    loop {
+        match rx.recv_timeout(idle_timeout) {
+            Ok(Msg::Progress(stage)) => {
+                last_stage = Some(stage.label());
+                on_progress(stage);
+            }
+            Ok(Msg::Done(Ok(value))) => return Ok(value),
+            Ok(Msg::Done(Err(err))) => return Err(RemoteOpError::Failed(err)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(RemoteOpError::TimedOut {
+                    idle: idle_timeout,
+                    stage: last_stage,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(RemoteOpError::WorkerGone)
+            }
+        }
     }
 }
 
@@ -2699,10 +2755,13 @@ where
 /// mapped error message.
 fn classify_add_remote_bridge_error(err: RemoteOpError) -> AddRemoteFailure {
     match err {
-        RemoteOpError::TimedOut(timeout) => AddRemoteFailure::Message(format!(
-            "failed to start ssh remote bridge: timed out after {}s connecting to the remote host",
-            timeout.as_secs()
-        )),
+        RemoteOpError::TimedOut { idle, stage } => {
+            let doing = stage.unwrap_or_else(|| "connecting to the remote host".to_string());
+            AddRemoteFailure::Message(format!(
+                "failed to start ssh remote bridge: no progress for {}s while {doing}",
+                idle.as_secs()
+            ))
+        }
         RemoteOpError::WorkerGone => AddRemoteFailure::Message(
             "failed to start ssh remote bridge: remote connection worker exited unexpectedly"
                 .to_string(),
@@ -2724,6 +2783,7 @@ fn prepare_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
     server_size: (u16, u16),
     cell_size_px: (u32, u32),
+    on_progress: &dyn Fn(crate::remote::RemoteProvisionStage),
 ) -> Result<ClientAddRemoteSuccess, AddRemoteFailure> {
     let target = crate::remote_registry::RemoteTargetSnapshot::parse(&draft.target)
         .map_err(|err| err.message().to_string())?;
@@ -2753,9 +2813,18 @@ fn prepare_client_add_remote_submission(
         }
         crate::remote_registry::RemoteTargetSnapshot::Ssh { target, args } => {
             let ssh_target = crate::remote::SshTarget::new(target.clone(), args.clone());
-            let bridge = run_remote_op_with_timeout(ADD_REMOTE_BRIDGE_TIMEOUT, move || {
-                crate::remote::start_ssh_remote_bridge(ssh_target, restart_incompatible, None)
-            })
+            let bridge = run_remote_op_with_progress(
+                ADD_REMOTE_BRIDGE_IDLE_TIMEOUT,
+                on_progress,
+                move |sink| {
+                    crate::remote::start_ssh_remote_bridge(
+                        ssh_target,
+                        restart_incompatible,
+                        None,
+                        sink,
+                    )
+                },
+            )
             .map_err(classify_add_remote_bridge_error)?;
             validate_add_remote_target(
                 crate::api::client::ConnectionTarget::SocketPath(
@@ -4314,6 +4383,15 @@ async fn run_client_loop(
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);
             }
+            ClientLoopEvent::AddRemoteProgress { message } => {
+                // Update the dialog's live provisioning line (ignored once the form has closed or
+                // the worker already reported a terminal error).
+                if let Some(model) = &mut state.supervisor_model {
+                    model.set_add_remote_progress(message);
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
             ClientLoopEvent::AddRemoteFinished { result, elapsed } => {
                 state.pending_add_remote = false;
                 if elapsed > CLIENT_60FPS_FRAME_BUDGET {
@@ -5003,15 +5081,19 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     #[test]
-    fn run_remote_op_with_timeout_returns_fast_success() {
-        let value = run_remote_op_with_timeout(Duration::from_secs(5), || Ok(7u32)).unwrap();
+    fn run_remote_op_with_progress_returns_fast_success() {
+        let value =
+            run_remote_op_with_progress(Duration::from_secs(5), &|_| {}, |_sink| Ok(7u32)).unwrap();
         assert_eq!(value, 7);
     }
 
     #[test]
-    fn run_remote_op_with_timeout_surfaces_inner_error() {
-        let result: Result<(), RemoteOpError> =
-            run_remote_op_with_timeout(Duration::from_secs(5), || Err(io::Error::other("boom")));
+    fn run_remote_op_with_progress_surfaces_inner_error() {
+        let result: Result<(), RemoteOpError> = run_remote_op_with_progress(
+            Duration::from_secs(5),
+            &|_| {},
+            |_sink| Err(io::Error::other("boom")),
+        );
         match result {
             Err(RemoteOpError::Failed(err)) => assert_eq!(err.to_string(), "boom"),
             other => panic!("expected Failed(boom), got {other:?}"),
@@ -5019,16 +5101,20 @@ mod tests {
     }
 
     #[test]
-    fn run_remote_op_with_timeout_fails_when_op_exceeds_deadline() {
-        // The core anti-hang guarantee: a stuck remote op yields a timeout error, not a wedge.
-        let result: Result<(), RemoteOpError> =
-            run_remote_op_with_timeout(Duration::from_millis(50), || {
+    fn run_remote_op_with_progress_fails_when_op_stalls_without_progress() {
+        // The core anti-hang guarantee: an op that makes no progress for a whole idle window yields
+        // a timeout error, not a wedge.
+        let result: Result<(), RemoteOpError> = run_remote_op_with_progress(
+            Duration::from_millis(50),
+            &|_| {},
+            |_sink| {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(())
-            });
+            },
+        );
         assert!(
-            matches!(result, Err(RemoteOpError::TimedOut(_))),
-            "slow op must time out, got {result:?}"
+            matches!(result, Err(RemoteOpError::TimedOut { .. })),
+            "stalled op must time out, got {result:?}"
         );
     }
 
@@ -7976,6 +8062,74 @@ mod tests {
         session_client_thread.join().unwrap();
         main_api_thread.join().unwrap();
         std::fs::remove_dir_all(config_home).ok();
+    }
+
+    #[test]
+    fn progress_runner_resets_idle_timeout_on_each_stage() {
+        use crate::remote::RemoteProvisionStage;
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let on_progress = move |stage: RemoteProvisionStage| seen_cb.lock().unwrap().push(stage);
+
+        // Three stages spaced under the idle window; total runtime (~120ms) exceeds it, so this only
+        // succeeds because each progress event resets the deadline.
+        let result: Result<u32, RemoteOpError> = run_remote_op_with_progress(
+            Duration::from_millis(80),
+            &on_progress,
+            |sink| {
+                for stage in [
+                    RemoteProvisionStage::Connecting,
+                    RemoteProvisionStage::Installing,
+                    RemoteProvisionStage::Verifying,
+                ] {
+                    std::thread::sleep(Duration::from_millis(40));
+                    sink(stage);
+                }
+                Ok(42)
+            },
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(seen.lock().unwrap().len(), 3, "all stages forwarded to the UI");
+    }
+
+    #[test]
+    fn progress_runner_times_out_naming_the_last_stage() {
+        use crate::remote::RemoteProvisionStage;
+
+        let result: Result<u32, RemoteOpError> = run_remote_op_with_progress(
+            Duration::from_millis(60),
+            &|_| {},
+            |sink| {
+                sink(RemoteProvisionStage::Installing);
+                std::thread::sleep(Duration::from_millis(400)); // stall past the idle window
+                Ok(0)
+            },
+        );
+
+        match result {
+            Err(RemoteOpError::TimedOut { stage, .. }) => assert_eq!(
+                stage.as_deref(),
+                Some("installing herdr on the remote…"),
+                "the timeout should blame the stalled stage, not the connect"
+            ),
+            other => panic!("expected idle timeout, got {other:?}"),
+        }
+
+        // And that timeout maps to a truthful, stage-named dialog message.
+        let failure = classify_add_remote_bridge_error(RemoteOpError::TimedOut {
+            idle: Duration::from_secs(90),
+            stage: Some("installing herdr on the remote…".to_string()),
+        });
+        match failure {
+            AddRemoteFailure::Message(msg) => {
+                assert!(msg.contains("installing herdr on the remote"), "got: {msg}");
+                assert!(msg.contains("no progress for 90s"), "got: {msg}");
+            }
+            other => panic!("expected a message failure, got {other:?}"),
+        }
     }
 
     #[test]

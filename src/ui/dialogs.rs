@@ -30,6 +30,9 @@ pub(crate) struct AddRemoteOverlayView<'a> {
     /// When true, the status row shows an animated "connecting" line instead of an error. Takes
     /// precedence over `error` (the worker clears the error when it starts).
     pub in_progress: bool,
+    /// Latest provisioning stage to show on the in-progress row (e.g. "installing herdr on the
+    /// remote…"). `None` falls back to the generic "connecting to remote…" (issue #32).
+    pub progress: Option<&'a str>,
     /// Current spinner glyph for the in-progress line (advances with the shared animation tick).
     pub spinner: &'a str,
     /// When set (the destination), the status row shows a `[y/N]` prompt to restart an
@@ -898,8 +901,9 @@ pub(crate) fn render_add_remote_overlay(
             rows[4],
         );
     } else if view.in_progress {
+        let stage = view.progress.unwrap_or("connecting to remote…");
         frame.render_widget(
-            Paragraph::new(format!(" {} connecting to remote…", view.spinner))
+            Paragraph::new(format!(" {} {stage}", view.spinner))
                 .style(Style::default().fg(palette.accent)),
             rows[4],
         );
