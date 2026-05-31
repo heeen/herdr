@@ -22,6 +22,12 @@ pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 /// `DOUBLE_CLICK_WINDOW` (`src/app/input/mouse.rs`).
 const DIVIDER_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// #23: the two fixed workspace context-menu rows, in render order. Kept here (ui-side strings) so
+/// the renderer and the geometry/hit-test that derive their row count from `.len()` cannot drift.
+/// Mirrors `ClientSupervisorModel::workspace_context_menu_items` (the supervisor side that maps a
+/// row index to a `Rename`/`Close` action); the two MUST stay in lockstep.
+const WORKSPACE_CONTEXT_MENU_ITEMS: [&str; 2] = ["rename", "close"];
+
 /// #19: minimum pointer travel (in cells) before a workspace press becomes a drag-reorder, mirroring
 /// the monolithic host's `WORKSPACE_DRAG_THRESHOLD` (`src/app/input/mod.rs`).
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
@@ -154,6 +160,10 @@ pub(crate) struct ClientCompositor {
     // a per-client view preference fed into the render snapshot (`from_model`) and used to scope
     // the flat `agent_routes` so agent-row hit-testing stays aligned with the rendered entries.
     agent_panel_scope: crate::app::state::AgentPanelScope,
+    // #25: client-local collapsed-sidebar view state. The server never owns this; it is a per-client
+    // view preference fed into `from_model` (sets `app.sidebar_collapsed`) so the SHARED renderer
+    // branches to the narrow collapsed layout and `hit_test` reads the collapsed geometry.
+    sidebar_collapsed: bool,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
@@ -185,6 +195,10 @@ pub(crate) enum SidebarHitTarget {
     /// #20: the agents-panel "all"/"current" scope toggle. Client-local view state (no server
     /// round-trip), handled in `dispatch_composited_mouse_input` since it needs `&mut compositor`.
     AgentScopeToggle,
+    /// #25: the collapse/expand sidebar toggle (bottom-right 1x1). Drawn in BOTH modes by
+    /// `render_sidebar_toggle`, so it is hittable to collapse (expanded) AND to expand (collapsed).
+    /// Client-local view state, flipped via `compositor.toggle_sidebar_collapsed()`.
+    CollapsedSidebarToggle,
     // item 1: composited-modal action buttons (centered ratatui modals).
     AddRemoteSubmit,
     AddRemoteCancel,
@@ -197,6 +211,14 @@ pub(crate) enum SidebarHitTarget {
     RemoteManageAdd,
     RemoteManageConfirmDelete,
     RemoteManageCancelDelete,
+    // #23: workspace context-menu + rename + confirm-close overlay targets.
+    WorkspaceContextMenuRow {
+        index: usize,
+    },
+    RenameWorkspaceSubmit,
+    RenameWorkspaceCancel,
+    ConfirmCloseWorkspaceConfirm,
+    ConfirmCloseWorkspaceCancel,
 }
 
 #[derive(Clone)]
@@ -221,6 +243,11 @@ struct ClientSidebarSnapshot {
     // deterministically (render == hit geometry).
     host_banner_server_ids: Vec<ServerId>,
     agent_routes: Vec<AgentRoute>,
+    // #25: the SELECTED workspace's agent routes, in pane order — the SAME order the collapsed
+    // detail section renders `pane_details`. Carried separately from the scope-dependent flat
+    // `agent_routes` so a collapsed agent-detail row resolves to `Agent { server_id, agent_id }`
+    // regardless of the (irrelevant-when-collapsed) agents-panel scope.
+    collapsed_detail_agent_routes: Vec<AgentRoute>,
     // overlay carriers (items 1 & 3), all ui-owned/cloned — see Area 3:
     add_remote_form: Option<crate::client::supervisor::AddRemoteForm>, // item 1
     new_workspace_picker: Option<(Vec<crate::client::supervisor::ServerDestination>, usize)>, // item 1
@@ -230,6 +257,11 @@ struct ClientSidebarSnapshot {
         crate::client::supervisor::RemoteManageOverlay,
         Vec<crate::client::supervisor::RemoteManageRow>,
     )>,
+    // #23: the workspace context menu / rename / confirm-close overlay state, cloned out of the
+    // model. The render closure maps these into ui-owned views before drawing (layering rule).
+    workspace_context_menu: Option<crate::client::supervisor::WorkspaceContextMenu>,
+    rename_workspace: Option<crate::client::supervisor::RenameWorkspaceForm>,
+    confirm_close_workspace: Option<crate::client::supervisor::ConfirmCloseWorkspace>,
 }
 
 impl ClientCompositor {
@@ -248,6 +280,7 @@ impl ClientCompositor {
             animation_tick: 0,
             hover: None,
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
+            sidebar_collapsed: false,
             working_since: HashMap::new(),
         }
     }
@@ -269,6 +302,13 @@ impl ClientCompositor {
             AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
         };
         self.agent_panel_scroll = 0;
+    }
+
+    /// #25: flip the client-local collapsed-sidebar view state. Mirrors the monolithic host's
+    /// collapse toggle; `from_model` feeds the flag into `app.sidebar_collapsed`, which gates the
+    /// SHARED renderer onto its narrow collapsed layout. Client-local; no server traffic.
+    pub(crate) fn toggle_sidebar_collapsed(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
     }
 
     /// Advance the single client-owned animation clock by `step`. Called ONLY from the
@@ -915,6 +955,17 @@ impl ClientCompositor {
             if overlay.confirm_delete.is_some() {
                 excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
             }
+        } else if snapshot.workspace_context_menu.is_some() {
+            // #23: protect the context-menu popup rect (same `*_popup_rect(anchor_area)` the
+            // renderer uses), so the menu floats over the content cell-for-cell.
+            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect(
+                anchor_area,
+                WORKSPACE_CONTEXT_MENU_ITEMS.len(),
+            ));
+        } else if snapshot.rename_workspace.is_some() {
+            excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
+        } else if snapshot.confirm_close_workspace.is_some() {
+            excluded_rects.extend(crate::ui::confirm_close_workspace_popup_rect(anchor_area));
         } else {
             excluded_rects.extend(snapshot.global_menu_rect());
         }
@@ -934,6 +985,9 @@ impl ClientCompositor {
         if model.add_remote_form().is_some()
             || model.new_workspace_picker().is_some()
             || model.remote_manage_overlay().is_some()
+            || model.workspace_context_menu().is_some()
+            || model.rename_workspace_form().is_some()
+            || model.confirm_close_workspace().is_some()
         {
             frame.cursor = None;
         } else {
@@ -1030,9 +1084,40 @@ impl ClientCompositor {
         if snapshot.remote_manage.is_some() {
             return hit_test_remote_manage(&snapshot, anchor_area, x, y);
         }
+        // #23: the workspace context menu / rename / confirm-close overlays are modal too — when
+        // open they own the whole host rect (their own targets or none), so a click on a sidebar
+        // row beneath never resolves to a `Workspace` hit. Geometry comes from the SAME shared `ui`
+        // helpers the renderer uses, so render == hit_test.
+        if snapshot.workspace_context_menu.is_some() {
+            return hit_test_workspace_context_menu(&snapshot, anchor_area, x, y);
+        }
+        if snapshot.rename_workspace.is_some() {
+            return hit_test_rename_workspace(&snapshot, anchor_area, x, y);
+        }
+        if snapshot.confirm_close_workspace.is_some() {
+            return hit_test_confirm_close_workspace(&snapshot, anchor_area, x, y);
+        }
 
         if x >= sidebar_width {
             return None;
+        }
+
+        // #25: the collapse/expand toggle (bottom-right 1x1) is drawn in BOTH modes by
+        // `render_sidebar_toggle`, using the SAME `collapsed_sidebar_toggle_rect`. Check it before
+        // any mode-specific rows so it is hittable to collapse (expanded) AND to expand (collapsed).
+        if rect_contains(
+            crate::ui::collapsed_sidebar_toggle_rect(snapshot.app.view.sidebar_rect),
+            x,
+            y,
+        ) {
+            return Some(SidebarHitTarget::CollapsedSidebarToggle);
+        }
+
+        // #25: in collapsed mode the renderer drew the narrow workspace-glance + agent-detail
+        // sections, so hit-test reads the COLLAPSED geometry and SKIPS every expanded hit-test
+        // (filter/new/menu/banners/cards/scope/agent-rows all use expanded geometry).
+        if snapshot.app.sidebar_collapsed {
+            return collapsed_hit_test(&snapshot, x, y);
         }
 
         if rect_contains(
@@ -1287,6 +1372,11 @@ impl ClientSidebarSnapshot {
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
         app.sidebar_host = settings.sidebar_host.clone();
         app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
+        // #25: gate the SHARED renderer onto its collapsed layout BEFORE geometry is computed, so
+        // the collapsed sections + toggle rect are what gets laid out and what `hit_test` reads
+        // back. Collapsed keeps the normal sidebar width (mirrors the server: width is unchanged,
+        // only the layout branches on this flag) — width 0 still means "no sidebar", never collapsed.
+        app.sidebar_collapsed = compositor.sidebar_collapsed;
         app.view.layout = ViewLayout::Desktop;
         app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
         app.view.terminal_area = Rect::new(
@@ -1424,6 +1514,12 @@ impl ClientSidebarSnapshot {
         // workspace's slice. The snapshot mode is always Navigate/GlobalMenu, so the renderer's
         // `agent_panel_current_workspace_idx` resolves to `app.selected` — mirror that here so the
         // flat `agent_routes` index stays aligned with `hit_test_agent_panel`.
+        // #25: the collapsed detail section always shows the SELECTED workspace's panes (scope-
+        // independent), so capture that slice BEFORE the scope match consumes `per_ws_agent_routes`.
+        let collapsed_detail_agent_routes = per_ws_agent_routes
+            .get(app.selected)
+            .cloned()
+            .unwrap_or_default();
         let agent_routes: Vec<AgentRoute> = match app.agent_panel_scope {
             crate::app::state::AgentPanelScope::CurrentWorkspace => per_ws_agent_routes
                 .get(app.selected)
@@ -1558,6 +1654,7 @@ impl ClientSidebarSnapshot {
             workspace_routes,
             host_banner_server_ids,
             agent_routes,
+            collapsed_detail_agent_routes,
             // item 1: clone the overlay state out of the model into ui-owned carriers (pure read).
             // The closure maps these into ui view structs before rendering.
             add_remote_form: model.add_remote_form().cloned(),
@@ -1569,6 +1666,12 @@ impl ClientSidebarSnapshot {
             remote_manage: model
                 .remote_manage_overlay()
                 .map(|overlay| (overlay.clone(), model.remote_manage_rows())),
+            // #23: clone the workspace context-menu / rename / confirm-close overlay state out of
+            // the model into ui-owned carriers (pure read). The render closure maps these into ui
+            // view structs before drawing.
+            workspace_context_menu: model.workspace_context_menu().cloned(),
+            rename_workspace: model.rename_workspace_form().cloned(),
+            confirm_close_workspace: model.confirm_close_workspace().cloned(),
         }
     }
 
@@ -1664,6 +1767,40 @@ fn render_client_shell(
                     overlay.selected,
                     overlay.scroll,
                     overlay.confirm_delete.as_deref(),
+                    frame,
+                    anchor_area,
+                );
+            }
+            // #23: render the workspace context menu / rename / confirm-close overlays. The
+            // compositor maps the supervisor state into ui-owned views here (no supervisor types
+            // reach `ui`). At most one is ever open (single `client_overlay` slot).
+            if let Some(menu) = &snapshot.workspace_context_menu {
+                let rows: Vec<&str> = WORKSPACE_CONTEXT_MENU_ITEMS.to_vec();
+                let view = crate::ui::WorkspaceContextMenuView {
+                    label: &menu.label,
+                    rows: &rows,
+                };
+                crate::ui::render_workspace_context_menu_overlay(
+                    &snapshot.app.palette,
+                    &view,
+                    menu.selected,
+                    frame,
+                    anchor_area,
+                );
+            }
+            if let Some(form) = &snapshot.rename_workspace {
+                crate::ui::render_rename_workspace_overlay(
+                    &snapshot.app.palette,
+                    &form.label,
+                    form.error.as_deref(),
+                    frame,
+                    anchor_area,
+                );
+            }
+            if let Some(confirm) = &snapshot.confirm_close_workspace {
+                crate::ui::render_confirm_close_workspace_overlay(
+                    &snapshot.app.palette,
+                    &confirm.label,
                     frame,
                     anchor_area,
                 );
@@ -1914,6 +2051,74 @@ fn hit_test_remote_manage(
     None
 }
 
+/// #23: hit-test the workspace context menu. Resolves a click on a menu row to its index, derived
+/// from the SAME shared `ui` geometry the renderer uses (`workspace_context_menu_inner_rect` /
+/// `_row_rect`), guaranteeing render == hit_test. The overlay is modal: a click that misses every
+/// row returns `None` (the dimmed sidebar beneath never hit-tests).
+fn hit_test_workspace_context_menu(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    snapshot.workspace_context_menu.as_ref()?;
+    let count = WORKSPACE_CONTEXT_MENU_ITEMS.len();
+    let inner = crate::ui::workspace_context_menu_inner_rect(full_rect, count)?;
+    for index in 0..count {
+        let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
+        if rect_contains(rect, x, y) {
+            return Some(SidebarHitTarget::WorkspaceContextMenuRow { index });
+        }
+    }
+    None
+}
+
+/// #23: hit-test the rename overlay's submit/cancel buttons. Geometry comes from the shared
+/// `rename_workspace_inner_rect` + `rename_workspace_button_rects`, so render == hit_test.
+fn hit_test_rename_workspace(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    snapshot.rename_workspace.as_ref()?;
+    let inner = crate::ui::rename_workspace_inner_rect(full_rect)?;
+    let (submit_rect, cancel_rect) = crate::ui::rename_workspace_button_rects(inner);
+    if rect_contains(submit_rect, x, y) {
+        return Some(SidebarHitTarget::RenameWorkspaceSubmit);
+    }
+    if rect_contains(cancel_rect, x, y) {
+        return Some(SidebarHitTarget::RenameWorkspaceCancel);
+    }
+    None
+}
+
+/// #23: hit-test the close-confirm overlay's confirm/cancel buttons. Geometry comes from the
+/// shared `confirm_close_workspace_popup_rect` + `confirm_close_workspace_button_rects`.
+fn hit_test_confirm_close_workspace(
+    snapshot: &ClientSidebarSnapshot,
+    full_rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    snapshot.confirm_close_workspace.as_ref()?;
+    let popup = crate::ui::confirm_close_workspace_popup_rect(full_rect)?;
+    let inner = Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    let (confirm_rect, cancel_rect) = crate::ui::confirm_close_workspace_button_rects(inner);
+    if rect_contains(confirm_rect, x, y) {
+        return Some(SidebarHitTarget::ConfirmCloseWorkspaceConfirm);
+    }
+    if rect_contains(cancel_rect, x, y) {
+        return Some(SidebarHitTarget::ConfirmCloseWorkspaceCancel);
+    }
+    None
+}
+
 /// Shared geometry for the open global launcher menu: resolve a position to a 0-based item index,
 /// or `None` when the menu is closed or the position misses the menu's inner item rows. Both
 /// `hit_test_global_menu` (click) and `client_global_menu_item_at` (motion) resolve through this so
@@ -1946,6 +2151,76 @@ fn agent_panel_toggle_hit_rect(app: &crate::app::AppState) -> Rect {
     let (_, detail_area) =
         crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
     crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_scope)
+}
+
+/// #25: collapsed-mode row hit-test. The collapsed renderer draws (top→bottom) a narrow
+/// workspace-glance section then an agent-detail section, both from the SHARED
+/// `collapsed_sidebar_sections` geometry. Mirror the server's `collapsed_*_at` row math here,
+/// resolving each row to the owning server via the SAME `workspace_routes`/`agent_routes` the
+/// expanded path uses, so a collapsed click focuses the right server exactly like the expanded one.
+/// The toggle is resolved by the caller; this only covers the two row sections.
+fn collapsed_hit_test(
+    snapshot: &ClientSidebarSnapshot,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    let app = &snapshot.app;
+    let sidebar_rect = app.view.sidebar_rect;
+    if x >= sidebar_rect.x + sidebar_rect.width {
+        return None;
+    }
+    let (ws_area, _, detail_area) = crate::ui::collapsed_sidebar_sections(sidebar_rect);
+
+    // Agent-detail rows (mirrors the server's `collapsed_agent_detail_target_at`): the detail
+    // section shows the selected workspace's panes. The client snapshot is always built in
+    // Navigate/GlobalMenu, so the detail workspace is `app.selected` (matching the renderer's
+    // `detail_ws_idx` and the server's `collapsed_detail_workspace_idx`). The last detail row is
+    // reserved (the renderer subtracts 1 for the toggle row), so use `detail_content_area`.
+    let detail_content_area = Rect::new(
+        detail_area.x,
+        detail_area.y,
+        detail_area.width,
+        detail_area.height.saturating_sub(1),
+    );
+    if detail_content_area != Rect::default()
+        && y >= detail_content_area.y
+        && y < detail_content_area.y + detail_content_area.height
+    {
+        // Detail rows are the selected workspace's panes in order; `collapsed_detail_agent_routes`
+        // is that workspace's agents in the SAME order (built in `from_model`), so row `i` resolves
+        // to route `i` — the SAME `AgentRoute { server_id, agent_id }` the expanded path focuses.
+        let detail_idx = (y - detail_content_area.y) as usize;
+        if let Some(route) = snapshot.collapsed_detail_agent_routes.get(detail_idx) {
+            return Some(SidebarHitTarget::Agent {
+                server_id: route.server_id.clone(),
+                agent_id: route.agent_id.clone(),
+            });
+        }
+        return None;
+    }
+
+    // Workspace-glance rows (mirrors the server's `collapsed_workspace_at_row`): one row per
+    // workspace, `idx == y - ws_area.y`, resolved through `workspace_routes` exactly like the
+    // expanded card path (disabled → no hit, Some(id) → Workspace, None → new-workspace dest).
+    if ws_area != Rect::default() && y >= ws_area.y && y < ws_area.y + ws_area.height {
+        let idx = (y - ws_area.y) as usize;
+        if let Some(route) = snapshot.workspace_routes.get(idx) {
+            if route.disabled {
+                return None;
+            }
+            return Some(match route.workspace_id.clone() {
+                Some(workspace_id) => SidebarHitTarget::Workspace {
+                    server_id: route.server_id.clone(),
+                    workspace_id,
+                },
+                None => SidebarHitTarget::NewWorkspaceDestination {
+                    server_id: route.server_id.clone(),
+                },
+            });
+        }
+    }
+
+    None
 }
 
 fn hit_test_agent_panel(
@@ -5039,5 +5314,163 @@ mod tests {
             )
             .unwrap();
         (model, remote_id)
+    }
+
+    // ---- #25: collapsed sidebar (client compositor) ----
+
+    // A single-server model whose focused workspace owns an agent, so the collapsed detail section
+    // (which shows the SELECTED workspace's panes) is non-empty. Returns the agent id for assertions.
+    fn collapsed_model() -> (ClientSupervisorModel, ServerId, String) {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "main-herdr".into(),
+                            label: "herdr".into(),
+                            branch: None,
+                            focused: true,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-2".into(),
+                            label: "two".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                    ],
+                    agents: vec![AgentSummary {
+                        agent_id: "agent-1".into(),
+                        workspace_id: "main-herdr".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, ServerId::main(), "agent-1".into())
+    }
+
+    // The compositor's collapsed flag drives `from_model`'s `app.sidebar_collapsed`, which is what
+    // gates the SHARED renderer onto its collapsed layout. Toggling flips it both ways.
+    #[test]
+    fn collapsed_flag_gates_snapshot() {
+        let (model, _local, _agent) = collapsed_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snap = |c: &ClientCompositor| {
+            ClientSidebarSnapshot::from_model(&model, c, 26, host.0, host.1, Instant::now())
+        };
+
+        assert!(!snap(&compositor).app.sidebar_collapsed);
+        compositor.toggle_sidebar_collapsed();
+        assert!(snap(&compositor).app.sidebar_collapsed);
+        compositor.toggle_sidebar_collapsed();
+        assert!(!snap(&compositor).app.sidebar_collapsed);
+    }
+
+    // The collapse/expand toggle is hittable in EXPANDED mode (so the user can collapse).
+    #[test]
+    fn expanded_toggle_rect_hits_toggle_target() {
+        let (model, _local, _agent) = collapsed_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
+        assert!(rect.width > 0);
+        assert_eq!(
+            compositor.hit_test(&model, rect.x, rect.y, host.0, host.1),
+            Some(SidebarHitTarget::CollapsedSidebarToggle)
+        );
+    }
+
+    // In COLLAPSED mode the toggle rect still hit-tests to the toggle; clicking it (mirrored by the
+    // mod.rs dispatch flipping the compositor flag) returns to expanded.
+    #[test]
+    fn collapsed_toggle_rect_hits_and_clicking_expands() {
+        let (model, _local, _agent) = collapsed_model();
+        let mut compositor = ClientCompositor::new(26);
+        compositor.toggle_sidebar_collapsed();
+        let host = (60u16, 28u16);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        assert!(snap.app.sidebar_collapsed);
+
+        let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
+        assert_eq!(
+            compositor.hit_test(&model, rect.x, rect.y, host.0, host.1),
+            Some(SidebarHitTarget::CollapsedSidebarToggle)
+        );
+
+        // The mod.rs dispatch flips the compositor flag on this target.
+        compositor.toggle_sidebar_collapsed();
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        assert!(!snap.app.sidebar_collapsed);
+    }
+
+    // In COLLAPSED mode a workspace-glance row resolves to Workspace for the owning server, and that
+    // target focuses the right workspace via `focus_workspace_route` (mirrors the expanded path).
+    #[test]
+    fn collapsed_workspace_row_hits_workspace_target() {
+        let (mut model, local, _agent) = collapsed_model();
+        let mut compositor = ClientCompositor::new(26);
+        compositor.toggle_sidebar_collapsed();
+        let host = (60u16, 28u16);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(snap.app.view.sidebar_rect);
+        assert!(ws_area.width > 0 && ws_area.height > 0);
+
+        // Second workspace glance row -> workspace index 1 ("ws-2").
+        match compositor.hit_test(&model, ws_area.x, ws_area.y + 1, host.0, host.1) {
+            Some(SidebarHitTarget::Workspace {
+                server_id,
+                workspace_id,
+            }) => {
+                assert_eq!(server_id, local);
+                assert_eq!(workspace_id, "ws-2");
+                // Same focus round-trip the expanded path uses.
+                assert!(model
+                    .focus_workspace_route(&server_id, &workspace_id)
+                    .api_request("test")
+                    .is_some());
+            }
+            other => panic!("expected Workspace target, got {other:?}"),
+        }
+    }
+
+    // In COLLAPSED mode an agent-detail row resolves to Agent for the owning server, and that target
+    // focuses the agent via `focus_agent_route`.
+    #[test]
+    fn collapsed_agent_detail_row_hits_agent_target() {
+        let (mut model, local, agent) = collapsed_model();
+        let mut compositor = ClientCompositor::new(26);
+        compositor.toggle_sidebar_collapsed();
+        let host = (60u16, 28u16);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let (_, _, detail_area) =
+            crate::ui::collapsed_sidebar_sections(snap.app.view.sidebar_rect);
+        assert!(detail_area.width > 0 && detail_area.height > 1);
+
+        // First agent-detail row of the selected (focused, index 0) workspace.
+        match compositor.hit_test(&model, detail_area.x, detail_area.y, host.0, host.1) {
+            Some(SidebarHitTarget::Agent {
+                server_id,
+                agent_id,
+            }) => {
+                assert_eq!(server_id, local);
+                assert_eq!(agent_id, agent);
+                assert!(model
+                    .focus_agent_route(&server_id, &agent_id)
+                    .api_request("test")
+                    .is_some());
+            }
+            other => panic!("expected Agent target, got {other:?}"),
+        }
     }
 }

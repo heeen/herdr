@@ -219,6 +219,75 @@ enum ClientOverlayState {
     GlobalMenu { highlighted: usize },
     AddRemote(AddRemoteForm),
     ManageRemotes(RemoteManageOverlay), // item 3 (Area 5)
+    // #23: per-workspace context menu and its two follow-on overlays (rename / confirm-close).
+    // All client-local; the action routes to the owning server via the existing workspace.* API.
+    WorkspaceContextMenu(WorkspaceContextMenu),
+    RenameWorkspace(RenameWorkspaceForm),
+    ConfirmCloseWorkspace(ConfirmCloseWorkspace),
+}
+
+/// #23: a right-click context menu over a workspace card, listing `Rename`/`Close` for the
+/// captured `(server_id, workspace_id)`. `label` is the workspace's current label, carried so the
+/// rename prefill and the close-confirm text need no second lookup. Mirrors `RemoteManageOverlay`
+/// (a small list overlay), but anchored to a single workspace target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceContextMenu {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) label: String,
+    pub(crate) selected: usize,
+}
+
+/// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
+/// error line). `label` holds the in-progress edit, prefilled with the workspace's current label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameWorkspaceForm {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) label: String,
+    pub(crate) error: Option<String>,
+}
+
+/// #23: the close-confirmation overlay ("Close <label>?"). Mirrors `RemoteManageOverlay`'s
+/// `confirm_delete` sub-state, hoisted to its own overlay since it has no parent list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmCloseWorkspace {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) label: String,
+}
+
+/// #23: the typed outcome of a key press in the context menu. The client loop opens the follow-on
+/// overlay (`Rename`/`Close`) or just redraws. Mirrors `RemoteManageOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceContextOutcome {
+    Redraw,
+    OpenRename,
+    OpenConfirmClose,
+}
+
+/// #23: the typed outcome of a key press in the rename overlay. `Submit` carries the
+/// `(server_id, workspace_id, label)` the client turns into a `workspace.rename` round-trip.
+/// Mirrors `AddRemoteFormOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenameWorkspaceOutcome {
+    Redraw,
+    Submit {
+        server_id: ServerId,
+        workspace_id: String,
+        label: String,
+    },
+}
+
+/// #23: the typed outcome of a key press in the close-confirm overlay. `Confirm` carries the
+/// `(server_id, workspace_id)` the client turns into a `workspace.close` round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfirmCloseOutcome {
+    Redraw,
+    Confirm {
+        server_id: ServerId,
+        workspace_id: String,
+    },
 }
 
 /// item 3 (Area 5): remote-management overlay state. Inert in C0; item 3 fills behavior.
@@ -909,7 +978,10 @@ impl ClientSupervisorModel {
             ClientOverlayState::GlobalMenu { highlighted } => Some(highlighted),
             ClientOverlayState::None
             | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_) => None,
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1005,7 +1077,10 @@ impl ClientSupervisorModel {
             ClientOverlayState::AddRemote(form) => Some(form),
             ClientOverlayState::None
             | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::ManageRemotes(_) => None,
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1188,7 +1263,10 @@ impl ClientSupervisorModel {
             ClientOverlayState::ManageRemotes(overlay) => Some(overlay),
             ClientOverlayState::None
             | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_) => None,
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1197,7 +1275,10 @@ impl ClientSupervisorModel {
             ClientOverlayState::ManageRemotes(overlay) => Some(overlay),
             ClientOverlayState::None
             | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_) => None,
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1393,6 +1474,315 @@ impl ClientSupervisorModel {
                 RemoteManageOutcome::OpenAddRemote
             }
             _ => RemoteManageOutcome::Redraw,
+        }
+    }
+
+    // ----- #23: workspace context menu + rename + confirm-close overlays ----------------------
+
+    /// #23: the two fixed context-menu rows, in render order. Mirrors `client_global_menu_items`.
+    pub(crate) fn workspace_context_menu_items(&self) -> Vec<&'static str> {
+        vec!["rename", "close"]
+    }
+
+    /// #23: the current label of `(server_id, workspace_id)` from the cached summaries, used by the
+    /// right-click handler to capture the label for the context menu (rename prefill / close text).
+    /// Falls back to `None` when the server or workspace is not in the model.
+    pub(crate) fn workspace_label(
+        &self,
+        server_id: &ServerId,
+        workspace_id: &str,
+    ) -> Option<String> {
+        self.server(server_id)?
+            .summaries
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id == workspace_id)
+            .map(|ws| ws.label.clone())
+    }
+
+    /// #23: open the workspace context menu for `(server_id, workspace_id)`, capturing the current
+    /// `label` for the rename prefill and the close-confirm text. Mirrors `open_remote_manage_overlay`.
+    pub(crate) fn open_workspace_context_menu(
+        &mut self,
+        server_id: ServerId,
+        workspace_id: String,
+        label: String,
+    ) {
+        self.new_workspace_picker = None;
+        self.client_overlay = ClientOverlayState::WorkspaceContextMenu(WorkspaceContextMenu {
+            server_id,
+            workspace_id,
+            label,
+            selected: 0,
+        });
+    }
+
+    pub(crate) fn workspace_context_menu(&self) -> Option<&WorkspaceContextMenu> {
+        match &self.client_overlay {
+            ClientOverlayState::WorkspaceContextMenu(menu) => Some(menu),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    fn workspace_context_menu_mut(&mut self) -> Option<&mut WorkspaceContextMenu> {
+        match &mut self.client_overlay {
+            ClientOverlayState::WorkspaceContextMenu(menu) => Some(menu),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    pub(crate) fn move_workspace_context_menu_next(&mut self) {
+        let count = self.workspace_context_menu_items().len();
+        if let Some(menu) = self.workspace_context_menu_mut() {
+            menu.selected = (menu.selected + 1).min(count.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn move_workspace_context_menu_prev(&mut self) {
+        if let Some(menu) = self.workspace_context_menu_mut() {
+            menu.selected = menu.selected.saturating_sub(1);
+        }
+    }
+
+    /// #23: mouse-driven selection — clamp and set the highlighted context-menu row.
+    pub(crate) fn set_workspace_context_menu_selected(&mut self, index: usize) {
+        let count = self.workspace_context_menu_items().len();
+        if let Some(menu) = self.workspace_context_menu_mut() {
+            menu.selected = index.min(count.saturating_sub(1));
+        }
+    }
+
+    /// #23: resolve a context-menu row index into an action, opening the matching follow-on overlay.
+    /// `0 -> Rename`, `1 -> Close`. Mirrors `select_client_global_menu_item`.
+    pub(crate) fn select_workspace_context_menu_item(
+        &mut self,
+        index: usize,
+    ) -> WorkspaceContextOutcome {
+        match index {
+            0 => {
+                self.open_rename_workspace();
+                WorkspaceContextOutcome::OpenRename
+            }
+            1 => {
+                self.open_confirm_close_workspace();
+                WorkspaceContextOutcome::OpenConfirmClose
+            }
+            _ => WorkspaceContextOutcome::Redraw,
+        }
+    }
+
+    pub(crate) fn accept_workspace_context_menu_item(&mut self) -> WorkspaceContextOutcome {
+        let Some(selected) = self.workspace_context_menu().map(|menu| menu.selected) else {
+            return WorkspaceContextOutcome::Redraw;
+        };
+        self.select_workspace_context_menu_item(selected)
+    }
+
+    /// #23: translate a context-menu key press into a typed outcome. Mirrors
+    /// `handle_remote_manage_key`: Up/Down (and j/k) move, Enter activates, Esc closes.
+    pub(crate) fn handle_workspace_context_menu_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> WorkspaceContextOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return WorkspaceContextOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                WorkspaceContextOutcome::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_workspace_context_menu_prev();
+                WorkspaceContextOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_workspace_context_menu_next();
+                WorkspaceContextOutcome::Redraw
+            }
+            KeyCode::Enter => self.accept_workspace_context_menu_item(),
+            _ => WorkspaceContextOutcome::Redraw,
+        }
+    }
+
+    /// #23: transition the open context menu into the rename overlay, prefilled with the captured
+    /// label. A no-op (closes) when no context menu is open. Mirrors `open_add_remote_form`.
+    pub(crate) fn open_rename_workspace(&mut self) {
+        let Some(menu) = self.workspace_context_menu() else {
+            return;
+        };
+        let form = RenameWorkspaceForm {
+            server_id: menu.server_id.clone(),
+            workspace_id: menu.workspace_id.clone(),
+            label: menu.label.clone(),
+            error: None,
+        };
+        self.client_overlay = ClientOverlayState::RenameWorkspace(form);
+    }
+
+    pub(crate) fn rename_workspace_form(&self) -> Option<&RenameWorkspaceForm> {
+        match &self.client_overlay {
+            ClientOverlayState::RenameWorkspace(form) => Some(form),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    fn rename_workspace_form_mut(&mut self) -> Option<&mut RenameWorkspaceForm> {
+        match &mut self.client_overlay {
+            ClientOverlayState::RenameWorkspace(form) => Some(form),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    /// #23: text editing for the rename overlay. Mirrors `handle_add_remote_key`'s
+    /// Esc/Backspace/Ctrl-U/Char handling; Enter submits a non-empty trimmed label.
+    pub(crate) fn handle_rename_workspace_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> RenameWorkspaceOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return RenameWorkspaceOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                RenameWorkspaceOutcome::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(form) = self.rename_workspace_form_mut() else {
+                    return RenameWorkspaceOutcome::Redraw;
+                };
+                let label = form.label.trim().to_string();
+                if label.is_empty() {
+                    form.error = Some("label required".to_string());
+                    return RenameWorkspaceOutcome::Redraw;
+                }
+                RenameWorkspaceOutcome::Submit {
+                    server_id: form.server_id.clone(),
+                    workspace_id: form.workspace_id.clone(),
+                    label,
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(form) = self.rename_workspace_form_mut() {
+                    form.label.clear();
+                    form.error = None;
+                }
+                RenameWorkspaceOutcome::Redraw
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.rename_workspace_form_mut() {
+                    form.label.pop();
+                    form.error = None;
+                }
+                RenameWorkspaceOutcome::Redraw
+            }
+            KeyCode::Char(ch) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                if let Some(form) = self.rename_workspace_form_mut() {
+                    form.label.push(ch);
+                    form.error = None;
+                }
+                RenameWorkspaceOutcome::Redraw
+            }
+            _ => RenameWorkspaceOutcome::Redraw,
+        }
+    }
+
+    /// #23: paste support for the rename field, mirroring `append_add_remote_paste`.
+    pub(crate) fn append_rename_workspace_paste(&mut self, text: &str) -> RenameWorkspaceOutcome {
+        if let Some(form) = self.rename_workspace_form_mut() {
+            form.label.push_str(text);
+            form.error = None;
+        }
+        RenameWorkspaceOutcome::Redraw
+    }
+
+    /// #23: transition the open context menu into the close-confirm overlay. A no-op (closes) when
+    /// no context menu is open. Mirrors `begin_remote_manage_delete`.
+    pub(crate) fn open_confirm_close_workspace(&mut self) {
+        let Some(menu) = self.workspace_context_menu() else {
+            return;
+        };
+        let confirm = ConfirmCloseWorkspace {
+            server_id: menu.server_id.clone(),
+            workspace_id: menu.workspace_id.clone(),
+            label: menu.label.clone(),
+        };
+        self.client_overlay = ClientOverlayState::ConfirmCloseWorkspace(confirm);
+    }
+
+    pub(crate) fn confirm_close_workspace(&self) -> Option<&ConfirmCloseWorkspace> {
+        match &self.client_overlay {
+            ClientOverlayState::ConfirmCloseWorkspace(confirm) => Some(confirm),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_) => None,
+        }
+    }
+
+    /// #23: confirm the close (Enter / y / a confirm button), emitting the `(server_id,
+    /// workspace_id)` the client turns into a `workspace.close` round-trip. Mirrors
+    /// `confirm_remote_manage_delete`.
+    pub(crate) fn accept_confirm_close_workspace(&mut self) -> ConfirmCloseOutcome {
+        let Some(confirm) = self.confirm_close_workspace() else {
+            return ConfirmCloseOutcome::Redraw;
+        };
+        ConfirmCloseOutcome::Confirm {
+            server_id: confirm.server_id.clone(),
+            workspace_id: confirm.workspace_id.clone(),
+        }
+    }
+
+    /// #23: translate a key press in the close-confirm overlay into a typed outcome. Enter / y
+    /// confirms, Esc / n cancels (mirrors the remote-manage delete-confirm sub-state).
+    pub(crate) fn handle_confirm_close_workspace_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> ConfirmCloseOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return ConfirmCloseOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.accept_confirm_close_workspace()
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.close_client_overlay();
+                ConfirmCloseOutcome::Redraw
+            }
+            _ => ConfirmCloseOutcome::Redraw,
         }
     }
 
@@ -1757,7 +2147,10 @@ impl ClientSupervisorModel {
             ClientOverlayState::AddRemote(form) => Some(form),
             ClientOverlayState::None
             | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::ManageRemotes(_) => None,
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -4317,5 +4710,178 @@ mod tests {
         let action = model.select_client_global_menu_item(5);
         assert_eq!(action, Some(ClientGlobalMenuAction::ManageRemotes));
         assert!(model.remote_manage_overlay().is_some());
+    }
+
+    // ----- #23: workspace context menu + rename + confirm-close --------------------------------
+
+    fn model_with_workspace() -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        model
+            .set_summary(
+                &remote,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "ws-1".into(),
+                        label: "feature".into(),
+                        branch: None,
+                        focused: false,
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        (model, remote)
+    }
+
+    fn ctrl_u() -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )
+    }
+
+    #[test]
+    fn open_workspace_context_menu_captures_target_and_label() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        let label = model.workspace_label(&server_id, "ws-1").unwrap();
+        assert_eq!(label, "feature");
+
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label);
+
+        let menu = model.workspace_context_menu().expect("menu open");
+        assert_eq!(menu.server_id, server_id);
+        assert_eq!(menu.workspace_id, "ws-1");
+        assert_eq!(menu.label, "feature");
+        assert_eq!(menu.selected, 0);
+        assert_eq!(model.workspace_context_menu_items(), ["rename", "close"]);
+
+        // a missing workspace yields no label.
+        assert!(model.workspace_label(&server_id, "nope").is_none());
+        let _ = KeyCode::Esc;
+    }
+
+    #[test]
+    fn context_menu_nav_and_esc_dismiss() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+
+        // Down moves to "close", k clamps back to "rename".
+        assert_eq!(
+            model.handle_workspace_context_menu_key(press(KeyCode::Down)),
+            WorkspaceContextOutcome::Redraw
+        );
+        assert_eq!(model.workspace_context_menu().unwrap().selected, 1);
+        model.handle_workspace_context_menu_key(press(KeyCode::Char('k')));
+        assert_eq!(model.workspace_context_menu().unwrap().selected, 0);
+
+        // Esc dismisses.
+        model.handle_workspace_context_menu_key(press(KeyCode::Esc));
+        assert!(model.workspace_context_menu().is_none());
+    }
+
+    #[test]
+    fn context_menu_enter_on_rename_opens_prefilled_rename_overlay() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into());
+
+        assert_eq!(
+            model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
+            WorkspaceContextOutcome::OpenRename
+        );
+        let form = model.rename_workspace_form().expect("rename overlay open");
+        assert_eq!(form.server_id, server_id);
+        assert_eq!(form.workspace_id, "ws-1");
+        assert_eq!(form.label, "feature", "prefilled with current label");
+        assert!(model.workspace_context_menu().is_none());
+    }
+
+    #[test]
+    fn rename_typing_builds_label_and_enter_submits_rename() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), String::new());
+        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
+
+        for ch in "next".chars() {
+            model.handle_rename_workspace_key(press(KeyCode::Char(ch)));
+        }
+        assert_eq!(model.rename_workspace_form().unwrap().label, "next");
+
+        let outcome = model.handle_rename_workspace_key(press(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            RenameWorkspaceOutcome::Submit {
+                server_id,
+                workspace_id: "ws-1".into(),
+                label: "next".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_empty_label_does_not_submit() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
+
+        // clear the prefilled label with Ctrl-U, then Enter must NOT submit.
+        model.handle_rename_workspace_key(ctrl_u());
+        assert_eq!(model.rename_workspace_form().unwrap().label, "");
+
+        let outcome = model.handle_rename_workspace_key(press(KeyCode::Enter));
+        assert_eq!(outcome, RenameWorkspaceOutcome::Redraw);
+        assert!(
+            model.rename_workspace_form().unwrap().error.is_some(),
+            "empty label surfaces an inline error"
+        );
+        assert!(model.rename_workspace_form().is_some(), "overlay stays open");
+    }
+
+    #[test]
+    fn context_menu_close_opens_confirm_and_enter_confirms_close() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into());
+        // select "close" (index 1) then Enter -> confirm overlay.
+        model.handle_workspace_context_menu_key(press(KeyCode::Down));
+        assert_eq!(
+            model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
+            WorkspaceContextOutcome::OpenConfirmClose
+        );
+        let confirm = model.confirm_close_workspace().expect("confirm overlay open");
+        assert_eq!(confirm.server_id, server_id);
+        assert_eq!(confirm.workspace_id, "ws-1");
+        assert_eq!(confirm.label, "feature");
+
+        let outcome = model.handle_confirm_close_workspace_key(press(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            ConfirmCloseOutcome::Confirm {
+                server_id,
+                workspace_id: "ws-1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_close_cancel_dismisses_without_request() {
+        use crossterm::event::KeyCode;
+        let (mut model, server_id) = model_with_workspace();
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into());
+        model.handle_workspace_context_menu_key(press(KeyCode::Down));
+        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> confirm overlay
+
+        // 'n' cancels with no request and closes the overlay.
+        let outcome = model.handle_confirm_close_workspace_key(press(KeyCode::Char('n')));
+        assert_eq!(outcome, ConfirmCloseOutcome::Redraw);
+        assert!(model.confirm_close_workspace().is_none());
     }
 }

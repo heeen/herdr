@@ -59,7 +59,8 @@ use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
         add_remote_button_rects, add_remote_inner_rect, add_remote_popup_rect,
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect, confirm_close_workspace_button_rects,
+        confirm_close_workspace_popup_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, new_workspace_picker_button_rects,
         new_workspace_picker_inner_rect, new_workspace_picker_popup_rect,
         new_workspace_picker_row_rect, open_existing_worktree_button_rects,
@@ -67,9 +68,13 @@ pub(crate) use self::{
         remote_manage_confirm_button_rects, remote_manage_confirm_popup_rect,
         remote_manage_inner_rect, remote_manage_popup_rect, remote_manage_row_rect,
         remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
-        render_add_remote_overlay, render_new_workspace_picker_overlay,
-        render_remote_manage_overlay, AddRemoteOverlayView, DestinationView, RemoteManageRowView,
-        RemoteStateGlyph,
+        rename_workspace_button_rects, rename_workspace_inner_rect, rename_workspace_popup_rect,
+        render_add_remote_overlay, render_confirm_close_workspace_overlay,
+        render_new_workspace_picker_overlay, render_remote_manage_overlay,
+        render_rename_workspace_overlay, render_workspace_context_menu_overlay,
+        workspace_context_menu_inner_rect, workspace_context_menu_popup_rect,
+        workspace_context_menu_row_rect, AddRemoteOverlayView, DestinationView,
+        RemoteManageRowView, RemoteStateGlyph, WorkspaceContextMenuView,
     },
     settings::{
         settings_button_rects, settings_show_primary_action, SETTINGS_POPUP_HEIGHT,

@@ -77,6 +77,14 @@ pub(crate) struct RemoteManageRowView<'a> {
     pub disabled: bool,
 }
 
+/// #23: ui-owned view for the workspace context menu. `label` is the workspace name shown as the
+/// modal sub-header; `rows` are the menu item labels. Holds only borrowed strings (no supervisor
+/// type), per the layering rule.
+pub(crate) struct WorkspaceContextMenuView<'a> {
+    pub label: &'a str,
+    pub rows: &'a [&'a str],
+}
+
 fn truncate_text(text: &str, max_width: usize) -> String {
     let len = text.chars().count();
     if len <= max_width {
@@ -1265,6 +1273,291 @@ fn render_remote_manage_confirm(
         delete_rect,
         Some("↵"),
         "delete",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+// ----- #23: workspace context menu + rename + confirm-close geometry/render -------------------
+// Single-source-of-truth geometry for the three #23 overlays, mirroring the add-remote /
+// manage-remotes modals above. Both the renderer and `ClientCompositor::hit_test` derive every
+// row/button rect from these helpers, so render geometry == hit-test geometry.
+
+/// The context-menu popup height for `count` rows: header + the workspace-name sub-row + one row
+/// per item + vertical margins, clamped to a sane band. Used by BOTH the inner-rect helper and the
+/// renderer so they cannot diverge. Mirrors `picker_popup_height`.
+fn workspace_context_menu_popup_height(count: usize) -> u16 {
+    (count as u16).saturating_add(4).clamp(6, 12)
+}
+
+/// The outer popup rect for the workspace context menu — footer-anchored (bottom-left of `area`,
+/// opening upward) like the other client overlays. Used by BOTH render and hit-test.
+pub(crate) fn workspace_context_menu_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+    bottom_left_popup_rect(area, 34, workspace_context_menu_popup_height(count))
+}
+
+/// Shared inner rect for the workspace context menu. Returns `None` when the host is too small.
+pub(crate) fn workspace_context_menu_inner_rect(area: Rect, count: usize) -> Option<Rect> {
+    workspace_context_menu_popup_rect(area, count).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The rect for menu row `row_index` inside the context menu's inner rect. Rows start two lines
+/// below the inner top (header + workspace-name sub-row). Used by BOTH render and hit-test.
+pub(crate) fn workspace_context_menu_row_rect(inner: Rect, row_index: usize) -> Rect {
+    let y = inner.y.saturating_add(2 + row_index as u16);
+    Rect::new(inner.x, y, inner.width, 1)
+}
+
+/// The outer popup rect for the rename overlay — footer-anchored, like add-remote.
+pub(crate) fn rename_workspace_popup_rect(area: Rect) -> Option<Rect> {
+    bottom_left_popup_rect(area, 48, 7)
+}
+
+/// Fixed inner rect for the rename overlay. Returns `None` when the host is too small.
+pub(crate) fn rename_workspace_inner_rect(area: Rect) -> Option<Rect> {
+    rename_workspace_popup_rect(area).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The (save, cancel) button rects inside the rename overlay's inner rect. Mirrors
+/// `add_remote_button_rects`.
+pub(crate) fn rename_workspace_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "save",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// The close-confirm popup rect (centered red panel), mirroring `remote_manage_confirm_popup_rect`.
+pub(crate) fn confirm_close_workspace_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 48, 6)
+}
+
+/// The (close, cancel) button rects inside the close-confirm popup's inner rect.
+pub(crate) fn confirm_close_workspace_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "close",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// #23: render the workspace context menu as a footer-anchored accent panel — a selectable list of
+/// menu items with the workspace name as a sub-header. Geometry comes from
+/// `workspace_context_menu_inner_rect`/`_row_rect` so it matches `hit_test`. Mirrors
+/// `render_new_workspace_picker_overlay`.
+pub(crate) fn render_workspace_context_menu_overlay(
+    palette: &Palette,
+    view: &WorkspaceContextMenuView,
+    selected: usize,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let Some(popup) = workspace_context_menu_popup_rect(area, view.rows.len()) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    debug_assert_eq!(
+        Some(inner),
+        workspace_context_menu_inner_rect(area, view.rows.len()),
+        "context menu render and hit-test geometry diverged"
+    );
+    if inner.height < 4 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "workspace",
+        palette,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {}", truncate_text(view.label, inner.width as usize)))
+            .style(Style::default().fg(palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    let selected = selected.min(view.rows.len().saturating_sub(1));
+    let max_rows = inner.height.saturating_sub(2) as usize;
+    for (row_index, label) in view.rows.iter().enumerate().take(max_rows) {
+        let is_selected = row_index == selected;
+        let marker = if is_selected { "›" } else { " " };
+        let text = format!("{marker} {label}");
+        let style = if is_selected {
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.subtext0)
+        };
+        let row = workspace_context_menu_row_rect(inner, row_index);
+        frame.render_widget(
+            Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
+            row,
+        );
+    }
+}
+
+/// #23: render the rename text overlay as a footer-anchored accent panel with a single focused text
+/// field + save/cancel buttons. Mirrors `render_add_remote_overlay`. The caller forces
+/// `frame.cursor = None` while the modal is open.
+pub(crate) fn render_rename_workspace_overlay(
+    palette: &Palette,
+    label: &str,
+    error: Option<&str>,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let Some(popup) = rename_workspace_popup_rect(area) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    debug_assert_eq!(
+        Some(inner),
+        rename_workspace_inner_rect(area),
+        "rename render and hit-test geometry diverged"
+    );
+    if inner.height < 4 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // input
+        Constraint::Length(1), // error
+        Constraint::Min(0),    // actions live on inner.height - 1
+    ])
+    .areas::<4>(inner);
+
+    render_modal_header(frame, rows[0], "rename workspace", palette);
+    render_add_remote_field(frame, rows[1], "label", label, true, palette);
+
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
+            rows[2],
+        );
+    }
+
+    let (save_rect, cancel_rect) = rename_workspace_button_rects(inner);
+    render_action_button(
+        frame,
+        save_rect,
+        Some("↵"),
+        "save",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// #23: render the close-confirm overlay as a centered red panel ("Close <label>?") with
+/// close/cancel buttons. Mirrors `render_remote_manage_confirm`.
+pub(crate) fn render_confirm_close_workspace_overlay(
+    palette: &Palette,
+    label: &str,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let Some(popup) = confirm_close_workspace_popup_rect(area) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, palette.red, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 3 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " close workspace?",
+            Style::default()
+                .fg(palette.red)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " Close {}?",
+            truncate_text(label, inner.width.saturating_sub(8) as usize)
+        ))
+        .style(Style::default().fg(palette.text)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    let (close_rect, cancel_rect) = confirm_close_workspace_button_rects(inner);
+    render_action_button(
+        frame,
+        close_rect,
+        Some("↵"),
+        "close",
         Style::default()
             .fg(panel_contrast_fg(palette))
             .bg(palette.red)

@@ -370,6 +370,9 @@ fn dispatch_composited_input(
         || model.client_global_menu_highlighted().is_some()
         || model.new_workspace_picker().is_some()
         || model.remote_manage_overlay().is_some()
+        || model.workspace_context_menu().is_some()
+        || model.rename_workspace_form().is_some()
+        || model.confirm_close_workspace().is_some()
     {
         return dispatch_client_overlay_input(data, compositor, model, host_size);
     }
@@ -424,6 +427,35 @@ fn dispatch_client_overlay_input(
                 if model.remote_manage_overlay().is_some() =>
             {
                 dispatch_for_remote_manage_outcome(model.handle_remote_manage_key(key))
+            }
+            // #23: workspace context menu / rename / confirm-close key + paste handling. Each
+            // delegates to the supervisor key handler and maps its typed outcome into a dispatch
+            // (mirrors the add-remote / remote-manage arms above).
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.workspace_context_menu().is_some() =>
+            {
+                match model.handle_workspace_context_menu_key(key) {
+                    supervisor::WorkspaceContextOutcome::Redraw
+                    | supervisor::WorkspaceContextOutcome::OpenRename
+                    | supervisor::WorkspaceContextOutcome::OpenConfirmClose => {
+                        ClientInputDispatch::Redraw
+                    }
+                }
+            }
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.rename_workspace_form().is_some() =>
+            {
+                dispatch_for_rename_workspace_outcome(model.handle_rename_workspace_key(key))
+            }
+            crate::raw_input::RawInputEvent::Paste(text)
+                if model.rename_workspace_form().is_some() =>
+            {
+                dispatch_for_rename_workspace_outcome(model.append_rename_workspace_paste(&text))
+            }
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.confirm_close_workspace().is_some() =>
+            {
+                dispatch_for_confirm_close_outcome(model.handle_confirm_close_workspace_key(key))
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 dispatch_composited_mouse_input(data.clone(), compositor, model, host_size, &mouse)
@@ -612,6 +644,23 @@ fn dispatch_composited_mouse_input(
         }
     }
 
+    // #23: a right-click (Down, MouseButton::Right) over a workspace card opens the client-rendered
+    // context menu anchored at that row, capturing the workspace's current label for the rename
+    // prefill / close-confirm text. Resolved through the SAME `hit_test` the left-click path uses.
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+        if let Some(compositor::SidebarHitTarget::Workspace {
+            server_id,
+            workspace_id,
+        }) = compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
+        {
+            let label = model
+                .workspace_label(&server_id, &workspace_id)
+                .unwrap_or_else(|| workspace_id.clone());
+            model.open_workspace_context_menu(server_id, workspace_id, label);
+            return ClientInputDispatch::Redraw;
+        }
+    }
+
     if let Some(outcome) =
         compositor.handle_sidebar_resize_mouse(mouse, host_size.0, host_size.1, model.ui_settings())
     {
@@ -713,6 +762,16 @@ fn dispatch_composited_mouse_input(
         if matches!(target, compositor::SidebarHitTarget::AgentScopeToggle) {
             return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 compositor.toggle_agent_panel_scope();
+                ClientInputDispatch::Redraw
+            } else {
+                ClientInputDispatch::Consumed
+            };
+        }
+        // #25: the collapse/expand toggle mutates client-local compositor state (no server round-
+        // trip), so it is handled here where `&mut compositor` is in scope (like the scope toggle).
+        if matches!(target, compositor::SidebarHitTarget::CollapsedSidebarToggle) {
+            return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                compositor.toggle_sidebar_collapsed();
                 ClientInputDispatch::Redraw
             } else {
                 ClientInputDispatch::Consumed
@@ -850,6 +909,9 @@ fn dispatch_sidebar_hit_target(
         // #20: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
         // arm only keeps the match exhaustive and is not reached in practice.
         compositor::SidebarHitTarget::AgentScopeToggle => ClientInputDispatch::Consumed,
+        // #25: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
+        // arm only keeps the match exhaustive and is not reached in practice.
+        compositor::SidebarHitTarget::CollapsedSidebarToggle => ClientInputDispatch::Consumed,
         // #19 (host half): a host-banner press arms a host drag-reorder in
         // `dispatch_composited_mouse_input` (needs `&mut compositor`); the click itself focuses the
         // host's first workspace there too. This arm only keeps the match exhaustive.
@@ -895,6 +957,35 @@ fn dispatch_sidebar_hit_target(
             model.cancel_remote_manage_delete();
             ClientInputDispatch::Redraw
         }
+        // #23: workspace context-menu mouse targets. Clicking a menu row selects AND activates it
+        // (opening the rename / confirm-close follow-on overlay); the rename submit/cancel and
+        // confirm close/cancel buttons replay the SAME paths the keys use.
+        compositor::SidebarHitTarget::WorkspaceContextMenuRow { index } => {
+            model.set_workspace_context_menu_selected(index);
+            match model.select_workspace_context_menu_item(index) {
+                supervisor::WorkspaceContextOutcome::Redraw
+                | supervisor::WorkspaceContextOutcome::OpenRename
+                | supervisor::WorkspaceContextOutcome::OpenConfirmClose => {
+                    ClientInputDispatch::Redraw
+                }
+            }
+        }
+        compositor::SidebarHitTarget::RenameWorkspaceSubmit => {
+            // replay an Enter through the rename key handler so the BUTTON re-runs the exact same
+            // empty-label validation / submit path as the Enter KEY (mirrors AddRemoteSubmit).
+            dispatch_for_rename_workspace_outcome(model.handle_rename_workspace_key(enter_key()))
+        }
+        compositor::SidebarHitTarget::RenameWorkspaceCancel => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
+        compositor::SidebarHitTarget::ConfirmCloseWorkspaceConfirm => {
+            dispatch_for_confirm_close_outcome(model.accept_confirm_close_workspace())
+        }
+        compositor::SidebarHitTarget::ConfirmCloseWorkspaceCancel => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
     }
 }
 
@@ -902,6 +993,58 @@ fn dispatch_sidebar_hit_target(
 /// same validation/submit path as the Enter KEY in `handle_add_remote_key`.
 fn enter_key() -> crate::input::TerminalKey {
     crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())
+}
+
+/// #23: map a `RenameWorkspaceOutcome` into a dispatch. `Submit` becomes a `workspace.rename`
+/// round-trip to the OWNING server with an `Immediate` refresh so the renamed row reconciles on
+/// the next summary; `Redraw` just repaints. Mirrors `dispatch_for_remote_manage_outcome`.
+fn dispatch_for_rename_workspace_outcome(
+    outcome: supervisor::RenameWorkspaceOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::RenameWorkspaceOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::RenameWorkspaceOutcome::Submit {
+            server_id,
+            workspace_id,
+            label,
+        } => ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:workspace-rename".into(),
+                method: crate::api::schema::Method::WorkspaceRename(
+                    crate::api::schema::WorkspaceRenameParams {
+                        workspace_id,
+                        label,
+                    },
+                ),
+            }),
+        },
+    }
+}
+
+/// #23: map a `ConfirmCloseOutcome` into a dispatch. `Confirm` becomes a `workspace.close`
+/// round-trip to the OWNING server with an `Immediate` refresh so the closed row disappears on the
+/// next summary; `Redraw` just repaints.
+fn dispatch_for_confirm_close_outcome(
+    outcome: supervisor::ConfirmCloseOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::ConfirmCloseOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::ConfirmCloseOutcome::Confirm {
+            server_id,
+            workspace_id,
+        } => ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:workspace-close".into(),
+                method: crate::api::schema::Method::WorkspaceClose(
+                    crate::api::schema::WorkspaceTarget { workspace_id },
+                ),
+            }),
+        },
+    }
 }
 
 fn translate_content_mouse_input(
@@ -5489,6 +5632,195 @@ mod tests {
             )
             .unwrap();
         (model, remote_id)
+    }
+
+    // ----- #23: workspace context menu mouse round-trips ----------------------------------------
+
+    fn down(button: MouseButton, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(button),
+            column: 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn workspace_card_right_click_opens_context_menu() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+
+        let dispatch = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        let menu = model
+            .workspace_context_menu()
+            .expect("right-click opened the context menu");
+        assert_eq!(menu.server_id, remote_id);
+        assert_eq!(menu.workspace_id, "remote-api");
+        assert_eq!(menu.label, "api", "captured the current label");
+    }
+
+    #[test]
+    fn context_menu_rename_then_submit_yields_workspace_rename_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+
+        // click the "rename" row (index 0) -> rename overlay opens prefilled.
+        let rename_hit = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 0 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        assert!(matches!(rename_hit, ClientInputDispatch::Redraw));
+        assert!(model.rename_workspace_form().is_some());
+
+        // submit via the button -> workspace.rename ApiRequest to the OWNING server.
+        let submit = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::RenameWorkspaceSubmit,
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        match submit {
+            ClientInputDispatch::ApiRequest {
+                server_id,
+                request,
+                refresh,
+            } => {
+                assert_eq!(server_id, remote_id);
+                assert_eq!(refresh, ClientApiRefreshPolicy::Immediate);
+                match request.method {
+                    crate::api::schema::Method::WorkspaceRename(params) => {
+                        assert_eq!(params.workspace_id, "remote-api");
+                        assert_eq!(params.label, "api");
+                    }
+                    other => panic!("expected WorkspaceRename, got {other:?}"),
+                }
+            }
+            other => panic!("expected ApiRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_menu_close_confirm_yields_workspace_close_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+
+        // click the "close" row (index 1) -> confirm overlay opens.
+        dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        assert!(model.confirm_close_workspace().is_some());
+
+        // confirm -> workspace.close ApiRequest to the OWNING server.
+        let confirm = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::ConfirmCloseWorkspaceConfirm,
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        match confirm {
+            ClientInputDispatch::ApiRequest {
+                server_id,
+                request,
+                refresh,
+            } => {
+                assert_eq!(server_id, remote_id);
+                assert_eq!(refresh, ClientApiRefreshPolicy::Immediate);
+                match request.method {
+                    crate::api::schema::Method::WorkspaceClose(target) => {
+                        assert_eq!(target.workspace_id, "remote-api");
+                    }
+                    other => panic!("expected WorkspaceClose, got {other:?}"),
+                }
+            }
+            other => panic!("expected ApiRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_menu_close_cancel_dismisses_without_request() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+        dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        let cancel = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::ConfirmCloseWorkspaceCancel,
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        assert!(matches!(cancel, ClientInputDispatch::Redraw));
+        assert!(model.confirm_close_workspace().is_none());
     }
 
     fn mixed_remote_model_with_many_workspaces(
