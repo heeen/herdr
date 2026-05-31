@@ -1249,7 +1249,9 @@ fn ensure_remote_server_ready(
                     // it rather than killing panes. For a compatible server, fall back to attaching.
                     Err(err) if reason == RemoteServerRestartReason::ProtocolMismatch => Err(err),
                     Err(err) => {
-                        eprintln!(
+                        // NonInteractive = in-client TUI worker: log, don't eprintln onto the
+                        // raw-mode screen (issue #32 follow-up).
+                        tracing::warn!(
                             "remote live handoff failed: {err}; attaching to the running server."
                         );
                         Ok(())
@@ -1694,8 +1696,11 @@ fn warn_if_remote_bin_not_on_path(target: &SshTarget) -> io::Result<()> {
         "case \":$PATH:\" in *\":$HOME/.local/bin:\"*) exit 0 ;; *) exit 1 ;; esac",
     )?;
     if !output.status.success() {
-        eprintln!(
-            "herdr: installed remote binary to ~/.local/bin/herdr, but ~/.local/bin is not in the remote PATH"
+        // tracing (log file), not eprintln: this runs inside the raw-mode add-remote TUI worker, so
+        // printing to stderr would scroll the screen. add-remote uses the absolute install path
+        // regardless, so this is purely advisory.
+        tracing::warn!(
+            "installed remote binary to ~/.local/bin/herdr, but ~/.local/bin is not in the remote PATH"
         );
     }
     Ok(())
@@ -1839,32 +1844,42 @@ mv "$tmp" "$dest"
         install_suffix = remote_herdr.install_suffix
     );
 
+    // Capture (never inherit) the install child's output: this also runs inside the in-client
+    // add-remote worker, where the raw-mode TUI owns the terminal, so any inherited byte (ssh's
+    // "Permanently added … to known hosts" warning, remote shell chatter) scrolls/garbles the
+    // screen mid-provision (issue #32 follow-up). stdout is discarded; stderr is kept only to
+    // enrich a failure message.
     let mut child = target
         .command(&format!("sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
     let mut source = File::open(source_path)?;
-    let copy_result = if let Some(mut stdin) = child.stdin.take() {
-        io::copy(&mut source, &mut stdin).map(|_| ())
-    } else {
-        Err(io::Error::new(
+    let copy_result = match child.stdin.take() {
+        Some(mut stdin) => io::copy(&mut source, &mut stdin).map(|_| ()),
+        None => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "ssh install stdin missing",
-        ))
+        )),
     };
-    let status = child.wait()?;
+    // The ~11 MB binary went to stdin above; stderr stays tiny (one ssh warning at most), so
+    // wait_with_output cannot deadlock on a full pipe.
+    let output = child.wait_with_output()?;
     copy_result?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "remote install exited with {status}"
-        )))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        Err(io::Error::other(if stderr.is_empty() {
+            format!("remote install exited with {}", output.status)
+        } else {
+            format!("remote install exited with {}: {stderr}", output.status)
+        }))
     }
 }
 
@@ -1948,7 +1963,10 @@ fn spawn_bridge_worker(
 ) {
     let _ = thread::spawn(move || {
         if let Err(err) = run(stream) {
-            eprintln!("herdr: remote bridge failed: {err}");
+            // Log, never eprintln: the bridge lives in the in-client TUI process, and a connection
+            // can fail repeatedly during connect/reconnect — printing would flood the raw-mode
+            // screen (issue #32 follow-up).
+            tracing::warn!("remote bridge connection failed: {err}");
         }
     });
 }
@@ -1973,8 +1991,8 @@ impl SshStdioBridge {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         if let Err(err) = stream.set_nonblocking(false) {
-                            eprintln!(
-                                "herdr: remote bridge failed to prepare client socket: {err}"
+                            tracing::warn!(
+                                "remote bridge failed to prepare client socket: {err}"
                             );
                             continue;
                         }
@@ -1995,7 +2013,7 @@ impl SshStdioBridge {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
-                        eprintln!("herdr: remote bridge listener failed: {err}");
+                        tracing::warn!("remote bridge listener failed: {err}");
                         break;
                     }
                 }
