@@ -169,6 +169,12 @@ pub(crate) struct ClientCompositor {
     // key for prefix-bound sidebar-nav actions. Bare keys are never intercepted unless armed, so
     // normal terminal input is preserved.
     prefix_armed: bool,
+    // #22: client-local collapsed worktree-group keys. The server persists its OWN set
+    // (`AppState.collapsed_space_keys`); collapse of the client's AGGREGATED multi-host view is a
+    // per-client display concern, so the client owns this set (no server round-trip). Fed into
+    // `from_model` (sets `app.collapsed_space_keys`) so the SHARED grouping renderer collapses the
+    // right groups.
+    collapsed_space_keys: std::collections::HashSet<String>,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
@@ -204,6 +210,13 @@ pub(crate) enum SidebarHitTarget {
     /// `render_sidebar_toggle`, so it is hittable to collapse (expanded) AND to expand (collapsed).
     /// Client-local view state, flipped via `compositor.toggle_sidebar_collapsed()`.
     CollapsedSidebarToggle,
+    /// #22: the chevron column of a worktree-group PARENT row. A `Down(Left)` here toggles the
+    /// group's collapsed state in the client-local set (no server round-trip), handled in
+    /// `dispatch_composited_mouse_input` since it needs `&mut compositor`. A NON-chevron click on the
+    /// parent row stays `Workspace` (focus), matching the server's `mouse.rs` chevron geometry.
+    WorktreeChevron {
+        group_key: String,
+    },
     // item 1: composited-modal action buttons (centered ratatui modals).
     AddRemoteSubmit,
     AddRemoteCancel,
@@ -287,6 +300,7 @@ impl ClientCompositor {
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             sidebar_collapsed: false,
             prefix_armed: false,
+            collapsed_space_keys: std::collections::HashSet::new(),
             working_since: HashMap::new(),
         }
     }
@@ -339,6 +353,22 @@ impl ClientCompositor {
     /// SHARED renderer onto its narrow collapsed layout. Client-local; no server traffic.
     pub(crate) fn toggle_sidebar_collapsed(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+    }
+
+    /// #22: toggle a worktree group's collapsed state in the client-local set (no server round-trip,
+    /// since collapse of the aggregated multi-host view is a per-client display concern). Mirrors the
+    /// server's `mouse.rs` chevron toggle (remove if present, else insert). Fed into `from_model`.
+    pub(crate) fn toggle_collapsed_space_key(&mut self, key: String) {
+        if !self.collapsed_space_keys.remove(&key) {
+            self.collapsed_space_keys.insert(key);
+        }
+    }
+
+    /// #22: test accessor for the client-local collapsed worktree-group set, so the chevron-toggle
+    /// tests can assert the set's membership without reaching into the private field.
+    #[cfg(test)]
+    pub(crate) fn collapsed_space_keys_for_test(&self) -> &std::collections::HashSet<String> {
+        &self.collapsed_space_keys
     }
 
     /// Advance the single client-owned animation clock by `step`. Called ONLY from the
@@ -546,8 +576,10 @@ impl ClientCompositor {
             Instant::now(),
         );
         let sidebar_rect = snapshot.app.view.sidebar_rect;
-        let divider =
-            crate::ui::sidebar_section_divider_rect(sidebar_rect, snapshot.app.sidebar_section_split);
+        let divider = crate::ui::sidebar_section_divider_rect(
+            sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left)
@@ -600,8 +632,8 @@ impl ClientCompositor {
             return self.scrollbar_drag.take().map(|_| false);
         }
         let is_press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-        let is_drag =
-            matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) && self.scrollbar_drag.is_some();
+        let is_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))
+            && self.scrollbar_drag.is_some();
         if !is_press && !is_drag {
             return None;
         }
@@ -701,7 +733,9 @@ impl ClientCompositor {
         metrics: crate::pane::ScrollMetrics,
         offset_from_bottom: usize,
     ) -> bool {
-        let next = metrics.max_offset_from_bottom.saturating_sub(offset_from_bottom);
+        let next = metrics
+            .max_offset_from_bottom
+            .saturating_sub(offset_from_bottom);
         let changed = next != self.workspace_scroll;
         self.workspace_scroll = next;
         changed
@@ -713,7 +747,9 @@ impl ClientCompositor {
         metrics: crate::pane::ScrollMetrics,
         offset_from_bottom: usize,
     ) -> bool {
-        let next = metrics.max_offset_from_bottom.saturating_sub(offset_from_bottom);
+        let next = metrics
+            .max_offset_from_bottom
+            .saturating_sub(offset_from_bottom);
         let changed = next != self.agent_panel_scroll;
         self.agent_panel_scroll = next;
         changed
@@ -777,8 +813,13 @@ impl ClientCompositor {
                     // A plain click (no drag) already focused on the down-press; nothing to commit.
                     return WorkspaceReorderOutcome::Ignored;
                 }
-                match self.workspace_reorder_target(model, &press, mouse.row, host_width, host_height)
-                {
+                match self.workspace_reorder_target(
+                    model,
+                    &press,
+                    mouse.row,
+                    host_width,
+                    host_height,
+                ) {
                     Some(insert_index) => WorkspaceReorderOutcome::Commit {
                         server_id: press.server_id,
                         workspace_id: press.workspace_id,
@@ -1179,6 +1220,19 @@ impl ClientCompositor {
 
         for card in &snapshot.app.view.workspace_card_areas {
             if rect_contains(card.rect, x, y) {
+                // #22: a click in the chevron column (column 0 of a worktree-PARENT row) toggles the
+                // group's collapsed state instead of focusing. Reuses the SERVER's chevron geometry
+                // (`mouse.rs`: the chevron glyph is drawn at `card.rect.x`) and the SHARED
+                // `workspace_parent_group_state` (parent = a group with >=2 members, not a linked
+                // child). A NON-chevron click on the parent falls through to the `Workspace` focus
+                // arm below, so the body click still focuses (matches the server contract).
+                if x == card.rect.x {
+                    if let Some((group_key, _collapsed)) =
+                        crate::ui::workspace_parent_group_state(&snapshot.app, card.ws_idx)
+                    {
+                        return Some(SidebarHitTarget::WorktreeChevron { group_key });
+                    }
+                }
                 let route = snapshot.workspace_routes.get(card.ws_idx)?;
                 if route.disabled {
                     return None;
@@ -1407,6 +1461,11 @@ impl ClientSidebarSnapshot {
         // back. Collapsed keeps the normal sidebar width (mirrors the server: width is unchanged,
         // only the layout branches on this flag) — width 0 still means "no sidebar", never collapsed.
         app.sidebar_collapsed = compositor.sidebar_collapsed;
+        // #22: feed the client-local collapsed worktree-group keys into the SHARED grouping renderer
+        // BEFORE geometry is computed, so `workspace_list_entries` collapses the right groups and the
+        // chevron glyph renders the matching state. Client-owned (the aggregated view's collapse is a
+        // per-client display concern), unlike the server's persisted set.
+        app.collapsed_space_keys = compositor.collapsed_space_keys.clone();
         app.view.layout = ViewLayout::Desktop;
         app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
         app.view.terminal_area = Rect::new(
@@ -1511,13 +1570,28 @@ impl ClientSidebarSnapshot {
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| format!("client-sidebar-row-{idx}"));
-            let (workspace, _) = crate::workspace::Workspace::sidebar_placeholder(
+            let (mut workspace, _) = crate::workspace::Workspace::sidebar_placeholder(
                 workspace_id,
                 row.label.clone(),
                 row.branch.clone(),
                 pane_terminals,
                 focused_agent_idx,
             );
+            // #22: populate the placeholder's worktree grouping from the wire field so the SHARED
+            // `workspace_list_entries` groups worktree parents/children exactly like the server. The
+            // grouping renderer + `workspace_parent_group_state` only read `key` and
+            // `is_linked_worktree`; the path fields are display-only placeholders here (the client
+            // sidebar derives the child label from `branch`, not these paths).
+            workspace.worktree_space =
+                row.worktree_key
+                    .clone()
+                    .map(|key| crate::workspace::WorktreeSpaceMembership {
+                        key,
+                        label: row.label.clone(),
+                        repo_root: std::path::PathBuf::new(),
+                        checkout_path: std::path::PathBuf::new(),
+                        is_linked_worktree: row.worktree_is_linked,
+                    });
             app.workspaces.push(workspace);
             // item 4: mirror the per-row local/remote signal into AppState, index-aligned with
             // app.workspaces. Empty in monolithic mode (no rows), so monolithic emits no divider.
@@ -1653,7 +1727,11 @@ impl ClientSidebarSnapshot {
         // release would commit to. The insert slot is computed from the banner rects ONLY (via
         // `server_insert_index`), so it can never land inside a space block. Only one of
         // workspace_press/host_press is ever dragging, so this never fights the branch above.
-        if let Some(press) = compositor.host_press.as_ref().filter(|press| press.dragging) {
+        if let Some(press) = compositor
+            .host_press
+            .as_ref()
+            .filter(|press| press.dragging)
+        {
             if let Some(drop_row) = press.last_drag_row {
                 let source_host_idx = host_banner_server_ids
                     .iter()
@@ -2497,6 +2575,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: Some("master".into()),
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2511,6 +2590,7 @@ mod tests {
                         label: "api".into(),
                         branch: Some("feature/api".into()),
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -2590,6 +2670,7 @@ mod tests {
                         label: "api".into(),
                         branch: Some("feature/api".into()),
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2670,6 +2751,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2684,6 +2766,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -2815,6 +2898,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2859,12 +2943,14 @@ mod tests {
                             label: "one".into(),
                             branch: None,
                             focused: true,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-2".into(),
                             label: "two".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: vec![
@@ -2896,7 +2982,10 @@ mod tests {
         use crate::app::state::AgentPanelScope;
         let model = single_server_two_ws_model();
         let mut compositor = ClientCompositor::new(26);
-        assert_eq!(compositor.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
+        assert_eq!(
+            compositor.agent_panel_scope(),
+            AgentPanelScope::AllWorkspaces
+        );
 
         let snapshot =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
@@ -2965,6 +3054,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "main-agent".into(),
@@ -2986,6 +3076,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -3213,18 +3304,21 @@ mod tests {
                             label: "one".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-2".into(),
                             label: "two".into(),
                             branch: None,
                             focused: true,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-3".into(),
                             label: "three".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: Vec::new(),
@@ -3320,12 +3414,14 @@ mod tests {
                             label: "l1".into(),
                             branch: None,
                             focused: true,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "local-2".into(),
                             label: "l2".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: Vec::new(),
@@ -3342,12 +3438,14 @@ mod tests {
                             label: "r1".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "remote-2".into(),
                             label: "r2".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: Vec::new(),
@@ -3514,6 +3612,8 @@ mod tests {
                             label: label.into(),
                             branch: None,
                             focused,
+                            worktree_key: None,
+                            worktree_is_linked: false,
                         }],
                         agents: Vec::new(),
                     },
@@ -3553,7 +3653,12 @@ mod tests {
 
         // Banner rects in render order: [local, x, y].
         let snapshot = ClientSidebarSnapshot::from_model(
-            &model, &compositor, 26, host.0, host.1, Instant::now(),
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
         );
         let banner_y = |idx: usize| snapshot.app.view.host_banner_areas[idx].rect.y;
         let local_banner_y = banner_y(0);
@@ -3581,7 +3686,12 @@ mod tests {
         );
 
         let preview = ClientSidebarSnapshot::from_model(
-            &model, &compositor, 26, host.0, host.1, Instant::now(),
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
         );
         let (source_host_idx, insert_idx) = match preview.app.drag.as_ref().map(|d| &d.target) {
             Some(crate::app::state::DragTarget::HostReorder {
@@ -3612,7 +3722,12 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         let host = (60u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
-            &model, &compositor, 26, host.0, host.1, Instant::now(),
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
         );
         let local_banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
         let y_banner_rect = snapshot.app.view.host_banner_areas[2].rect;
@@ -3651,7 +3766,10 @@ mod tests {
             .iter()
             .map(|r| r.server_id.clone())
             .collect();
-        assert_eq!(before, vec![ServerId::main(), remote_x.clone(), remote_y.clone()]);
+        assert_eq!(
+            before,
+            vec![ServerId::main(), remote_x.clone(), remote_y.clone()]
+        );
         assert!(model.reorder_server(&source_server_id, insert_index));
         // workspace_rows() now reflects the new host order with Local last.
         let after: Vec<ServerId> = model
@@ -3672,7 +3790,12 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         let host = (60u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
-            &model, &compositor, 26, host.0, host.1, Instant::now(),
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
         );
         let banner_rects: Vec<Rect> = snapshot
             .app
@@ -3694,9 +3817,11 @@ mod tests {
         let area = snapshot.app.view.sidebar_rect;
         for drop_row in 0..host.1 {
             let insert_idx = server_insert_index(&banner_rects, drop_row);
-            if let Some(y) =
-                crate::ui::host_drop_indicator_row(&snapshot.app.view.host_banner_areas, area, insert_idx)
-            {
+            if let Some(y) = crate::ui::host_drop_indicator_row(
+                &snapshot.app.view.host_banner_areas,
+                area,
+                insert_idx,
+            ) {
                 assert!(
                     !card_rows.contains(&y),
                     "host drop indicator at row {y} fell inside a space block",
@@ -3713,7 +3838,12 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         let host = (60u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
-            &model, &compositor, 26, host.0, host.1, Instant::now(),
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
         );
 
         // A banner row hit-tests to HostBanner for the right host (banner idx 1 == remote_x).
@@ -3765,6 +3895,8 @@ mod tests {
                 label: format!("w{i}"),
                 branch: None,
                 focused: i == 0,
+                worktree_key: None,
+                worktree_is_linked: false,
             })
             .collect();
         model
@@ -3779,8 +3911,14 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         let host = (60u16, 16u16);
 
-        let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         let ws_area = crate::ui::workspace_list_rect(
             snapshot.app.view.sidebar_rect,
             snapshot.app.sidebar_section_split,
@@ -3872,6 +4010,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -3886,6 +4025,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4016,6 +4156,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4030,6 +4171,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -4107,6 +4249,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4182,6 +4325,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4196,6 +4340,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -4604,6 +4749,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: Some("master".into()),
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4618,6 +4764,7 @@ mod tests {
                         label: "api".into(),
                         branch: Some("feature/api".into()),
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -4945,6 +5092,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -5089,6 +5237,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -5318,6 +5467,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -5332,6 +5482,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -5362,12 +5513,14 @@ mod tests {
                             label: "herdr".into(),
                             branch: None,
                             focused: true,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-2".into(),
                             label: "two".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: vec![AgentSummary {
@@ -5407,8 +5560,14 @@ mod tests {
         let (model, _local, _agent) = collapsed_model();
         let compositor = ClientCompositor::new(26);
         let host = (60u16, 28u16);
-        let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
         assert!(rect.width > 0);
         assert_eq!(
@@ -5425,8 +5584,14 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
         let host = (60u16, 28u16);
-        let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         assert!(snap.app.sidebar_collapsed);
 
         let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
@@ -5437,8 +5602,14 @@ mod tests {
 
         // The mod.rs dispatch flips the compositor flag on this target.
         compositor.toggle_sidebar_collapsed();
-        let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         assert!(!snap.app.sidebar_collapsed);
     }
 
@@ -5450,8 +5621,14 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
         let host = (60u16, 28u16);
-        let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(snap.app.view.sidebar_rect);
         assert!(ws_area.width > 0 && ws_area.height > 0);
 
@@ -5481,10 +5658,15 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
         let host = (60u16, 28u16);
-        let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
-        let (_, _, detail_area) =
-            crate::ui::collapsed_sidebar_sections(snap.app.view.sidebar_rect);
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(snap.app.view.sidebar_rect);
         assert!(detail_area.width > 0 && detail_area.height > 1);
 
         // First agent-detail row of the selected (focused, index 0) workspace.
@@ -5501,6 +5683,162 @@ mod tests {
                     .is_some());
             }
             other => panic!("expected Agent target, got {other:?}"),
+        }
+    }
+
+    // #22: a worktree GROUP on the local server — a parent (non-linked) plus one linked child that
+    // share a worktree key, so the SHARED grouping renderer (`workspace_parent_group_state`) treats
+    // it as a collapsible group.
+    fn worktree_grouped_model() -> ClientSupervisorModel {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "parent".into(),
+                            label: "herdr".into(),
+                            branch: Some("master".into()),
+                            focused: true,
+                            worktree_key: Some("repo-key".into()),
+                            worktree_is_linked: false,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "child".into(),
+                            label: "herdr".into(),
+                            branch: Some("feature".into()),
+                            focused: false,
+                            worktree_key: Some("repo-key".into()),
+                            worktree_is_linked: true,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+    }
+
+    fn worktree_parent_card(
+        snapshot: &ClientSidebarSnapshot,
+    ) -> crate::app::state::WorkspaceCardArea {
+        snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| {
+                crate::ui::workspace_parent_group_state(&snapshot.app, card.ws_idx).is_some()
+            })
+            .cloned()
+            .expect("a worktree-parent card")
+    }
+
+    // #22: a click in the chevron column (column 0) of a worktree-parent row resolves to the chevron
+    // (NOT focus); toggling it flips the client-local collapsed set, and the next snapshot renders
+    // the group collapsed. Mirrors the server's `clicking_worktree_parent_chevron_toggles_group_only`.
+    #[test]
+    fn worktree_parent_chevron_hit_test_resolves_and_toggles_group() {
+        let model = worktree_grouped_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let parent = worktree_parent_card(&snapshot);
+        let (group_key, collapsed) =
+            crate::ui::workspace_parent_group_state(&snapshot.app, parent.ws_idx).unwrap();
+        assert!(!collapsed, "the group starts expanded");
+
+        let chevron_hit = compositor.hit_test(&model, parent.rect.x, parent.rect.y, host.0, host.1);
+        assert_eq!(
+            chevron_hit,
+            Some(SidebarHitTarget::WorktreeChevron {
+                group_key: group_key.clone()
+            })
+        );
+
+        compositor.toggle_collapsed_space_key(group_key.clone());
+        assert!(compositor
+            .collapsed_space_keys_for_test()
+            .contains(&group_key));
+        let collapsed_snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        assert_eq!(
+            crate::ui::workspace_parent_group_state(&collapsed_snap.app, parent.ws_idx)
+                .map(|(_, collapsed)| collapsed),
+            Some(true),
+            "the group renders collapsed after the toggle"
+        );
+        // A second toggle expands it again (server's remove-if-present contract).
+        compositor.toggle_collapsed_space_key(group_key.clone());
+        assert!(!compositor
+            .collapsed_space_keys_for_test()
+            .contains(&group_key));
+    }
+
+    // #22: a click on the parent row BODY (past the chevron column) focuses the workspace and never
+    // toggles the group. Mirrors `clicking_worktree_parent_row_focuses_workspace_without_toggling`.
+    #[test]
+    fn worktree_parent_body_click_focuses_without_toggling() {
+        let model = worktree_grouped_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let parent = worktree_parent_card(&snapshot);
+        let body_hit =
+            compositor.hit_test(&model, parent.rect.x + 2, parent.rect.y, host.0, host.1);
+        match body_hit {
+            Some(SidebarHitTarget::Workspace {
+                server_id,
+                workspace_id,
+            }) => {
+                assert_eq!(server_id, ServerId::main());
+                assert_eq!(workspace_id, "parent");
+            }
+            other => panic!("expected Workspace focus on a body click, got {other:?}"),
+        }
+    }
+
+    // #22: a standalone (ungrouped) workspace exposes no chevron — a column-0 click focuses it.
+    #[test]
+    fn standalone_workspace_has_no_chevron_hit() {
+        let model = single_server_two_ws_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        for card in &snapshot.app.view.workspace_card_areas {
+            let hit = compositor.hit_test(&model, card.rect.x, card.rect.y, host.0, host.1);
+            assert!(
+                !matches!(hit, Some(SidebarHitTarget::WorktreeChevron { .. })),
+                "standalone workspace must not expose a chevron hit region"
+            );
         }
     }
 }

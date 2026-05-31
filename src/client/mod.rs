@@ -500,10 +500,16 @@ fn sidebar_action_dispatch(
     // rename / close the focused workspace: open the #23 overlays (the existing overlay key-gate
     // then handles typing/confirm), reusing the supervisor opener methods the context menu uses.
     if matches(&keybinds.rename_workspace) {
-        return Some(open_focused_workspace_overlay(model, FocusedWorkspaceOverlay::Rename));
+        return Some(open_focused_workspace_overlay(
+            model,
+            FocusedWorkspaceOverlay::Rename,
+        ));
     }
     if matches(&keybinds.close_workspace) {
-        return Some(open_focused_workspace_overlay(model, FocusedWorkspaceOverlay::Close));
+        return Some(open_focused_workspace_overlay(
+            model,
+            FocusedWorkspaceOverlay::Close,
+        ));
     }
 
     // toggle sidebar collapse (#25) / agent-scope (#20): client-local compositor flips, no server
@@ -589,11 +595,7 @@ fn step_agent_focus(
 
 /// #24: pick the `delta`-step neighbour (with wraparound) of `current` in `targets`. When nothing
 /// is currently focused, a forward step lands on the first entry and a backward step on the last.
-fn step_focus_target<T: Clone>(
-    targets: &[T],
-    current: Option<usize>,
-    delta: isize,
-) -> Option<T> {
+fn step_focus_target<T: Clone>(targets: &[T], current: Option<usize>, delta: isize) -> Option<T> {
     if targets.is_empty() {
         return None;
     }
@@ -1059,6 +1061,17 @@ fn dispatch_composited_mouse_input(
                 ClientInputDispatch::Consumed
             };
         }
+        // #22: a chevron click toggles the worktree group's collapsed state in the client-local set
+        // (no server round-trip — the aggregated view's collapse is a per-client display concern).
+        // Handled here where `&mut compositor` is in scope (like the scope / collapse toggles).
+        if let compositor::SidebarHitTarget::WorktreeChevron { group_key } = &target {
+            return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                compositor.toggle_collapsed_space_key(group_key.clone());
+                ClientInputDispatch::Redraw
+            } else {
+                ClientInputDispatch::Consumed
+            };
+        }
         // #19: arm a drag-reorder on a workspace down-press. The click still focuses-on-down via
         // `dispatch_sidebar_hit_target` below; a subsequent drag promotes the press to a reorder.
         if let compositor::SidebarHitTarget::Workspace {
@@ -1194,6 +1207,9 @@ fn dispatch_sidebar_hit_target(
         // #25: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
         // arm only keeps the match exhaustive and is not reached in practice.
         compositor::SidebarHitTarget::CollapsedSidebarToggle => ClientInputDispatch::Consumed,
+        // #22: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
+        // arm only keeps the match exhaustive and is not reached in practice.
+        compositor::SidebarHitTarget::WorktreeChevron { .. } => ClientInputDispatch::Consumed,
         // #19 (host half): a host-banner press arms a host drag-reorder in
         // `dispatch_composited_mouse_input` (needs `&mut compositor`); the click itself focuses the
         // host's first workspace there too. This arm only keeps the match exhaustive.
@@ -5888,6 +5904,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: Some("master".into()),
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -5902,6 +5919,7 @@ mod tests {
                         label: "api".into(),
                         branch: Some("feature/api".into()),
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![supervisor::AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -6127,6 +6145,8 @@ mod tests {
                 label: format!("main-{idx}"),
                 branch: None,
                 focused: idx == 0,
+                worktree_key: None,
+                worktree_is_linked: false,
             })
             .collect();
         model
@@ -6145,6 +6165,8 @@ mod tests {
                 label: format!("remote-{idx}"),
                 branch: None,
                 focused: false,
+                worktree_key: None,
+                worktree_is_linked: false,
             })
             .collect();
         model
@@ -6345,10 +6367,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, keys_toml).unwrap();
-        let _env = EnvVarGuard::set(
-            crate::config::CONFIG_PATH_ENV_VAR,
-            path.to_str().unwrap(),
-        );
+        let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, path.to_str().unwrap());
         let result = body();
         std::fs::remove_file(&path).ok();
         result
@@ -6360,12 +6379,7 @@ mod tests {
         compositor: &mut compositor::ClientCompositor,
         model: &mut supervisor::ClientSupervisorModel,
     ) -> ClientInputDispatch {
-        dispatch_composited_input(
-            c.to_string().into_bytes(),
-            compositor,
-            model,
-            (60, 16),
-        )
+        dispatch_composited_input(c.to_string().into_bytes(), compositor, model, (60, 16))
     }
 
     // A next-workspace key (bound direct to `alt+n`) routed through `dispatch_composited_input`
@@ -6378,12 +6392,8 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
 
-            let dispatch = dispatch_composited_input(
-                b"\x1bn".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1bn".to_vec(), &mut compositor, &mut model, (60, 16));
 
             assert_eq!(
                 dispatch,
@@ -6412,12 +6422,8 @@ mod tests {
             let (mut model, remote_id) = mixed_remote_model();
             let mut compositor = compositor::ClientCompositor::new(26);
 
-            let dispatch = dispatch_composited_input(
-                b"\x1bp".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1bp".to_vec(), &mut compositor, &mut model, (60, 16));
 
             assert_eq!(
                 dispatch,
@@ -6446,12 +6452,8 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.new_workspace_picker().is_none());
 
-            let dispatch = dispatch_composited_input(
-                b"\x1bm".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1bm".to_vec(), &mut compositor, &mut model, (60, 16));
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             assert!(model.new_workspace_picker().is_some());
@@ -6466,12 +6468,8 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.rename_workspace_form().is_none());
 
-            let dispatch = dispatch_composited_input(
-                b"\x1br".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1br".to_vec(), &mut compositor, &mut model, (60, 16));
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             let form = model
@@ -6490,12 +6488,8 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.confirm_close_workspace().is_none());
 
-            let dispatch = dispatch_composited_input(
-                b"\x1bd".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1bd".to_vec(), &mut compositor, &mut model, (60, 16));
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             let confirm = model
@@ -6514,12 +6508,8 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(!compositor.sidebar_collapsed_for_test());
 
-            let dispatch = dispatch_composited_input(
-                b"\x1bb".to_vec(),
-                &mut compositor,
-                &mut model,
-                (60, 16),
-            );
+            let dispatch =
+                dispatch_composited_input(b"\x1bb".to_vec(), &mut compositor, &mut model, (60, 16));
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             assert!(compositor.sidebar_collapsed_for_test());
         });
@@ -6566,12 +6556,7 @@ mod tests {
 
                 // Press the prefix key (ctrl+b == 0x02): arms prefix mode, swallowed (Redraw).
                 assert_eq!(
-                    dispatch_composited_input(
-                        vec![0x02],
-                        &mut compositor,
-                        &mut model,
-                        (60, 16),
-                    ),
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16),),
                     ClientInputDispatch::Redraw
                 );
                 assert!(compositor.prefix_armed());
@@ -8221,6 +8206,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: Some("master".into()),
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -8235,6 +8221,7 @@ mod tests {
                         label: "api".into(),
                         branch: Some("feature/api".into()),
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![supervisor::AgentSummary {
                         agent_id: "remote-agent".into(),

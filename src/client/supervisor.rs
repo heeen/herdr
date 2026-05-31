@@ -91,12 +91,18 @@ pub(crate) struct ServerSummary {
     pub(crate) agents: Vec<AgentSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceSummary {
     pub(crate) workspace_id: String,
     pub(crate) label: String,
     pub(crate) branch: Option<String>,
     pub(crate) focused: bool,
+    // #22: worktree-grouping provenance, mirrored from the wire `WorkspaceInfo.worktree`. The
+    // client-rendered sidebar reuses the SERVER's grouping renderer, which only needs the group
+    // `key` (members sharing a key form a group) and whether this member is a linked worktree (the
+    // non-linked member is the group parent). `None` key = a standalone (ungrouped) workspace.
+    pub(crate) worktree_key: Option<String>,
+    pub(crate) worktree_is_linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +391,11 @@ pub(crate) struct WorkspaceSidebarRow {
     pub(crate) focused: bool,
     pub(crate) disabled: bool,
     pub(crate) is_remote: bool, // item 4: server.role == ServerRole::Secondary
+    // #22: worktree-grouping provenance threaded from the wire summary so `from_model` can populate
+    // each placeholder workspace's `worktree_space`, letting the SHARED grouping renderer group
+    // worktree parents/children. `None` for placeholder/unavailable rows (they never group).
+    pub(crate) worktree_key: Option<String>,
+    pub(crate) worktree_is_linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2021,7 +2032,11 @@ impl ClientSupervisorModel {
     /// (session-local; not persisted to the remote registry), so this only reorders the in-memory
     /// `servers` Vec and never round-trips to a server. `active_server_id` keeps pointing at the
     /// same host after the move. Returns whether the order actually changed.
-    pub(crate) fn reorder_server(&mut self, source_server_id: &ServerId, insert_index: usize) -> bool {
+    pub(crate) fn reorder_server(
+        &mut self,
+        source_server_id: &ServerId,
+        insert_index: usize,
+    ) -> bool {
         let Some(from) = self.servers.iter().position(|s| &s.id == source_server_id) else {
             return false;
         };
@@ -2205,6 +2220,8 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             focused: false,
             disabled: true,
             is_remote,
+            worktree_key: None,
+            worktree_is_linked: false,
         }];
     }
 
@@ -2217,6 +2234,8 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             focused: false,
             disabled: true,
             is_remote,
+            worktree_key: None,
+            worktree_is_linked: false,
         }];
     }
 
@@ -2232,6 +2251,9 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             focused: workspace.focused,
             disabled: server.connection_state != ConnectionState::Connected,
             is_remote,
+            // #22: thread the worktree group key + linked flag through to `from_model`.
+            worktree_key: workspace.worktree_key.clone(),
+            worktree_is_linked: workspace.worktree_is_linked,
         })
         .collect()
 }
@@ -2464,6 +2486,13 @@ impl ServerSummary {
                     label: workspace.label,
                     branch: workspace.branch,
                     focused: workspace.focused,
+                    // #22: carry the wire worktree group key + linked flag so the client's shared
+                    // sidebar grouping renderer can collapse/expand worktree groups.
+                    worktree_key: workspace.worktree.as_ref().map(|w| w.repo_key.clone()),
+                    worktree_is_linked: workspace
+                        .worktree
+                        .as_ref()
+                        .is_some_and(|w| w.is_linked_worktree),
                 })
                 .collect(),
             agents: agents
@@ -2661,6 +2690,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2689,6 +2719,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -2890,6 +2921,8 @@ mod tests {
                 focused: true,
                 disabled: false,
                 is_remote: false,
+                worktree_key: None,
+                worktree_is_linked: false,
             }]
         );
         // the client-owned global menu still offers add remote / manage remotes.
@@ -2946,6 +2979,8 @@ mod tests {
                     focused: true,
                     disabled: false,
                     is_remote: false,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-ssh"),
@@ -2955,6 +2990,8 @@ mod tests {
                     focused: false,
                     disabled: true,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -2964,6 +3001,8 @@ mod tests {
                     focused: false,
                     disabled: true,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
             ]
         );
@@ -3070,6 +3109,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -3101,6 +3141,8 @@ mod tests {
                     focused: true,
                     disabled: false,
                     is_remote: false,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id,
@@ -3110,6 +3152,8 @@ mod tests {
                     focused: false,
                     disabled: false,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
             ]
         );
@@ -3133,6 +3177,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 }),
@@ -3165,6 +3210,8 @@ mod tests {
                     focused: false,
                     disabled: true,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -3174,6 +3221,8 @@ mod tests {
                     focused: false,
                     disabled: false,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
             ]
         );
@@ -3550,6 +3599,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -3564,6 +3614,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -3581,6 +3632,8 @@ mod tests {
                     focused: true,
                     disabled: false,
                     is_remote: false,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id.clone(),
@@ -3592,6 +3645,8 @@ mod tests {
                     focused: false,
                     disabled: false,
                     is_remote: true,
+                    worktree_key: None,
+                    worktree_is_linked: false,
                 },
             ]
         );
@@ -3607,6 +3662,8 @@ mod tests {
                 focused: false,
                 disabled: false,
                 is_remote: true,
+                worktree_key: None,
+                worktree_is_linked: false,
             }]
         );
     }
@@ -3630,6 +3687,8 @@ mod tests {
                 focused: false,
                 disabled: true,
                 is_remote: true,
+                worktree_key: None,
+                worktree_is_linked: false,
             }]
         );
 
@@ -3644,6 +3703,8 @@ mod tests {
                 focused: false,
                 disabled: true,
                 is_remote: true,
+                worktree_key: None,
+                worktree_is_linked: false,
             }]
         );
     }
@@ -3667,6 +3728,8 @@ mod tests {
                 focused: false,
                 disabled: true,
                 is_remote: true,
+                worktree_key: None,
+                worktree_is_linked: false,
             }]
         );
     }
@@ -3685,6 +3748,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "main-agent".into(),
@@ -3705,6 +3769,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -3779,6 +3844,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -3822,6 +3888,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: vec![AgentSummary {
                         agent_id: "remote-agent".into(),
@@ -3906,12 +3973,14 @@ mod tests {
                             label: "api".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "remote-web".into(),
                             label: "web".into(),
                             branch: None,
                             focused: true,
+                            ..Default::default()
                         },
                     ],
                     agents: vec![AgentSummary {
@@ -4007,6 +4076,7 @@ mod tests {
                     label: "api".into(),
                     branch: None,
                     focused: false,
+                    ..Default::default()
                 }],
                 agents: Vec::new(),
             }),
@@ -4031,6 +4101,7 @@ mod tests {
                         label: "web".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4061,6 +4132,7 @@ mod tests {
                         label: "a".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4075,6 +4147,7 @@ mod tests {
                         label: "b".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4107,6 +4180,7 @@ mod tests {
                         label: "a".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4122,6 +4196,7 @@ mod tests {
                         label: "b".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4181,6 +4256,7 @@ mod tests {
                         label: "api".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4352,6 +4428,7 @@ mod tests {
                         label: "herdr".into(),
                         branch: None,
                         focused: true,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4369,12 +4446,14 @@ mod tests {
                             label: "a".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                         WorkspaceSummary {
                             workspace_id: "dev-b".into(),
                             label: "b".into(),
                             branch: None,
                             focused: false,
+                            ..Default::default()
                         },
                     ],
                     agents: Vec::new(),
@@ -4390,6 +4469,7 @@ mod tests {
                         label: "p".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4729,6 +4809,7 @@ mod tests {
                         label: "feature".into(),
                         branch: None,
                         focused: false,
+                        ..Default::default()
                     }],
                     agents: Vec::new(),
                 },
@@ -4842,7 +4923,10 @@ mod tests {
             model.rename_workspace_form().unwrap().error.is_some(),
             "empty label surfaces an inline error"
         );
-        assert!(model.rename_workspace_form().is_some(), "overlay stays open");
+        assert!(
+            model.rename_workspace_form().is_some(),
+            "overlay stays open"
+        );
     }
 
     #[test]
@@ -4856,7 +4940,9 @@ mod tests {
             model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
             WorkspaceContextOutcome::OpenConfirmClose
         );
-        let confirm = model.confirm_close_workspace().expect("confirm overlay open");
+        let confirm = model
+            .confirm_close_workspace()
+            .expect("confirm overlay open");
         assert_eq!(confirm.server_id, server_id);
         assert_eq!(confirm.workspace_id, "ws-1");
         assert_eq!(confirm.label, "feature");
