@@ -44,6 +44,8 @@ pub enum Method {
     WorkspaceRename(WorkspaceRenameParams),
     #[serde(rename = "workspace.close")]
     WorkspaceClose(WorkspaceTarget),
+    #[serde(rename = "workspace.reorder")]
+    WorkspaceReorder(WorkspaceReorderParams),
     #[serde(rename = "worktree.list")]
     WorktreeList(WorktreeListParams),
     #[serde(rename = "worktree.create")]
@@ -177,6 +179,15 @@ pub struct WorkspaceCreateParams {
 pub struct WorkspaceRenameParams {
     pub workspace_id: String,
     pub label: String,
+}
+
+/// #19: move `workspace_id` so it sits at `insert_index` in the server's workspace list. The index
+/// is an insert position into the list as it stands *before* the move (0..=len), matching the
+/// monolithic `AppState::move_workspace` contract. Clamped server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReorderParams {
+    pub workspace_id: String,
+    pub insert_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

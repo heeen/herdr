@@ -612,13 +612,38 @@ fn dispatch_composited_mouse_input(
         }
     }
 
-    if let Some((cols, rows)) =
+    if let Some(outcome) =
         compositor.handle_sidebar_resize_mouse(mouse, host_size.0, host_size.1, model.ui_settings())
     {
-        return if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
-            ClientInputDispatch::Resize { cols, rows }
-        } else {
+        // #26: the outcome decides resize vs redraw — a drag or a double-click reset changes the
+        // content width (resize the remote PTY); beginning/ending a drag only redraws.
+        return match outcome {
+            compositor::SidebarResizeOutcome::Resized(cols, rows) => {
+                ClientInputDispatch::Resize { cols, rows }
+            }
+            compositor::SidebarResizeOutcome::Redraw => ClientInputDispatch::Redraw,
+        };
+    }
+
+    // #16: the spaces↔agents section divider re-splits the sidebar locally (no content resize), so
+    // it is checked after the width divider (which wins at the shared corner column) and always
+    // redraws rather than resizing the remote PTY.
+    if compositor
+        .handle_sidebar_section_divider_mouse(model, mouse, host_size.0, host_size.1)
+        .is_some()
+    {
+        return ClientInputDispatch::Redraw;
+    }
+
+    // #21: scrollbar track-click + thumb-drag (client-local). Runs before the wheel handler and
+    // hit_test so a press on the scrollbar column scrolls instead of focusing the card beneath it.
+    if let Some(changed) =
+        compositor.handle_sidebar_scrollbar_mouse(model, mouse, host_size.0, host_size.1)
+    {
+        return if changed {
             ClientInputDispatch::Redraw
+        } else {
+            ClientInputDispatch::Consumed
         };
     }
 
@@ -632,9 +657,66 @@ fn dispatch_composited_mouse_input(
         };
     }
 
+    // #19: workspace drag-to-reorder. `Drag`/`Up` over the sidebar are otherwise swallowed by the
+    // sidebar-width guard below, so the tracker runs before `hit_test` (which only acts on
+    // `Down(Left)` anyway). The `Down` that arms the press is recorded in the Workspace hit arm
+    // below, where the click still focuses-on-down.
+    match compositor.handle_workspace_reorder_mouse(model, mouse, host_size.0, host_size.1) {
+        compositor::WorkspaceReorderOutcome::Dragging => return ClientInputDispatch::Redraw,
+        compositor::WorkspaceReorderOutcome::Commit {
+            server_id,
+            workspace_id,
+            insert_index,
+        } => {
+            return ClientInputDispatch::ApiRequest {
+                server_id,
+                // Reorder changes persisted server state; refresh the fleet so the new order shows.
+                refresh: ClientApiRefreshPolicy::Immediate,
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:workspace-reorder".into(),
+                    method: crate::api::schema::Method::WorkspaceReorder(
+                        crate::api::schema::WorkspaceReorderParams {
+                            workspace_id,
+                            insert_index,
+                        },
+                    ),
+                }),
+            };
+        }
+        compositor::WorkspaceReorderOutcome::Cancelled => return ClientInputDispatch::Consumed,
+        compositor::WorkspaceReorderOutcome::Ignored => {}
+    }
+
     if let Some(target) =
         compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
     {
+        // #20: the scope toggle mutates client-local compositor state (no server round-trip), so it
+        // is handled here where `&mut compositor` is in scope rather than in the model-only
+        // `dispatch_sidebar_hit_target`.
+        if matches!(target, compositor::SidebarHitTarget::AgentScopeToggle) {
+            return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                compositor.toggle_agent_panel_scope();
+                ClientInputDispatch::Redraw
+            } else {
+                ClientInputDispatch::Consumed
+            };
+        }
+        // #19: arm a drag-reorder on a workspace down-press. The click still focuses-on-down via
+        // `dispatch_sidebar_hit_target` below; a subsequent drag promotes the press to a reorder.
+        if let compositor::SidebarHitTarget::Workspace {
+            server_id,
+            workspace_id,
+        } = &target
+        {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                compositor.begin_workspace_press(
+                    server_id.clone(),
+                    workspace_id.clone(),
+                    mouse.column,
+                    mouse.row,
+                );
+            }
+        }
         return dispatch_sidebar_hit_target(target, model, mouse);
     }
 
@@ -740,6 +822,9 @@ fn dispatch_sidebar_hit_target(
             model.open_client_global_menu();
             ClientInputDispatch::Redraw
         }
+        // #20: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
+        // arm only keeps the match exhaustive and is not reached in practice.
+        compositor::SidebarHitTarget::AgentScopeToggle => ClientInputDispatch::Consumed,
         // item 1: composited-modal action buttons.
         compositor::SidebarHitTarget::AddRemoteSubmit => {
             // re-run the SAME empty-target validation as the Enter key by replaying an Enter

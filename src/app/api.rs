@@ -489,6 +489,9 @@ impl App {
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target)
             }
+            Method::WorkspaceReorder(params) => {
+                return self.handle_workspace_reorder(request.id, params)
+            }
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {
                 return self.handle_worktree_create(request.id, params);

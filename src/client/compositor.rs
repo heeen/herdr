@@ -18,13 +18,87 @@ use crate::terminal::{TerminalId, TerminalRuntimeRegistry, TerminalState};
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 
+/// #26: double-click window for the width-divider reset, matching the monolithic host's
+/// `DOUBLE_CLICK_WINDOW` (`src/app/input/mouse.rs`).
+const DIVIDER_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// #19: minimum pointer travel (in cells) before a workspace press becomes a drag-reorder, mirroring
+/// the monolithic host's `WORKSPACE_DRAG_THRESHOLD` (`src/app/input/mod.rs`).
+const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
+
+/// #21: which sidebar list a scrollbar drag is acting on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollbarPanel {
+    Workspace,
+    Agent,
+}
+
+/// #21: an in-progress scrollbar thumb drag (client-local). `grab_row_offset` keeps the grab point
+/// fixed under the pointer, matching the monolithic host's scrollbar drag.
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    panel: ScrollbarPanel,
+    grab_row_offset: u16,
+}
+
+/// #19: an in-progress press on a workspace card. A press that moves past `WORKSPACE_DRAG_THRESHOLD`
+/// becomes a drag-reorder; on release it commits a `workspace.reorder` to the owning server.
+#[derive(Clone)]
+struct WorkspacePress {
+    server_id: ServerId,
+    workspace_id: String,
+    origin_col: u16,
+    origin_row: u16,
+    dragging: bool,
+}
+
+/// #19: outcome of feeding a mouse event to the workspace drag-reorder tracker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceReorderOutcome {
+    /// Not part of a drag-reorder (caller continues its normal dispatch).
+    Ignored,
+    /// An active drag moved — the caller should redraw (drop indicator follows the pointer).
+    Dragging,
+    /// A drag was released over a valid slot — send `workspace.reorder` to `server_id`.
+    Commit {
+        server_id: ServerId,
+        workspace_id: String,
+        insert_index: usize,
+    },
+    /// A drag was released but resolved to no valid slot — swallow it (no request).
+    Cancelled,
+}
+
+/// Outcome of a width-divider mouse interaction. A change to the sidebar width changes the content
+/// area, so it must resize the remote PTY (`Resized`); merely beginning/ending a drag only needs a
+/// local redraw (`Redraw`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarResizeOutcome {
+    Redraw,
+    Resized(u16, u16),
+}
+
 pub(crate) struct ClientCompositor {
     sidebar_width: u16,
     workspace_scroll: usize,
     agent_panel_scroll: usize,
     resizing_sidebar: bool,
+    // #16: client-local spaces↔agents split override. `None` follows the server/settings default;
+    // `Some(ratio)` is a user drag. Fed into `from_model` and tracked while `resizing_section`.
+    section_split: Option<f32>,
+    resizing_section: bool,
+    // #26: instant of the last left-press on the width divider, for double-click reset detection.
+    last_divider_down: Option<Instant>,
+    // #19: in-progress press on a workspace card, promoted to a drag-reorder past the threshold.
+    workspace_press: Option<WorkspacePress>,
+    // #21: in-progress scrollbar thumb drag for the workspace or agent list.
+    scrollbar_drag: Option<ScrollbarDrag>,
     animation_tick: u32,                                  // item 5
     hover: Option<crate::app::state::SidebarHoverTarget>, // item 7
+    // #20: client-local agents-panel scope ("all" vs "current"). The server never owns this; it is
+    // a per-client view preference fed into the render snapshot (`from_model`) and used to scope
+    // the flat `agent_routes` so agent-row hit-testing stays aligned with the rendered entries.
+    agent_panel_scope: crate::app::state::AgentPanelScope,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
@@ -48,6 +122,9 @@ pub(crate) enum SidebarHitTarget {
     },
     New,
     Menu,
+    /// #20: the agents-panel "all"/"current" scope toggle. Client-local view state (no server
+    /// round-trip), handled in `dispatch_composited_mouse_input` since it needs `&mut compositor`.
+    AgentScopeToggle,
     // item 1: composited-modal action buttons (centered ratatui modals).
     AddRemoteSubmit,
     AddRemoteCancel,
@@ -98,14 +175,35 @@ impl ClientCompositor {
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             resizing_sidebar: false,
+            section_split: None,
+            resizing_section: false,
+            last_divider_down: None,
+            workspace_press: None,
+            scrollbar_drag: None,
             animation_tick: 0,
             hover: None,
+            agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             working_since: HashMap::new(),
         }
     }
 
     pub(crate) fn sidebar_width(&self) -> u16 {
         self.sidebar_width
+    }
+
+    pub(crate) fn agent_panel_scope(&self) -> crate::app::state::AgentPanelScope {
+        self.agent_panel_scope
+    }
+
+    /// #20: flip the agents-panel scope and reset the panel scroll, mirroring the monolithic
+    /// host's toggle handler (`src/app/input/mouse.rs:525`). Client-local; no server traffic.
+    pub(crate) fn toggle_agent_panel_scope(&mut self) {
+        use crate::app::state::AgentPanelScope;
+        self.agent_panel_scope = match self.agent_panel_scope {
+            AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
+            AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
+        };
+        self.agent_panel_scroll = 0;
     }
 
     /// Advance the single client-owned animation clock by `step`. Called ONLY from the
@@ -167,28 +265,53 @@ impl ClientCompositor {
         host_width: u16,
         host_height: u16,
         settings: &crate::api::schema::UiSettingsInfo,
-    ) -> Option<(u16, u16)> {
+    ) -> Option<SidebarResizeOutcome> {
         use crossterm::event::{MouseButton, MouseEventKind};
 
         let sidebar_width = self.effective_sidebar_width(host_width);
         let divider_col = sidebar_width.checked_sub(1)?;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if mouse.column == divider_col => {
-                self.resizing_sidebar = true;
-                Some(self.content_size(host_width, host_height))
+                // #26: a second press on the divider within the double-click window resets the
+                // width to the configured default (mirrors the host's divider double-click), rather
+                // than starting another drag. Clear the timestamp so a third click can't chain.
+                let now = Instant::now();
+                let double_click = self
+                    .last_divider_down
+                    .is_some_and(|prev| now.duration_since(prev) <= DIVIDER_DOUBLE_CLICK_WINDOW);
+                if double_click {
+                    self.resizing_sidebar = false;
+                    self.last_divider_down = None;
+                    self.sidebar_width = settings
+                        .sidebar_default_width
+                        .clamp(settings.sidebar_min_width, settings.sidebar_max_width);
+                    // The reset changes the content width, so the remote PTY must resize.
+                    let (cols, rows) = self.content_size(host_width, host_height);
+                    Some(SidebarResizeOutcome::Resized(cols, rows))
+                } else {
+                    self.resizing_sidebar = true;
+                    self.last_divider_down = Some(now);
+                    // Starting a drag does not change the width yet — only redraw.
+                    Some(SidebarResizeOutcome::Redraw)
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.resizing_sidebar => {
+                // #26: a drag is a resize gesture, not part of a double-click — clear the press
+                // timestamp so the next press starts a fresh double-click window (a press → drag →
+                // press sequence must NOT reset to default).
+                self.last_divider_down = None;
                 self.set_sidebar_width_from_column(
                     mouse.column,
                     host_width,
                     settings.sidebar_min_width,
                     settings.sidebar_max_width,
                 );
-                Some(self.content_size(host_width, host_height))
+                let (cols, rows) = self.content_size(host_width, host_height);
+                Some(SidebarResizeOutcome::Resized(cols, rows))
             }
             MouseEventKind::Up(MouseButton::Left) if self.resizing_sidebar => {
                 self.resizing_sidebar = false;
-                Some(self.content_size(host_width, host_height))
+                Some(SidebarResizeOutcome::Redraw)
             }
             _ => None,
         }
@@ -256,6 +379,328 @@ impl ClientCompositor {
         let changed = next != snapshot.app.workspace_scroll;
         self.workspace_scroll = next;
         Some(changed)
+    }
+
+    /// #16: drag the spaces↔agents section divider, mirroring the monolithic host's
+    /// `on_sidebar_section_divider` + `set_sidebar_section_split` (`src/app/input/`). Client-local
+    /// (no server traffic): it only re-splits the sidebar's two panels, the content area is
+    /// unchanged, so the caller redraws rather than resizing the remote PTY. Returns `Some(true)`
+    /// when it owned the event (Down on the divider, or Drag/Up while dragging), else `None`.
+    pub(crate) fn handle_sidebar_section_divider_mouse(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<bool> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 {
+            return None;
+        }
+        // Resolve the divider row from the SAME rendered geometry the renderer uses, so a click
+        // lands on exactly the drawn divider (render == hit_test). `sidebar_rect`/`split` are Copy,
+        // so the snapshot borrow ends here and the match below can mutate `self`.
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let sidebar_rect = snapshot.app.view.sidebar_rect;
+        let divider =
+            crate::ui::sidebar_section_divider_rect(sidebar_rect, snapshot.app.sidebar_section_split);
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if rect_contains(divider, mouse.column, mouse.row) =>
+            {
+                self.resizing_section = true;
+                self.set_section_split_from_row(sidebar_rect, mouse.row);
+                Some(true)
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.resizing_section => {
+                self.set_section_split_from_row(sidebar_rect, mouse.row);
+                Some(true)
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.resizing_section => {
+                self.resizing_section = false;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// #16: set the section split from an absolute row, clamped 0.1..0.9 (mirrors the host's
+    /// `set_sidebar_section_split`). Requires a tall-enough sidebar (>= 6 rows), matching
+    /// `sidebar_section_divider_rect`'s guard.
+    fn set_section_split_from_row(&mut self, sidebar_rect: Rect, row: u16) {
+        let content_height = sidebar_rect.height;
+        if content_height < 6 {
+            return;
+        }
+        let relative_y = row.saturating_sub(sidebar_rect.y);
+        let ratio = (relative_y as f32) / (content_height as f32);
+        self.section_split = Some(ratio.clamp(0.1, 0.9));
+    }
+
+    /// #21: scrollbar track-click + thumb-drag for the workspace and agent lists (client-local; the
+    /// scroll offsets already live on the compositor). A `Down` on a thumb starts a drag, a `Down`
+    /// on the track pages to that position, a `Drag` moves the active thumb, and `Up` ends it.
+    /// Returns `Some(changed)` when it owned the event, else `None` (caller continues dispatch).
+    pub(crate) fn handle_sidebar_scrollbar_mouse(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<bool> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // A release always ends an active drag, regardless of geometry.
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            return self.scrollbar_drag.take().map(|_| false);
+        }
+        let is_press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        let is_drag =
+            matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) && self.scrollbar_drag.is_some();
+        if !is_press && !is_drag {
+            return None;
+        }
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 {
+            return None;
+        }
+
+        // Snapshot geometry/metrics are Copy, so the immutable borrow of `self` (via `from_model`)
+        // ends here and the offset writes below can mutate `self`.
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let ws_area = crate::ui::workspace_list_rect(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        let (_, agent_area) = crate::ui::expanded_sidebar_sections(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        let ws_track = crate::ui::workspace_list_scrollbar_rect(&snapshot.app, ws_area);
+        let agent_track = crate::ui::agent_panel_scrollbar_rect(&snapshot.app, agent_area);
+        let ws_metrics = crate::ui::workspace_list_scroll_metrics(&snapshot.app, ws_area);
+        let agent_metrics = crate::ui::agent_panel_scroll_metrics(&snapshot.app, agent_area);
+
+        if is_press {
+            if let Some(track) = ws_track {
+                if rect_contains(track, mouse.column, mouse.row) {
+                    if let Some(grab) =
+                        crate::ui::scrollbar_thumb_grab_offset(ws_metrics, track, mouse.row)
+                    {
+                        self.scrollbar_drag = Some(ScrollbarDrag {
+                            panel: ScrollbarPanel::Workspace,
+                            grab_row_offset: grab,
+                        });
+                        return Some(false);
+                    }
+                    let offset = crate::ui::scrollbar_offset_from_row(ws_metrics, track, mouse.row);
+                    return Some(self.set_workspace_scroll_from_bottom(ws_metrics, offset));
+                }
+            }
+            if let Some(track) = agent_track {
+                if rect_contains(track, mouse.column, mouse.row) {
+                    if let Some(grab) =
+                        crate::ui::scrollbar_thumb_grab_offset(agent_metrics, track, mouse.row)
+                    {
+                        self.scrollbar_drag = Some(ScrollbarDrag {
+                            panel: ScrollbarPanel::Agent,
+                            grab_row_offset: grab,
+                        });
+                        return Some(false);
+                    }
+                    let offset =
+                        crate::ui::scrollbar_offset_from_row(agent_metrics, track, mouse.row);
+                    return Some(self.set_agent_scroll_from_bottom(agent_metrics, offset));
+                }
+            }
+            return None;
+        }
+
+        // is_drag: move the active thumb, keeping the grab point under the pointer.
+        let drag = self.scrollbar_drag?;
+        match drag.panel {
+            ScrollbarPanel::Workspace => {
+                let track = ws_track?;
+                let offset = crate::ui::scrollbar_offset_from_drag_row(
+                    ws_metrics,
+                    track,
+                    mouse.row,
+                    drag.grab_row_offset,
+                );
+                Some(self.set_workspace_scroll_from_bottom(ws_metrics, offset))
+            }
+            ScrollbarPanel::Agent => {
+                let track = agent_track?;
+                let offset = crate::ui::scrollbar_offset_from_drag_row(
+                    agent_metrics,
+                    track,
+                    mouse.row,
+                    drag.grab_row_offset,
+                );
+                Some(self.set_agent_scroll_from_bottom(agent_metrics, offset))
+            }
+        }
+    }
+
+    /// #21: convert a scrollbar `offset_from_bottom` to the workspace scroll offset and store it,
+    /// mirroring the host's `set_workspace_list_offset_from_bottom`. Returns whether it changed.
+    fn set_workspace_scroll_from_bottom(
+        &mut self,
+        metrics: crate::pane::ScrollMetrics,
+        offset_from_bottom: usize,
+    ) -> bool {
+        let next = metrics.max_offset_from_bottom.saturating_sub(offset_from_bottom);
+        let changed = next != self.workspace_scroll;
+        self.workspace_scroll = next;
+        changed
+    }
+
+    /// #21: agent-panel sibling of `set_workspace_scroll_from_bottom`.
+    fn set_agent_scroll_from_bottom(
+        &mut self,
+        metrics: crate::pane::ScrollMetrics,
+        offset_from_bottom: usize,
+    ) -> bool {
+        let next = metrics.max_offset_from_bottom.saturating_sub(offset_from_bottom);
+        let changed = next != self.agent_panel_scroll;
+        self.agent_panel_scroll = next;
+        changed
+    }
+
+    /// #19: record a press on a workspace card (called when a `Down(Left)` hit-tests to a
+    /// workspace). The click still focuses immediately (focus-on-down, unchanged); this only arms a
+    /// potential drag-reorder that commits on release.
+    pub(crate) fn begin_workspace_press(
+        &mut self,
+        server_id: ServerId,
+        workspace_id: String,
+        col: u16,
+        row: u16,
+    ) {
+        self.workspace_press = Some(WorkspacePress {
+            server_id,
+            workspace_id,
+            origin_col: col,
+            origin_row: row,
+            dragging: false,
+        });
+    }
+
+    /// #19: feed a `Drag`/`Up` to the workspace drag-reorder tracker. `Down` is recorded separately
+    /// via `begin_workspace_press` (so the click can still focus). Returns `Ignored` for everything
+    /// that is not an active drag, so the caller falls through to its normal dispatch.
+    pub(crate) fn handle_workspace_reorder_mouse(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> WorkspaceReorderOutcome {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(press) = self.workspace_press.as_mut() else {
+                    return WorkspaceReorderOutcome::Ignored;
+                };
+                let moved = mouse
+                    .column
+                    .abs_diff(press.origin_col)
+                    .max(mouse.row.abs_diff(press.origin_row));
+                if !press.dragging && moved < WORKSPACE_DRAG_THRESHOLD {
+                    return WorkspaceReorderOutcome::Ignored;
+                }
+                press.dragging = true;
+                WorkspaceReorderOutcome::Dragging
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(press) = self.workspace_press.take() else {
+                    return WorkspaceReorderOutcome::Ignored;
+                };
+                if !press.dragging {
+                    // A plain click (no drag) already focused on the down-press; nothing to commit.
+                    return WorkspaceReorderOutcome::Ignored;
+                }
+                match self.workspace_reorder_target(model, &press, mouse.row, host_width, host_height)
+                {
+                    Some(insert_index) => WorkspaceReorderOutcome::Commit {
+                        server_id: press.server_id,
+                        workspace_id: press.workspace_id,
+                        insert_index,
+                    },
+                    None => WorkspaceReorderOutcome::Cancelled,
+                }
+            }
+            _ => WorkspaceReorderOutcome::Ignored,
+        }
+    }
+
+    /// #19: resolve a drop row to an insert position within the pressed server's workspace list.
+    /// Reorder is constrained to the source server's rows (a workspace belongs to exactly one
+    /// server), so the index is the count of that server's cards whose midpoint sits above the drop
+    /// row — a 0..=len insert position matching the monolithic `move_workspace` contract.
+    fn workspace_reorder_target(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        press: &WorkspacePress,
+        drop_row: u16,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<usize> {
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        // The pressed server's cards, in render order (== the server's stored workspace order).
+        let server_rects: Vec<Rect> = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .filter_map(|card| {
+                let route = snapshot.workspace_routes.get(card.ws_idx)?;
+                (route.server_id == press.server_id && route.workspace_id.is_some())
+                    .then_some(card.rect)
+            })
+            .collect();
+        if server_rects.is_empty() {
+            return None;
+        }
+        let mut insert = 0usize;
+        for rect in &server_rects {
+            let midpoint = rect.y.saturating_add(rect.height / 2);
+            if drop_row > midpoint {
+                insert += 1;
+            } else {
+                break;
+            }
+        }
+        Some(insert.min(server_rects.len()))
     }
 
     fn set_sidebar_width_from_column(
@@ -462,6 +907,14 @@ impl ClientCompositor {
             }
         }
 
+        // #20: the agents-panel scope toggle sits in the panel header; resolve it before the
+        // entry rows so a click on "all"/"current" toggles scope instead of focusing an agent.
+        // Geometry is the SAME helper the renderer uses (`agent_panel_toggle_rect` over the
+        // `expanded_sidebar_sections` detail area), so render == hit_test.
+        if rect_contains(agent_panel_toggle_hit_rect(&snapshot.app), x, y) {
+            return Some(SidebarHitTarget::AgentScopeToggle);
+        }
+
         hit_test_agent_panel(&snapshot, x, y)
     }
 
@@ -579,6 +1032,12 @@ impl ClientCompositor {
             }
         }
 
+        // #20: hover the scope toggle (matches the monolithic host's `resolve_sidebar_hover`
+        // `ScopeToggle` arm). Same geometry as `hit_test` so hover and click agree.
+        if rect_contains(agent_panel_toggle_hit_rect(&snapshot.app), x, y) {
+            return Some(SidebarHoverTarget::ScopeToggle);
+        }
+
         hover_test_agent_panel(&snapshot, x, y)
     }
 
@@ -645,7 +1104,14 @@ impl ClientSidebarSnapshot {
         app.default_sidebar_width = settings.sidebar_default_width;
         app.sidebar_min_width = settings.sidebar_min_width;
         app.sidebar_max_width = settings.sidebar_max_width;
-        app.sidebar_section_split = settings.sidebar_section_split();
+        // #16: a client drag on the section divider overrides the settings default; otherwise
+        // follow the server-provided default split.
+        app.sidebar_section_split = compositor
+            .section_split
+            .unwrap_or_else(|| settings.sidebar_section_split());
+        // #20: client-local scope drives both the rendered entries and the scroll-metric clamp
+        // below, so it must be set before `agent_panel_scroll_metrics` is consulted.
+        app.agent_panel_scope = compositor.agent_panel_scope;
         app.sidebar_space = settings.sidebar_spaces.clone();
         app.sidebar_agent = settings.sidebar_agents.clone();
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
@@ -678,7 +1144,9 @@ impl ClientSidebarSnapshot {
         }
 
         let mut workspace_routes = Vec::new();
-        let mut agent_routes = Vec::new();
+        // #20: collect routes per-workspace so the flat `agent_routes` can be assembled to match
+        // the rendered entries under the active scope (all workspaces vs the current one only).
+        let mut per_ws_agent_routes: Vec<Vec<AgentRoute>> = Vec::new();
         let mut active_idx = None;
         let workspace_rows = model.workspace_rows();
         for (idx, row) in workspace_rows.into_iter().enumerate() {
@@ -695,6 +1163,7 @@ impl ClientSidebarSnapshot {
             }
 
             let mut pane_terminals = Vec::new();
+            let mut ws_agent_routes = Vec::new();
             for agent in &agents {
                 let terminal_id = TerminalId::alloc();
                 let (state, seen) = agent_state_from_status(&agent.status);
@@ -726,7 +1195,7 @@ impl ClientSidebarSnapshot {
                 }
                 app.terminals.insert(terminal_id.clone(), terminal);
                 pane_terminals.push((terminal_id, seen));
-                agent_routes.push(AgentRoute {
+                ws_agent_routes.push(AgentRoute {
                     server_id: row.server_id.clone(),
                     agent_id: agent.agent_id.clone(),
                 });
@@ -747,6 +1216,9 @@ impl ClientSidebarSnapshot {
             // item 4: mirror the per-row local/remote signal into AppState, index-aligned with
             // app.workspaces. Empty in monolithic mode (no rows), so monolithic emits no divider.
             app.client_workspace_remote.push(row.is_remote);
+            // #20: index-aligned with `app.workspaces` so the current-workspace scope can pick its
+            // slice below.
+            per_ws_agent_routes.push(ws_agent_routes);
             workspace_routes.push(WorkspaceRoute {
                 server_id: row.server_id,
                 workspace_id: row.workspace_id,
@@ -759,6 +1231,22 @@ impl ClientSidebarSnapshot {
             app.active = Some(selected);
             app.selected = selected;
         }
+
+        // #20: flatten the per-workspace routes to match the entries `agent_panel_entries` renders
+        // under the active scope. `AllWorkspaces` concatenates every workspace's agents in row
+        // order (== the renderer's iteration); `CurrentWorkspace` keeps only the current
+        // workspace's slice. The snapshot mode is always Navigate/GlobalMenu, so the renderer's
+        // `agent_panel_current_workspace_idx` resolves to `app.selected` — mirror that here so the
+        // flat `agent_routes` index stays aligned with `hit_test_agent_panel`.
+        let agent_routes: Vec<AgentRoute> = match app.agent_panel_scope {
+            crate::app::state::AgentPanelScope::CurrentWorkspace => per_ws_agent_routes
+                .get(app.selected)
+                .cloned()
+                .unwrap_or_default(),
+            crate::app::state::AgentPanelScope::AllWorkspaces => {
+                per_ws_agent_routes.into_iter().flatten().collect()
+            }
+        };
         app.workspace_scroll = crate::ui::normalized_workspace_scroll(
             &app,
             app.view.sidebar_rect,
@@ -1184,6 +1672,15 @@ fn global_menu_item_index_at(app: &crate::app::AppState, x: u16, y: u16) -> Opti
 fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<SidebarHitTarget> {
     global_menu_item_index_at(app, x, y)
         .map(|index| SidebarHitTarget::ClientGlobalMenuItem { index })
+}
+
+/// #20: the rect of the agents-panel "all"/"current" toggle in the rendered snapshot, derived from
+/// the SAME `expanded_sidebar_sections` detail area + `agent_panel_toggle_rect` the renderer uses
+/// (`render_agent_detail`). Returns an empty rect when the panel is too short to draw the toggle.
+fn agent_panel_toggle_hit_rect(app: &crate::app::AppState) -> Rect {
+    let (_, detail_area) =
+        crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+    crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_scope)
 }
 
 fn hit_test_agent_panel(
@@ -1740,6 +2237,406 @@ mod tests {
         let compositor = ClientCompositor::new(26);
 
         assert_eq!(compositor.hit_test(&model, 1, 2, 60, 16), None);
+    }
+
+    /// #16/#20/#26: a single local server with two workspaces, each owning one agent. ws-1 is
+    /// focused (→ the snapshot's active/selected workspace), so it exercises both the
+    /// `CurrentWorkspace` scope slice and the section-divider/divider-reset geometry without the
+    /// host-banner rows a secondary server would add.
+    fn single_server_two_ws_model() -> ClientSupervisorModel {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "ws-1".into(),
+                            label: "one".into(),
+                            branch: None,
+                            focused: true,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-2".into(),
+                            label: "two".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                    ],
+                    agents: vec![
+                        AgentSummary {
+                            agent_id: "agent-1".into(),
+                            workspace_id: "ws-1".into(),
+                            label: "claude".into(),
+                            status: "idle".into(),
+                            focused: false,
+                        },
+                        AgentSummary {
+                            agent_id: "agent-2".into(),
+                            workspace_id: "ws-2".into(),
+                            label: "codex".into(),
+                            status: "idle".into(),
+                            focused: false,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        model
+    }
+
+    // #20: the agents-panel "all"/"current" toggle resolves to `AgentScopeToggle`, and toggling it
+    // flips the compositor's client-local scope and zeroes the panel scroll.
+    #[test]
+    fn scope_toggle_hit_test_resolves_and_toggles_scope() {
+        use crate::app::state::AgentPanelScope;
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        assert_eq!(compositor.agent_panel_scope(), AgentPanelScope::AllWorkspaces);
+
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        let rect = agent_panel_toggle_hit_rect(&snapshot.app);
+        assert!(rect.width > 0, "the scope toggle should be drawn");
+        assert_eq!(
+            compositor.hit_test(&model, rect.x, rect.y, 60, 28),
+            Some(SidebarHitTarget::AgentScopeToggle)
+        );
+
+        compositor.agent_panel_scroll = 3;
+        compositor.toggle_agent_panel_scope();
+        assert_eq!(
+            compositor.agent_panel_scope(),
+            AgentPanelScope::CurrentWorkspace
+        );
+        assert_eq!(compositor.agent_panel_scroll, 0);
+    }
+
+    // #20: under `CurrentWorkspace` scope, the agent panel only renders the active workspace's
+    // agents, and the flat `agent_routes` stays aligned so an agent-row hit resolves correctly.
+    #[test]
+    fn current_scope_limits_agent_routes_to_active_workspace() {
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+
+        // AllWorkspaces: both agents have routes.
+        let all =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        assert_eq!(all.agent_routes.len(), 2);
+
+        // CurrentWorkspace: only the active workspace's (ws-1) agent route remains.
+        compositor.toggle_agent_panel_scope();
+        let current =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        assert_eq!(current.agent_routes.len(), 1);
+        assert_eq!(current.agent_routes[0].agent_id, "agent-1");
+    }
+
+    // #16: dragging the spaces↔agents section divider sets a client-local split override that
+    // grows the workspace section as the divider moves down.
+    #[test]
+    fn section_divider_drag_sets_local_split() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        assert!(compositor.section_split.is_none());
+
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        let divider = crate::ui::sidebar_section_divider_rect(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        assert!(divider.width > 0, "the section divider should be drawn");
+
+        let ev = |kind, row| crossterm::event::MouseEvent {
+            kind,
+            column: divider.x,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(
+            compositor.handle_sidebar_section_divider_mouse(
+                &model,
+                &ev(MouseEventKind::Down(MouseButton::Left), divider.y),
+                60,
+                28,
+            ),
+            Some(true)
+        );
+        let after_press = compositor.section_split.expect("press sets a split");
+        assert_eq!(
+            compositor.handle_sidebar_section_divider_mouse(
+                &model,
+                &ev(MouseEventKind::Drag(MouseButton::Left), divider.y + 2),
+                60,
+                28,
+            ),
+            Some(true)
+        );
+        let after_drag = compositor.section_split.expect("drag keeps a split");
+        assert!(
+            after_drag > after_press,
+            "dragging down increases the workspace ratio ({after_press} -> {after_drag})"
+        );
+
+        // Release ends the drag; a later drag with no active drag is ignored.
+        assert_eq!(
+            compositor.handle_sidebar_section_divider_mouse(
+                &model,
+                &ev(MouseEventKind::Up(MouseButton::Left), divider.y + 2),
+                60,
+                28,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            compositor.handle_sidebar_section_divider_mouse(
+                &model,
+                &ev(MouseEventKind::Drag(MouseButton::Left), divider.y + 4),
+                60,
+                28,
+            ),
+            None
+        );
+    }
+
+    // #26: a second divider press within the double-click window resets the width to the default
+    // and reports a content resize; the first press only starts a drag (redraw).
+    #[test]
+    fn divider_double_click_resets_width_to_default() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        let settings = model.ui_settings();
+
+        // The divider sits at the rightmost sidebar column (`sidebar_width - 1`); a press only
+        // registers when it lands on that exact column, which moves as the width changes.
+        let press = |column: u16| crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        assert_eq!(
+            compositor.handle_sidebar_resize_mouse(&press(25), 80, 24, settings),
+            Some(SidebarResizeOutcome::Redraw)
+        );
+        assert_eq!(compositor.sidebar_width(), 26);
+
+        // Drag narrower → the divider (and thus the press column) moves to col 18.
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 18,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(matches!(
+            compositor.handle_sidebar_resize_mouse(&drag, 80, 24, settings),
+            Some(SidebarResizeOutcome::Resized(..))
+        ));
+        assert_eq!(compositor.sidebar_width(), 19);
+
+        // Two quick presses on the NEW divider column (18) → reset to default, reported as a
+        // resize. The drag cleared the press timestamp, so the first of these starts a fresh
+        // double-click window (redraw) and the second triggers the reset.
+        assert_eq!(
+            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings),
+            Some(SidebarResizeOutcome::Redraw)
+        );
+        assert!(matches!(
+            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings),
+            Some(SidebarResizeOutcome::Resized(..))
+        ));
+        assert_eq!(
+            compositor.sidebar_width(),
+            settings
+                .sidebar_default_width
+                .clamp(settings.sidebar_min_width, settings.sidebar_max_width)
+        );
+    }
+
+    // #19: pressing a workspace card and dragging past the threshold to another card's row, then
+    // releasing, commits a `workspace.reorder` with the drop position within the owning server.
+    #[test]
+    fn workspace_drag_reorder_commits_insert_index() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let card = |ws_idx: usize| {
+            snapshot
+                .app
+                .view
+                .workspace_card_areas
+                .iter()
+                .find(|c| c.ws_idx == ws_idx)
+                .expect("card")
+                .rect
+        };
+        let ws1_row = card(0).y;
+        let ws2_row = card(1).y;
+
+        // Arm the press on ws-2 (the second workspace), like the Down hit arm does.
+        compositor.begin_workspace_press(ServerId::main(), "ws-2".into(), 1, ws2_row);
+
+        // Drag up onto ws-1's row.
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: ws1_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &drag, host.0, host.1),
+            WorkspaceReorderOutcome::Dragging
+        );
+
+        // Release on ws-1's row → reorder ws-2 to index 0 within the (single) server's list.
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 1,
+            row: ws1_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &up, host.0, host.1),
+            WorkspaceReorderOutcome::Commit {
+                server_id: ServerId::main(),
+                workspace_id: "ws-2".into(),
+                insert_index: 0,
+            }
+        );
+    }
+
+    // #19: a press with no drag (sub-threshold) is not a reorder — release is `Ignored` so the
+    // focus-on-down click stands.
+    #[test]
+    fn workspace_press_without_drag_is_not_a_reorder() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+
+        compositor.begin_workspace_press(ServerId::main(), "ws-2".into(), 1, 5);
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 1,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &up, host.0, host.1),
+            WorkspaceReorderOutcome::Ignored
+        );
+    }
+
+    // #21: pressing the workspace scrollbar thumb and dragging it down scrolls the list; release
+    // ends the drag and a later drag is no longer owned.
+    #[test]
+    fn workspace_scrollbar_thumb_drag_scrolls_list() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut model = ClientSupervisorModel::new("local");
+        let workspaces: Vec<_> = (0..20)
+            .map(|i| WorkspaceSummary {
+                workspace_id: format!("ws-{i}"),
+                label: format!("w{i}"),
+                branch: None,
+                focused: i == 0,
+            })
+            .collect();
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces,
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let ws_area = crate::ui::workspace_list_rect(
+            snapshot.app.view.sidebar_rect,
+            snapshot.app.sidebar_section_split,
+        );
+        let track = crate::ui::workspace_list_scrollbar_rect(&snapshot.app, ws_area)
+            .expect("a long list shows the scrollbar");
+        assert!(track.height >= 2);
+
+        let ev = |kind, row| crossterm::event::MouseEvent {
+            kind,
+            column: track.x,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Press the thumb (top of track at scroll 0) → starts a drag, no movement yet.
+        assert_eq!(
+            compositor.handle_sidebar_scrollbar_mouse(
+                &model,
+                &ev(MouseEventKind::Down(MouseButton::Left), track.y),
+                host.0,
+                host.1,
+            ),
+            Some(false)
+        );
+        assert_eq!(compositor.workspace_scroll, 0);
+
+        // Drag to the bottom of the track → scrolls down.
+        assert_eq!(
+            compositor.handle_sidebar_scrollbar_mouse(
+                &model,
+                &ev(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    track.y + track.height - 1,
+                ),
+                host.0,
+                host.1,
+            ),
+            Some(true)
+        );
+        assert!(compositor.workspace_scroll > 0);
+
+        // Release ends the drag; a later drag is no longer owned by the scrollbar.
+        assert_eq!(
+            compositor.handle_sidebar_scrollbar_mouse(
+                &model,
+                &ev(
+                    MouseEventKind::Up(MouseButton::Left),
+                    track.y + track.height - 1,
+                ),
+                host.0,
+                host.1,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            compositor.handle_sidebar_scrollbar_mouse(
+                &model,
+                &ev(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    track.y + track.height - 1,
+                ),
+                host.0,
+                host.1,
+            ),
+            None
+        );
     }
 
     // item 4: a [Main, Secondary] model with workspaces on both sides.
