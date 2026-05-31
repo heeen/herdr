@@ -164,6 +164,11 @@ pub(crate) struct ClientCompositor {
     // view preference fed into `from_model` (sets `app.sidebar_collapsed`) so the SHARED renderer
     // branches to the narrow collapsed layout and `hit_test` reads the collapsed geometry.
     sidebar_collapsed: bool,
+    // #24: client-local prefix-mode flag. Mirrors the server's `Mode::Prefix` state machine so the
+    // configured prefix key (a modified chord, e.g. `ctrl+b`) arms interception of the very next
+    // key for prefix-bound sidebar-nav actions. Bare keys are never intercepted unless armed, so
+    // normal terminal input is preserved.
+    prefix_armed: bool,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
@@ -281,12 +286,37 @@ impl ClientCompositor {
             hover: None,
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             sidebar_collapsed: false,
+            prefix_armed: false,
             working_since: HashMap::new(),
         }
     }
 
     pub(crate) fn sidebar_width(&self) -> u16 {
         self.sidebar_width
+    }
+
+    /// #24: whether the prefix key has been pressed and the next key should be matched against
+    /// prefix-mode sidebar-nav bindings.
+    pub(crate) fn prefix_armed(&self) -> bool {
+        self.prefix_armed
+    }
+
+    /// #24: arm prefix mode (the configured prefix key was pressed).
+    pub(crate) fn arm_prefix(&mut self) {
+        self.prefix_armed = true;
+    }
+
+    /// #24: clear prefix mode (a key was resolved/consumed, or it did not match a binding).
+    pub(crate) fn disarm_prefix(&mut self) {
+        self.prefix_armed = false;
+    }
+
+    /// #24: test accessor for the client-local collapsed-sidebar flag (the value `from_model`
+    /// feeds into `app.sidebar_collapsed`). Lets the #24 key-nav tests assert the collapse toggle
+    /// without reaching into the private field.
+    #[cfg(test)]
+    pub(crate) fn sidebar_collapsed_for_test(&self) -> bool {
+        self.sidebar_collapsed
     }
 
     pub(crate) fn agent_panel_scope(&self) -> crate::app::state::AgentPanelScope {

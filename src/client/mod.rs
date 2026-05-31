@@ -378,11 +378,293 @@ fn dispatch_composited_input(
     }
 
     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-    let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() else {
-        return ClientInputDispatch::Forward(data);
+    if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
+        return dispatch_composited_mouse_input(data, compositor, model, host_size, mouse);
+    }
+
+    // #24: client-side sidebar keyboard navigation. Before forwarding a key to the focused remote
+    // terminal, check whether it matches a configured sidebar-nav binding and, if so, route it to
+    // the SAME client action the mouse path uses. Only a single bare Key event is considered; any
+    // multi-event/paste/unmatched input falls through to Forward so terminal input is preserved.
+    if let [crate::raw_input::RawInputEvent::Key(key)] = events.as_slice() {
+        if let Some(dispatch) = dispatch_composited_key_input(*key, compositor, model) {
+            return dispatch;
+        }
+    }
+
+    ClientInputDispatch::Forward(data)
+}
+
+/// #24: route a single keypress to a client-side sidebar-navigation action, mirroring the
+/// server's gating (`src/app/input/navigate.rs`). Returns `None` for any key that is NOT a
+/// configured sidebar-nav binding so the caller forwards it to the focused remote terminal.
+///
+/// Gating mirrors the server's two-stage `Mode::Prefix` state machine: the configured prefix key
+/// (a modified chord, e.g. `ctrl+b`) arms `compositor.prefix_armed`; only WHILE armed is the next
+/// key matched against the configured prefix-mode bindings (next/prev workspace+agent, new/rename/
+/// close workspace, sidebar collapse, agent-scope). Direct (modified-chord) bindings still fire
+/// without the prefix, exactly as the server's `terminal_direct_navigation_action` does. Bare,
+/// unmodified keys are never intercepted unless prefix-armed, so normal typing reaches the agent.
+fn dispatch_composited_key_input(
+    key: crate::input::TerminalKey,
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+) -> Option<ClientInputDispatch> {
+    let (keybinds, prefix) = client_navigation_keybinds();
+
+    if compositor.prefix_armed() {
+        // Mirror the server's prefix mode: Esc / the prefix key itself just leaves prefix mode and
+        // is swallowed (never forwarded to the terminal). Any other key resolves a prefix-mode
+        // binding (or, if none matches, is consumed — the server's prefix mode does not forward
+        // unbound keys to the pane).
+        compositor.disarm_prefix();
+        let key_event = key.as_key_event();
+        if key_event.code == crossterm::event::KeyCode::Esc
+            || crate::config::terminal_key_matches_combo(key, prefix)
+        {
+            return Some(ClientInputDispatch::Redraw);
+        }
+        return Some(
+            sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Prefix)
+                .unwrap_or(ClientInputDispatch::Redraw),
+        );
+    }
+
+    // Not armed: a press of the configured prefix key arms prefix mode (and is swallowed). Other
+    // keys only fire if they match a DIRECT (modified-chord) sidebar-nav binding; everything else
+    // returns None so the caller forwards it to the terminal.
+    if crate::config::terminal_key_matches_combo(key, prefix) {
+        compositor.arm_prefix();
+        return Some(ClientInputDispatch::Redraw);
+    }
+
+    sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Direct)
+}
+
+/// #24: whether to match the configured prefix-mode side of a binding (`prefix+x`, only checked
+/// while the prefix is armed) or the direct side (a modified chord like `alt+a`, checked always).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionTrigger {
+    Direct,
+    Prefix,
+}
+
+/// #24: resolve the client's effective keybindings (and the prefix combo). The client renders the
+/// sidebar with the SAME shared code as the server, and its sidebar-nav keys come from the same
+/// config the server reads; the client reuses `Config::keybinds()` / `Config::prefix_key()` (the
+/// identical resolution the server uses) rather than inventing a parallel binding source. Computed
+/// per keypress (keypresses are rare), so no caching is needed and a live config reload is
+/// naturally picked up on the next key.
+fn client_navigation_keybinds() -> (crate::config::Keybinds, (KeyCode, KeyModifiers)) {
+    let config = crate::config::Config::load().config;
+    (config.keybinds(), config.prefix_key())
+}
+
+/// #24: match `key` against the sidebar-nav bindings for the given trigger side and, if it matches,
+/// perform the SAME client action the mouse path performs. Returns `None` when no sidebar-nav
+/// binding matches (so the key is forwarded / consumed by the caller). Bindings and actions are a
+/// strict subset of the server's `navigate.rs` map — the workspace-tree / pane / tab actions that
+/// have no client-rendered-sidebar equivalent are intentionally NOT bound here.
+fn sidebar_action_dispatch(
+    keybinds: &crate::config::Keybinds,
+    key: crate::input::TerminalKey,
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    trigger: ActionTrigger,
+) -> Option<ClientInputDispatch> {
+    let matches = |binding: &crate::config::ActionKeybinds| match trigger {
+        ActionTrigger::Direct => binding.matches_direct_key(key),
+        ActionTrigger::Prefix => binding.matches_prefix_key(key),
     };
 
-    dispatch_composited_mouse_input(data, compositor, model, host_size, mouse)
+    // next/prev workspace + agent: step the aggregated list and route the focus exactly like the
+    // mouse workspace/agent-click path (FocusRoute -> ApiRequest, crossing servers as needed).
+    if matches(&keybinds.next_workspace) {
+        return Some(step_workspace_focus(model, 1));
+    }
+    if matches(&keybinds.previous_workspace) {
+        return Some(step_workspace_focus(model, -1));
+    }
+    if matches(&keybinds.next_agent) {
+        return Some(step_agent_focus(model, 1));
+    }
+    if matches(&keybinds.previous_agent) {
+        return Some(step_agent_focus(model, -1));
+    }
+
+    // new workspace: open the same picker the New button / `SidebarHitTarget::New` path opens.
+    if matches(&keybinds.new_workspace) || matches(&keybinds.workspace_picker) {
+        return Some(open_new_workspace_picker_dispatch(model));
+    }
+
+    // rename / close the focused workspace: open the #23 overlays (the existing overlay key-gate
+    // then handles typing/confirm), reusing the supervisor opener methods the context menu uses.
+    if matches(&keybinds.rename_workspace) {
+        return Some(open_focused_workspace_overlay(model, FocusedWorkspaceOverlay::Rename));
+    }
+    if matches(&keybinds.close_workspace) {
+        return Some(open_focused_workspace_overlay(model, FocusedWorkspaceOverlay::Close));
+    }
+
+    // toggle sidebar collapse (#25) / agent-scope (#20): client-local compositor flips, no server
+    // round-trip — the SAME methods the mouse toggles call.
+    if matches(&keybinds.toggle_sidebar) {
+        compositor.toggle_sidebar_collapsed();
+        return Some(ClientInputDispatch::Redraw);
+    }
+
+    None
+}
+
+/// #24: enumerate the aggregated workspace rows (across servers, in render order), find the focused
+/// one, step ±1 with wraparound, and route the focus through `focus_workspace_route` -> ApiRequest
+/// exactly like the mouse workspace-click path (including switching the active server across a
+/// host boundary, handled inside `focus_workspace_route`). Placeholder rows (`workspace_id == None`)
+/// are skipped so a step always lands on a real, focusable workspace.
+fn step_workspace_focus(
+    model: &mut supervisor::ClientSupervisorModel,
+    delta: isize,
+) -> ClientInputDispatch {
+    let targets: Vec<(supervisor::ServerId, String)> = model
+        .workspace_rows()
+        .into_iter()
+        .filter_map(|row| row.workspace_id.map(|id| (row.server_id, id)))
+        .collect();
+    let Some((server_id, workspace_id)) = step_focus_target(
+        &targets,
+        model
+            .workspace_rows()
+            .iter()
+            .position(|row| row.focused && row.workspace_id.is_some()),
+        delta,
+    ) else {
+        return ClientInputDispatch::Consumed;
+    };
+
+    let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+    model
+        .focus_workspace_route(&server_id, &workspace_id)
+        .api_request("client:workspace-focus")
+        .map(|request| ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh,
+            request: Box::new(request),
+        })
+        .unwrap_or(ClientInputDispatch::Consumed)
+}
+
+/// #24: agent sibling of `step_workspace_focus`. Flattens `agent_groups()` (across servers, in
+/// render order) into `(server_id, agent_id)` rows, steps ±1 with wraparound from the focused
+/// agent, and routes through `focus_agent_route` -> ApiRequest like the mouse agent-click path.
+fn step_agent_focus(
+    model: &mut supervisor::ClientSupervisorModel,
+    delta: isize,
+) -> ClientInputDispatch {
+    let mut targets: Vec<(supervisor::ServerId, String)> = Vec::new();
+    let mut focused_index = None;
+    for group in model.agent_groups() {
+        for agent in group.agents {
+            if agent.focused {
+                focused_index = Some(targets.len());
+            }
+            targets.push((group.server_id.clone(), agent.agent_id));
+        }
+    }
+
+    let Some((server_id, agent_id)) = step_focus_target(&targets, focused_index, delta) else {
+        return ClientInputDispatch::Consumed;
+    };
+
+    let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+    model
+        .focus_agent_route(&server_id, &agent_id)
+        .api_request("client:agent-focus")
+        .map(|request| ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh,
+            request: Box::new(request),
+        })
+        .unwrap_or(ClientInputDispatch::Consumed)
+}
+
+/// #24: pick the `delta`-step neighbour (with wraparound) of `current` in `targets`. When nothing
+/// is currently focused, a forward step lands on the first entry and a backward step on the last.
+fn step_focus_target<T: Clone>(
+    targets: &[T],
+    current: Option<usize>,
+    delta: isize,
+) -> Option<T> {
+    if targets.is_empty() {
+        return None;
+    }
+    let len = targets.len() as isize;
+    let base = match current {
+        Some(idx) => idx as isize,
+        // No focus yet: stepping forward starts at 0, backward at the last entry.
+        None => {
+            if delta >= 0 {
+                -1
+            } else {
+                0
+            }
+        }
+    };
+    let next = ((base + delta) % len + len) % len;
+    targets.get(next as usize).cloned()
+}
+
+/// #24: open the new-workspace picker the SAME way the New button does, mapping a single-destination
+/// route straight to a create request and a multi-destination route to the picker overlay (Redraw).
+fn open_new_workspace_picker_dispatch(
+    model: &mut supervisor::ClientSupervisorModel,
+) -> ClientInputDispatch {
+    match model.open_new_workspace_picker() {
+        route @ supervisor::NewWorkspaceRoute::CreateOn(_) => route
+            .api_request("client:workspace-create")
+            .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                server_id,
+                refresh: ClientApiRefreshPolicy::Immediate,
+                request: Box::new(request),
+            })
+            .unwrap_or(ClientInputDispatch::Consumed),
+        supervisor::NewWorkspaceRoute::PickDestination(_) => ClientInputDispatch::Redraw,
+        supervisor::NewWorkspaceRoute::Unavailable { .. } => ClientInputDispatch::Consumed,
+    }
+}
+
+/// #24: which #23 overlay to open for the focused workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedWorkspaceOverlay {
+    Rename,
+    Close,
+}
+
+/// #24: open the rename / confirm-close overlay (#23) for the currently focused workspace. The
+/// supervisor's `open_rename_workspace` / `open_confirm_close_workspace` openers read the workspace
+/// context menu, so this first opens that menu for the focused row (the SAME state a right-click
+/// produces) and then promotes it to the requested overlay. The existing overlay key-gate then
+/// handles typing / confirmation.
+fn open_focused_workspace_overlay(
+    model: &mut supervisor::ClientSupervisorModel,
+    overlay: FocusedWorkspaceOverlay,
+) -> ClientInputDispatch {
+    let Some((server_id, workspace_id)) = model
+        .workspace_rows()
+        .into_iter()
+        .find(|row| row.focused && row.workspace_id.is_some())
+        .and_then(|row| row.workspace_id.map(|id| (row.server_id, id)))
+    else {
+        return ClientInputDispatch::Consumed;
+    };
+    let label = model
+        .workspace_label(&server_id, &workspace_id)
+        .unwrap_or_else(|| workspace_id.clone());
+    model.open_workspace_context_menu(server_id, workspace_id, label);
+    match overlay {
+        FocusedWorkspaceOverlay::Rename => model.open_rename_workspace(),
+        FocusedWorkspaceOverlay::Close => model.open_confirm_close_workspace(),
+    }
+    ClientInputDispatch::Redraw
 }
 
 fn dispatch_client_overlay_input(
@@ -6041,6 +6323,279 @@ mod tests {
             }
         );
         assert_eq!(model.active_server_id(), &remote_id);
+    }
+
+    // ---------------------------------------------------------------------------
+    // #24: client-side sidebar keyboard-navigation tests. These drive raw key bytes through
+    // `dispatch_composited_input` and assert the SAME client actions the mouse path produces.
+    // Each writes a temp config that enables the (default-unset) sidebar-nav bindings and points
+    // `Config::load()` at it via `CONFIG_PATH_ENV_VAR`, guarded by the shared config env lock so
+    // the bindings the interception layer resolves are deterministic.
+    // ---------------------------------------------------------------------------
+
+    /// #24: run `body` with `Config::load()` pointed at a temp config containing `keys_toml`.
+    fn with_client_keys_config<T>(keys_toml: &str, body: impl FnOnce() -> T) -> T {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-client-keys-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, keys_toml).unwrap();
+        let _env = EnvVarGuard::set(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            path.to_str().unwrap(),
+        );
+        let result = body();
+        std::fs::remove_file(&path).ok();
+        result
+    }
+
+    /// #24: feed a single bare char keypress (no modifiers) through the composited input path.
+    fn press_char(
+        c: char,
+        compositor: &mut compositor::ClientCompositor,
+        model: &mut supervisor::ClientSupervisorModel,
+    ) -> ClientInputDispatch {
+        dispatch_composited_input(
+            c.to_string().into_bytes(),
+            compositor,
+            model,
+            (60, 16),
+        )
+    }
+
+    // A next-workspace key (bound direct to `alt+n`) routed through `dispatch_composited_input`
+    // yields an ApiRequest focusing the NEXT workspace in the aggregated list — which crosses the
+    // server boundary from main to the remote, switching the active server.
+    #[test]
+    fn next_workspace_key_focuses_next_workspace_across_server_boundary() {
+        with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
+            let (mut model, remote_id) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+            assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
+
+            let dispatch = dispatch_composited_input(
+                b"\x1bn".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+
+            assert_eq!(
+                dispatch,
+                ClientInputDispatch::ApiRequest {
+                    server_id: remote_id.clone(),
+                    refresh: ClientApiRefreshPolicy::ImmediateFocused,
+                    request: Box::new(crate::api::schema::Request {
+                        id: "client:workspace-focus".into(),
+                        method: crate::api::schema::Method::WorkspaceFocus(
+                            crate::api::schema::WorkspaceTarget {
+                                workspace_id: "remote-api".into(),
+                            },
+                        ),
+                    }),
+                }
+            );
+            assert_eq!(model.active_server_id(), &remote_id);
+        });
+    }
+
+    // prev-workspace symmetric: from the first (main) workspace, stepping back wraps to the last
+    // (remote) workspace, crossing the server boundary.
+    #[test]
+    fn prev_workspace_key_wraps_to_last_workspace() {
+        with_client_keys_config("[keys]\nprevious_workspace = \"alt+p\"\n", || {
+            let (mut model, remote_id) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+
+            let dispatch = dispatch_composited_input(
+                b"\x1bp".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+
+            assert_eq!(
+                dispatch,
+                ClientInputDispatch::ApiRequest {
+                    server_id: remote_id.clone(),
+                    refresh: ClientApiRefreshPolicy::ImmediateFocused,
+                    request: Box::new(crate::api::schema::Request {
+                        id: "client:workspace-focus".into(),
+                        method: crate::api::schema::Method::WorkspaceFocus(
+                            crate::api::schema::WorkspaceTarget {
+                                workspace_id: "remote-api".into(),
+                            },
+                        ),
+                    }),
+                }
+            );
+            assert_eq!(model.active_server_id(), &remote_id);
+        });
+    }
+
+    // A new-workspace key opens the picker (multi-destination → Redraw, picker overlay set).
+    #[test]
+    fn new_workspace_key_opens_picker() {
+        with_client_keys_config("[keys]\nnew_workspace = \"alt+m\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+            assert!(model.new_workspace_picker().is_none());
+
+            let dispatch = dispatch_composited_input(
+                b"\x1bm".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+
+            assert_eq!(dispatch, ClientInputDispatch::Redraw);
+            assert!(model.new_workspace_picker().is_some());
+        });
+    }
+
+    // A rename key opens the #23 rename overlay for the focused workspace.
+    #[test]
+    fn rename_workspace_key_opens_rename_overlay_for_focused_workspace() {
+        with_client_keys_config("[keys]\nrename_workspace = \"alt+r\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+            assert!(model.rename_workspace_form().is_none());
+
+            let dispatch = dispatch_composited_input(
+                b"\x1br".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+
+            assert_eq!(dispatch, ClientInputDispatch::Redraw);
+            let form = model
+                .rename_workspace_form()
+                .expect("rename overlay should be open");
+            // main-herdr is the focused workspace in the fixture.
+            assert_eq!(form.workspace_id, "main-herdr");
+        });
+    }
+
+    // A close key opens the #23 confirm-close overlay for the focused workspace.
+    #[test]
+    fn close_workspace_key_opens_confirm_close_overlay_for_focused_workspace() {
+        with_client_keys_config("[keys]\nclose_workspace = \"alt+d\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+            assert!(model.confirm_close_workspace().is_none());
+
+            let dispatch = dispatch_composited_input(
+                b"\x1bd".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+
+            assert_eq!(dispatch, ClientInputDispatch::Redraw);
+            let confirm = model
+                .confirm_close_workspace()
+                .expect("confirm-close overlay should be open");
+            assert_eq!(confirm.workspace_id, "main-herdr");
+        });
+    }
+
+    // A collapse-toggle key flips `from_model`'s `app.sidebar_collapsed`; a scope-toggle key flips
+    // the agent-panel scope. Both are client-local compositor flips (Redraw, no server traffic).
+    #[test]
+    fn collapse_toggle_key_flips_sidebar_collapsed() {
+        with_client_keys_config("[keys]\ntoggle_sidebar = \"alt+b\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+            assert!(!compositor.sidebar_collapsed_for_test());
+
+            let dispatch = dispatch_composited_input(
+                b"\x1bb".to_vec(),
+                &mut compositor,
+                &mut model,
+                (60, 16),
+            );
+            assert_eq!(dispatch, ClientInputDispatch::Redraw);
+            assert!(compositor.sidebar_collapsed_for_test());
+        });
+    }
+
+    // SAFETY: a normal/unbound key (a plain letter, NOT in prefix mode) is NOT intercepted — it is
+    // Forwarded unchanged so terminal/agent input is preserved.
+    #[test]
+    fn unbound_plain_key_is_forwarded_not_intercepted() {
+        with_client_keys_config("[keys]\nnext_workspace = \"alt+n\"\n", || {
+            let (mut model, _) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+
+            // 'x' matches no sidebar-nav binding and the prefix is not armed: Forward.
+            assert_eq!(
+                press_char('x', &mut compositor, &mut model),
+                ClientInputDispatch::Forward(b"x".to_vec())
+            );
+            // Even a bare 'n' (the RHS of the alt+n direct binding) is NOT intercepted without
+            // the alt modifier — the direct chord requires its modifier.
+            assert_eq!(
+                press_char('n', &mut compositor, &mut model),
+                ClientInputDispatch::Forward(b"n".to_vec())
+            );
+        });
+    }
+
+    // Prefix-mode gating: with a prefix-bound next-workspace (`prefix+n`), a bare 'n' is Forwarded
+    // when prefix is NOT armed, and intercepted only AFTER the prefix key (ctrl+b) arms the mode.
+    #[test]
+    fn prefix_bound_key_intercepted_only_while_prefix_armed() {
+        with_client_keys_config(
+            "[keys]\nprefix = \"ctrl+b\"\nnext_workspace = \"prefix+n\"\n",
+            || {
+                let (mut model, remote_id) = mixed_remote_model();
+                let mut compositor = compositor::ClientCompositor::new(26);
+
+                // Not armed: a bare 'n' is forwarded to the terminal (never hijacked).
+                assert_eq!(
+                    press_char('n', &mut compositor, &mut model),
+                    ClientInputDispatch::Forward(b"n".to_vec())
+                );
+                assert!(!compositor.prefix_armed());
+
+                // Press the prefix key (ctrl+b == 0x02): arms prefix mode, swallowed (Redraw).
+                assert_eq!(
+                    dispatch_composited_input(
+                        vec![0x02],
+                        &mut compositor,
+                        &mut model,
+                        (60, 16),
+                    ),
+                    ClientInputDispatch::Redraw
+                );
+                assert!(compositor.prefix_armed());
+
+                // Now 'n' resolves the prefix-mode next-workspace action and disarms prefix mode.
+                let dispatch = press_char('n', &mut compositor, &mut model);
+                assert!(!compositor.prefix_armed());
+                assert_eq!(
+                    dispatch,
+                    ClientInputDispatch::ApiRequest {
+                        server_id: remote_id.clone(),
+                        refresh: ClientApiRefreshPolicy::ImmediateFocused,
+                        request: Box::new(crate::api::schema::Request {
+                            id: "client:workspace-focus".into(),
+                            method: crate::api::schema::Method::WorkspaceFocus(
+                                crate::api::schema::WorkspaceTarget {
+                                    workspace_id: "remote-api".into(),
+                                },
+                            ),
+                        }),
+                    }
+                );
+            },
+        );
     }
 
     // item 6 (Area 6): the focus dispatch emits ImmediateFocused (a server-switching focus), not
