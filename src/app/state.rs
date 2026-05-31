@@ -1399,6 +1399,14 @@ pub(crate) enum DragTarget {
         source_ws_idx: usize,
         insert_idx: Option<usize>,
     },
+    /// #19 (host half): an in-progress host (server) drag in the client-rendered sidebar.
+    /// `source_host_idx`/`insert_idx` index the ORDERED host/banner list (the visible-server
+    /// order). Client-local; the drop indicator is drawn only at host boundaries (banner rows
+    /// or the end of the list), never between two spaces.
+    HostReorder {
+        source_host_idx: usize,
+        insert_idx: Option<usize>,
+    },
     TabReorder {
         ws_idx: usize,
         source_tab_idx: usize,

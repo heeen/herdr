@@ -1571,17 +1571,24 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// item 2 (C3): one banner spec per visible `Secondary` host, in `visible_servers()`
-    /// order. Each tuple is `(insertion_index, spec)` where `insertion_index` is the position
-    /// in the flat `workspace_rows()` stream at which the banner precedes that host's first
-    /// row. `Main` yields no entry; monolithic mode (no secondaries) yields an empty Vec.
+    /// item 2 (C3): one banner spec per visible host, in `visible_servers()` order. Each tuple
+    /// is `(insertion_index, spec)` where `insertion_index` is the position in the flat
+    /// `workspace_rows()` stream at which the banner precedes that host's first row.
+    ///
+    /// #19 (host half): the Local/Main host also gets a banner — but ONLY in multi-host mode
+    /// (≥2 visible hosts, i.e. at least one remote), so its banner is the draggable handle for
+    /// reordering hosts. The single-local case stays banner-free (unchanged single-host UX).
     pub(crate) fn host_banner_specs(&self) -> Vec<(usize, crate::app::state::HostBannerSpec)> {
         let all_filter = self.filter == ServerFilter::All;
+        let visible = self.visible_servers();
+        // #19: in multi-host mode every host (Local included) gets a banner; otherwise only
+        // remotes do (and a lone local yields none, preserving the single-host UX).
+        let banner_local = visible.len() >= 2;
         let mut specs = Vec::new();
         let mut row_offset = 0usize;
-        for server in self.visible_servers() {
+        for server in visible {
             let rows = workspace_rows_for_server(server, all_filter);
-            if server.role == ServerRole::Secondary {
+            if server.role == ServerRole::Secondary || banner_local {
                 let space_count = server
                     .summaries
                     .workspaces
@@ -1602,6 +1609,43 @@ impl ClientSupervisorModel {
             row_offset += rows.len();
         }
         specs
+    }
+
+    /// #19 (host half): the ordered list of `ServerId`s that get a host banner, in the SAME
+    /// `visible_servers()` order and using the SAME multi-host gate as `host_banner_specs`. The
+    /// client builds a parallel `banner_idx -> server_id` map from this so host hit-testing and
+    /// the drag preview resolve a banner to its host deterministically (render == hit geometry).
+    pub(crate) fn host_banner_server_ids(&self) -> Vec<ServerId> {
+        let visible = self.visible_servers();
+        let banner_local = visible.len() >= 2;
+        visible
+            .into_iter()
+            .filter(|server| server.role == ServerRole::Secondary || banner_local)
+            .map(|server| server.id.clone())
+            .collect()
+    }
+
+    /// #19 (host half): reorder the host (server) block. `source_server_id` is the dragged host;
+    /// `insert_index` is its target slot among the ORDERED host list (0..=len), matching the
+    /// `WorkspaceReorder` insert contract. Client-local — host order is owned by this client
+    /// (session-local; not persisted to the remote registry), so this only reorders the in-memory
+    /// `servers` Vec and never round-trips to a server. `active_server_id` keeps pointing at the
+    /// same host after the move. Returns whether the order actually changed.
+    pub(crate) fn reorder_server(&mut self, source_server_id: &ServerId, insert_index: usize) -> bool {
+        let Some(from) = self.servers.iter().position(|s| &s.id == source_server_id) else {
+            return false;
+        };
+        // Translate the insert slot (a position in the post-removal list) into the destination
+        // index, mirroring the monolithic `move_workspace` contract: removing the source first
+        // shifts every later slot left by one.
+        let clamped = insert_index.min(self.servers.len());
+        let to = if clamped > from { clamped - 1 } else { clamped };
+        if to == from {
+            return false;
+        }
+        let server = self.servers.remove(from);
+        self.servers.insert(to, server);
+        true
     }
 
     /// item 2 (C3) coordination flag — `true` whenever the host-banner feature is live, i.e.
@@ -3960,23 +4004,30 @@ mod tests {
             .unwrap();
 
         let specs = model.host_banner_specs();
-        // Exactly one spec per visible Secondary, none for Main, in visible_servers() order.
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].1.display_name, "dev");
-        assert_eq!(specs[0].1.connection_state, HostBannerState::Connected);
-        assert_eq!(specs[0].1.space_count, 2);
-        assert_eq!(specs[1].1.display_name, "prod");
-        assert_eq!(specs[1].1.space_count, 1);
+        // #19 (host half): a banner per visible host (Local + each Secondary), in
+        // visible_servers() order — Local first (it is the draggable host handle).
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].1.display_name, "local");
+        assert_eq!(specs[1].1.display_name, "dev");
+        assert_eq!(specs[1].1.connection_state, HostBannerState::Connected);
+        assert_eq!(specs[1].1.space_count, 2);
+        assert_eq!(specs[2].1.display_name, "prod");
+        assert_eq!(specs[2].1.space_count, 1);
 
         // The insertion index precedes that host's first row in the flat workspace_rows() stream.
         let rows = model.workspace_rows();
         assert_eq!(
             rows[specs[0].0].server_id,
+            ServerId::main(),
+            "local banner index precedes the local row"
+        );
+        assert_eq!(
+            rows[specs[1].0].server_id,
             ServerId::secondary("dev"),
             "dev banner index precedes dev's first row"
         );
         assert_eq!(
-            rows[specs[1].0].server_id,
+            rows[specs[2].0].server_id,
             ServerId::secondary("prod"),
             "prod banner index precedes prod's first row"
         );

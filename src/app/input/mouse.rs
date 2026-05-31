@@ -720,6 +720,9 @@ impl AppState {
                         DragTarget::ReleaseNotesScrollbar { .. }
                         | DragTarget::ProductAnnouncementScrollbar { .. }
                         | DragTarget::KeybindHelpScrollbar { .. } => {}
+                        // #19 (host half): host reorder is a client-only drag (the thin client
+                        // owns host order). The monolithic host never produces it.
+                        DragTarget::HostReorder { .. } => {}
                     }
                 }
             }

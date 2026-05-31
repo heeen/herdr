@@ -687,6 +687,23 @@ fn dispatch_composited_mouse_input(
         compositor::WorkspaceReorderOutcome::Ignored => {}
     }
 
+    // #19 (host half): host drag-to-reorder. Runs alongside the workspace tracker, before
+    // hit_test, for the same reason (Drag/Up over the sidebar are otherwise swallowed). The
+    // commit is CLIENT-LOCAL: host order is client-owned, so it mutates the model and redraws
+    // with no server round-trip (contrast with workspace.reorder above).
+    match compositor.handle_host_reorder_mouse(model, mouse, host_size.0, host_size.1) {
+        compositor::HostReorderOutcome::Dragging => return ClientInputDispatch::Redraw,
+        compositor::HostReorderOutcome::Commit {
+            source_server_id,
+            insert_index,
+        } => {
+            model.reorder_server(&source_server_id, insert_index);
+            return ClientInputDispatch::Redraw;
+        }
+        compositor::HostReorderOutcome::Cancelled => return ClientInputDispatch::Consumed,
+        compositor::HostReorderOutcome::Ignored => {}
+    }
+
     if let Some(target) =
         compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
     {
@@ -715,6 +732,14 @@ fn dispatch_composited_mouse_input(
                     mouse.column,
                     mouse.row,
                 );
+            }
+        }
+        // #19 (host half): arm a host drag-reorder on a host-banner down-press. A subsequent drag
+        // promotes it to a reorder (committed client-locally); a plain click just consumes (the
+        // banner is the host's drag handle). Mirrors the workspace press above.
+        if let compositor::SidebarHitTarget::HostBanner { server_id } = &target {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                compositor.begin_host_press(server_id.clone(), mouse.column, mouse.row);
             }
         }
         return dispatch_sidebar_hit_target(target, model, mouse);
@@ -825,6 +850,10 @@ fn dispatch_sidebar_hit_target(
         // #20: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
         // arm only keeps the match exhaustive and is not reached in practice.
         compositor::SidebarHitTarget::AgentScopeToggle => ClientInputDispatch::Consumed,
+        // #19 (host half): a host-banner press arms a host drag-reorder in
+        // `dispatch_composited_mouse_input` (needs `&mut compositor`); the click itself focuses the
+        // host's first workspace there too. This arm only keeps the match exhaustive.
+        compositor::SidebarHitTarget::HostBanner { .. } => ClientInputDispatch::Consumed,
         // item 1: composited-modal action buttons.
         compositor::SidebarHitTarget::AddRemoteSubmit => {
             // re-run the SAME empty-target validation as the Enter key by replaying an Enter

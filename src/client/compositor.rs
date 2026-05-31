@@ -50,6 +50,9 @@ struct WorkspacePress {
     origin_col: u16,
     origin_row: u16,
     dragging: bool,
+    /// #19: latest pointer row while dragging, so `from_model` can render a live drop indicator
+    /// each frame (the drop position the release would commit). `None` until the press becomes a drag.
+    last_drag_row: Option<u16>,
 }
 
 /// #19: outcome of feeding a mouse event to the workspace drag-reorder tracker.
@@ -67,6 +70,55 @@ pub(crate) enum WorkspaceReorderOutcome {
     },
     /// A drag was released but resolved to no valid slot — swallow it (no request).
     Cancelled,
+}
+
+/// #19 (host half): an in-progress press on a host banner. Mirrors `WorkspacePress`: a press that
+/// moves past `WORKSPACE_DRAG_THRESHOLD` becomes a host drag-reorder; on release it commits a
+/// client-local host move (host order is client-owned, no server round-trip).
+#[derive(Clone)]
+struct HostPress {
+    server_id: ServerId,
+    origin_col: u16,
+    origin_row: u16,
+    dragging: bool,
+    /// Latest pointer row while dragging, so `from_model` can render a live host drop indicator
+    /// each frame. `None` until the press becomes a drag.
+    last_drag_row: Option<u16>,
+}
+
+/// #19 (host half): outcome of feeding a mouse event to the host drag-reorder tracker. Mirrors
+/// `WorkspaceReorderOutcome`, but `Commit` carries an `insert_index` into the ORDERED host list
+/// and is applied client-locally (`model.reorder_server`), never sent to a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostReorderOutcome {
+    /// Not part of a host drag-reorder (caller continues its normal dispatch).
+    Ignored,
+    /// An active host drag moved — the caller should redraw (drop indicator follows the pointer).
+    Dragging,
+    /// A host drag was released over a valid slot — reorder `source_server_id` to `insert_index`.
+    Commit {
+        source_server_id: ServerId,
+        insert_index: usize,
+    },
+    /// A host drag was released but resolved to no valid slot — swallow it (no reorder).
+    Cancelled,
+}
+
+/// #19: resolve a drop row to a `0..=cards.len()` insert position within one server's contiguous
+/// workspace cards (render order == stored order). The index is the count of cards whose vertical
+/// midpoint sits strictly above the drop row — the same rule used for both the live drop indicator
+/// (`from_model`) and the committed `workspace.reorder` (`workspace_reorder_target`).
+fn server_insert_index(cards: &[Rect], drop_row: u16) -> usize {
+    let mut insert = 0usize;
+    for rect in cards {
+        let midpoint = rect.y.saturating_add(rect.height / 2);
+        if drop_row > midpoint {
+            insert += 1;
+        } else {
+            break;
+        }
+    }
+    insert.min(cards.len())
 }
 
 /// Outcome of a width-divider mouse interaction. A change to the sidebar width changes the content
@@ -91,6 +143,9 @@ pub(crate) struct ClientCompositor {
     last_divider_down: Option<Instant>,
     // #19: in-progress press on a workspace card, promoted to a drag-reorder past the threshold.
     workspace_press: Option<WorkspacePress>,
+    // #19 (host half): in-progress press on a host banner, promoted to a host drag-reorder past
+    // the threshold. Only one of `workspace_press`/`host_press` is ever dragging at a time.
+    host_press: Option<HostPress>,
     // #21: in-progress scrollbar thumb drag for the workspace or agent list.
     scrollbar_drag: Option<ScrollbarDrag>,
     animation_tick: u32,                                  // item 5
@@ -115,6 +170,11 @@ pub(crate) enum SidebarHitTarget {
         agent_id: String,
     },
     NewWorkspaceDestination {
+        server_id: crate::client::supervisor::ServerId,
+    },
+    /// #19 (host half): a host banner row. A `Down(Left)` here arms a host drag-reorder (and
+    /// otherwise focuses the host's first workspace via the existing dispatch). Client-local.
+    HostBanner {
         server_id: crate::client::supervisor::ServerId,
     },
     ClientGlobalMenuItem {
@@ -156,6 +216,10 @@ struct ClientSidebarSnapshot {
     app: crate::app::AppState,
     filter_label: String,
     workspace_routes: Vec<WorkspaceRoute>,
+    // #19 (host half): `banner_idx -> server_id`, in the SAME order banners are emitted
+    // (`host_banner_server_ids`), so `host_banner_areas[i]` resolves to `host_banner_server_ids[i]`
+    // deterministically (render == hit geometry).
+    host_banner_server_ids: Vec<ServerId>,
     agent_routes: Vec<AgentRoute>,
     // overlay carriers (items 1 & 3), all ui-owned/cloned — see Area 3:
     add_remote_form: Option<crate::client::supervisor::AddRemoteForm>, // item 1
@@ -179,6 +243,7 @@ impl ClientCompositor {
             resizing_section: false,
             last_divider_down: None,
             workspace_press: None,
+            host_press: None,
             scrollbar_drag: None,
             animation_tick: 0,
             hover: None,
@@ -600,6 +665,7 @@ impl ClientCompositor {
             origin_col: col,
             origin_row: row,
             dragging: false,
+            last_drag_row: None,
         });
     }
 
@@ -628,6 +694,9 @@ impl ClientCompositor {
                     return WorkspaceReorderOutcome::Ignored;
                 }
                 press.dragging = true;
+                // #19: remember the pointer row so `from_model` can draw a live drop indicator
+                // (the slot this drag would commit to) every frame until release.
+                press.last_drag_row = Some(mouse.row);
                 WorkspaceReorderOutcome::Dragging
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -691,16 +760,104 @@ impl ClientCompositor {
         if server_rects.is_empty() {
             return None;
         }
-        let mut insert = 0usize;
-        for rect in &server_rects {
-            let midpoint = rect.y.saturating_add(rect.height / 2);
-            if drop_row > midpoint {
-                insert += 1;
-            } else {
-                break;
+        Some(server_insert_index(&server_rects, drop_row))
+    }
+
+    /// #19 (host half): record a press on a host banner (called when a `Down(Left)` hit-tests to a
+    /// `HostBanner`). Mirrors `begin_workspace_press`: the click still focuses-on-down (handled by
+    /// the normal dispatch); this only arms a potential host drag-reorder that commits on release.
+    pub(crate) fn begin_host_press(&mut self, server_id: ServerId, col: u16, row: u16) {
+        self.host_press = Some(HostPress {
+            server_id,
+            origin_col: col,
+            origin_row: row,
+            dragging: false,
+            last_drag_row: None,
+        });
+    }
+
+    /// #19 (host half): feed a `Drag`/`Up` to the host drag-reorder tracker, mirroring
+    /// `handle_workspace_reorder_mouse`. `Down` is recorded separately via `begin_host_press` (so
+    /// the click can still focus). Returns `Ignored` for everything that is not an active host drag.
+    pub(crate) fn handle_host_reorder_mouse(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> HostReorderOutcome {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(press) = self.host_press.as_mut() else {
+                    return HostReorderOutcome::Ignored;
+                };
+                let moved = mouse
+                    .column
+                    .abs_diff(press.origin_col)
+                    .max(mouse.row.abs_diff(press.origin_row));
+                if !press.dragging && moved < WORKSPACE_DRAG_THRESHOLD {
+                    return HostReorderOutcome::Ignored;
+                }
+                press.dragging = true;
+                press.last_drag_row = Some(mouse.row);
+                HostReorderOutcome::Dragging
             }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(press) = self.host_press.take() else {
+                    return HostReorderOutcome::Ignored;
+                };
+                if !press.dragging {
+                    // A plain click (no drag) already focused on the down-press; nothing to commit.
+                    return HostReorderOutcome::Ignored;
+                }
+                match self.host_reorder_target(model, mouse.row, host_width, host_height) {
+                    Some(insert_index) => HostReorderOutcome::Commit {
+                        source_server_id: press.server_id,
+                        insert_index,
+                    },
+                    None => HostReorderOutcome::Cancelled,
+                }
+            }
+            _ => HostReorderOutcome::Ignored,
         }
-        Some(insert.min(server_rects.len()))
+    }
+
+    /// #19 (host half): resolve a drop row to an insert position among the ORDERED host list. The
+    /// index is the count of host banners whose vertical midpoint sits above the drop row (the SAME
+    /// `server_insert_index` rule used for workspaces), so the host drop slot is ALWAYS a host
+    /// boundary — never inside a space block.
+    fn host_reorder_target(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        drop_row: u16,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<usize> {
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let banner_rects: Vec<Rect> = snapshot
+            .app
+            .view
+            .host_banner_areas
+            .iter()
+            .map(|banner| banner.rect)
+            .collect();
+        if banner_rects.is_empty() {
+            return None;
+        }
+        Some(server_insert_index(&banner_rects, drop_row))
     }
 
     fn set_sidebar_width_from_column(
@@ -890,6 +1047,19 @@ impl ClientCompositor {
         }
         if rect_contains(snapshot.app.global_launcher_rect(), x, y) {
             return Some(SidebarHitTarget::Menu);
+        }
+
+        // #19 (host half): a press on a host banner resolves to that banner's host. Banner rows
+        // produce no `WorkspaceCardArea`, so the card loop below never matches them; resolved here
+        // before the cards so a `Down(Left)` arms a host drag-reorder. `host_banner_areas[i]` maps
+        // to `host_banner_server_ids[i]` (same emission order — render == hit geometry).
+        for (banner_idx, banner) in snapshot.app.view.host_banner_areas.iter().enumerate() {
+            if rect_contains(banner.rect, x, y) {
+                let server_id = snapshot.host_banner_server_ids.get(banner_idx)?;
+                return Some(SidebarHitTarget::HostBanner {
+                    server_id: server_id.clone(),
+                });
+            }
         }
 
         for card in &snapshot.app.view.workspace_card_areas {
@@ -1148,6 +1318,14 @@ impl ClientSidebarSnapshot {
         // the rendered entries under the active scope (all workspaces vs the current one only).
         let mut per_ws_agent_routes: Vec<Vec<AgentRoute>> = Vec::new();
         let mut active_idx = None;
+        // #20: in mixed-remote mode every connected server independently reports its own focused
+        // workspace, so multiple `workspace_rows()` can carry `row.focused == true`. A plain
+        // last-wins on `row.focused || agent-focused` let a trailing remote's *workspace*-focused
+        // row override the local row that actually owns the user's focused agent, so under the
+        // default `CurrentWorkspace` scope the local agents vanished. Rank the focus signal so an
+        // agent-focused row always beats a merely workspace-focused one; ties keep last-wins (the
+        // existing optimistic-focus / divider tests rely on a later agent-focused row winning).
+        let mut active_rank = 0u8; // 0 = none, 1 = workspace-focused, 2 = agent-focused
         let workspace_rows = model.workspace_rows();
         for (idx, row) in workspace_rows.into_iter().enumerate() {
             let agents = row
@@ -1158,8 +1336,16 @@ impl ClientSidebarSnapshot {
                 })
                 .unwrap_or_default();
             let focused_agent_idx = agents.iter().position(|agent| agent.focused);
-            if row.focused || focused_agent_idx.is_some() {
+            let row_rank = if focused_agent_idx.is_some() {
+                2
+            } else if row.focused {
+                1
+            } else {
+                0
+            };
+            if row_rank > 0 && row_rank >= active_rank {
                 active_idx = Some(idx);
+                active_rank = row_rank;
             }
 
             let mut pane_terminals = Vec::new();
@@ -1272,6 +1458,10 @@ impl ClientSidebarSnapshot {
             .map(|(_, spec)| spec)
             .collect();
         app.host_banner_active = model.host_banner_active();
+        // #19 (host half): the parallel `banner_idx -> server_id` map, built from the SAME
+        // emission order as `host_banner_specs`, so hit-test and the drag preview resolve a banner
+        // to its host. Carried on the snapshot for `hit_test`.
+        let host_banner_server_ids = model.host_banner_server_ids();
         // item 4: one pass produces card rects, host-banner rects (item 2), and divider rows,
         // so render and hit-test share one geometry source. `host_banner_areas` is populated
         // from the second slot of THIS single call (render == hit_test geometry), and
@@ -1288,10 +1478,85 @@ impl ClientSidebarSnapshot {
         // pure read). Render reads `app.sidebar_hover` and never mutates it.
         app.set_sidebar_hover(compositor.hover);
 
+        // #19: while a workspace card is being dragged, populate `app.drag` so the shared sidebar
+        // renderer draws the same live drop indicator the server-rendered sidebar shows (the client
+        // path previously showed nothing until release). Reuse the existing render state — only
+        // compute the dragged card's global index and the global insert slot the release would
+        // commit to; the renderer (`render_workspace_list`) does the rest.
+        if let Some(press) = compositor
+            .workspace_press
+            .as_ref()
+            .filter(|press| press.dragging)
+        {
+            if let Some(drop_row) = press.last_drag_row {
+                // The dragged card's GLOBAL index (into `app.workspaces` / `workspace_routes`).
+                let source_ws_idx = workspace_routes.iter().position(|route| {
+                    route.server_id == press.server_id
+                        && route.workspace_id.as_deref() == Some(press.workspace_id.as_str())
+                });
+                // The source server's cards, in render order (== its stored workspace order). They
+                // are contiguous in global `ws_idx`, so `base` is the block's first global index.
+                let mut server_rects: Vec<Rect> = Vec::new();
+                let mut base: Option<usize> = None;
+                for card in &app.view.workspace_card_areas {
+                    let Some(route) = workspace_routes.get(card.ws_idx) else {
+                        continue;
+                    };
+                    if route.server_id == press.server_id && route.workspace_id.is_some() {
+                        server_rects.push(card.rect);
+                        base = Some(base.map_or(card.ws_idx, |b: usize| b.min(card.ws_idx)));
+                    }
+                }
+                if let (Some(source_ws_idx), Some(base)) = (source_ws_idx, base) {
+                    // Per-server insert position via the SAME midpoint rule as the commit path,
+                    // offset into the source server's contiguous global block. Clamped to the block
+                    // so the indicator can never point into another host's spaces.
+                    let insert_idx = base + server_insert_index(&server_rects, drop_row);
+                    app.drag = Some(crate::app::state::DragState {
+                        target: crate::app::state::DragTarget::WorkspaceReorder {
+                            source_ws_idx,
+                            insert_idx: Some(insert_idx),
+                        },
+                    });
+                }
+            }
+        }
+
+        // #19 (host half): while a host banner is being dragged, populate `app.drag` with a
+        // `HostReorder` so the shared renderer draws a host drop indicator at the boundary the
+        // release would commit to. The insert slot is computed from the banner rects ONLY (via
+        // `server_insert_index`), so it can never land inside a space block. Only one of
+        // workspace_press/host_press is ever dragging, so this never fights the branch above.
+        if let Some(press) = compositor.host_press.as_ref().filter(|press| press.dragging) {
+            if let Some(drop_row) = press.last_drag_row {
+                let source_host_idx = host_banner_server_ids
+                    .iter()
+                    .position(|id| id == &press.server_id);
+                let banner_rects: Vec<Rect> = app
+                    .view
+                    .host_banner_areas
+                    .iter()
+                    .map(|banner| banner.rect)
+                    .collect();
+                if let Some(source_host_idx) = source_host_idx {
+                    if !banner_rects.is_empty() {
+                        let insert_idx = server_insert_index(&banner_rects, drop_row);
+                        app.drag = Some(crate::app::state::DragState {
+                            target: crate::app::state::DragTarget::HostReorder {
+                                source_host_idx,
+                                insert_idx: Some(insert_idx),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
         Self {
             app,
             filter_label: model.filter_label(),
             workspace_routes,
+            host_banner_server_ids,
             agent_routes,
             // item 1: clone the overlay state out of the model into ui-owned carriers (pure read).
             // The closure maps these into ui view structs before rendering.
@@ -2146,7 +2411,18 @@ mod tests {
             .find(|c| c.ws_idx == 1)
             .expect("remote card");
         let divider_y = snapshot.app.view.divider_rows[0];
-        let banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
+        // #19 (host half): in multi-host mode the Local banner is the FIRST banner (above the local
+        // card — it is the host's drag handle); the remote banner is the LAST one (above the remote
+        // card). `local_banner_y` keeps the original "a banner row resolves to no workspace" check.
+        let local_banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
+        let remote_banner_y = snapshot
+            .app
+            .view
+            .host_banner_areas
+            .last()
+            .expect("remote banner")
+            .rect
+            .y;
 
         assert_eq!(
             compositor.hit_test(&model, 23, 0, 60, 28),
@@ -2166,10 +2442,22 @@ mod tests {
             Some(SidebarHitTarget::Workspace { .. })
         ));
         assert!(!matches!(
-            compositor.hit_test(&model, 1, banner_y, 60, 28),
+            compositor.hit_test(&model, 1, local_banner_y, 60, 28),
             Some(SidebarHitTarget::Workspace { .. })
         ));
-        assert!(divider_y < banner_y && banner_y < remote_card.rect.y);
+        // #19 (host half): the Local banner sits ABOVE the local card (it is the host drag handle).
+        // The divider and the remote banner are host boundaries between the local block and the
+        // remote card.
+        assert!(
+            local_banner_y < main_card.rect.y,
+            "local banner is above the local card"
+        );
+        assert!(main_card.rect.y < divider_y);
+        assert!(divider_y < remote_card.rect.y);
+        assert!(
+            main_card.rect.y < remote_banner_y && remote_banner_y < remote_card.rect.y,
+            "remote banner sits between the local block and the remote card"
+        );
         assert_eq!(
             compositor.hit_test(&model, 1, remote_card.rect.y, 60, 28),
             Some(SidebarHitTarget::Workspace {
@@ -2236,7 +2524,18 @@ mod tests {
 
         let compositor = ClientCompositor::new(26);
 
-        assert_eq!(compositor.hit_test(&model, 1, 2, 60, 16), None);
+        // The disconnected remote's row is a placeholder (no workspace_id), so no row in the
+        // sidebar resolves to a `Workspace` hit. #19 (host half): the Local/remote banner rows are
+        // `HostBanner` hits, not `Workspace` ones, so the invariant holds across the whole column.
+        for y in 0..16 {
+            assert!(
+                !matches!(
+                    compositor.hit_test(&model, 1, y, 60, 16),
+                    Some(SidebarHitTarget::Workspace { .. })
+                ),
+                "row {y} unexpectedly hit-tested to a workspace",
+            );
+        }
     }
 
     /// #16/#20/#26: a single local server with two workspaces, each owning one agent. ws-1 is
@@ -2330,6 +2629,78 @@ mod tests {
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
         assert_eq!(current.agent_routes.len(), 1);
         assert_eq!(current.agent_routes[0].agent_id, "agent-1");
+    }
+
+    // #20 regression: in mixed-remote mode each connected server independently reports its own
+    // focused workspace, so the local `main-herdr` row (focused, owning the focused agent the user
+    // is attached to) AND the trailing remote `remote-api` row both carry `focused == true`. A
+    // plain last-wins selected the remote, so under the default `CurrentWorkspace` scope the local
+    // agent disappeared from the panel. The agent-focused local row must win over the merely
+    // workspace-focused remote row.
+    #[test]
+    fn current_scope_keeps_local_agents_when_remote_also_focused() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        // Local server (row 0): workspace focused AND its agent is the focused one.
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "main-agent".into(),
+                        workspace_id: "main-herdr".into(),
+                        label: "claude".into(),
+                        status: "working".into(),
+                        focused: true,
+                    }],
+                },
+            )
+            .unwrap();
+        // Remote server (row 1): workspace also reports focused, but no focused agent.
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: true,
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "codex".into(),
+                        status: "idle".into(),
+                        focused: false,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let mut compositor = ClientCompositor::new(26);
+        compositor.toggle_agent_panel_scope(); // -> CurrentWorkspace
+        let current =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        // The local workspace (row 0, the agent-focused one) wins, so its agent renders.
+        assert_eq!(current.app.active, Some(0));
+        assert_eq!(current.agent_routes.len(), 1);
+        assert_eq!(current.agent_routes[0].agent_id, "main-agent");
     }
 
     // #16: dragging the spaces↔agents section divider sets a client-local split override that
@@ -2520,8 +2891,543 @@ mod tests {
         );
     }
 
+    // #19: while dragging a space the snapshot must carry a live drop indicator (`app.drag`) so the
+    // shared renderer draws the drop line every frame — the client path used to show nothing until
+    // release. The dragged card's global index and the global insert slot must both be correct.
+    #[test]
+    fn workspace_drag_preview_populates_app_drag() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "ws-1".into(),
+                            label: "one".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-2".into(),
+                            label: "two".into(),
+                            branch: None,
+                            focused: true,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-3".into(),
+                            label: "three".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        // No drag in progress yet: the renderer gets no drop indicator.
+        assert!(snapshot.app.drag.is_none());
+
+        let card = |ws_idx: usize| {
+            snapshot
+                .app
+                .view
+                .workspace_card_areas
+                .iter()
+                .find(|c| c.ws_idx == ws_idx)
+                .expect("card")
+                .rect
+        };
+        let ws1_row = card(0).y;
+        let ws3_rect = card(2);
+
+        // Press on ws-2 (global index 1), then drag down past ws-3's midpoint.
+        compositor.begin_workspace_press(ServerId::main(), "ws-2".into(), 1, ws1_row);
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: ws3_rect.y + ws3_rect.height,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &drag, host.0, host.1),
+            WorkspaceReorderOutcome::Dragging
+        );
+
+        let dragging = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        match dragging.app.drag.as_ref().map(|d| &d.target) {
+            Some(crate::app::state::DragTarget::WorkspaceReorder {
+                source_ws_idx,
+                insert_idx,
+            }) => {
+                // ws-2 is global index 1; dropping past ws-3 (the third, single-server card) lands
+                // at global insert position 3 (after the whole block).
+                assert_eq!(*source_ws_idx, 1);
+                assert_eq!(*insert_idx, Some(3));
+            }
+            _ => panic!("expected a WorkspaceReorder drag preview"),
+        }
+    }
+
+    // #19: the drop indicator must stay inside the SOURCE server's contiguous row block. Dragging a
+    // local space far below the remote's rows must still resolve to an insert index at the end of
+    // the local block (≤ local card count) and never point into the remote block.
+    #[test]
+    fn workspace_drag_preview_clamps_to_source_server_block() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "local-1".into(),
+                            label: "l1".into(),
+                            branch: None,
+                            focused: true,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "local-2".into(),
+                            label: "l2".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "remote-1".into(),
+                            label: "r1".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "remote-2".into(),
+                            label: "r2".into(),
+                            branch: None,
+                            focused: false,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        // Global indices of the LOCAL cards (the source block): base + count == block end.
+        let local_indices: Vec<usize> = snapshot
+            .workspace_routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| {
+                route.server_id == ServerId::main() && route.workspace_id.is_some()
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        let local_base = *local_indices.first().expect("local cards present");
+        let local_block_end = local_base + local_indices.len();
+        let first_local_row = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|c| c.ws_idx == local_base)
+            .expect("first local card")
+            .rect
+            .y;
+
+        // Press the first local space, then drag all the way to the bottom (past every remote card).
+        compositor.begin_workspace_press(ServerId::main(), "local-1".into(), 1, first_local_row);
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: host.1 - 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &drag, host.0, host.1),
+            WorkspaceReorderOutcome::Dragging
+        );
+
+        let dragging = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        match dragging.app.drag.as_ref().map(|d| &d.target) {
+            Some(crate::app::state::DragTarget::WorkspaceReorder {
+                source_ws_idx,
+                insert_idx,
+            }) => {
+                assert_eq!(*source_ws_idx, local_base);
+                // Clamped to the local block: the insert slot never points into the remote block.
+                let insert = insert_idx.expect("preview carries an insert slot");
+                assert!(
+                    insert <= local_block_end,
+                    "insert {insert} escaped local block end {local_block_end}"
+                );
+            }
+            _ => panic!("expected a WorkspaceReorder drag preview"),
+        }
+    }
+
+    // #19: a sub-threshold press (no drag) must leave `app.drag` empty so no phantom drop line shows.
+    #[test]
+    fn workspace_sub_threshold_press_has_no_drag_preview() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let ws1_row = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|c| c.ws_idx == 0)
+            .expect("first card")
+            .rect
+            .y;
+        // Press, then a zero-movement "drag" stays under the threshold: no drag begins.
+        compositor.begin_workspace_press(ServerId::main(), "ws-1".into(), 1, ws1_row);
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: ws1_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_workspace_reorder_mouse(&model, &drag, host.0, host.1),
+            WorkspaceReorderOutcome::Ignored
+        );
+
+        let after = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        assert!(after.app.drag.is_none());
+    }
+
     // #19: a press with no drag (sub-threshold) is not a reorder — release is `Ignored` so the
     // focus-on-down click stands.
+    // #19 (host half): a 3-host model — Local + two connected remotes — used by the host
+    // drag-reorder tests. Mirrors `mixed_supervisor_model` but with a second remote so reorder
+    // has somewhere to move.
+    fn three_host_model() -> (ClientSupervisorModel, ServerId, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_x = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        let remote_y = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-y".into(),
+            name: "y".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("y".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        });
+        for (id, ws, label, focused) in [
+            (ServerId::main(), "main-herdr", "herdr", true),
+            (remote_x.clone(), "x-api", "api", false),
+            (remote_y.clone(), "y-api", "api", false),
+        ] {
+            model
+                .set_summary(
+                    &id,
+                    ServerSummary {
+                        workspaces: vec![WorkspaceSummary {
+                            workspace_id: ws.into(),
+                            label: label.into(),
+                            branch: None,
+                            focused,
+                        }],
+                        agents: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        (model, remote_x, remote_y)
+    }
+
+    // #19 (host half): multi-host mode emits a Local banner (the draggable host handle); the
+    // single-local case must stay banner-free. Asserts both directions explicitly.
+    #[test]
+    fn local_host_banner_only_in_multi_host_mode() {
+        // Lone local: no banner.
+        let local_only = ClientSupervisorModel::new("local");
+        assert!(local_only.host_banner_specs().is_empty());
+        assert!(local_only.host_banner_server_ids().is_empty());
+
+        // Local + 2 remotes: a banner per host, in visible order, with Local first.
+        let (model, remote_x, remote_y) = three_host_model();
+        let ids = model.host_banner_server_ids();
+        assert_eq!(ids, vec![ServerId::main(), remote_x, remote_y]);
+        let specs = model.host_banner_specs();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].1.display_name, "local");
+    }
+
+    // #19 (host half): pressing a host banner then dragging past the threshold populates
+    // `app.drag` with a `HostReorder` whose `insert_idx` is a HOST boundary (a banner row),
+    // never inside a space block.
+    #[test]
+    fn host_drag_preview_populates_app_drag_at_host_boundary() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let (model, _x, _y) = three_host_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+
+        // Banner rects in render order: [local, x, y].
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model, &compositor, 26, host.0, host.1, Instant::now(),
+        );
+        let banner_y = |idx: usize| snapshot.app.view.host_banner_areas[idx].rect.y;
+        let local_banner_y = banner_y(0);
+        let y_banner_y = banner_y(2);
+        // The set of every host boundary row (banner tops, and just below the last banner).
+        let banner_rects: Vec<Rect> = snapshot
+            .app
+            .view
+            .host_banner_areas
+            .iter()
+            .map(|b| b.rect)
+            .collect();
+
+        // Press the LOCAL banner (host idx 0), then drag down onto the third host's banner.
+        compositor.begin_host_press(ServerId::main(), 1, local_banner_y);
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: y_banner_y,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_host_reorder_mouse(&model, &drag, host.0, host.1),
+            HostReorderOutcome::Dragging
+        );
+
+        let preview = ClientSidebarSnapshot::from_model(
+            &model, &compositor, 26, host.0, host.1, Instant::now(),
+        );
+        let (source_host_idx, insert_idx) = match preview.app.drag.as_ref().map(|d| &d.target) {
+            Some(crate::app::state::DragTarget::HostReorder {
+                source_host_idx,
+                insert_idx,
+            }) => (*source_host_idx, *insert_idx),
+            _ => panic!("expected HostReorder drag in the preview snapshot"),
+        };
+        assert_eq!(source_host_idx, 0, "dragged host is Local (idx 0)");
+        let insert_idx = insert_idx.expect("preview carries a live insert slot");
+        // The insert slot must equal the count of banner midpoints above the drop row — i.e. a
+        // host boundary — and never resolve into a space row.
+        assert_eq!(insert_idx, server_insert_index(&banner_rects, y_banner_y));
+        // A host insert slot is `0..=host_count`; it can never index a space card.
+        assert!(insert_idx <= banner_rects.len());
+    }
+
+    // #19 (host half): releasing a host drag commits a client-local `move_server`/`reorder_server`
+    // — `servers` order changes, `workspace_rows()` follows, and `active_server_id` is preserved.
+    #[test]
+    fn host_drag_commit_reorders_servers_client_local() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let (mut model, remote_x, remote_y) = three_host_model();
+        // Focus the second remote so we can prove the active server survives the move.
+        model.focus_workspace_route(&remote_y, "y-api");
+        assert_eq!(model.active_server_id(), &remote_y);
+
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model, &compositor, 26, host.0, host.1, Instant::now(),
+        );
+        let local_banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
+        let y_banner_rect = snapshot.app.view.host_banner_areas[2].rect;
+
+        // Drag Local down past the LAST host's midpoint → Local moves to the end.
+        compositor.begin_host_press(ServerId::main(), 1, local_banner_y);
+        let drag = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: y_banner_rect.y + y_banner_rect.height,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            compositor.handle_host_reorder_mouse(&model, &drag, host.0, host.1),
+            HostReorderOutcome::Dragging
+        );
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 1,
+            row: y_banner_rect.y + y_banner_rect.height,
+            modifiers: KeyModifiers::empty(),
+        };
+        let outcome = compositor.handle_host_reorder_mouse(&model, &up, host.0, host.1);
+        let (source_server_id, insert_index) = match outcome {
+            HostReorderOutcome::Commit {
+                source_server_id,
+                insert_index,
+            } => (source_server_id, insert_index),
+            other => panic!("expected Commit, got {other:?}"),
+        };
+        assert_eq!(source_server_id, ServerId::main());
+
+        // Order before: [main, x, y]. Apply the client-local reorder.
+        let before: Vec<ServerId> = model
+            .workspace_rows()
+            .iter()
+            .map(|r| r.server_id.clone())
+            .collect();
+        assert_eq!(before, vec![ServerId::main(), remote_x.clone(), remote_y.clone()]);
+        assert!(model.reorder_server(&source_server_id, insert_index));
+        // workspace_rows() now reflects the new host order with Local last.
+        let after: Vec<ServerId> = model
+            .workspace_rows()
+            .iter()
+            .map(|r| r.server_id.clone())
+            .collect();
+        assert_eq!(after, vec![remote_x, remote_y.clone(), ServerId::main()]);
+        // The active server is unchanged by the host move.
+        assert_eq!(model.active_server_id(), &remote_y);
+    }
+
+    // #19 (host half): the host drop indicator only ever lands on a host boundary (a banner row
+    // or just below the last banner) — never inside a space block — for every drop row.
+    #[test]
+    fn host_drop_indicator_never_inside_a_space_block() {
+        let (model, _x, _y) = three_host_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model, &compositor, 26, host.0, host.1, Instant::now(),
+        );
+        let banner_rects: Vec<Rect> = snapshot
+            .app
+            .view
+            .host_banner_areas
+            .iter()
+            .map(|b| b.rect)
+            .collect();
+        let card_rows: std::collections::HashSet<u16> = snapshot
+            .app
+            .view
+            .workspace_card_areas
+            .iter()
+            .flat_map(|c| c.rect.y..c.rect.y + c.rect.height)
+            .collect();
+
+        // Sweep every drop row over the whole sidebar height and confirm the resolved host
+        // drop-indicator row is always a banner-derived boundary, never a space card row.
+        let area = snapshot.app.view.sidebar_rect;
+        for drop_row in 0..host.1 {
+            let insert_idx = server_insert_index(&banner_rects, drop_row);
+            if let Some(y) =
+                crate::ui::host_drop_indicator_row(&snapshot.app.view.host_banner_areas, area, insert_idx)
+            {
+                assert!(
+                    !card_rows.contains(&y),
+                    "host drop indicator at row {y} fell inside a space block",
+                );
+            }
+        }
+    }
+
+    // #19 (host half): a press on a SPACE arms a workspace drag (not a host drag); a press on a
+    // BANNER hit-tests to `HostBanner` (the host-drag arming target).
+    #[test]
+    fn space_press_is_workspace_and_banner_press_is_host() {
+        let (model, remote_x, _y) = three_host_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model, &compositor, 26, host.0, host.1, Instant::now(),
+        );
+
+        // A banner row hit-tests to HostBanner for the right host (banner idx 1 == remote_x).
+        let x_banner_y = snapshot.app.view.host_banner_areas[1].rect.y;
+        assert_eq!(
+            compositor.hit_test(&model, 1, x_banner_y, host.0, host.1),
+            Some(SidebarHitTarget::HostBanner {
+                server_id: remote_x,
+            })
+        );
+
+        // A workspace card row hit-tests to a Workspace, never a HostBanner.
+        let card_y = snapshot.app.view.workspace_card_areas[0].rect.y;
+        assert!(matches!(
+            compositor.hit_test(&model, 1, card_y, host.0, host.1),
+            Some(SidebarHitTarget::Workspace { .. })
+        ));
+    }
+
     #[test]
     fn workspace_press_without_drag_is_not_a_reorder() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
@@ -2708,33 +3614,36 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         let snapshot =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
-        // A mixed model yields exactly one divider row. item 2 (C3): the single visible
-        // Secondary now also emits one host-banner area (from the same compute pass).
+        // A mixed model yields exactly one divider row. #19 (host half): in multi-host mode
+        // BOTH hosts emit a banner (Local + the one visible Secondary), so two host-banner
+        // areas come out of the same compute pass.
         assert_eq!(snapshot.app.view.divider_rows.len(), 1);
-        assert_eq!(snapshot.app.view.host_banner_areas.len(), 1);
+        assert_eq!(snapshot.app.view.host_banner_areas.len(), 2);
     }
 
     #[test]
     fn from_model_populates_host_banner_areas() {
         // item 2 (C3): the host-banner specs + the second slot of the single
         // compute_workspace_list_areas pass populate `app.host_banners` and
-        // `app.view.host_banner_areas` (one per visible Secondary), and flip
-        // `host_banner_active`. The banner_idx indexes app.host_banners.
+        // `app.view.host_banner_areas`, and flip `host_banner_active`. #19 (host half):
+        // in multi-host mode the banners are [Local, remote] in visible_servers() order;
+        // banner_idx indexes app.host_banners.
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
 
         assert!(snapshot.app.host_banner_active);
-        assert_eq!(snapshot.app.host_banners.len(), 1);
-        assert_eq!(snapshot.app.host_banners[0].display_name, "x");
-        assert_eq!(snapshot.app.view.host_banner_areas.len(), 1);
-        let area = snapshot.app.view.host_banner_areas[0];
-        assert_eq!(area.banner_idx, 0);
-        // The banner area never overlaps a workspace card (render == hit_test).
-        assert!(snapshot.app.view.workspace_card_areas.iter().all(|card| {
-            !(area.rect.y >= card.rect.y && area.rect.y < card.rect.y + card.rect.height)
-        }));
+        assert_eq!(snapshot.app.host_banners.len(), 2);
+        assert_eq!(snapshot.app.host_banners[0].display_name, "local");
+        assert_eq!(snapshot.app.host_banners[1].display_name, "x");
+        assert_eq!(snapshot.app.view.host_banner_areas.len(), 2);
+        // Every banner area never overlaps a workspace card (render == hit_test).
+        for area in &snapshot.app.view.host_banner_areas {
+            assert!(snapshot.app.view.workspace_card_areas.iter().all(|card| {
+                !(area.rect.y >= card.rect.y && area.rect.y < card.rect.y + card.rect.height)
+            }));
+        }
     }
 
     #[test]
@@ -2752,7 +3661,8 @@ mod tests {
         let pre =
             ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
         assert_eq!(pre.app.view.divider_rows.len(), 1);
-        assert_eq!(pre.app.view.host_banner_areas.len(), 1);
+        // #19 (host half): multi-host mode banners both hosts (Local + remote).
+        assert_eq!(pre.app.view.host_banner_areas.len(), 2);
 
         // The remote workspace's index in the flat workspace_rows() stream (no divider/banner).
         let remote_idx = model

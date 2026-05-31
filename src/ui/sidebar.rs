@@ -1520,6 +1520,38 @@ pub(crate) fn workspace_drop_indicator_row(
     None
 }
 
+/// #19 (host half): resolve a host insert position (`0..=banners.len()`) to the screen row the
+/// host drop indicator draws on, mirroring `workspace_drop_indicator_row` but operating on host
+/// banner rects. `banners[i]` is the i-th host's banner; an `insert_idx` of `i` draws just above
+/// banner `i`, and `banners.len()` draws just below the last banner (end of the host list). The
+/// returned row is therefore ALWAYS a host boundary — never inside a space block.
+pub(crate) fn host_drop_indicator_row(
+    banners: &[HostBannerArea],
+    area: Rect,
+    insert_idx: usize,
+) -> Option<u16> {
+    if area.height == 0 {
+        return None;
+    }
+    let list_bottom = area.y + area.height.saturating_sub(1);
+
+    if let Some(banner) = banners.get(insert_idx) {
+        return banner.rect.y.checked_sub(1).filter(|y| *y < list_bottom);
+    }
+    // insert_idx == banners.len(): just below the last banner (end of the host list).
+    if insert_idx == banners.len() {
+        if let Some(last) = banners.last() {
+            return last
+                .rect
+                .y
+                .saturating_add(last.rect.height)
+                .checked_sub(1)
+                .filter(|y| *y < list_bottom);
+        }
+    }
+    None
+}
+
 pub(crate) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1567,6 +1599,20 @@ fn render_workspace_list(
             insert_idx: Some(insert_idx),
             ..
         }) => workspace_drop_indicator_row(&app.view.workspace_card_areas, area, *insert_idx),
+        // #19 (host half): a host drag draws the SAME accent drop line, but at a host boundary
+        // computed from the banner rects only (never inside a space block).
+        Some(crate::app::state::DragTarget::HostReorder {
+            insert_idx: Some(insert_idx),
+            ..
+        }) => host_drop_indicator_row(&app.view.host_banner_areas, area, *insert_idx),
+        _ => None,
+    };
+    // #19 (host half): the dragged host's banner index (== its position in the ordered host list),
+    // so its banner row dims while dragging — mirroring the dragged-workspace lift.
+    let dragged_host_idx = match app.drag.as_ref().map(|drag| &drag.target) {
+        Some(crate::app::state::DragTarget::HostReorder { source_host_idx, .. }) => {
+            Some(*source_host_idx)
+        }
         _ => None,
     };
 
@@ -1770,7 +1816,7 @@ fn render_workspace_list(
     // SAME single `compute_workspace_list_areas_full` pass that produced the card geometry, so
     // render never recomputes a banner y — render == hit_test). Content left→right: optional
     // connection glyph, the per-char lolcat gradient host name (bold), an optional dim suffix.
-    for banner_area in &app.view.host_banner_areas {
+    for (host_idx, banner_area) in app.view.host_banner_areas.iter().enumerate() {
         let row_y = banner_area.rect.y;
         if row_y >= list_bottom {
             continue;
@@ -1778,6 +1824,14 @@ fn render_workspace_list(
         let Some(spec) = app.host_banners.get(banner_area.banner_idx) else {
             continue;
         };
+        // #19 (host half): dim the dragged host's banner row while a host drag is live (mirrors
+        // the dragged-workspace `surface1` lift). Banner index == host position in the ordered list.
+        if dragged_host_idx == Some(host_idx) {
+            let buf = frame.buffer_mut();
+            for x in banner_area.rect.x..banner_area.rect.x + banner_area.rect.width {
+                buf[(x, row_y)].set_style(Style::default().bg(p.surface1));
+            }
+        }
         let name_spans =
             host_banner_spans(&spec.display_name, app.spinner_tick, &app.sidebar_host, p);
         let glyph_color = match spec.connection_state {
