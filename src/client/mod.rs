@@ -531,19 +531,21 @@ fn step_workspace_focus(
     model: &mut supervisor::ClientSupervisorModel,
     delta: isize,
 ) -> ClientInputDispatch {
-    let targets: Vec<(supervisor::ServerId, String)> = model
-        .workspace_rows()
-        .into_iter()
-        .filter_map(|row| row.workspace_id.map(|id| (row.server_id, id)))
-        .collect();
-    let Some((server_id, workspace_id)) = step_focus_target(
-        &targets,
-        model
-            .workspace_rows()
-            .iter()
-            .position(|row| row.focused && row.workspace_id.is_some()),
-        delta,
-    ) else {
+    // Build `targets` and locate the focused entry in a SINGLE pass (mirroring `step_agent_focus`)
+    // so the focus index is recorded against the FILTERED target list. Seeding `current` from
+    // `.position()` over the unfiltered `workspace_rows()` skewed the step by the number of
+    // placeholder rows (`workspace_id == None`) preceding the focused workspace.
+    let mut targets: Vec<(supervisor::ServerId, String)> = Vec::new();
+    let mut focused_index = None;
+    for row in model.workspace_rows() {
+        if let Some(workspace_id) = row.workspace_id {
+            if row.focused {
+                focused_index = Some(targets.len());
+            }
+            targets.push((row.server_id, workspace_id));
+        }
+    }
+    let Some((server_id, workspace_id)) = step_focus_target(&targets, focused_index, delta) else {
         return ClientInputDispatch::Consumed;
     };
 
@@ -1016,7 +1018,9 @@ fn dispatch_composited_mouse_input(
                 }),
             };
         }
-        compositor::WorkspaceReorderOutcome::Cancelled => return ClientInputDispatch::Consumed,
+        // Cancelled only fires after an actual drag (plain clicks return Ignored), so the prior
+        // Dragging frames painted a drop indicator. Redraw to clear it — Consumed schedules no frame.
+        compositor::WorkspaceReorderOutcome::Cancelled => return ClientInputDispatch::Redraw,
         compositor::WorkspaceReorderOutcome::Ignored => {}
     }
 
@@ -1033,7 +1037,9 @@ fn dispatch_composited_mouse_input(
             model.reorder_server(&source_server_id, insert_index);
             return ClientInputDispatch::Redraw;
         }
-        compositor::HostReorderOutcome::Cancelled => return ClientInputDispatch::Consumed,
+        // Cancelled only fires after an actual drag (plain clicks return Ignored), so the prior
+        // Dragging frames painted a host drop indicator. Redraw to clear it — Consumed schedules none.
+        compositor::HostReorderOutcome::Cancelled => return ClientInputDispatch::Redraw,
         compositor::HostReorderOutcome::Ignored => {}
     }
 

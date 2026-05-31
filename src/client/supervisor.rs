@@ -1694,11 +1694,16 @@ impl ClientSupervisorModel {
                     form.error = Some("label required".to_string());
                     return RenameWorkspaceOutcome::Redraw;
                 }
-                RenameWorkspaceOutcome::Submit {
+                let outcome = RenameWorkspaceOutcome::Submit {
                     server_id: form.server_id.clone(),
                     workspace_id: form.workspace_id.clone(),
                     label,
-                }
+                };
+                // Close the overlay on submit so it can't linger and be re-submitted (the request
+                // flows through the overlay-agnostic ApiRequest path, which never closes it). Esc and
+                // Cancel already close; mirror them here.
+                self.close_client_overlay();
+                outcome
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(form) = self.rename_workspace_form_mut() {
@@ -1767,10 +1772,15 @@ impl ClientSupervisorModel {
         let Some(confirm) = self.confirm_close_workspace() else {
             return ConfirmCloseOutcome::Redraw;
         };
-        ConfirmCloseOutcome::Confirm {
+        let outcome = ConfirmCloseOutcome::Confirm {
             server_id: confirm.server_id.clone(),
             workspace_id: confirm.workspace_id.clone(),
-        }
+        };
+        // Close the overlay on confirm so it can't linger and be re-confirmed (the workspace.close
+        // request flows through the overlay-agnostic ApiRequest path, which never closes it). Esc
+        // and Cancel already close; mirror them here.
+        self.close_client_overlay();
+        outcome
     }
 
     /// #23: translate a key press in the close-confirm overlay into a typed outcome. Enter / y

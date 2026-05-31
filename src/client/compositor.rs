@@ -834,8 +834,11 @@ impl ClientCompositor {
 
     /// #19: resolve a drop row to an insert position within the pressed server's workspace list.
     /// Reorder is constrained to the source server's rows (a workspace belongs to exactly one
-    /// server), so the index is the count of that server's cards whose midpoint sits above the drop
-    /// row — a 0..=len insert position matching the monolithic `move_workspace` contract.
+    /// server). The drop row's visual midpoint count gives a *render position*; that position is
+    /// then mapped to the STORAGE index of the card it lands on (`card.ws_idx - base`), matching the
+    /// server-local `move_workspace` contract. A bare count diverges from storage order under
+    /// worktree grouping (#22, render order != storage order) or a scrolled list (leading cards
+    /// omitted), so we must read the actual `ws_idx` rather than counting visible cards.
     fn workspace_reorder_target(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
@@ -856,8 +859,15 @@ impl ClientCompositor {
             host_height,
             Instant::now(),
         );
-        // The pressed server's cards, in render order (== the server's stored workspace order).
-        let server_rects: Vec<Rect> = snapshot
+        // The pressed server's first GLOBAL `ws_idx`. `workspace_routes` is the full (never scrolled,
+        // storage-ordered) per-server flat list, so this anchors the server's contiguous block and
+        // lets a global `ws_idx` be translated into the server-local index `move_workspace` expects.
+        let base = snapshot
+            .workspace_routes
+            .iter()
+            .position(|route| route.server_id == press.server_id && route.workspace_id.is_some())?;
+        // The pressed server's cards, in render order, paired with their true global `ws_idx`.
+        let server_cards: Vec<(usize, Rect)> = snapshot
             .app
             .view
             .workspace_card_areas
@@ -865,13 +875,26 @@ impl ClientCompositor {
             .filter_map(|card| {
                 let route = snapshot.workspace_routes.get(card.ws_idx)?;
                 (route.server_id == press.server_id && route.workspace_id.is_some())
-                    .then_some(card.rect)
+                    .then_some((card.ws_idx, card.rect))
             })
             .collect();
-        if server_rects.is_empty() {
+        if server_cards.is_empty() {
             return None;
         }
-        Some(server_insert_index(&server_rects, drop_row))
+        let rects: Vec<Rect> = server_cards.iter().map(|(_, rect)| *rect).collect();
+        let above = server_insert_index(&rects, drop_row);
+        let insert_index = if above >= server_cards.len() {
+            // Dropped past the last rendered card: insert after this server's highest storage slot.
+            server_cards
+                .iter()
+                .map(|(ws_idx, _)| ws_idx.saturating_sub(base))
+                .max()
+                .map_or(0, |local| local + 1)
+        } else {
+            // Insert before the storage slot of the card the drop landed above.
+            server_cards[above].0.saturating_sub(base)
+        };
+        Some(insert_index)
     }
 
     /// #19 (host half): record a press on a host banner (called when a `Down(Left)` hit-tests to a
@@ -1012,7 +1035,12 @@ impl ClientCompositor {
         // it. Both render and these exclusion rects derive from the SAME `*_popup_rect(anchor_area)`
         // helpers, so what we protect lines up cell-for-cell with what gets drawn. Without an open
         // overlay we fall back to protecting just the open global-menu rect.
-        let anchor_area = self.overlay_anchor_area(model, host_width, host_height);
+        //
+        // Derive the anchor from the snapshot already built above instead of calling
+        // `overlay_anchor_area` (which rebuilds the full snapshot a second time per frame just to
+        // read `sidebar_footer_rect().y` — a heavy `from_model` of terminal/route state we already
+        // have). This is exactly what `overlay_anchor_area` returns.
+        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
         let mut excluded_rects: Vec<Rect> = Vec::new();
         if model.add_remote_form().is_some() {
             excluded_rects.extend(crate::ui::add_remote_popup_rect(anchor_area));
@@ -1207,11 +1235,13 @@ impl ClientCompositor {
 
         // #19 (host half): a press on a host banner resolves to that banner's host. Banner rows
         // produce no `WorkspaceCardArea`, so the card loop below never matches them; resolved here
-        // before the cards so a `Down(Left)` arms a host drag-reorder. `host_banner_areas[i]` maps
-        // to `host_banner_server_ids[i]` (same emission order — render == hit geometry).
-        for (banner_idx, banner) in snapshot.app.view.host_banner_areas.iter().enumerate() {
+        // before the cards so a `Down(Left)` arms a host drag-reorder. Index `host_banner_server_ids`
+        // by the area's TRUE `banner_idx`, not its positional `enumerate()` index — when the list is
+        // scrolled a leading banner is omitted from `host_banner_areas`, so positions no longer line
+        // up with the (never-truncated) server-id list.
+        for banner in snapshot.app.view.host_banner_areas.iter() {
             if rect_contains(banner.rect, x, y) {
-                let server_id = snapshot.host_banner_server_ids.get(banner_idx)?;
+                let server_id = snapshot.host_banner_server_ids.get(banner.banner_idx)?;
                 return Some(SidebarHitTarget::HostBanner {
                     server_id: server_id.clone(),
                 });
@@ -1502,9 +1532,11 @@ impl ClientSidebarSnapshot {
         // last-wins on `row.focused || agent-focused` let a trailing remote's *workspace*-focused
         // row override the local row that actually owns the user's focused agent, so under the
         // default `CurrentWorkspace` scope the local agents vanished. Rank the focus signal so an
-        // agent-focused row always beats a merely workspace-focused one; ties keep last-wins (the
-        // existing optimistic-focus / divider tests rely on a later agent-focused row winning).
+        // agent-focused row always beats a merely workspace-focused one; on an EQUAL-rank tie prefer
+        // the row on the authoritative `active_server_id` (a bare last-wins attached the wrong host
+        // whenever two connected servers reported the same rank simultaneously).
         let mut active_rank = 0u8; // 0 = none, 1 = workspace-focused, 2 = agent-focused
+        let active_server = model.active_server_id().clone();
         let workspace_rows = model.workspace_rows();
         for (idx, row) in workspace_rows.into_iter().enumerate() {
             let agents = row
@@ -1522,7 +1554,14 @@ impl ClientSidebarSnapshot {
             } else {
                 0
             };
-            if row_rank > 0 && row_rank >= active_rank {
+            // Strictly higher rank always wins; an equal-rank row only overrides when nothing is
+            // selected yet or it belongs to the active server (so a single-server fleet — where every
+            // focused row is on the active server — keeps the prior last-wins behaviour exactly).
+            let on_active_server = row.server_id == active_server;
+            if row_rank > 0
+                && (row_rank > active_rank
+                    || (row_rank == active_rank && (active_idx.is_none() || on_active_server)))
+            {
                 active_idx = Some(idx);
                 active_rank = row_rank;
             }
@@ -1694,30 +1733,39 @@ impl ClientSidebarSnapshot {
                     route.server_id == press.server_id
                         && route.workspace_id.as_deref() == Some(press.workspace_id.as_str())
                 });
-                // The source server's cards, in render order (== its stored workspace order). They
-                // are contiguous in global `ws_idx`, so `base` is the block's first global index.
-                let mut server_rects: Vec<Rect> = Vec::new();
-                let mut base: Option<usize> = None;
+                // The source server's cards, in render order, paired with their true global `ws_idx`.
+                let mut server_cards: Vec<(usize, Rect)> = Vec::new();
                 for card in &app.view.workspace_card_areas {
                     let Some(route) = workspace_routes.get(card.ws_idx) else {
                         continue;
                     };
                     if route.server_id == press.server_id && route.workspace_id.is_some() {
-                        server_rects.push(card.rect);
-                        base = Some(base.map_or(card.ws_idx, |b: usize| b.min(card.ws_idx)));
+                        server_cards.push((card.ws_idx, card.rect));
                     }
                 }
-                if let (Some(source_ws_idx), Some(base)) = (source_ws_idx, base) {
-                    // Per-server insert position via the SAME midpoint rule as the commit path,
-                    // offset into the source server's contiguous global block. Clamped to the block
-                    // so the indicator can never point into another host's spaces.
-                    let insert_idx = base + server_insert_index(&server_rects, drop_row);
-                    app.drag = Some(crate::app::state::DragState {
-                        target: crate::app::state::DragTarget::WorkspaceReorder {
-                            source_ws_idx,
-                            insert_idx: Some(insert_idx),
-                        },
-                    });
+                if let Some(source_ws_idx) = source_ws_idx {
+                    if !server_cards.is_empty() {
+                        // The midpoint rule gives a render *position*; resolve it to the global
+                        // `ws_idx` of the card it lands on (what `workspace_drop_indicator_row` keys
+                        // off) so the indicator row matches the storage slot the commit path
+                        // (`workspace_reorder_target`) will actually move into. A bare count + base
+                        // diverges under worktree grouping (#22) or a scrolled list.
+                        let rects: Vec<Rect> = server_cards.iter().map(|(_, rect)| *rect).collect();
+                        let above = server_insert_index(&rects, drop_row);
+                        let insert_idx = if above >= server_cards.len() {
+                            server_cards
+                                .last()
+                                .map_or(0, |(ws_idx, _)| ws_idx.saturating_add(1))
+                        } else {
+                            server_cards[above].0
+                        };
+                        app.drag = Some(crate::app::state::DragState {
+                            target: crate::app::state::DragTarget::WorkspaceReorder {
+                                source_ws_idx,
+                                insert_idx: Some(insert_idx),
+                            },
+                        });
+                    }
                 }
             }
         }

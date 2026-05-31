@@ -1816,7 +1816,7 @@ fn render_workspace_list(
     // SAME single `compute_workspace_list_areas_full` pass that produced the card geometry, so
     // render never recomputes a banner y — render == hit_test). Content left→right: optional
     // connection glyph, the per-char lolcat gradient host name (bold), an optional dim suffix.
-    for (host_idx, banner_area) in app.view.host_banner_areas.iter().enumerate() {
+    for banner_area in app.view.host_banner_areas.iter() {
         let row_y = banner_area.rect.y;
         if row_y >= list_bottom {
             continue;
@@ -1825,8 +1825,10 @@ fn render_workspace_list(
             continue;
         };
         // #19 (host half): dim the dragged host's banner row while a host drag is live (mirrors
-        // the dragged-workspace `surface1` lift). Banner index == host position in the ordered list.
-        if dragged_host_idx == Some(host_idx) {
+        // the dragged-workspace `surface1` lift). Compare against the area's TRUE `banner_idx`
+        // (`source_host_idx` is a position in the full ordered host list) — a positional loop index
+        // would dim the wrong row once a leading banner has scrolled off.
+        if dragged_host_idx == Some(banner_area.banner_idx) {
             let buf = frame.buffer_mut();
             for x in banner_area.rect.x..banner_area.rect.x + banner_area.rect.width {
                 buf[(x, row_y)].set_style(Style::default().bg(p.surface1));
