@@ -387,7 +387,7 @@ fn dispatch_composited_input(
     // the SAME client action the mouse path uses. Only a single bare Key event is considered; any
     // multi-event/paste/unmatched input falls through to Forward so terminal input is preserved.
     if let [crate::raw_input::RawInputEvent::Key(key)] = events.as_slice() {
-        if let Some(dispatch) = dispatch_composited_key_input(*key, compositor, model) {
+        if let Some(dispatch) = dispatch_composited_key_input(*key, &data, compositor, model) {
             return dispatch;
         }
     }
@@ -395,7 +395,7 @@ fn dispatch_composited_input(
     ClientInputDispatch::Forward(data)
 }
 
-/// #24: route a single keypress to a client-side sidebar-navigation action, mirroring the
+/// #24/#30: route a single keypress to a client-side sidebar-navigation action, mirroring the
 /// server's gating (`src/app/input/navigate.rs`). Returns `None` for any key that is NOT a
 /// configured sidebar-nav binding so the caller forwards it to the focused remote terminal.
 ///
@@ -405,40 +405,68 @@ fn dispatch_composited_input(
 /// close workspace, sidebar collapse, agent-scope). Direct (modified-chord) bindings still fire
 /// without the prefix, exactly as the server's `terminal_direct_navigation_action` does. Bare,
 /// unmodified keys are never intercepted unless prefix-armed, so normal typing reaches the agent.
+///
+/// #30: the client only re-implements the *sidebar* subset of prefix actions. The prefix key is
+/// therefore buffered (not forwarded) on arm, and an armed follow-up the client does NOT handle is
+/// replayed to the active server as `prefix-bytes ++ key-bytes`, so the server's own prefix state
+/// machine runs everything else (new tab/split/close-pane/zoom/resize/pane-focus/tab-switch/detach
+/// /help/settings/navigate/custom commands). Only `Press`/`Repeat` arms or resolves the prefix; a
+/// `Release` (e.g. the prefix key's own release under a CSI-u keyboard protocol) must not disarm.
 fn dispatch_composited_key_input(
     key: crate::input::TerminalKey,
+    data: &[u8],
     compositor: &mut compositor::ClientCompositor,
     model: &mut supervisor::ClientSupervisorModel,
 ) -> Option<ClientInputDispatch> {
     let (keybinds, prefix) = client_navigation_keybinds();
+    let is_press = matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    );
 
     if compositor.prefix_armed() {
-        // Mirror the server's prefix mode: Esc / the prefix key itself just leaves prefix mode and
-        // is swallowed (never forwarded to the terminal). Any other key resolves a prefix-mode
-        // binding (or, if none matches, is consumed — the server's prefix mode does not forward
-        // unbound keys to the pane).
+        // A release while armed (the prefix key's own release, etc.) must NOT cancel prefix mode
+        // before the follow-up press arrives; swallow it and stay armed.
+        if !is_press {
+            return Some(ClientInputDispatch::Consumed);
+        }
+        let prefix_bytes = compositor.take_prefix_pending_bytes();
         compositor.disarm_prefix();
         let key_event = key.as_key_event();
+        // Esc / the prefix key itself just leaves prefix mode, swallowed (mirrors the server).
         if key_event.code == crossterm::event::KeyCode::Esc
             || crate::config::terminal_key_matches_combo(key, prefix)
         {
             return Some(ClientInputDispatch::Redraw);
         }
-        return Some(
+        // A client-rendered-sidebar action is handled locally and swallowed — the server never
+        // entered prefix mode (we never forwarded the prefix key).
+        if let Some(dispatch) =
             sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Prefix)
-                .unwrap_or(ClientInputDispatch::Redraw),
-        );
+        {
+            return Some(dispatch);
+        }
+        // Everything else is owned by the server's prefix state machine. Replay the buffered prefix
+        // key + this key to the active server so it runs the action (#30).
+        let mut forwarded = prefix_bytes.unwrap_or_default();
+        forwarded.extend_from_slice(data);
+        return Some(ClientInputDispatch::Forward(forwarded));
     }
 
-    // Not armed: a press of the configured prefix key arms prefix mode (and is swallowed). Other
-    // keys only fire if they match a DIRECT (modified-chord) sidebar-nav binding; everything else
-    // returns None so the caller forwards it to the terminal.
-    if crate::config::terminal_key_matches_combo(key, prefix) {
-        compositor.arm_prefix();
+    // Not armed: a press of the configured prefix key arms prefix mode, buffering its raw bytes
+    // (swallowed for now — replayed to the server later only if the follow-up isn't a client
+    // sidebar action). Other keys fire only on a DIRECT (modified-chord) sidebar-nav binding;
+    // everything else returns None so the caller forwards it to the terminal.
+    if is_press && crate::config::terminal_key_matches_combo(key, prefix) {
+        compositor.arm_prefix(data.to_vec());
         return Some(ClientInputDispatch::Redraw);
     }
 
-    sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Direct)
+    if is_press {
+        sidebar_action_dispatch(&keybinds, key, compositor, model, ActionTrigger::Direct)
+    } else {
+        None
+    }
 }
 
 /// #24: whether to match the configured prefix-mode side of a binding (`prefix+x`, only checked
@@ -531,21 +559,32 @@ fn step_workspace_focus(
     model: &mut supervisor::ClientSupervisorModel,
     delta: isize,
 ) -> ClientInputDispatch {
-    // Build `targets` and locate the focused entry in a SINGLE pass (mirroring `step_agent_focus`)
-    // so the focus index is recorded against the FILTERED target list. Seeding `current` from
-    // `.position()` over the unfiltered `workspace_rows()` skewed the step by the number of
-    // placeholder rows (`workspace_id == None`) preceding the focused workspace.
+    // Build `targets` and locate the focused entry in a SINGLE pass so the focus index is recorded
+    // against the FILTERED target list. (Seeding `current` from `.position()` over the unfiltered
+    // `workspace_rows()` skewed the step by the number of placeholder rows (`workspace_id == None`)
+    // preceding the focused workspace.) Each connected server independently reports a `focused`
+    // workspace, so several rows can be focused at once; anchor the step on the row owned by the
+    // ACTIVE server (the workspace the user is actually on), falling back to the first focused row.
+    // This matches the active-server tie-break the sidebar snapshot uses for the same ambiguity.
+    let active_server = model.active_server_id().clone();
     let mut targets: Vec<(supervisor::ServerId, String)> = Vec::new();
     let mut focused_index = None;
+    let mut active_focused_index = None;
     for row in model.workspace_rows() {
         if let Some(workspace_id) = row.workspace_id {
             if row.focused {
-                focused_index = Some(targets.len());
+                if focused_index.is_none() {
+                    focused_index = Some(targets.len());
+                }
+                if active_focused_index.is_none() && row.server_id == active_server {
+                    active_focused_index = Some(targets.len());
+                }
             }
             targets.push((row.server_id, workspace_id));
         }
     }
-    let Some((server_id, workspace_id)) = step_focus_target(&targets, focused_index, delta) else {
+    let current = active_focused_index.or(focused_index);
+    let Some((server_id, workspace_id)) = step_focus_target(&targets, current, delta) else {
         return ClientInputDispatch::Consumed;
     };
 
@@ -1380,7 +1419,16 @@ fn translate_content_mouse_input(
                 crate::input::MouseProtocolEncoding::Sgr,
             )
         }
-        MouseEventKind::Moved => None,
+        // #31: re-encode buttonless motion with the content-translated column too (SGR motion).
+        // Forwarding `original` here leaked the host column (off by the sidebar width) to apps
+        // using any-event mouse tracking (?1003h).
+        MouseEventKind::Moved => crate::input::encode_mouse_button(
+            mouse.kind,
+            column,
+            mouse.row,
+            mouse.modifiers,
+            crate::input::MouseProtocolEncoding::Sgr,
+        ),
     };
 
     ClientInputDispatch::Forward(encoded.unwrap_or(original))
@@ -6450,6 +6498,64 @@ mod tests {
         });
     }
 
+    // #24: each connected server independently reports a focused workspace, so several rows are
+    // focused at once. Stepping must anchor on the ACTIVE server's focused row — not the first or
+    // last focused row in the aggregated list. The active server here is the MIDDLE of three, which
+    // distinguishes active-anchoring (→ next server) from first-anchoring or last-anchoring.
+    #[test]
+    fn step_workspace_focus_anchors_on_active_server() {
+        let secondary = |id: &str, session: &str| crate::remote_registry::RemoteDefinitionSnapshot {
+            id: id.into(),
+            name: id.into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some(session.into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+        };
+        let focused_ws = |id: &str| supervisor::WorkspaceSummary {
+            workspace_id: id.into(),
+            label: id.into(),
+            branch: None,
+            focused: true,
+            ..Default::default()
+        };
+        let summary = |ws: &str| supervisor::ServerSummary {
+            workspaces: vec![focused_ws(ws)],
+            agents: Vec::new(),
+        };
+
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let mid = model.add_secondary(secondary("remote-b", "b"));
+        let last = model.add_secondary(secondary("remote-c", "c"));
+        // visible order is [main, remote-b, remote-c]; every server has one focused workspace.
+        model.set_summary(&supervisor::ServerId::main(), summary("main-ws")).unwrap();
+        model.set_summary(&mid, summary("mid-ws")).unwrap();
+        model.set_summary(&last, summary("last-ws")).unwrap();
+
+        // Make the MIDDLE server active. All three rows stay focused (each from its own summary).
+        model.focus_workspace_route(&mid, "mid-ws");
+        assert_eq!(model.active_server_id(), &mid);
+
+        // Forward step anchors on the active (middle) server's row → the NEXT server's workspace.
+        // (First-anchoring would step from main → mid; last-anchoring would wrap last → main.)
+        match step_workspace_focus(&mut model, 1) {
+            ClientInputDispatch::ApiRequest {
+                server_id, request, ..
+            } => {
+                assert_eq!(server_id, last);
+                match &request.method {
+                    crate::api::schema::Method::WorkspaceFocus(target) => {
+                        assert_eq!(target.workspace_id, "last-ws");
+                    }
+                    other => panic!("expected WorkspaceFocus, got {other:?}"),
+                }
+            }
+            other => panic!("expected ApiRequest, got {other:?}"),
+        }
+    }
+
     // A new-workspace key opens the picker (multi-destination → Redraw, picker overlay set).
     #[test]
     fn new_workspace_key_opens_picker() {
@@ -6585,6 +6691,54 @@ mod tests {
                         }),
                     }
                 );
+            },
+        );
+    }
+
+    // #30: in client-compositor mode the prefix key must still reach the server for any prefix
+    // action the client does NOT re-implement. `c` (new_tab = prefix+c) is not a sidebar-nav
+    // binding, so `ctrl+b` then `c` must forward the buffered prefix byte + `c` to the active
+    // server (so the server's prefix state machine runs new-tab) — not silently swallow it.
+    #[test]
+    fn prefix_then_unhandled_key_forwards_prefix_and_key_to_server() {
+        with_client_keys_config("[keys]\nprefix = \"ctrl+b\"\n", || {
+            let (mut model, _remote_id) = mixed_remote_model();
+            let mut compositor = compositor::ClientCompositor::new(26);
+
+            // ctrl+b (0x02) arms prefix mode and is swallowed (not forwarded yet).
+            assert_eq!(
+                dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                ClientInputDispatch::Redraw
+            );
+            assert!(compositor.prefix_armed());
+
+            // 'c' is not a client sidebar-nav binding → replay prefix + key to the server.
+            assert_eq!(
+                press_char('c', &mut compositor, &mut model),
+                ClientInputDispatch::Forward(vec![0x02, b'c'])
+            );
+            assert!(!compositor.prefix_armed());
+        });
+    }
+
+    // #30: detach (prefix+q) is not a client sidebar action, so it must reach the server too
+    // (previously it was eaten, leaving `ctrl+b q` dead in mixed sessions).
+    #[test]
+    fn prefix_then_detach_forwards_to_server() {
+        with_client_keys_config(
+            "[keys]\nprefix = \"ctrl+b\"\ndetach = \"prefix+q\"\n",
+            || {
+                let (mut model, _remote_id) = mixed_remote_model();
+                let mut compositor = compositor::ClientCompositor::new(26);
+                assert_eq!(
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    ClientInputDispatch::Redraw
+                );
+                assert_eq!(
+                    press_char('q', &mut compositor, &mut model),
+                    ClientInputDispatch::Forward(vec![0x02, b'q'])
+                );
+                assert!(!compositor.prefix_armed());
             },
         );
     }
@@ -6951,11 +7105,13 @@ mod tests {
             ClientInputDispatch::Redraw
         );
         assert_eq!(compositor.hover(), None);
-        // a second content motion (no prior hover) is NOT intercepted: it falls through to
-        // translate_content_mouse_input, which maps Moved → the original bytes (Forward).
+        // #31: a second content motion (no prior hover) falls through to
+        // translate_content_mouse_input, which must re-encode the Moved event with the column
+        // translated into content space (host col 40 − sidebar width 26 = content col 14) — not
+        // forward the original host-coordinate bytes.
         assert_eq!(
             dispatch_composited_input(moved_bytes(40, 3), &mut compositor, &mut model, host),
-            ClientInputDispatch::Forward(moved_bytes(40, 3))
+            ClientInputDispatch::Forward(moved_bytes(14, 3))
         );
     }
 

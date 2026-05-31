@@ -110,10 +110,12 @@ pub(crate) enum HostReorderOutcome {
     Cancelled,
 }
 
-/// #19: resolve a drop row to a `0..=cards.len()` insert position within one server's contiguous
-/// workspace cards (render order == stored order). The index is the count of cards whose vertical
-/// midpoint sits strictly above the drop row — the same rule used for both the live drop indicator
-/// (`from_model`) and the committed `workspace.reorder` (`workspace_reorder_target`).
+/// #19: resolve a drop row to a RENDER POSITION (`0..=cards.len()`) among a contiguous block of
+/// cards — the count of cards whose vertical midpoint sits strictly above the drop row. This is a
+/// position in the slice AS PASSED (render order, possibly scroll-truncated), NOT a storage index.
+/// Callers translate it into the index space their consumer needs via `block_insert_global_index`:
+/// render order may differ from storage order (worktree grouping #22) or omit leading cards (when
+/// scrolled), so the bare position must be mapped through each card's true stored index.
 fn server_insert_index(cards: &[Rect], drop_row: u16) -> usize {
     let mut insert = 0usize;
     for rect in cards {
@@ -125,6 +127,24 @@ fn server_insert_index(cards: &[Rect], drop_row: u16) -> usize {
         }
     }
     insert.min(cards.len())
+}
+
+/// #19: map a drop within ONE contiguous block to the GLOBAL index slot it lands on. `cards` are
+/// the block's cards in RENDER order, each paired with its true global index (`ws_idx` for
+/// workspaces, `banner_idx` for hosts). Returns the global index of the card the drop lands above,
+/// or `max(index) + 1` when dropped past the last card — `max`, NOT the last *rendered* card,
+/// because render order != storage order under worktree grouping (#22). The live drop indicator
+/// and the committed reorder both derive their slot from THIS function (the commit then subtracts
+/// the block's base to get a server-local index), so the preview and the commit cannot disagree.
+/// `None` only when `cards` is empty.
+fn block_insert_global_index(cards: &[(usize, Rect)], drop_row: u16) -> Option<usize> {
+    let rects: Vec<Rect> = cards.iter().map(|(_, rect)| *rect).collect();
+    let above = server_insert_index(&rects, drop_row);
+    match cards.get(above) {
+        Some((global, _)) => Some(*global),
+        // Dropped past the last rendered card: insert after the block's HIGHEST stored slot.
+        None => cards.iter().map(|(global, _)| *global).max().map(|max| max + 1),
+    }
 }
 
 /// Outcome of a width-divider mouse interaction. A change to the sidebar width changes the content
@@ -169,6 +189,11 @@ pub(crate) struct ClientCompositor {
     // key for prefix-bound sidebar-nav actions. Bare keys are never intercepted unless armed, so
     // normal terminal input is preserved.
     prefix_armed: bool,
+    // #30: raw bytes of the prefix keypress that armed prefix mode, buffered so an unhandled
+    // follow-up key can be replayed to the active server as `prefix + key`. The client owns only a
+    // subset of prefix actions (sidebar nav); the server owns the rest (tabs/panes/splits/detach),
+    // so a key the client does not handle must reach the server WITH the prefix that preceded it.
+    prefix_pending_bytes: Option<Vec<u8>>,
     // #22: client-local collapsed worktree-group keys. The server persists its OWN set
     // (`AppState.collapsed_space_keys`); collapse of the client's AGGREGATED multi-host view is a
     // per-client display concern, so the client owns this set (no server round-trip). Fed into
@@ -300,6 +325,7 @@ impl ClientCompositor {
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             sidebar_collapsed: false,
             prefix_armed: false,
+            prefix_pending_bytes: None,
             collapsed_space_keys: std::collections::HashSet::new(),
             working_since: HashMap::new(),
         }
@@ -315,14 +341,23 @@ impl ClientCompositor {
         self.prefix_armed
     }
 
-    /// #24: arm prefix mode (the configured prefix key was pressed).
-    pub(crate) fn arm_prefix(&mut self) {
+    /// #24/#30: arm prefix mode (the configured prefix key was pressed), buffering its raw bytes so
+    /// an unhandled follow-up key can be replayed to the server as `prefix + key`.
+    pub(crate) fn arm_prefix(&mut self, prefix_bytes: Vec<u8>) {
         self.prefix_armed = true;
+        self.prefix_pending_bytes = Some(prefix_bytes);
     }
 
     /// #24: clear prefix mode (a key was resolved/consumed, or it did not match a binding).
     pub(crate) fn disarm_prefix(&mut self) {
         self.prefix_armed = false;
+        self.prefix_pending_bytes = None;
+    }
+
+    /// #30: take the buffered prefix-key bytes, used to replay `prefix + follow-up` to the server
+    /// when the follow-up is not a client-handled sidebar action. Leaves the buffer empty.
+    pub(crate) fn take_prefix_pending_bytes(&mut self) -> Option<Vec<u8>> {
+        self.prefix_pending_bytes.take()
     }
 
     /// #24: test accessor for the client-local collapsed-sidebar flag (the value `from_model`
@@ -878,23 +913,11 @@ impl ClientCompositor {
                     .then_some((card.ws_idx, card.rect))
             })
             .collect();
-        if server_cards.is_empty() {
-            return None;
-        }
-        let rects: Vec<Rect> = server_cards.iter().map(|(_, rect)| *rect).collect();
-        let above = server_insert_index(&rects, drop_row);
-        let insert_index = if above >= server_cards.len() {
-            // Dropped past the last rendered card: insert after this server's highest storage slot.
-            server_cards
-                .iter()
-                .map(|(ws_idx, _)| ws_idx.saturating_sub(base))
-                .max()
-                .map_or(0, |local| local + 1)
-        } else {
-            // Insert before the storage slot of the card the drop landed above.
-            server_cards[above].0.saturating_sub(base)
-        };
-        Some(insert_index)
+        // Resolve to the global `ws_idx` slot, then offset into the server's contiguous block to the
+        // server-local index `move_workspace` expects. Shares `block_insert_global_index` with the
+        // live drop indicator (`from_model`) so the preview and the commit can never diverge.
+        let global = block_insert_global_index(&server_cards, drop_row)?;
+        Some(global.saturating_sub(base))
     }
 
     /// #19 (host half): record a press on a host banner (called when a `Down(Left)` hit-tests to a
@@ -958,10 +981,14 @@ impl ClientCompositor {
         }
     }
 
-    /// #19 (host half): resolve a drop row to an insert position among the ORDERED host list. The
-    /// index is the count of host banners whose vertical midpoint sits above the drop row (the SAME
-    /// `server_insert_index` rule used for workspaces), so the host drop slot is ALWAYS a host
-    /// boundary — never inside a space block.
+    /// #19 (host half): resolve a drop row to an insert position among the ORDERED host list, so the
+    /// host drop slot is ALWAYS a host boundary — never inside a space block. `reorder_server`
+    /// expects a position in the full, never-scrolled host list (`self.servers` order, == each
+    /// banner's `banner_idx`), so resolve the render position through the banner's true `banner_idx`
+    /// via `block_insert_global_index` rather than a bare count over the (scroll-truncated) visible
+    /// banners — otherwise a leading banner scrolled off the top would offset the committed slot.
+    /// (The live host indicator instead wants a visible-slice position, since `host_drop_indicator_row`
+    /// indexes the visible banners positionally; it keeps the bare `server_insert_index` count.)
     fn host_reorder_target(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
@@ -981,17 +1008,14 @@ impl ClientCompositor {
             host_height,
             Instant::now(),
         );
-        let banner_rects: Vec<Rect> = snapshot
+        let host_cards: Vec<(usize, Rect)> = snapshot
             .app
             .view
             .host_banner_areas
             .iter()
-            .map(|banner| banner.rect)
+            .map(|banner| (banner.banner_idx, banner.rect))
             .collect();
-        if banner_rects.is_empty() {
-            return None;
-        }
-        Some(server_insert_index(&banner_rects, drop_row))
+        block_insert_global_index(&host_cards, drop_row)
     }
 
     fn set_sidebar_width_from_column(
@@ -1106,6 +1130,10 @@ impl ClientCompositor {
     /// the sidebar footer row, so the popups open upward from the footer like the global launcher
     /// menu (instead of dead-centered). Render, content-copy exclusion, hit-test and hover-test all
     /// derive overlay geometry from this SAME rect, so they cannot drift.
+    ///
+    /// Production code inlines this body (`compose_frame`/`hit_test` build the snapshot once and
+    /// reuse it); only tests call the helper standalone, hence `#[cfg(test)]`.
+    #[cfg(test)]
     pub(crate) fn overlay_anchor_area(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
@@ -1744,21 +1772,13 @@ impl ClientSidebarSnapshot {
                     }
                 }
                 if let Some(source_ws_idx) = source_ws_idx {
-                    if !server_cards.is_empty() {
-                        // The midpoint rule gives a render *position*; resolve it to the global
-                        // `ws_idx` of the card it lands on (what `workspace_drop_indicator_row` keys
-                        // off) so the indicator row matches the storage slot the commit path
-                        // (`workspace_reorder_target`) will actually move into. A bare count + base
-                        // diverges under worktree grouping (#22) or a scrolled list.
-                        let rects: Vec<Rect> = server_cards.iter().map(|(_, rect)| *rect).collect();
-                        let above = server_insert_index(&rects, drop_row);
-                        let insert_idx = if above >= server_cards.len() {
-                            server_cards
-                                .last()
-                                .map_or(0, |(ws_idx, _)| ws_idx.saturating_add(1))
-                        } else {
-                            server_cards[above].0
-                        };
+                    // Resolve to the global `ws_idx` of the slot the drop lands on (what
+                    // `workspace_drop_indicator_row` keys off). Shares `block_insert_global_index`
+                    // with the commit path (`workspace_reorder_target`, which subtracts the block
+                    // base) so the indicator row matches the storage slot the release commits to —
+                    // even under worktree grouping (#22, render order != storage order) or a
+                    // scrolled list.
+                    if let Some(insert_idx) = block_insert_global_index(&server_cards, drop_row) {
                         app.drag = Some(crate::app::state::DragState {
                             target: crate::app::state::DragTarget::WorkspaceReorder {
                                 source_ws_idx,
@@ -3271,6 +3291,39 @@ mod tests {
                 .sidebar_default_width
                 .clamp(settings.sidebar_min_width, settings.sidebar_max_width)
         );
+    }
+
+    // #19: `block_insert_global_index` resolves a render-order drop to a GLOBAL index slot. The
+    // critical case is worktree grouping, where render order != storage (ws_idx/banner_idx) order:
+    // dropping past the last RENDERED card must land after the block's HIGHEST stored slot (`max`),
+    // not after the last rendered card. This is what keeps the live drop indicator and the commit in
+    // lockstep (both derive their slot here) and what makes host reorder robust to a scrolled-off
+    // leading banner (the visible block's first banner_idx is not 0).
+    #[test]
+    fn block_insert_global_index_uses_storage_max_not_render_last() {
+        // Storage [L=0, M=1, P=2] rendered parent-first as [P(2), L(0), M(1)] (worktree group).
+        let cards = vec![
+            (2usize, Rect::new(0, 0, 4, 2)), // P: rows 0..2, midpoint 1
+            (0usize, Rect::new(0, 2, 4, 2)), // L: rows 2..4, midpoint 3
+            (1usize, Rect::new(0, 4, 4, 2)), // M: rows 4..6, midpoint 5
+        ];
+        // Dropped below every midpoint → after the block's HIGHEST stored slot: max(0,1,2)+1 = 3.
+        // (The pre-fix code returned the last RENDERED card's index + 1 = M(1)+1 = 2 — the bug.)
+        assert_eq!(block_insert_global_index(&cards, 99), Some(3));
+        // Above the very first rendered card → that card's global index (P = 2).
+        assert_eq!(block_insert_global_index(&cards, 0), Some(2));
+        // Between P and L (above L's midpoint) → L's global index (0).
+        assert_eq!(block_insert_global_index(&cards, 3), Some(0));
+
+        // Host scroll analogue: leading banner (banner_idx 0) scrolled off, visible = [1, 2].
+        let scrolled = vec![(1usize, Rect::new(0, 0, 4, 1)), (2usize, Rect::new(0, 1, 4, 1))];
+        // A drop above the first VISIBLE banner resolves to its true banner_idx (1), not 0.
+        assert_eq!(block_insert_global_index(&scrolled, 0), Some(1));
+        // Past the last → max(1,2)+1 = 3 (the full-list end), not visible-count 2.
+        assert_eq!(block_insert_global_index(&scrolled, 99), Some(3));
+
+        // Empty block → no slot.
+        assert_eq!(block_insert_global_index(&[], 5), None);
     }
 
     // #19: pressing a workspace card and dragging past the threshold to another card's row, then
