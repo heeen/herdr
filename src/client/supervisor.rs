@@ -129,6 +129,13 @@ pub(crate) struct ManagedServer {
     pub(crate) ping_samples: std::collections::VecDeque<u32>,
     /// Most recent downstream frame throughput from this host in bytes/sec, if measured.
     pub(crate) download_bps: Option<u64>,
+    /// #44: the remote's reported herdr version string (e.g. `0.6.4`), captured over the Ping/Pong
+    /// runtime-status path (NOT the handshake Welcome, which carries only the protocol u32). `None`
+    /// until the first status fetch lands; shown in the host context menu's version readout row.
+    pub(crate) remote_version: Option<String>,
+    /// #44: the remote's reported wire protocol version, captured over the same Ping/Pong path. The
+    /// host context menu flags a mismatch when this differs from the local `PROTOCOL_VERSION`.
+    pub(crate) remote_protocol: Option<u32>,
 }
 
 /// How many recent round-trip samples feed the host-banner ping average.
@@ -295,6 +302,11 @@ pub(crate) struct HostContextMenu {
     pub(crate) disabled: bool,
     pub(crate) connected: bool,
     pub(crate) selected: usize,
+    // #44: the remote's runtime version/protocol captured at open time, so the version-readout row
+    // label (and its ⚠ mismatch marker) are stable while the menu is open. Mirrors how `disabled`/
+    // `connected` are snapshotted so the row list and the action mapping share one source.
+    pub(crate) remote_version: Option<String>,
+    pub(crate) remote_protocol: Option<u32>,
     // #43: the right-click cursor position, so the popup anchors at the cursor (clamped to screen).
     // Render and hit-test both derive geometry from this. Mirrors `WorkspaceContextMenu`.
     pub(crate) anchor_col: u16,
@@ -313,6 +325,23 @@ pub(crate) enum HostContextOutcome {
     ToggleEnabled { remote_id: String, enabled: bool },
     Disconnect(ServerId),
     Reconnect(ServerId),
+    /// #44: reinstall the LOCAL client's herdr onto this remote by reusing the add-remote
+    /// provisioning flow (NOT an internet download). Returned only for the "update" row when the
+    /// host is connected; otherwise the row selects to `Redraw`.
+    Update(ServerId),
+}
+
+/// #44: the ordered host context-menu row kinds. The version readout (top) is non-selectable; the
+/// rest map 1:1 to `HostContextOutcome` actions. Both the label list and the index→action mapping
+/// derive from the SAME ordered Vec of these (see `host_context_menu_rows`), so no hard-coded
+/// integer index can drift from the row order when rows are added/removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostMenuRow {
+    VersionReadout,
+    AddSpace,
+    ToggleEnabled,
+    Disconnect,
+    Update,
 }
 
 /// #23: the typed outcome of a key press in the rename overlay. `Submit` carries the
@@ -514,6 +543,10 @@ pub(crate) struct ClientSupervisorModel {
     new_workspace_picker: Option<NewWorkspacePickerState>, // item 1 (was new_workspace_picker_destinations)
     client_overlay: ClientOverlayState,
     optimistic_focus: Option<(ServerId, OptimisticFocusTarget)>, // item 6 (always None in C0)
+    /// #44: per-host live "update" provisioning progress line, keyed by `ServerId` so the banner
+    /// sub-line targets the right host. Populated by `set_update_progress` from the update worker's
+    /// stage events; cleared when the update finishes. Threaded into `host_banner_specs`.
+    update_progress: std::collections::HashMap<ServerId, String>,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -584,6 +617,8 @@ impl ClientSupervisorModel {
                 disabled: false,
                 ping_samples: std::collections::VecDeque::new(),
                 download_bps: None,
+                remote_version: None,
+                remote_protocol: None,
             }],
             filter: ServerFilter::All,
             active_server_id: ServerId::main(),
@@ -591,7 +626,28 @@ impl ClientSupervisorModel {
             new_workspace_picker: None,
             client_overlay: ClientOverlayState::None,
             optimistic_focus: None,
+            update_progress: std::collections::HashMap::new(),
         }
+    }
+
+    /// #44: set or clear the live "update" provisioning progress line for `id`. `Some(message)`
+    /// shows a banner sub-line under that host; `None` clears it (on finish/teardown). Mirrors
+    /// `set_server_download_bps` in spirit but keyed in a side map (the banner sub-line is render-only
+    /// and not tied to the `ManagedServer`'s persisted state).
+    pub(crate) fn set_update_progress(&mut self, id: &ServerId, message: Option<String>) {
+        match message {
+            Some(message) => {
+                self.update_progress.insert(id.clone(), message);
+            }
+            None => {
+                self.update_progress.remove(id);
+            }
+        }
+    }
+
+    /// #44: the current live "update" progress line for `id`, if an update is in flight.
+    pub(crate) fn update_progress_for(&self, id: &ServerId) -> Option<&str> {
+        self.update_progress.get(id).map(String::as_str)
     }
 
     pub(crate) fn ui_settings(&self) -> &crate::api::schema::UiSettingsInfo {
@@ -787,6 +843,21 @@ impl ClientSupervisorModel {
     pub(crate) fn set_server_download_bps(&mut self, id: &ServerId, bps: u64) {
         if let Some(server) = self.server_mut(id) {
             server.download_bps = Some(bps);
+        }
+    }
+
+    /// #44: record the remote's reported herdr version + wire protocol (from the Ping/Pong runtime
+    /// status). Drives the host context-menu version readout and its mismatch flag. Mirrors
+    /// `set_server_download_bps`.
+    pub(crate) fn set_remote_runtime_info(
+        &mut self,
+        id: &ServerId,
+        version: Option<String>,
+        protocol: Option<u32>,
+    ) {
+        if let Some(server) = self.server_mut(id) {
+            server.remote_version = version;
+            server.remote_protocol = protocol;
         }
     }
 
@@ -1738,26 +1809,64 @@ impl ClientSupervisorModel {
         }
     }
 
-    // ----- #43: host context menu (add-space / enable-disable / disconnect-reconnect) ----------
+    // ----- #43/#44: host context menu (version readout / add-space / enable-disable /
+    // disconnect-reconnect / update) ---------------------------------------------------------------
 
-    /// #43: the host context-menu rows in render order. DYNAMIC: the toggle labels flip with the
-    /// captured `disabled`/`connected` state, so this Vec is the SINGLE source of the row count for
-    /// the cursor-anchored geometry (mirrors `workspace_context_menu_items`, but state-driven).
-    pub(crate) fn host_context_menu_items(&self) -> Vec<String> {
-        let (disabled, connected) = self
-            .host_context_menu()
-            .map(|menu| (menu.disabled, menu.connected))
-            .unwrap_or((false, false));
+    /// #44: the ordered host context-menu rows for the currently-open menu. SINGLE SOURCE OF TRUTH:
+    /// both `host_context_menu_items` (labels + row count for geometry) and
+    /// `select_host_context_menu_item` (index → action) derive from this same ordered list, so the
+    /// non-selectable version-readout row (top) and the "update" row (bottom) can never drift from
+    /// the action mapping. Empty when no host menu is open.
+    fn host_context_menu_rows(&self) -> Vec<HostMenuRow> {
+        if self.host_context_menu().is_none() {
+            return Vec::new();
+        }
         vec![
-            "add new space".to_string(),
-            if disabled { "enable" } else { "disable" }.to_string(),
-            if connected {
-                "disconnect"
-            } else {
-                "reconnect"
-            }
-            .to_string(),
+            HostMenuRow::VersionReadout,
+            HostMenuRow::AddSpace,
+            HostMenuRow::ToggleEnabled,
+            HostMenuRow::Disconnect,
+            HostMenuRow::Update,
         ]
+    }
+
+    /// #43/#44: the host context-menu row labels in render order. DYNAMIC: the version readout, the
+    /// toggle label, and the disconnect/reconnect label all flip with the captured menu state, so
+    /// this Vec is the SINGLE source of the row count for the cursor-anchored geometry. Built from
+    /// `host_context_menu_rows` so labels and the action mapping share one ordered list.
+    pub(crate) fn host_context_menu_items(&self) -> Vec<String> {
+        let Some(menu) = self.host_context_menu() else {
+            return Vec::new();
+        };
+        let (version_label, is_mismatch) = host_version_readout(
+            menu.remote_version.as_deref(),
+            menu.remote_protocol,
+        );
+        let disabled = menu.disabled;
+        let connected = menu.connected;
+        self.host_context_menu_rows()
+            .into_iter()
+            .map(|row| match row {
+                HostMenuRow::VersionReadout => {
+                    if is_mismatch {
+                        format!("⚠ {version_label}")
+                    } else {
+                        version_label.clone()
+                    }
+                }
+                HostMenuRow::AddSpace => "add new space".to_string(),
+                HostMenuRow::ToggleEnabled => {
+                    if disabled { "enable" } else { "disable" }.to_string()
+                }
+                HostMenuRow::Disconnect => if connected {
+                    "disconnect"
+                } else {
+                    "reconnect"
+                }
+                .to_string(),
+                HostMenuRow::Update => "update".to_string(),
+            })
+            .collect()
     }
 
     /// #43: open the host context menu for `server_id`, capturing the host's current `disabled` flag
@@ -1770,15 +1879,17 @@ impl ClientSupervisorModel {
         anchor_col: u16,
         anchor_row: u16,
     ) {
-        let (disabled, connected) = self
+        let (disabled, connected, remote_version, remote_protocol) = self
             .server(&server_id)
             .map(|server| {
                 (
                     server.disabled,
                     server.connection_state == ConnectionState::Connected,
+                    server.remote_version.clone(),
+                    server.remote_protocol,
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, None, None));
         self.new_workspace_picker = None;
         self.client_overlay = ClientOverlayState::HostContextMenu(HostContextMenu {
             server_id,
@@ -1786,6 +1897,8 @@ impl ClientSupervisorModel {
             disabled,
             connected,
             selected: 0,
+            remote_version,
+            remote_protocol,
             anchor_col,
             anchor_row,
         });
@@ -1838,36 +1951,48 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// #43: resolve a host context-menu row index into an action. `0 -> add space on this host`
-    /// (only when connected, else a no-op redraw); `1 -> toggle the registry disabled flag`;
-    /// `2 -> disconnect/reconnect the live stream`. Mirrors `select_workspace_context_menu_item`.
+    /// #43/#44: resolve a host context-menu row index into an action by looking up the row KIND at
+    /// `index` in the SAME ordered list `host_context_menu_items` renders (`host_context_menu_rows`)
+    /// — never a hard-coded integer. The version-readout row is non-actionable (`Redraw`); add-space
+    /// and update require a live connection (else `Redraw`); toggle flips the registry disabled flag;
+    /// disconnect/reconnect drop/restore the live stream. Mirrors `select_workspace_context_menu_item`.
     pub(crate) fn select_host_context_menu_item(&mut self, index: usize) -> HostContextOutcome {
+        let Some(row) = self.host_context_menu_rows().get(index).copied() else {
+            return HostContextOutcome::Redraw;
+        };
         let Some(menu) = self.host_context_menu() else {
             return HostContextOutcome::Redraw;
         };
         let server_id = menu.server_id.clone();
         let disabled = menu.disabled;
         let connected = menu.connected;
-        match index {
-            0 => {
+        match row {
+            HostMenuRow::VersionReadout => HostContextOutcome::Redraw,
+            HostMenuRow::AddSpace => {
                 if connected {
                     HostContextOutcome::AddSpace(server_id)
                 } else {
                     HostContextOutcome::Redraw
                 }
             }
-            1 => HostContextOutcome::ToggleEnabled {
+            HostMenuRow::ToggleEnabled => HostContextOutcome::ToggleEnabled {
                 remote_id: server_id.registry_id().to_string(),
                 enabled: disabled,
             },
-            2 => {
+            HostMenuRow::Disconnect => {
                 if connected {
                     HostContextOutcome::Disconnect(server_id)
                 } else {
                     HostContextOutcome::Reconnect(server_id)
                 }
             }
-            _ => HostContextOutcome::Redraw,
+            HostMenuRow::Update => {
+                if connected {
+                    HostContextOutcome::Update(server_id)
+                } else {
+                    HostContextOutcome::Redraw
+                }
+            }
         }
     }
 
@@ -2303,6 +2428,7 @@ impl ClientSupervisorModel {
                         space_count,
                         latency_ms: server.avg_ping_ms(),
                         download_bps: server.download_bps,
+                        update_progress: self.update_progress.get(&server.id).cloned(),
                     },
                 ));
             }
@@ -2433,6 +2559,19 @@ impl ClientSupervisorModel {
     /// state (e.g. #36's retained `frame_cache`) for a remote dropped by a registry sync.
     pub(crate) fn contains_server(&self, id: &ServerId) -> bool {
         self.server(id).is_some()
+    }
+
+    /// #44: the ssh `(destination, options)` for `id`, or `None` for a non-ssh (local) host. The
+    /// one-click "update" worker reuses these to rebuild the `SshTarget` for the add-remote
+    /// provisioning flow without reaching into the private `ManagedServer`.
+    pub(crate) fn server_ssh_target(&self, id: &ServerId) -> Option<(String, Vec<String>)> {
+        match self.server(id).map(|server| &server.target) {
+            Some(ServerConnectionTarget::Ssh {
+                destination,
+                options,
+            }) => Some((destination.clone(), options.clone())),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -2648,6 +2787,28 @@ fn trimmed_optional(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// #44: format the host context-menu version-readout label and whether the remote's wire protocol
+/// mismatches the LOCAL client. Pure so the label + mismatch flag derive from one place and are
+/// unit-testable. Returns `("v<ver> · proto <n>", is_mismatch)` when both are known, `("proto <n>",
+/// is_mismatch)` with only a protocol, and `("unknown", false)` when nothing was captured yet.
+///
+/// `is_mismatch` is true only when a protocol is KNOWN and differs from `PROTOCOL_VERSION`; an
+/// unknown protocol is treated as neutral (false) so a not-yet-probed host never shows a false ⚠.
+pub(crate) fn host_version_readout(
+    remote_version: Option<&str>,
+    remote_protocol: Option<u32>,
+) -> (String, bool) {
+    let is_mismatch = matches!(remote_protocol, Some(proto)
+        if proto != crate::protocol::PROTOCOL_VERSION);
+    let label = match (remote_version, remote_protocol) {
+        (Some(version), Some(proto)) => format!("v{version} · proto {proto}"),
+        (Some(version), None) => format!("v{version}"),
+        (None, Some(proto)) => format!("proto {proto}"),
+        (None, None) => "unknown".to_string(),
+    };
+    (label, is_mismatch)
+}
+
 fn managed_secondary(
     definition: crate::remote_registry::RemoteDefinitionSnapshot,
     connection_state: ConnectionState,
@@ -2663,6 +2824,8 @@ fn managed_secondary(
         disabled: definition.disabled, // item 3 (Area 5): gate input from the registry.
         ping_samples: std::collections::VecDeque::new(),
         download_bps: None,
+        remote_version: None,
+        remote_protocol: None,
     }
 }
 
@@ -5543,9 +5706,10 @@ mod tests {
         assert_eq!(menu.selected, 0);
         assert_eq!(menu.anchor_col, 4);
         assert_eq!(menu.anchor_row, 5);
+        // #44: a non-selectable version-readout row leads; then add/disable/disconnect; then update.
         assert_eq!(
             model.host_context_menu_items(),
-            ["add new space", "disable", "disconnect"]
+            ["unknown", "add new space", "disable", "disconnect", "update"]
         );
 
         // A disabled + disconnected host flips both toggle labels.
@@ -5560,19 +5724,20 @@ mod tests {
         assert!(!menu.connected);
         assert_eq!(
             model.host_context_menu_items(),
-            ["add new space", "enable", "reconnect"]
+            ["unknown", "add new space", "enable", "reconnect", "update"]
         );
     }
 
     #[test]
     fn host_context_menu_toggle_label_reflects_state() {
-        // A disabled host shows "enable" at row 1, and selecting it yields ToggleEnabled{true}.
+        // #44: the toggle row is now index 2 (after the version readout + add-space rows).
+        // A disabled host shows "enable" there, and selecting it yields ToggleEnabled{true}.
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(disabled_ssh_remote("r1", "alpha", "alpha"));
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
-        assert_eq!(model.host_context_menu_items()[1], "enable");
+        assert_eq!(model.host_context_menu_items()[2], "enable");
         assert_eq!(
-            model.select_host_context_menu_item(1),
+            model.select_host_context_menu_item(2),
             HostContextOutcome::ToggleEnabled {
                 remote_id: "r1".into(),
                 enabled: true,
@@ -5583,9 +5748,9 @@ mod tests {
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
-        assert_eq!(model.host_context_menu_items()[1], "disable");
+        assert_eq!(model.host_context_menu_items()[2], "disable");
         assert_eq!(
-            model.select_host_context_menu_item(1),
+            model.select_host_context_menu_item(2),
             HostContextOutcome::ToggleEnabled {
                 remote_id: "r1".into(),
                 enabled: false,
@@ -5595,7 +5760,9 @@ mod tests {
 
     #[test]
     fn host_context_menu_add_space_unavailable_when_disconnected() {
-        // Disconnected host: add-space (row 0) is a no-op redraw; disconnect row reconnects instead.
+        // #44 row order: 0=version readout, 1=add space, 2=toggle, 3=disconnect/reconnect, 4=update.
+        // Disconnected host: add-space (row 1) is a no-op redraw; the version row (0) also redraws;
+        // the disconnect row (3) reconnects instead; update (4) is a no-op redraw when disconnected.
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
         model
@@ -5607,11 +5774,19 @@ mod tests {
             HostContextOutcome::Redraw
         );
         assert_eq!(
-            model.select_host_context_menu_item(2),
+            model.select_host_context_menu_item(1),
+            HostContextOutcome::Redraw
+        );
+        assert_eq!(
+            model.select_host_context_menu_item(3),
             HostContextOutcome::Reconnect(remote.clone())
         );
+        assert_eq!(
+            model.select_host_context_menu_item(4),
+            HostContextOutcome::Redraw
+        );
 
-        // Connected host: add-space yields AddSpace(server_id); row 2 disconnects.
+        // Connected host: add-space (row 1) yields AddSpace; row 3 disconnects; row 4 updates.
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
         model
@@ -5619,12 +5794,16 @@ mod tests {
             .unwrap();
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
         assert_eq!(
-            model.select_host_context_menu_item(0),
+            model.select_host_context_menu_item(1),
             HostContextOutcome::AddSpace(remote.clone())
         );
         assert_eq!(
-            model.select_host_context_menu_item(2),
+            model.select_host_context_menu_item(3),
             HostContextOutcome::Disconnect(remote.clone())
+        );
+        assert_eq!(
+            model.select_host_context_menu_item(4),
+            HostContextOutcome::Update(remote.clone())
         );
     }
 
@@ -5638,7 +5817,8 @@ mod tests {
             .unwrap();
         model.open_host_context_menu(remote, "alpha".into(), 0, 0);
 
-        // Down advances to row 1 then row 2, clamped at the last (3-item) row.
+        // #44: Down advances through the 5-row menu (version/add/toggle/disconnect/update), clamped
+        // at the last row (index 4).
         assert_eq!(
             model.handle_host_context_menu_key(press(KeyCode::Down)),
             HostContextOutcome::Redraw
@@ -5647,13 +5827,150 @@ mod tests {
         model.handle_host_context_menu_key(press(KeyCode::Char('j')));
         assert_eq!(model.host_context_menu().unwrap().selected, 2);
         model.handle_host_context_menu_key(press(KeyCode::Down));
-        assert_eq!(model.host_context_menu().unwrap().selected, 2);
+        model.handle_host_context_menu_key(press(KeyCode::Down));
+        assert_eq!(model.host_context_menu().unwrap().selected, 4);
+        model.handle_host_context_menu_key(press(KeyCode::Down));
+        assert_eq!(model.host_context_menu().unwrap().selected, 4);
         // k moves back up.
         model.handle_host_context_menu_key(press(KeyCode::Char('k')));
-        assert_eq!(model.host_context_menu().unwrap().selected, 1);
+        assert_eq!(model.host_context_menu().unwrap().selected, 3);
 
         // Esc dismisses.
         model.handle_host_context_menu_key(press(KeyCode::Esc));
         assert!(model.host_context_menu().is_none());
+    }
+
+    // ----- #44: remote version/protocol readout + one-click update -------------------------------
+
+    #[test]
+    fn host_version_readout_flags_protocol_mismatch() {
+        let local = crate::protocol::PROTOCOL_VERSION;
+
+        // A matching protocol is NOT a mismatch; the label carries the version + "proto".
+        let (label, mismatch) = host_version_readout(Some("0.6.4"), Some(local));
+        assert!(!mismatch, "matching protocol is not a mismatch");
+        assert_eq!(label, format!("v0.6.4 · proto {local}"));
+        assert!(label.contains("proto"));
+
+        // A differing protocol IS a mismatch and still carries "proto" in the label.
+        let (label, mismatch) = host_version_readout(Some("0.6.3"), Some(local.wrapping_sub(1)));
+        assert!(mismatch, "differing protocol is a mismatch");
+        assert!(label.contains("proto"));
+
+        // Unknown (nothing captured) is neutral: label "unknown", not a mismatch.
+        let (label, mismatch) = host_version_readout(None, None);
+        assert!(!mismatch, "unknown is neutral, never a false mismatch");
+        assert_eq!(label, "unknown");
+    }
+
+    #[test]
+    fn set_remote_runtime_info_populates_managed_server() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+
+        // Initially unset.
+        let server = model.server_for_test(&remote).expect("server present");
+        assert_eq!(server.remote_version, None);
+        assert_eq!(server.remote_protocol, None);
+
+        model.set_remote_runtime_info(&remote, Some("0.6.4".into()), Some(13));
+        let server = model.server_for_test(&remote).expect("server present");
+        assert_eq!(server.remote_version.as_deref(), Some("0.6.4"));
+        assert_eq!(server.remote_protocol, Some(13));
+
+        // Clearing both back to None is honored.
+        model.set_remote_runtime_info(&remote, None, None);
+        let server = model.server_for_test(&remote).expect("server present");
+        assert_eq!(server.remote_version, None);
+        assert_eq!(server.remote_protocol, None);
+    }
+
+    #[test]
+    fn host_menu_includes_version_row_and_update_item() {
+        let local = crate::protocol::PROTOCOL_VERSION;
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        model.set_remote_runtime_info(&remote, Some("0.6.4".into()), Some(local));
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+
+        // The items list STARTS with the version readout row and CONTAINS "update".
+        let items = model.host_context_menu_items();
+        assert_eq!(items.first().map(String::as_str), Some(
+            format!("v0.6.4 · proto {local}").as_str()
+        ));
+        assert!(
+            items.iter().any(|item| item == "update"),
+            "menu contains an update item: {items:?}"
+        );
+
+        // The version-readout row (index 0) is non-actionable -> Redraw.
+        assert_eq!(
+            model.select_host_context_menu_item(0),
+            HostContextOutcome::Redraw
+        );
+
+        // Selecting the update row index returns Update(server_id) for a connected host.
+        let update_index = items
+            .iter()
+            .position(|item| item == "update")
+            .expect("update row present");
+        assert_eq!(
+            model.select_host_context_menu_item(update_index),
+            HostContextOutcome::Update(remote.clone())
+        );
+    }
+
+    #[test]
+    fn host_menu_version_row_marks_mismatch() {
+        let local = crate::protocol::PROTOCOL_VERSION;
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        // A stale protocol flags a ⚠ marker on the readout row.
+        model.set_remote_runtime_info(&remote, Some("0.6.0".into()), Some(local.wrapping_add(1)));
+        model.open_host_context_menu(remote, "alpha".into(), 0, 0);
+        let first = model.host_context_menu_items()[0].clone();
+        assert!(first.starts_with("⚠ "), "mismatched proto marks ⚠: {first:?}");
+    }
+
+    #[test]
+    fn update_progress_threads_into_host_banner_spec() {
+        // Two visible servers (local + remote) so the multi-host gate emits a banner per host.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+
+        // The remote's banner is the 2nd spec (visible order: [local, remote]).
+        let banner_index = model
+            .host_banner_specs()
+            .iter()
+            .position(|(_, spec)| spec.display_name == "alpha")
+            .expect("remote banner present");
+
+        // No progress yet.
+        assert_eq!(
+            model.host_banner_specs()[banner_index].1.update_progress,
+            None
+        );
+
+        model.set_update_progress(&remote, Some("installing herdr on the remote…".into()));
+        assert_eq!(
+            model.host_banner_specs()[banner_index].1.update_progress,
+            Some("installing herdr on the remote…".to_string())
+        );
+
+        // Clearing returns the spec to None.
+        model.set_update_progress(&remote, None);
+        assert_eq!(
+            model.host_banner_specs()[banner_index].1.update_progress,
+            None
+        );
     }
 }

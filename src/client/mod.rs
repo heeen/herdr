@@ -130,6 +130,10 @@ struct ClientState {
     /// until an explicit "reconnect" (which removes the entry) — that is what makes Disconnect a
     /// distinct, non-persistent action from Disable.
     manually_disconnected: HashSet<supervisor::ServerId>,
+    /// #44: hosts with a one-click "update" (reinstall the local herdr via the add-remote
+    /// provisioning flow) running off the UI loop. Guards against double-spawn from a repeated
+    /// menu click while the worker is in flight; cleared when `UpdateRemoteFinished` arrives.
+    pending_update_remote: HashSet<supervisor::ServerId>,
     /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
     last_animation_tick: Instant,
     /// item 6 (Area 6): last time each connected secondary's summary refresh was STARTED. Drives
@@ -255,6 +259,11 @@ enum ClientInputDispatch {
     ReconnectRemote {
         server_id: supervisor::ServerId,
     },
+    // #44: reinstall the LOCAL client's herdr onto this remote by reusing the add-remote
+    // provisioning flow (no internet download). Spawns the update worker off the UI loop.
+    UpdateRemote {
+        server_id: supervisor::ServerId,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -316,6 +325,13 @@ fn dispatch_for_host_context_outcome(
         supervisor::HostContextOutcome::Reconnect(server_id) => {
             model.close_client_overlay();
             ClientInputDispatch::ReconnectRemote { server_id }
+        }
+        // #44: reinstall the local herdr onto this remote by reusing the add-remote provisioning
+        // flow (no internet download). The worker is spawned in the loop where the bridge map and
+        // event channel are in scope.
+        supervisor::HostContextOutcome::Update(server_id) => {
+            model.close_client_overlay();
+            ClientInputDispatch::UpdateRemote { server_id }
         }
     }
 }
@@ -1925,6 +1941,29 @@ enum ClientLoopEvent {
         result: Result<ClientAddRemoteSuccess, AddRemoteFailure>,
         elapsed: Duration,
     },
+    /// #44: a provisioning stage of an in-flight one-click "update" (reinstall the local herdr onto
+    /// a remote via the add-remote flow). Server_id-keyed so the banner sub-line targets the right
+    /// host's banner.
+    UpdateRemoteProgress {
+        server_id: supervisor::ServerId,
+        message: String,
+    },
+    /// #44: a one-click "update" completed off the UI loop. On Ok the client tears the stream down +
+    /// schedules an immediate reconnect (so it dials back up on the now-matching protocol) and
+    /// re-fetches runtime status; on Err it clears the progress line and surfaces a message.
+    UpdateRemoteFinished {
+        server_id: supervisor::ServerId,
+        result: Result<(), String>,
+        elapsed: Duration,
+    },
+    /// #44: a remote's runtime version/protocol was (re-)fetched off the UI loop. Applied via
+    /// `set_remote_runtime_info` so the host context-menu version readout and its mismatch flag
+    /// reflect the freshly-installed binary after a one-click update.
+    SupervisorRuntimeStatusFetched {
+        server_id: supervisor::ServerId,
+        version: Option<String>,
+        protocol: Option<u32>,
+    },
     /// item 3 (Area 5): a remote-management `remote.set_enabled`/`remote.remove` request finished
     /// off the UI loop. The handler branches on `action` to apply teardown / reconnect.
     RemoteManageRequestFinished {
@@ -2770,6 +2809,75 @@ fn spawn_client_remote_manage_request(
     });
 }
 
+/// #44: reinstall the LOCAL client's herdr onto a connected remote by reusing the add-remote
+/// provisioning flow (NOT an internet download). Modeled on `spawn_client_add_remote_submission`,
+/// but server_id-keyed so the banner sub-line targets the right host. Worker steps:
+///   1. PRE-FLIGHT seed check — if this build can't seed the remote's platform without a download,
+///      post a truthful `UpdateRemoteFinished(Err)` and return WITHOUT attempting an install.
+///   2. Run the SAME provisioning `add-remote` uses (`start_ssh_remote_bridge` with
+///      `restart_incompatible = true`, bounded by `run_remote_op_with_progress`), forwarding each
+///      stage as a server_id-keyed `UpdateRemoteProgress`.
+///   3. On success, post `UpdateRemoteFinished(Ok)`; the loop then reconnects on the new protocol
+///      and re-fetches runtime status so the version/mismatch readout clears.
+fn spawn_client_update_remote(
+    server_id: supervisor::ServerId,
+    ssh_target: crate::remote::SshTarget,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    pending_update_remote: &mut HashSet<supervisor::ServerId>,
+) {
+    if !pending_update_remote.insert(server_id.clone()) {
+        return;
+    }
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let result = run_client_update_remote(&server_id, ssh_target, &event_tx);
+        let elapsed = started_at.elapsed();
+        let _ = event_tx.blocking_send(ClientLoopEvent::UpdateRemoteFinished {
+            server_id,
+            result,
+            elapsed,
+        });
+    });
+}
+
+/// #44: the off-loop body of [`spawn_client_update_remote`]. PRE-FLIGHT seed check first (no install
+/// attempt on an unbuildable platform → no internet download), then the bounded add-remote-style
+/// provisioning. Returns `Ok(())` on a successful reinstall, `Err(message)` otherwise.
+fn run_client_update_remote(
+    server_id: &supervisor::ServerId,
+    ssh_target: crate::remote::SshTarget,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) -> Result<(), String> {
+    // (1) Truthful pre-flight: refuse (no download) when this build can't seed the remote platform.
+    crate::remote::preflight_remote_update_seed(&ssh_target)?;
+
+    // (2) Forward each provisioning stage to this host's banner sub-line.
+    let progress_tx = event_tx.clone();
+    let progress_server_id = server_id.clone();
+    let on_progress = move |stage: crate::remote::RemoteProvisionStage| {
+        let _ = progress_tx.blocking_send(ClientLoopEvent::UpdateRemoteProgress {
+            server_id: progress_server_id.clone(),
+            message: stage.label(),
+        });
+    };
+    // Same provisioning the add-remote path uses; `restart_incompatible = true` so an incompatible
+    // server is restarted onto the freshly-installed binary instead of blocking on a y/N prompt.
+    let bridge = run_remote_op_with_progress(
+        ADD_REMOTE_BRIDGE_IDLE_TIMEOUT,
+        &on_progress,
+        move |sink| crate::remote::start_ssh_remote_bridge(ssh_target, true, None, sink),
+    )
+    .map_err(|err| match classify_add_remote_bridge_error(err) {
+        AddRemoteFailure::Message(message) => message,
+        AddRemoteFailure::NeedsRestartConfirm { detail, .. } => detail,
+    })?;
+    // The reinstall is done; drop the throwaway bridge. The loop schedules a fresh reconnect so the
+    // live stream comes back up on the now-matching protocol (and re-fetches runtime status).
+    drop(bridge);
+    Ok(())
+}
+
 fn spawn_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
     server_size: (u16, u16),
@@ -3391,6 +3499,93 @@ fn teardown_secondary_connection(
     state.secondary_retries.remove(server_id);
 }
 
+/// #44: apply a one-click `UpdateRemoteFinished` to the client state. Always clears the host's
+/// banner progress line. On Ok, tears the (now stale-protocol) stream down and schedules an
+/// attempt-0 (shortest backoff) reconnect so the live stream comes back up on the freshly-installed,
+/// now-matching protocol; on Err, leaves a truthful message on the progress line so the failure is
+/// visible (and NEVER triggers an internet download — the worker pre-flighted that away). Extracted
+/// so the Ok/Err branches are unit-testable without the full event loop.
+fn apply_update_remote_finished(
+    state: &mut ClientState,
+    server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
+    server_id: &supervisor::ServerId,
+    result: Result<(), String>,
+    now: Instant,
+) {
+    match result {
+        Ok(()) => {
+            if let Some(model) = &mut state.supervisor_model {
+                model.set_update_progress(server_id, None);
+                let _ = model.set_connection_state(
+                    server_id,
+                    supervisor::ConnectionState::Connecting,
+                );
+            }
+            // Drop the stale-protocol stream and dial it back up on the new binary at the shortest
+            // (attempt-0) backoff — same as #43's "reconnect" path.
+            teardown_secondary_connection(state, server_writes, server_id);
+            state.manually_disconnected.remove(server_id);
+            schedule_secondary_retry(state, server_id.clone(), 0, now);
+        }
+        Err(message) => {
+            if let Some(model) = &mut state.supervisor_model {
+                model.set_update_progress(server_id, Some(message));
+            }
+        }
+    }
+}
+
+/// #44: re-fetch a remote's runtime version/protocol off the UI loop and post it back via
+/// `SupervisorRuntimeStatusFetched` so the host context-menu readout clears its mismatch flag after
+/// an update. Establishes its own short-lived ssh bridge from the host's ssh target (the live
+/// stream is being torn down + reconnected, so its api bridge isn't available). No-op for non-ssh
+/// hosts or when the host is gone. Fire-and-forget: a failed fetch simply leaves the stale readout.
+fn refetch_secondary_runtime_status(
+    state: &mut ClientState,
+    server_id: &supervisor::ServerId,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let Some(ssh_target) = state.supervisor_model.as_ref().and_then(|model| {
+        model
+            .server_ssh_target(server_id)
+            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
+    }) else {
+        return;
+    };
+    let server_id = server_id.clone();
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let bridge = match crate::remote::start_ssh_remote_bridge(
+            ssh_target,
+            false,
+            None,
+            &crate::remote::ignore_progress,
+        ) {
+            Ok(bridge) => bridge,
+            Err(err) => {
+                warn!(err = %err, "post-update runtime status refetch failed to start ssh bridge");
+                return;
+            }
+        };
+        let mut api = crate::api::client::ApiClient::for_target(
+            crate::api::client::ConnectionTarget::SocketPath(
+                bridge.api_socket_path().to_path_buf(),
+            ),
+        );
+        match supervisor::request_runtime_status(&mut api) {
+            Ok(status) => {
+                let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorRuntimeStatusFetched {
+                    server_id,
+                    version: status.version,
+                    protocol: status.protocol,
+                });
+            }
+            Err(err) => warn!(err = %err, "post-update runtime status refetch failed"),
+        }
+        drop(bridge);
+    });
+}
+
 fn schedule_secondary_retry(
     state: &mut ClientState,
     server_id: supervisor::ServerId,
@@ -3773,6 +3968,7 @@ async fn run_client_loop(
         ssh_bridges,
         secondary_retries: HashMap::new(),
         manually_disconnected: HashSet::new(),
+        pending_update_remote: HashSet::new(),
         last_animation_tick: Instant::now(),
         last_summary_refresh: HashMap::new(),
     };
@@ -4079,6 +4275,42 @@ async fn run_client_loop(
                                     0,
                                     Instant::now(),
                                 );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // #44: reinstall the local herdr onto this remote by reusing the
+                            // add-remote provisioning flow (no internet download). Resolve the ssh
+                            // target from the model, show an initial progress line, and spawn the
+                            // worker off the UI loop (the pending guard collapses double-clicks).
+                            ClientInputDispatch::UpdateRemote { server_id } => {
+                                let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
+                                    model.server_ssh_target(&server_id).map(
+                                        |(destination, options)| {
+                                            crate::remote::SshTarget::new(destination, options)
+                                        },
+                                    )
+                                });
+                                if let Some(ssh_target) = ssh_target {
+                                    if let Some(model) = &mut state.supervisor_model {
+                                        model.set_update_progress(
+                                            &server_id,
+                                            Some("starting update…".to_string()),
+                                        );
+                                    }
+                                    spawn_client_update_remote(
+                                        server_id,
+                                        ssh_target,
+                                        &event_tx,
+                                        &mut state.pending_update_remote,
+                                    );
+                                } else if let Some(model) = &mut state.supervisor_model {
+                                    // A non-ssh (local) host has nothing to reinstall over ssh.
+                                    model.set_update_progress(
+                                        &server_id,
+                                        Some("update is only available for ssh remotes".to_string()),
+                                    );
+                                }
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -4735,6 +4967,58 @@ async fn run_client_loop(
                     }
                 }
                 state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            // #44: a one-click update reported a provisioning stage — refresh that host's banner
+            // sub-line (ignored once the model is gone). Server_id-keyed so the right banner updates.
+            ClientLoopEvent::UpdateRemoteProgress { server_id, message } => {
+                if let Some(model) = &mut state.supervisor_model {
+                    model.set_update_progress(&server_id, Some(message));
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            // #44: a one-click update finished. Clear the progress line, and on success tear the
+            // stream down + schedule an immediate reconnect (so it dials back up on the now-matching
+            // protocol) and re-fetch runtime status; on failure, surface a truthful message.
+            ClientLoopEvent::UpdateRemoteFinished {
+                server_id,
+                result,
+                elapsed,
+            } => {
+                state.pending_update_remote.remove(&server_id);
+                if elapsed > CLIENT_60FPS_FRAME_BUDGET {
+                    debug!(
+                        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                        frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
+                        "client update-remote submission completed off UI thread"
+                    );
+                }
+                let succeeded = result.is_ok();
+                apply_update_remote_finished(
+                    &mut state,
+                    &mut server_writes,
+                    &server_id,
+                    result,
+                    Instant::now(),
+                );
+                // Only re-fetch the version/protocol on success — a failed update left the old
+                // binary in place (the readout is still accurate).
+                if succeeded {
+                    refetch_secondary_runtime_status(&mut state, &server_id, &event_tx);
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            ClientLoopEvent::SupervisorRuntimeStatusFetched {
+                server_id,
+                version,
+                protocol,
+            } => {
+                if let Some(model) = &mut state.supervisor_model {
+                    model.set_remote_runtime_info(&server_id, version, protocol);
+                    state.request_full_redraw();
+                }
                 render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::RemoteManageRequestFinished {
@@ -5558,6 +5842,7 @@ mod tests {
             ssh_bridges: HashMap::new(),
             secondary_retries: HashMap::new(),
             manually_disconnected: HashSet::new(),
+            pending_update_remote: HashSet::new(),
             last_animation_tick: Instant::now(),
             last_summary_refresh: HashMap::new(),
         }
@@ -6609,9 +6894,10 @@ mod tests {
         assert!(matches!(opened, ClientInputDispatch::Redraw));
         assert!(model.host_context_menu().is_some());
 
-        // Click "add new space" (row 0) -> WorkspaceCreate ApiRequest on that host; overlay closes.
+        // #44: click "add new space" (row 1, after the version readout) -> WorkspaceCreate
+        // ApiRequest on that host; overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 0 },
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 1 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -6647,9 +6933,9 @@ mod tests {
             &down(MouseButton::Right, row),
         );
 
-        // Click "disable" (row 1) -> SetRemoteEnabled{ registry_id, enabled:false }; overlay closes.
+        // #44: click "disable" (row 2) -> SetRemoteEnabled{ registry_id, enabled:false }; overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 1 },
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 2 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -6677,10 +6963,10 @@ mod tests {
             &down(MouseButton::Right, row),
         );
 
-        // Click "disconnect" (row 2) -> DisconnectRemote{server_id}, NOT SetRemoteEnabled (so it
+        // #44: click "disconnect" (row 3) -> DisconnectRemote{server_id}, NOT SetRemoteEnabled (so it
         // drops the live stream WITHOUT disabling the registry entry); overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 2 },
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 3 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -6695,6 +6981,87 @@ mod tests {
             other => panic!("expected DisconnectRemote, got {other:?}"),
         }
         assert!(model.host_context_menu().is_none(), "overlay closed");
+    }
+
+    #[test]
+    fn update_remote_finished_clears_progress_and_reconnects() {
+        let (model, remote_id) = mixed_remote_model();
+        let mut state = test_client_state_with_model(model);
+        let mut server_writes: HashMap<supervisor::ServerId, ServerWriteHandle> = HashMap::new();
+        let now = Instant::now();
+
+        // Seed an in-flight update: progress line set, and a manually-disconnected mark that the
+        // successful finish must clear so the reconnect actually sweeps it back up.
+        if let Some(model) = &mut state.supervisor_model {
+            model.set_update_progress(&remote_id, Some("installing herdr on the remote…".into()));
+        }
+        state.manually_disconnected.insert(remote_id.clone());
+        state.pending_update_remote.insert(remote_id.clone());
+
+        // Ok: clears progress, drops the manual-disconnect mark, schedules an immediate reconnect.
+        apply_update_remote_finished(
+            &mut state,
+            &mut server_writes,
+            &remote_id,
+            Ok(()),
+            now,
+        );
+        assert_eq!(
+            state
+                .supervisor_model
+                .as_ref()
+                .unwrap()
+                .update_progress_for(&remote_id),
+            None,
+            "Ok finish clears the host's update progress line"
+        );
+        assert!(
+            !state.manually_disconnected.contains(&remote_id),
+            "Ok finish clears the manual-disconnect mark so the retry can reconnect"
+        );
+        let retry = state
+            .secondary_retries
+            .get(&remote_id)
+            .expect("Ok finish schedules a reconnect");
+        assert_eq!(
+            retry.attempt, 0,
+            "reconnect is scheduled at attempt 0 (shortest backoff)"
+        );
+        assert!(
+            retry.next_retry_at <= now + secondary_retry_delay(0),
+            "reconnect is scheduled at the attempt-0 (shortest) backoff"
+        );
+
+        // Err: clears the spinner but leaves a truthful message; no reconnect scheduled, no download.
+        let (model2, remote2) = mixed_remote_model();
+        let mut state2 = test_client_state_with_model(model2);
+        let mut server_writes2: HashMap<supervisor::ServerId, ServerWriteHandle> = HashMap::new();
+        if let Some(model) = &mut state2.supervisor_model {
+            model.set_update_progress(&remote2, Some("starting update…".into()));
+        }
+        apply_update_remote_finished(
+            &mut state2,
+            &mut server_writes2,
+            &remote2,
+            Err("this herdr build has no binary for linux-aarch64; build/seed it instead of \
+                 downloading"
+                .to_string()),
+            now,
+        );
+        let message = state2
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .update_progress_for(&remote2)
+            .expect("Err finish leaves a message on the progress line");
+        assert!(
+            message.contains("no binary"),
+            "Err finish surfaces a truthful (no-download) message: {message}"
+        );
+        assert!(
+            !state2.secondary_retries.contains_key(&remote2),
+            "Err finish does not schedule a reconnect"
+        );
     }
 
     fn mixed_remote_model_with_many_workspaces(

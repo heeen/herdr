@@ -610,6 +610,10 @@ pub struct HostBannerSpec {
     pub latency_ms: Option<u32>,
     /// Recent downstream frame throughput from this host in bytes/sec, if measured.
     pub download_bps: Option<u64>,
+    /// #44: live "update" provisioning progress line for this host, if an update is in flight.
+    /// When `Some`, the sidebar reserves a render-only sub-line row under the banner and draws a dim
+    /// spinner + this message; the banner row itself stays the only hit target (height 1).
+    pub update_progress: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2225,6 +2229,7 @@ mod tests {
             space_count: 2,
             latency_ms: None,
             download_bps: None,
+            update_progress: None,
         };
         assert_eq!(spec.display_name, "prod");
         assert_eq!(spec.space_count, 2);
@@ -2243,6 +2248,7 @@ mod tests {
                     space_count: spec.space_count,
                     latency_ms: None,
                     download_bps: None,
+                    update_progress: None,
                 }
                 .connection_state,
                 state

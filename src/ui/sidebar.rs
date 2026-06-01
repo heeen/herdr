@@ -1342,16 +1342,26 @@ pub(crate) fn compute_workspace_list_areas_full(
                 row_y = row_y.saturating_add(row_height);
             }
             // item 2: advance one row AND push a banner area (tight, no gap).
+            // #44: when this banner is showing an in-flight "update" progress line, reserve a
+            // SECOND, render-only sub-line row beneath it (advance row_y by 2) — but keep the
+            // `HostBannerArea.rect.height == 1` so only the banner row is a hit target (render ==
+            // hit-test). The bottom-of-list guard requires the full 2-row span so a half-visible
+            // sub-row is dropped cleanly.
             WorkspaceListEntry::HostBanner { banner_idx } => {
-                let row_height = 1;
-                if row_y.saturating_add(row_height) > body_bottom {
+                let updating = app
+                    .host_banners
+                    .get(*banner_idx)
+                    .map(|spec| spec.update_progress.is_some())
+                    .unwrap_or(false);
+                let advance = if updating { 2 } else { 1 };
+                if row_y.saturating_add(advance) > body_bottom {
                     break;
                 }
                 banner_areas.push(HostBannerArea {
                     banner_idx: *banner_idx,
-                    rect: Rect::new(body.x, row_y, body.width, row_height),
+                    rect: Rect::new(body.x, row_y, body.width, 1),
                 });
-                row_y = row_y.saturating_add(row_height);
+                row_y = row_y.saturating_add(advance);
             }
         }
     }
@@ -1902,6 +1912,27 @@ fn render_workspace_list(
                 Paragraph::new(Line::from(metric_spans)),
                 Rect::new(metric_x, row_y, metric_width as u16, 1),
             );
+        }
+
+        // #44: render-only "update" progress sub-line one row beneath the banner. The layout pass
+        // (`compute_workspace_list_areas_full`) already advanced row_y by 2 for this banner, so the
+        // sub-row is reserved but is NOT a hit target (the banner area stays height 1 — render ==
+        // hit-test). Dim spinner + message, styled `overlay0` like the agent braille spinner. Guard
+        // the bottom of the list so a half-visible sub-row is never drawn.
+        if let Some(message) = &spec.update_progress {
+            let sub_y = row_y + 1;
+            if sub_y < list_bottom {
+                let spinner = super::spinner_frame(app.spinner_tick);
+                let sub_spans = vec![
+                    Span::styled(spinner.to_string(), Style::default().fg(p.overlay0)),
+                    Span::raw(" "),
+                    Span::styled(message.clone(), Style::default().fg(p.overlay0)),
+                ];
+                frame.render_widget(
+                    Paragraph::new(Line::from(sub_spans)),
+                    Rect::new(banner_area.rect.x, sub_y, banner_area.rect.width, 1),
+                );
+            }
         }
     }
 
@@ -2741,6 +2772,7 @@ mod tests {
             space_count: 1,
             latency_ms: Some(50),
             download_bps: Some(312_000),
+            update_progress: None,
         };
         let (spans, width) = host_banner_metric_spans(&spec, &p);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4907,6 +4939,7 @@ lines = [
                 space_count: 1,
                 latency_ms: None,
                 download_bps: None,
+                update_progress: None,
             })
             .collect();
         app.host_banner_active = !banner_rows.is_empty();
@@ -4985,6 +5018,46 @@ lines = [
             .find(|e| matches!(e, WorkspaceListEntry::Divider { .. }))
             .expect("divider present");
         assert_eq!(labeled, WorkspaceListEntry::Divider { labeled: true });
+    }
+
+    #[test]
+    fn host_banner_reserves_extra_row_while_updating() {
+        // #44: a banner whose spec.update_progress is Some advances the FOLLOWING entry's y by 2
+        // (banner row + a render-only sub-line row) vs the idle case, while the HostBannerArea stays
+        // height 1 (only the banner row is a hit target — render == hit-test).
+        let area = Rect::new(0, 0, 30, 24);
+
+        // Idle: single banner before the remote workspace card.
+        let idle = host_banner_app(&[false, true], &[1], &[HostBannerState::Connected]);
+        let (idle_cards, idle_banners, _) = compute_workspace_list_areas_full(&idle, area);
+        let idle_banner = idle_banners[0];
+        let idle_next = idle_cards
+            .iter()
+            .find(|c| c.ws_idx == 1)
+            .expect("remote card present");
+
+        // Updating: same layout, but the banner's spec carries an in-flight progress line.
+        let mut updating = host_banner_app(&[false, true], &[1], &[HostBannerState::Connected]);
+        updating.host_banners[0].update_progress =
+            Some("installing herdr on the remote…".to_string());
+        let (upd_cards, upd_banners, _) = compute_workspace_list_areas_full(&updating, area);
+        let upd_banner = upd_banners[0];
+        let upd_next = upd_cards
+            .iter()
+            .find(|c| c.ws_idx == 1)
+            .expect("remote card present");
+
+        // The banner area itself stays at the SAME y and height 1 in both cases.
+        assert_eq!(idle_banner.rect.height, 1);
+        assert_eq!(upd_banner.rect.height, 1, "banner stays a 1-row hit target");
+        assert_eq!(upd_banner.rect.y, idle_banner.rect.y, "banner y unchanged");
+
+        // The following entry shifts down by exactly one extra row (the reserved sub-line).
+        assert_eq!(
+            upd_next.rect.y,
+            idle_next.rect.y + 1,
+            "updating banner reserves one extra (render-only) row beneath it"
+        );
     }
 
     #[test]

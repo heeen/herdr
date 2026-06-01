@@ -1111,6 +1111,34 @@ fn classify_seed_source(platform: &RemotePlatform) -> NonOverrideSeed {
     )
 }
 
+/// #44: can this herdr build seed `platform` WITHOUT falling back to an internet download? True when
+/// a `HERDR_REMOTE_BINARY` override is set, OR when the seed source is the local exe / a carried
+/// bundle. The one-click "update" worker calls this BEFORE attempting an install so an unbuildable
+/// platform fails with a truthful message instead of silently downloading a release asset.
+fn can_seed_remote_without_download(platform: &RemotePlatform) -> bool {
+    if matches!(remote_binary_override_path(), Ok(Some(_))) {
+        return true;
+    }
+    !matches!(classify_seed_source(platform), NonOverrideSeed::Download)
+}
+
+/// #44: one-click "update" pre-flight. Detects the remote's platform over SSH and, when this build
+/// cannot seed it without an internet download, returns `Err(<truthful message>)` so the update
+/// worker can abort BEFORE `start_ssh_remote_bridge` would fall back to `download_release_asset`.
+/// `Ok(())` means the install can proceed from a local/bundled/override binary. Keeps the private
+/// `RemotePlatform` internal to this module.
+pub(crate) fn preflight_remote_update_seed(target: &SshTarget) -> Result<(), String> {
+    let platform = detect_remote_platform(target).map_err(|err| err.to_string())?;
+    if can_seed_remote_without_download(&platform) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this herdr build has no binary for {}; build/seed it instead of downloading",
+            platform.asset_key()
+        ))
+    }
+}
+
 fn resolve_install_source(
     platform: &RemotePlatform,
     override_binary: Option<PathBuf>,
@@ -3245,6 +3273,54 @@ mod tests {
         assert_eq!(choose_seed_source(true, false), NonOverrideSeed::LocalExe);
         assert_eq!(choose_seed_source(false, true), NonOverrideSeed::Bundle);
         assert_eq!(choose_seed_source(false, false), NonOverrideSeed::Download);
+    }
+
+    #[test]
+    fn can_seed_remote_without_download_refuses_unbuildable_platform() {
+        let _guard = remote_env_lock().lock().unwrap();
+        // Ensure no override is set so the classification path is exercised; restore on exit.
+        let saved_override = std::env::var_os(REMOTE_BINARY_ENV_VAR);
+        std::env::remove_var(REMOTE_BINARY_ENV_VAR);
+        struct RestoreOverride(Option<std::ffi::OsString>);
+        impl Drop for RestoreOverride {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(REMOTE_BINARY_ENV_VAR, v),
+                    None => std::env::remove_var(REMOTE_BINARY_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestoreOverride(saved_override);
+
+        // A foreign os/arch that this from-source build can neither run locally nor bundle classifies
+        // as Download — so it CANNOT be seeded without an internet download.
+        let unbuildable = RemotePlatform {
+            os: if RemotePlatform::local().os == "linux" {
+                "macos"
+            } else {
+                "linux"
+            },
+            arch: if RemotePlatform::local().arch == "x86_64" {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+        };
+        assert_eq!(classify_seed_source(&unbuildable), NonOverrideSeed::Download);
+        assert!(
+            !can_seed_remote_without_download(&unbuildable),
+            "an unbuildable (Download-only) platform refuses a download-free seed"
+        );
+
+        // The local platform seeds from the running exe (a from-source test binary is not package-
+        // manager-managed) — so it CAN be seeded without a download.
+        let local = RemotePlatform::local();
+        if classify_seed_source(&local) != NonOverrideSeed::Download {
+            assert!(
+                can_seed_remote_without_download(&local),
+                "a locally-seedable platform allows a download-free seed"
+            );
+        }
     }
 
     #[test]
