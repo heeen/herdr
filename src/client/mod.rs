@@ -125,6 +125,11 @@ struct ClientState {
     ssh_bridges: HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
     /// Backoff state for secondary servers that should be reconnected.
     secondary_retries: HashMap<supervisor::ServerId, SecondaryRetryState>,
+    /// #43: secondaries the user manually disconnected (host context-menu "disconnect") WITHOUT
+    /// disabling them in the registry. The retry sweeps filter these out so the stream stays down
+    /// until an explicit "reconnect" (which removes the entry) — that is what makes Disconnect a
+    /// distinct, non-persistent action from Disable.
+    manually_disconnected: HashSet<supervisor::ServerId>,
     /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
     last_animation_tick: Instant,
     /// item 6 (Area 6): last time each connected secondary's summary refresh was STARTED. Drives
@@ -240,6 +245,16 @@ enum ClientInputDispatch {
     DeleteRemote {
         remote_id: String,
     },
+    // #43: drop / restore a secondary's live stream WITHOUT touching the registry `disabled` flag.
+    // A `DisconnectRemote` tears the stream down and marks the host manually-disconnected so the
+    // retry sweeps leave it down (that is what makes Disconnect != Disable); `ReconnectRemote`
+    // clears the mark and schedules an immediate reconnect.
+    DisconnectRemote {
+        server_id: supervisor::ServerId,
+    },
+    ReconnectRemote {
+        server_id: supervisor::ServerId,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -262,6 +277,45 @@ fn dispatch_for_remote_manage_outcome(
         }
         supervisor::RemoteManageOutcome::Delete { remote_id } => {
             ClientInputDispatch::DeleteRemote { remote_id }
+        }
+    }
+}
+
+/// #43: map a `HostContextOutcome` from the model into the client input dispatch, closing the host
+/// context-menu overlay for the action arms (the menu has done its job). `AddSpace` resolves through
+/// the public route helper into a `workspace.create` ApiRequest on that host (same Immediate refresh
+/// the New button uses); `ToggleEnabled` reuses the existing `SetRemoteEnabled` registry path;
+/// `Disconnect`/`Reconnect` emit the new stream-only dispatches. `Redraw` just redraws.
+fn dispatch_for_host_context_outcome(
+    model: &mut supervisor::ClientSupervisorModel,
+    outcome: supervisor::HostContextOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::HostContextOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::HostContextOutcome::AddSpace(server_id) => {
+            let dispatch = model
+                .route_for_server(&server_id)
+                .api_request("client:workspace-create")
+                .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    refresh: ClientApiRefreshPolicy::Immediate,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Redraw);
+            model.close_client_overlay();
+            dispatch
+        }
+        supervisor::HostContextOutcome::ToggleEnabled { remote_id, enabled } => {
+            model.close_client_overlay();
+            ClientInputDispatch::SetRemoteEnabled { remote_id, enabled }
+        }
+        supervisor::HostContextOutcome::Disconnect(server_id) => {
+            model.close_client_overlay();
+            ClientInputDispatch::DisconnectRemote { server_id }
+        }
+        supervisor::HostContextOutcome::Reconnect(server_id) => {
+            model.close_client_overlay();
+            ClientInputDispatch::ReconnectRemote { server_id }
         }
     }
 }
@@ -377,6 +431,7 @@ fn dispatch_composited_input(
         || model.new_workspace_picker().is_some()
         || model.remote_manage_overlay().is_some()
         || model.workspace_context_menu().is_some()
+        || model.host_context_menu().is_some()
         || model.rename_workspace_form().is_some()
         || model.confirm_close_workspace().is_some()
     {
@@ -775,6 +830,14 @@ fn dispatch_client_overlay_input(
                     }
                 }
             }
+            // #43: host context-menu key handling. Delegates to the supervisor key handler and maps
+            // its typed outcome through the SAME helper the mouse path uses.
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.host_context_menu().is_some() =>
+            {
+                let outcome = model.handle_host_context_menu_key(key);
+                dispatch_for_host_context_outcome(model, outcome)
+            }
             crate::raw_input::RawInputEvent::Key(key)
                 if model.rename_workspace_form().is_some() =>
             {
@@ -801,6 +864,8 @@ fn dispatch_client_overlay_input(
             ClientInputDispatch::AddRemote(_)
                 | ClientInputDispatch::SetRemoteEnabled { .. }
                 | ClientInputDispatch::DeleteRemote { .. }
+                | ClientInputDispatch::DisconnectRemote { .. }
+                | ClientInputDispatch::ReconnectRemote { .. }
                 | ClientInputDispatch::ApiRequest { .. }
                 | ClientInputDispatch::ServerControl { .. }
                 | ClientInputDispatch::Resize { .. }
@@ -981,16 +1046,34 @@ fn dispatch_composited_mouse_input(
     // context menu anchored at that row, capturing the workspace's current label for the rename
     // prefill / close-confirm text. Resolved through the SAME `hit_test` the left-click path uses.
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
-        if let Some(compositor::SidebarHitTarget::Workspace {
-            server_id,
-            workspace_id,
-        }) = compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1)
-        {
-            let label = model
-                .workspace_label(&server_id, &workspace_id)
-                .unwrap_or_else(|| workspace_id.clone());
-            model.open_workspace_context_menu(server_id, workspace_id, label, mouse.column, mouse.row);
-            return ClientInputDispatch::Redraw;
+        match compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1) {
+            Some(compositor::SidebarHitTarget::Workspace {
+                server_id,
+                workspace_id,
+            }) => {
+                let label = model
+                    .workspace_label(&server_id, &workspace_id)
+                    .unwrap_or_else(|| workspace_id.clone());
+                model.open_workspace_context_menu(
+                    server_id,
+                    workspace_id,
+                    label,
+                    mouse.column,
+                    mouse.row,
+                );
+                return ClientInputDispatch::Redraw;
+            }
+            // #43: a right-click on a host banner opens the host context menu (add-space /
+            // enable-disable / disconnect-reconnect), anchored at the cursor. The display name is
+            // captured so the menu's sub-header needs no second lookup.
+            Some(compositor::SidebarHitTarget::HostBanner { server_id }) => {
+                let display_name = model
+                    .server_display_name(&server_id)
+                    .unwrap_or_else(|| server_id.registry_id().to_string());
+                model.open_host_context_menu(server_id, display_name, mouse.column, mouse.row);
+                return ClientInputDispatch::Redraw;
+            }
+            _ => {}
         }
     }
 
@@ -1347,6 +1430,14 @@ fn dispatch_sidebar_hit_target(
         compositor::SidebarHitTarget::ConfirmCloseWorkspaceCancel => {
             model.close_client_overlay();
             ClientInputDispatch::Redraw
+        }
+        // #43: clicking a host context-menu row selects AND activates it; the outcome is mapped
+        // through the shared helper (add-space ApiRequest / SetRemoteEnabled / Disconnect-Reconnect),
+        // closing the overlay for every action.
+        compositor::SidebarHitTarget::HostContextMenuRow { index } => {
+            model.set_host_context_menu_selected(index);
+            let outcome = model.select_host_context_menu_item(index);
+            dispatch_for_host_context_outcome(model, outcome)
         }
     }
 }
@@ -3329,6 +3420,11 @@ fn schedule_missing_secondary_stream_retries(
         .into_iter()
         .chain(model.unconnected_secondary_server_ids());
     for server_id in retry_server_ids {
+        // #43: a manually-disconnected host stays down — never re-enqueue its stream retry, or the
+        // next tick would silently reconnect it (collapsing Disconnect into a no-op).
+        if state.manually_disconnected.contains(&server_id) {
+            continue;
+        }
         state
             .secondary_retries
             .entry(server_id.clone())
@@ -3389,6 +3485,12 @@ fn retry_due_secondary_connections(
         .collect();
 
     for (server_id, attempt) in due {
+        // #43: a manually-disconnected host must not be reconnected by the retry sweep. Drop any
+        // stale retry entry and skip it so it stays down until an explicit "reconnect".
+        if state.manually_disconnected.contains(&server_id) {
+            state.secondary_retries.remove(&server_id);
+            continue;
+        }
         if server_writes.contains_key(&server_id) {
             state.secondary_retries.remove(&server_id);
             continue;
@@ -3670,6 +3772,7 @@ async fn run_client_loop(
         pending_add_remote: false,
         ssh_bridges,
         secondary_retries: HashMap::new(),
+        manually_disconnected: HashSet::new(),
         last_animation_tick: Instant::now(),
         last_summary_refresh: HashMap::new(),
     };
@@ -3933,6 +4036,48 @@ async fn run_client_loop(
                                     remote_id,
                                     &state.ssh_bridges,
                                     &event_tx,
+                                );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // #43: drop the live stream WITHOUT disabling the remote in the registry.
+                            // Tear the connection down (like a voluntary disable, no retry scheduled),
+                            // mark the host manually-disconnected so the retry sweeps leave it down,
+                            // and mark the model Disconnected (greyed, summaries retained).
+                            ClientInputDispatch::DisconnectRemote { server_id } => {
+                                teardown_secondary_connection(
+                                    &mut state,
+                                    &mut server_writes,
+                                    &server_id,
+                                );
+                                state.manually_disconnected.insert(server_id.clone());
+                                if let Some(model) = &mut state.supervisor_model {
+                                    let _ = model.set_connection_state(
+                                        &server_id,
+                                        supervisor::ConnectionState::Disconnected,
+                                    );
+                                }
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // #43: restore a manually-disconnected stream — clear the mark and
+                            // schedule an immediate (0-backoff) reconnect; the retry sweep then dials
+                            // it back up. Mark the model Connecting so the banner reflects the attempt.
+                            ClientInputDispatch::ReconnectRemote { server_id } => {
+                                state.manually_disconnected.remove(&server_id);
+                                if let Some(model) = &mut state.supervisor_model {
+                                    let _ = model.set_connection_state(
+                                        &server_id,
+                                        supervisor::ConnectionState::Connecting,
+                                    );
+                                }
+                                schedule_secondary_retry(
+                                    &mut state,
+                                    server_id,
+                                    0,
+                                    Instant::now(),
                                 );
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
@@ -5412,6 +5557,7 @@ mod tests {
             pending_add_remote: false,
             ssh_bridges: HashMap::new(),
             secondary_retries: HashMap::new(),
+            manually_disconnected: HashSet::new(),
             last_animation_tick: Instant::now(),
             last_summary_refresh: HashMap::new(),
         }
@@ -6423,6 +6569,132 @@ mod tests {
         );
         assert!(matches!(cancel, ClientInputDispatch::Redraw));
         assert!(model.confirm_close_workspace().is_none());
+    }
+
+    // ----- #43: host context menu dispatch ------------------------------------------------------
+
+    /// Find the visible banner row for `remote_id` by scanning hit_test for its `HostBanner`.
+    fn host_banner_row(
+        compositor: &compositor::ClientCompositor,
+        model: &supervisor::ClientSupervisorModel,
+        remote_id: &supervisor::ServerId,
+        host: (u16, u16),
+    ) -> u16 {
+        (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::HostBanner { server_id })
+                        if server_id == *remote_id
+                )
+            })
+            .expect("remote host banner row")
+    }
+
+    #[test]
+    fn host_menu_add_space_yields_workspace_create_on_that_host() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = host_banner_row(&compositor, &model, &remote_id, host);
+
+        // Right-click the banner opens the host menu anchored at that row.
+        let opened = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+        assert!(matches!(opened, ClientInputDispatch::Redraw));
+        assert!(model.host_context_menu().is_some());
+
+        // Click "add new space" (row 0) -> WorkspaceCreate ApiRequest on that host; overlay closes.
+        let dispatch = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 0 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        match dispatch {
+            ClientInputDispatch::ApiRequest {
+                server_id,
+                request,
+                refresh,
+            } => {
+                assert_eq!(server_id, remote_id);
+                assert_eq!(refresh, ClientApiRefreshPolicy::Immediate);
+                assert!(matches!(
+                    request.method,
+                    crate::api::schema::Method::WorkspaceCreate(_)
+                ));
+            }
+            other => panic!("expected WorkspaceCreate ApiRequest, got {other:?}"),
+        }
+        assert!(model.host_context_menu().is_none(), "overlay closed");
+    }
+
+    #[test]
+    fn host_menu_toggle_yields_set_remote_enabled() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = host_banner_row(&compositor, &model, &remote_id, host);
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+
+        // Click "disable" (row 1) -> SetRemoteEnabled{ registry_id, enabled:false }; overlay closes.
+        let dispatch = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 1 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        match dispatch {
+            ClientInputDispatch::SetRemoteEnabled { remote_id, enabled } => {
+                assert_eq!(remote_id, "remote-x", "addresses the registry id");
+                assert!(!enabled, "an enabled host disables");
+            }
+            other => panic!("expected SetRemoteEnabled, got {other:?}"),
+        }
+        assert!(model.host_context_menu().is_none(), "overlay closed");
+    }
+
+    #[test]
+    fn host_menu_disconnect_yields_disconnect_dispatch_not_disable() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = host_banner_row(&compositor, &model, &remote_id, host);
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+
+        // Click "disconnect" (row 2) -> DisconnectRemote{server_id}, NOT SetRemoteEnabled (so it
+        // drops the live stream WITHOUT disabling the registry entry); overlay closes.
+        let dispatch = dispatch_sidebar_hit_target(
+            compositor::SidebarHitTarget::HostContextMenuRow { index: 2 },
+            &mut model,
+            &down(MouseButton::Left, 1),
+        );
+        assert!(
+            !matches!(dispatch, ClientInputDispatch::SetRemoteEnabled { .. }),
+            "disconnect must not disable the remote: {dispatch:?}"
+        );
+        match dispatch {
+            ClientInputDispatch::DisconnectRemote { server_id } => {
+                assert_eq!(server_id, remote_id);
+            }
+            other => panic!("expected DisconnectRemote, got {other:?}"),
+        }
+        assert!(model.host_context_menu().is_none(), "overlay closed");
     }
 
     fn mixed_remote_model_with_many_workspaces(

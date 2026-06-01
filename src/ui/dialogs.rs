@@ -88,6 +88,14 @@ pub(crate) struct WorkspaceContextMenuView<'a> {
     pub rows: &'a [&'a str],
 }
 
+/// #43: ui-owned view for the host context menu. `display_name` is the host name shown as the modal
+/// sub-header; `rows` are the (state-dependent) menu item labels. Holds only borrowed strings (no
+/// supervisor type), per the layering rule. Mirrors `WorkspaceContextMenuView`.
+pub(crate) struct HostContextMenuView<'a> {
+    pub display_name: &'a str,
+    pub rows: &'a [String],
+}
+
 fn truncate_text(text: &str, max_width: usize) -> String {
     let len = text.chars().count();
     if len <= max_width {
@@ -1459,6 +1467,74 @@ pub(crate) fn render_workspace_context_menu_overlay(
     frame.render_widget(
         Paragraph::new(format!(" {}", truncate_text(view.label, inner.width as usize)))
             .style(Style::default().fg(palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    let selected = selected.min(view.rows.len().saturating_sub(1));
+    let max_rows = inner.height.saturating_sub(2) as usize;
+    for (row_index, label) in view.rows.iter().enumerate().take(max_rows) {
+        let is_selected = row_index == selected;
+        let marker = if is_selected { "›" } else { " " };
+        let text = format!("{marker} {label}");
+        let style = if is_selected {
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.subtext0)
+        };
+        let row = workspace_context_menu_row_rect(inner, row_index);
+        frame.render_widget(
+            Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
+            row,
+        );
+    }
+}
+
+/// #43: render the host context menu as a cursor-anchored accent panel — a selectable list of menu
+/// items with the host name as a sub-header. REUSES the workspace context-menu geometry helpers
+/// wholesale (`workspace_context_menu_row_rect` etc.), since they are label-agnostic and
+/// count-parameterised. Mirrors `render_workspace_context_menu_overlay`.
+pub(crate) fn render_host_context_menu_overlay(
+    palette: &Palette,
+    view: &HostContextMenuView,
+    selected: usize,
+    frame: &mut Frame,
+    popup: Rect,
+) {
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    // #43: render and hit-test must derive the SAME inner rect — re-pin the divergence assert at the
+    // exact formula `workspace_context_menu_inner_rect_at` uses for hit-testing (the host menu
+    // shares those helpers), so the two geometries can never silently diverge.
+    debug_assert_eq!(
+        inner,
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        ),
+        "context menu render and hit-test geometry diverged"
+    );
+    if inner.height < 4 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "host",
+        palette,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {}",
+            truncate_text(view.display_name, inner.width as usize)
+        ))
+        .style(Style::default().fg(palette.overlay0)),
         Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
     );
 

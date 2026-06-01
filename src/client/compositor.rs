@@ -296,6 +296,10 @@ pub(crate) enum SidebarHitTarget {
     RenameWorkspaceCancel,
     ConfirmCloseWorkspaceConfirm,
     ConfirmCloseWorkspaceCancel,
+    // #43: host context-menu overlay target (a click on a menu row resolves to its index).
+    HostContextMenuRow {
+        index: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -339,6 +343,12 @@ struct ClientSidebarSnapshot {
     workspace_context_menu: Option<crate::client::supervisor::WorkspaceContextMenu>,
     rename_workspace: Option<crate::client::supervisor::RenameWorkspaceForm>,
     confirm_close_workspace: Option<crate::client::supervisor::ConfirmCloseWorkspace>,
+    // #43: the host context menu cloned out of the model. The render closure maps it into a ui-owned
+    // view (with the state-dependent row labels) before drawing, per the layering rule.
+    host_context_menu: Option<crate::client::supervisor::HostContextMenu>,
+    // #43: the host menu's row labels, snapshotted alongside the menu so render AND hit-test resolve
+    // their (state-dependent) count from one cloned source, never from a fixed const.
+    host_context_menu_items: Vec<String>,
 }
 
 impl ClientCompositor {
@@ -1174,6 +1184,16 @@ impl ClientCompositor {
                 host_width,
                 host_height,
             ));
+        } else if let Some(menu) = snapshot.host_context_menu.as_ref() {
+            // #43: protect the cursor-anchored host context-menu popup rect (SAME geometry as the
+            // renderer; row count from the cloned state-dependent labels, never a const).
+            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect_at(
+                menu.anchor_col,
+                menu.anchor_row,
+                snapshot.host_context_menu_items.len(),
+                host_width,
+                host_height,
+            ));
         } else if snapshot.rename_workspace.is_some() {
             excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
         } else if snapshot.confirm_close_workspace.is_some() {
@@ -1198,6 +1218,7 @@ impl ClientCompositor {
             || model.new_workspace_picker().is_some()
             || model.remote_manage_overlay().is_some()
             || model.workspace_context_menu().is_some()
+            || model.host_context_menu().is_some()
             || model.rename_workspace_form().is_some()
             || model.confirm_close_workspace().is_some()
         {
@@ -1312,6 +1333,12 @@ impl ClientCompositor {
         // helpers the renderer uses, so render == hit_test.
         if snapshot.workspace_context_menu.is_some() {
             return hit_test_workspace_context_menu(&snapshot, host_width, host_height, x, y);
+        }
+        // #43: the host context menu is modal too — when open it owns the whole host rect (its own
+        // row targets or none). Geometry comes from the SAME cursor-anchored helpers the renderer
+        // uses, so render == hit_test.
+        if snapshot.host_context_menu.is_some() {
+            return hit_test_host_context_menu(&snapshot, host_width, host_height, x, y);
         }
         if snapshot.rename_workspace.is_some() {
             return hit_test_rename_workspace(&snapshot, anchor_area, x, y);
@@ -1954,6 +1981,13 @@ impl ClientSidebarSnapshot {
             workspace_context_menu: model.workspace_context_menu().cloned(),
             rename_workspace: model.rename_workspace_form().cloned(),
             confirm_close_workspace: model.confirm_close_workspace().cloned(),
+            // #43: clone the host context menu + its state-dependent row labels out of the model.
+            host_context_menu: model.host_context_menu().cloned(),
+            host_context_menu_items: if model.host_context_menu().is_some() {
+                model.host_context_menu_items()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -2073,6 +2107,29 @@ fn render_client_shell(
                         rows: &rows,
                     };
                     crate::ui::render_workspace_context_menu_overlay(
+                        &snapshot.app.palette,
+                        &view,
+                        menu.selected,
+                        frame,
+                        popup,
+                    );
+                }
+            }
+            // #43: render the host context menu. The compositor maps the supervisor state + its
+            // state-dependent row labels into a ui-owned view here (no supervisor types reach `ui`).
+            if let Some(menu) = &snapshot.host_context_menu {
+                if let Some(popup) = crate::ui::workspace_context_menu_popup_rect_at(
+                    menu.anchor_col,
+                    menu.anchor_row,
+                    snapshot.host_context_menu_items.len(),
+                    host_width,
+                    host_height,
+                ) {
+                    let view = crate::ui::HostContextMenuView {
+                        display_name: &menu.display_name,
+                        rows: &snapshot.host_context_menu_items,
+                    };
+                    crate::ui::render_host_context_menu_overlay(
                         &snapshot.app.palette,
                         &view,
                         menu.selected,
@@ -2376,6 +2433,40 @@ fn hit_test_workspace_context_menu(
         let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
         if rect_contains(rect, x, y) {
             return Some(SidebarHitTarget::WorkspaceContextMenuRow { index });
+        }
+    }
+    None
+}
+
+/// #43: hit-test the host context menu. Resolves a click on a menu row to its index, derived from
+/// the SAME cursor-anchored `ui` geometry the renderer uses. The row `count` comes from the cloned
+/// menu's snapshotted labels (NOT a fixed const — the labels flip with host state). The overlay is
+/// modal: a click that misses every row returns `None`. Mirrors `hit_test_workspace_context_menu`.
+fn hit_test_host_context_menu(
+    snapshot: &ClientSidebarSnapshot,
+    host_width: u16,
+    host_height: u16,
+    x: u16,
+    y: u16,
+) -> Option<SidebarHitTarget> {
+    let menu = snapshot.host_context_menu.as_ref()?;
+    let count = snapshot.host_context_menu_items.len();
+    let inner = crate::ui::workspace_context_menu_inner_rect_at(
+        menu.anchor_col,
+        menu.anchor_row,
+        count,
+        host_width,
+        host_height,
+    )?;
+    // #43: mirror the renderer's `inner.height < 4` bail so a host too short to actually draw the
+    // rows also hit-tests to nothing (otherwise a tiny terminal maps clicks to unpainted rows).
+    if inner.height < 4 {
+        return None;
+    }
+    for index in 0..count {
+        let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
+        if rect_contains(rect, x, y) {
+            return Some(SidebarHitTarget::HostContextMenuRow { index });
         }
     }
     None
@@ -4537,6 +4628,47 @@ mod tests {
         for card in &snapshot.app.view.workspace_card_areas {
             assert_ne!(card.rect.y, banner_y, "a card overlaps the banner row");
         }
+    }
+
+    #[test]
+    fn host_banner_right_click_opens_host_menu_and_row_hit_tests() {
+        // The host banner row hit-tests to a `HostBanner` target (which the client right-click path
+        // turns into an open). Once the host menu is open (modal), a click at a menu row y resolves
+        // to `HostContextMenuRow { index }` — render == hit_test via the shared cursor-anchored
+        // geometry the renderer uses.
+        let (mut model, remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        // The remote host's banner row (index 1 in visible_servers order: [local, remote]).
+        let banner_y = snapshot.app.view.host_banner_areas[1].rect.y;
+        assert_eq!(
+            compositor.hit_test(&model, 1, banner_y, host.0, host.1),
+            Some(SidebarHitTarget::HostBanner {
+                server_id: remote_id.clone()
+            }),
+            "the host banner row resolves to its host"
+        );
+
+        // Open the host context menu anchored at the banner row (the client right-click handler).
+        model.open_host_context_menu(remote_id.clone(), "x".into(), 1, banner_y);
+
+        // The menu's inner rect / row geometry comes from the SAME shared helpers the renderer uses.
+        let count = model.host_context_menu_items().len();
+        let inner = crate::ui::workspace_context_menu_inner_rect_at(1, banner_y, count, host.0, host.1)
+            .expect("host menu fits");
+        for index in 0..count {
+            let row = crate::ui::workspace_context_menu_row_rect(inner, index);
+            assert_eq!(
+                compositor.hit_test(&model, row.x, row.y, host.0, host.1),
+                Some(SidebarHitTarget::HostContextMenuRow { index }),
+                "menu row {index} at y={} should hit-test to its index",
+                row.y
+            );
+        }
+        // A click off every menu row (the modal owns the whole rect) hit-tests to nothing.
+        assert_eq!(compositor.hit_test(&model, 0, 0, host.0, host.1), None);
     }
 
     #[test]

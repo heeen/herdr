@@ -234,6 +234,10 @@ enum ClientOverlayState {
     WorkspaceContextMenu(WorkspaceContextMenu),
     RenameWorkspace(RenameWorkspaceForm),
     ConfirmCloseWorkspace(ConfirmCloseWorkspace),
+    // #43: per-host context menu (add-space / enable-disable / disconnect-reconnect). Mirrors the
+    // workspace context menu (#33) but anchored to a host banner; actions route to the registry
+    // (enable/disable) or the live stream (disconnect/reconnect) or the owning server (add-space).
+    HostContextMenu(HostContextMenu),
 }
 
 /// #23: a right-click context menu over a workspace card, listing `Rename`/`Close` for the
@@ -278,6 +282,37 @@ pub(crate) enum WorkspaceContextOutcome {
     Redraw,
     OpenRename,
     OpenConfirmClose,
+}
+
+/// #43: a right-click context menu over a host banner, listing `add new space` /
+/// `enable`-`disable` / `disconnect`-`reconnect` for the captured `server_id`. `disabled` and
+/// `connected` are captured at open time so the labels (which flip with state) and the geometry row
+/// count derive from one source. Mirrors `WorkspaceContextMenu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostContextMenu {
+    pub(crate) server_id: ServerId,
+    pub(crate) display_name: String,
+    pub(crate) disabled: bool,
+    pub(crate) connected: bool,
+    pub(crate) selected: usize,
+    // #43: the right-click cursor position, so the popup anchors at the cursor (clamped to screen).
+    // Render and hit-test both derive geometry from this. Mirrors `WorkspaceContextMenu`.
+    pub(crate) anchor_col: u16,
+    pub(crate) anchor_row: u16,
+}
+
+/// #43: the typed outcome of selecting a host context-menu row. `AddSpace` carries the `server_id`
+/// the client turns into a `workspace.create` round-trip (resolved via the public route helper, as
+/// `route_for_specific_server` is private). `ToggleEnabled` flips the registry `disabled` flag via
+/// the existing `remote.set_enabled` path. `Disconnect`/`Reconnect` drop/restore the live stream
+/// WITHOUT touching `disabled`. Mirrors `WorkspaceContextOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostContextOutcome {
+    Redraw,
+    AddSpace(ServerId),
+    ToggleEnabled { remote_id: String, enabled: bool },
+    Disconnect(ServerId),
+    Reconnect(ServerId),
 }
 
 /// #23: the typed outcome of a key press in the rename overlay. `Submit` carries the
@@ -1017,7 +1052,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1117,7 +1153,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1315,7 +1352,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1327,7 +1365,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1552,6 +1591,13 @@ impl ClientSupervisorModel {
             .unwrap_or(false)
     }
 
+    /// #43: the display name of `server_id`, used by the host right-click handler to capture the
+    /// host name for the context-menu sub-header. `None` when the server is not in the model.
+    pub(crate) fn server_display_name(&self, server_id: &ServerId) -> Option<String> {
+        self.server(server_id)
+            .map(|server| server.display_name.clone())
+    }
+
     /// #23: the current label of `(server_id, workspace_id)` from the cached summaries, used by the
     /// right-click handler to capture the label for the context menu (rename prefill / close text).
     /// Falls back to `None` when the server or workspace is not in the model.
@@ -1597,7 +1643,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1609,7 +1656,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1690,6 +1738,183 @@ impl ClientSupervisorModel {
         }
     }
 
+    // ----- #43: host context menu (add-space / enable-disable / disconnect-reconnect) ----------
+
+    /// #43: the host context-menu rows in render order. DYNAMIC: the toggle labels flip with the
+    /// captured `disabled`/`connected` state, so this Vec is the SINGLE source of the row count for
+    /// the cursor-anchored geometry (mirrors `workspace_context_menu_items`, but state-driven).
+    pub(crate) fn host_context_menu_items(&self) -> Vec<String> {
+        let (disabled, connected) = self
+            .host_context_menu()
+            .map(|menu| (menu.disabled, menu.connected))
+            .unwrap_or((false, false));
+        vec![
+            "add new space".to_string(),
+            if disabled { "enable" } else { "disable" }.to_string(),
+            if connected {
+                "disconnect"
+            } else {
+                "reconnect"
+            }
+            .to_string(),
+        ]
+    }
+
+    /// #43: open the host context menu for `server_id`, capturing the host's current `disabled` flag
+    /// and whether its connection is live (so the labels and the add-space availability reflect the
+    /// state at open time). Mirrors `open_workspace_context_menu`.
+    pub(crate) fn open_host_context_menu(
+        &mut self,
+        server_id: ServerId,
+        display_name: String,
+        anchor_col: u16,
+        anchor_row: u16,
+    ) {
+        let (disabled, connected) = self
+            .server(&server_id)
+            .map(|server| {
+                (
+                    server.disabled,
+                    server.connection_state == ConnectionState::Connected,
+                )
+            })
+            .unwrap_or((false, false));
+        self.new_workspace_picker = None;
+        self.client_overlay = ClientOverlayState::HostContextMenu(HostContextMenu {
+            server_id,
+            display_name,
+            disabled,
+            connected,
+            selected: 0,
+            anchor_col,
+            anchor_row,
+        });
+    }
+
+    pub(crate) fn host_context_menu(&self) -> Option<&HostContextMenu> {
+        match &self.client_overlay {
+            ClientOverlayState::HostContextMenu(menu) => Some(menu),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    fn host_context_menu_mut(&mut self) -> Option<&mut HostContextMenu> {
+        match &mut self.client_overlay {
+            ClientOverlayState::HostContextMenu(menu) => Some(menu),
+            ClientOverlayState::None
+            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::WorkspaceContextMenu(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    pub(crate) fn move_host_context_menu_next(&mut self) {
+        let count = self.host_context_menu_items().len();
+        if let Some(menu) = self.host_context_menu_mut() {
+            menu.selected = (menu.selected + 1).min(count.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn move_host_context_menu_prev(&mut self) {
+        if let Some(menu) = self.host_context_menu_mut() {
+            menu.selected = menu.selected.saturating_sub(1);
+        }
+    }
+
+    /// #43: mouse-driven selection — clamp and set the highlighted host context-menu row.
+    pub(crate) fn set_host_context_menu_selected(&mut self, index: usize) {
+        let count = self.host_context_menu_items().len();
+        if let Some(menu) = self.host_context_menu_mut() {
+            menu.selected = index.min(count.saturating_sub(1));
+        }
+    }
+
+    /// #43: resolve a host context-menu row index into an action. `0 -> add space on this host`
+    /// (only when connected, else a no-op redraw); `1 -> toggle the registry disabled flag`;
+    /// `2 -> disconnect/reconnect the live stream`. Mirrors `select_workspace_context_menu_item`.
+    pub(crate) fn select_host_context_menu_item(&mut self, index: usize) -> HostContextOutcome {
+        let Some(menu) = self.host_context_menu() else {
+            return HostContextOutcome::Redraw;
+        };
+        let server_id = menu.server_id.clone();
+        let disabled = menu.disabled;
+        let connected = menu.connected;
+        match index {
+            0 => {
+                if connected {
+                    HostContextOutcome::AddSpace(server_id)
+                } else {
+                    HostContextOutcome::Redraw
+                }
+            }
+            1 => HostContextOutcome::ToggleEnabled {
+                remote_id: server_id.registry_id().to_string(),
+                enabled: disabled,
+            },
+            2 => {
+                if connected {
+                    HostContextOutcome::Disconnect(server_id)
+                } else {
+                    HostContextOutcome::Reconnect(server_id)
+                }
+            }
+            _ => HostContextOutcome::Redraw,
+        }
+    }
+
+    pub(crate) fn accept_host_context_menu_item(&mut self) -> HostContextOutcome {
+        let Some(selected) = self.host_context_menu().map(|menu| menu.selected) else {
+            return HostContextOutcome::Redraw;
+        };
+        self.select_host_context_menu_item(selected)
+    }
+
+    /// #43: translate a host context-menu key press into a typed outcome. Mirrors
+    /// `handle_workspace_context_menu_key`: Up/Down (and j/k) move, Enter activates, Esc closes.
+    pub(crate) fn handle_host_context_menu_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> HostContextOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return HostContextOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                HostContextOutcome::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_host_context_menu_prev();
+                HostContextOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_host_context_menu_next();
+                HostContextOutcome::Redraw
+            }
+            KeyCode::Enter => self.accept_host_context_menu_item(),
+            _ => HostContextOutcome::Redraw,
+        }
+    }
+
+    /// #43: public wrapper over the private `route_for_specific_server`, so the client loop can
+    /// resolve a host context-menu `AddSpace(server_id)` into a `workspace.create` request without
+    /// reaching into the private routing internals.
+    pub(crate) fn route_for_server(&self, id: &ServerId) -> NewWorkspaceRoute {
+        self.route_for_specific_server(id)
+    }
+
     /// #23: transition the open context menu into the rename overlay, prefilled with the captured
     /// label. A no-op (closes) when no context menu is open. Mirrors `open_add_remote_form`.
     pub(crate) fn open_rename_workspace(&mut self) {
@@ -1713,7 +1938,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1725,7 +1951,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -1822,7 +2049,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::RenameWorkspace(_) => None,
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -2242,7 +2470,8 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_)
+            | ClientOverlayState::HostContextMenu(_) => None,
         }
     }
 
@@ -5292,5 +5521,139 @@ mod tests {
         let outcome = model.handle_confirm_close_workspace_key(press(KeyCode::Char('n')));
         assert_eq!(outcome, ConfirmCloseOutcome::Redraw);
         assert!(model.confirm_close_workspace().is_none());
+    }
+
+    // ----- #43: host context menu ---------------------------------------------------------------
+
+    #[test]
+    fn open_host_context_menu_captures_host_and_labels() {
+        // A connected, enabled host: items are add/disable/disconnect.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 4, 5);
+        let menu = model.host_context_menu().expect("host menu open");
+        assert_eq!(menu.server_id, remote);
+        assert_eq!(menu.display_name, "alpha");
+        assert!(!menu.disabled);
+        assert!(menu.connected);
+        assert_eq!(menu.selected, 0);
+        assert_eq!(menu.anchor_col, 4);
+        assert_eq!(menu.anchor_row, 5);
+        assert_eq!(
+            model.host_context_menu_items(),
+            ["add new space", "disable", "disconnect"]
+        );
+
+        // A disabled + disconnected host flips both toggle labels.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(disabled_ssh_remote("r2", "beta", "beta"));
+        model
+            .set_connection_state(&remote, ConnectionState::Disconnected)
+            .unwrap();
+        model.open_host_context_menu(remote.clone(), "beta".into(), 0, 0);
+        let menu = model.host_context_menu().expect("host menu open");
+        assert!(menu.disabled);
+        assert!(!menu.connected);
+        assert_eq!(
+            model.host_context_menu_items(),
+            ["add new space", "enable", "reconnect"]
+        );
+    }
+
+    #[test]
+    fn host_context_menu_toggle_label_reflects_state() {
+        // A disabled host shows "enable" at row 1, and selecting it yields ToggleEnabled{true}.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(disabled_ssh_remote("r1", "alpha", "alpha"));
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(model.host_context_menu_items()[1], "enable");
+        assert_eq!(
+            model.select_host_context_menu_item(1),
+            HostContextOutcome::ToggleEnabled {
+                remote_id: "r1".into(),
+                enabled: true,
+            }
+        );
+
+        // An enabled host shows "disable" and selecting it yields ToggleEnabled{false}.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(model.host_context_menu_items()[1], "disable");
+        assert_eq!(
+            model.select_host_context_menu_item(1),
+            HostContextOutcome::ToggleEnabled {
+                remote_id: "r1".into(),
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn host_context_menu_add_space_unavailable_when_disconnected() {
+        // Disconnected host: add-space (row 0) is a no-op redraw; disconnect row reconnects instead.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Disconnected)
+            .unwrap();
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(
+            model.select_host_context_menu_item(0),
+            HostContextOutcome::Redraw
+        );
+        assert_eq!(
+            model.select_host_context_menu_item(2),
+            HostContextOutcome::Reconnect(remote.clone())
+        );
+
+        // Connected host: add-space yields AddSpace(server_id); row 2 disconnects.
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(
+            model.select_host_context_menu_item(0),
+            HostContextOutcome::AddSpace(remote.clone())
+        );
+        assert_eq!(
+            model.select_host_context_menu_item(2),
+            HostContextOutcome::Disconnect(remote.clone())
+        );
+    }
+
+    #[test]
+    fn host_context_menu_nav_and_esc_dismiss() {
+        use crossterm::event::KeyCode;
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        model.open_host_context_menu(remote, "alpha".into(), 0, 0);
+
+        // Down advances to row 1 then row 2, clamped at the last (3-item) row.
+        assert_eq!(
+            model.handle_host_context_menu_key(press(KeyCode::Down)),
+            HostContextOutcome::Redraw
+        );
+        assert_eq!(model.host_context_menu().unwrap().selected, 1);
+        model.handle_host_context_menu_key(press(KeyCode::Char('j')));
+        assert_eq!(model.host_context_menu().unwrap().selected, 2);
+        model.handle_host_context_menu_key(press(KeyCode::Down));
+        assert_eq!(model.host_context_menu().unwrap().selected, 2);
+        // k moves back up.
+        model.handle_host_context_menu_key(press(KeyCode::Char('k')));
+        assert_eq!(model.host_context_menu().unwrap().selected, 1);
+
+        // Esc dismisses.
+        model.handle_host_context_menu_key(press(KeyCode::Esc));
+        assert!(model.host_context_menu().is_none());
     }
 }
