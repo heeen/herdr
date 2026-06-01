@@ -50,7 +50,7 @@ pub(crate) use self::scrollbar::{
 };
 use self::settings::render_settings_overlay;
 pub(crate) use self::sidebar::render_sidebar;
-use self::sidebar::render_sidebar_collapsed;
+pub(crate) use self::sidebar::render_sidebar_collapsed;
 use self::status::{
     render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,

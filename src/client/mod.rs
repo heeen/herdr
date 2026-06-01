@@ -1142,6 +1142,16 @@ fn dispatch_composited_mouse_input(
     host_size: (u16, u16),
     mouse: &MouseEvent,
 ) -> ClientInputDispatch {
+    // #46 (items 5/6/7): a right-click context menu is MODAL — it renders topmost, so it must be
+    // topmost in the EVENT pipeline too. Route every mouse event to it FIRST, ahead of the sidebar
+    // motion/resize/scroll/reorder handlers below (which otherwise highlight rows UNDER the menu on
+    // hover, wheel-scroll the sidebar beneath it, and let a divider-column click start a resize
+    // instead of selecting). This is the fix the user's "events in render order" intuition asks for:
+    // the render was already topmost; only the event ordering was wrong.
+    if model.context_menu_open() {
+        return dispatch_open_context_menu_mouse(compositor, model, host_size, mouse);
+    }
+
     // item 7 (Area 4): handle motion BEFORE resize/scroll/hit_test. The `hit_test` dispatch below
     // early-returns `Consumed` for any non-`Down(Left)` kind, so without this top-of-fn arm a
     // `Moved` over a sidebar row would never reach `hover_test`. Intercept only when over the
@@ -1388,6 +1398,64 @@ fn dispatch_composited_mouse_input(
     }
 
     translate_content_mouse_input(data, mouse, sidebar_width)
+}
+
+/// #46 (items 5/6/7): mouse handling for an OPEN context menu (workspace or host). Called from the
+/// top of `dispatch_composited_mouse_input` before any sidebar handler, so the modal menu owns the
+/// whole host rect. Motion highlights the hovered row (the sidebar hover path never knew about the
+/// menu, so hover used to highlight NOTHING on the menu); a left-press on a row selects it; any
+/// other press dismisses the menu and is CONSUMED (it must NOT leak to the pane underneath).
+/// Geometry comes from the SAME `hit_test` the open render uses, so hover/select line up with the
+/// painted rows.
+fn dispatch_open_context_menu_mouse(
+    compositor: &compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    host_size: (u16, u16),
+    mouse: &MouseEvent,
+) -> ClientInputDispatch {
+    let target = compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
+    match mouse.kind {
+        MouseEventKind::Moved => match target {
+            Some(compositor::SidebarHitTarget::HostContextMenuRow { index }) => {
+                if model.host_context_menu().map(|m| m.selected) == Some(index) {
+                    ClientInputDispatch::Consumed
+                } else {
+                    model.set_host_context_menu_selected(index);
+                    ClientInputDispatch::Redraw
+                }
+            }
+            Some(compositor::SidebarHitTarget::WorkspaceContextMenuRow { index }) => {
+                if model.workspace_context_menu().map(|m| m.selected) == Some(index) {
+                    ClientInputDispatch::Consumed
+                } else {
+                    model.set_workspace_context_menu_selected(index);
+                    ClientInputDispatch::Redraw
+                }
+            }
+            // Motion off the rows leaves the highlight where it is — a hover OUTSIDE the menu does
+            // not dismiss it (only a press does).
+            _ => ClientInputDispatch::Consumed,
+        },
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(
+                row_target @ (compositor::SidebarHitTarget::HostContextMenuRow { .. }
+                | compositor::SidebarHitTarget::WorkspaceContextMenuRow { .. }),
+            ) => dispatch_sidebar_hit_target(row_target, model, mouse),
+            // A left-press that misses every row is an outside-click → dismiss + consume (never
+            // forward to the pane beneath, which the old `None` fall-through did for content clicks).
+            _ => {
+                model.close_client_overlay();
+                ClientInputDispatch::Redraw
+            }
+        },
+        // A right/middle press anywhere dismisses the open menu.
+        MouseEventKind::Down(_) => {
+            model.close_client_overlay();
+            ClientInputDispatch::Redraw
+        }
+        // Drags / wheel / button-ups over the open menu are swallowed (the modal owns the rect).
+        _ => ClientInputDispatch::Consumed,
+    }
 }
 
 /// item 6 (Area 6): the refresh policy for a focus dispatch. A focus that switches the active
@@ -5454,6 +5522,43 @@ async fn run_client_loop(
                         prune_and_seed_working_since(c, m, now);
                     }
                     state.last_animation_tick = now;
+                    // #46 (item 2): the collapse/expand slide changes the content region width every
+                    // tick, so resize the server-rendered content to match — otherwise the reclaimed
+                    // columns stay blank and the server keeps rendering at the pre-collapse width
+                    // (collapse used to ONLY flip state + redraw, never resizing). Emit only when the
+                    // content size actually changed, so the slide costs ≤4 resizes over ~320ms — no
+                    // #17-style resize storm. Mirrors the `ClientInputDispatch::Resize` send path.
+                    let (host_cols, host_rows) = state.host_size;
+                    let content = state
+                        .compositor
+                        .as_ref()
+                        .map(|c| c.content_size(host_cols, host_rows));
+                    if let Some(content) = content {
+                        if content != state.reported_size {
+                            state.reported_size = content;
+                            let msg = ClientMessage::Resize {
+                                cols: content.0,
+                                rows: content.1,
+                                cell_width_px: state.cell_size_px.0,
+                                cell_height_px: state.cell_size_px.1,
+                            };
+                            let mut write_failures = Vec::new();
+                            for (server_id, handle) in server_writes.iter() {
+                                if let Err(e) = queue_to_server(handle, msg.clone()) {
+                                    write_failures.push((server_id.clone(), e));
+                                }
+                            }
+                            for (server_id, error) in write_failures {
+                                handle_server_write_failure(
+                                    &mut state,
+                                    &mut server_writes,
+                                    server_id,
+                                    error,
+                                    now,
+                                )?;
+                            }
+                        }
+                    }
                     render_cached_composited_frame(&mut state);
                 }
             }
@@ -6991,6 +7096,116 @@ mod tests {
         assert_eq!(menu.server_id, remote_id);
         assert_eq!(menu.workspace_id, "remote-api");
         assert_eq!(menu.label, "api", "captured the current label");
+    }
+
+    #[test]
+    fn open_context_menu_dismisses_on_outside_press() {
+        // #46 (item 6): with a context menu open, a press that misses every row dismisses it and is
+        // consumed. The old code had NO outside-click dismiss — the menu stayed open, and a press in
+        // the content area even leaked through to the pane beneath.
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+        assert!(model.workspace_context_menu().is_some(), "right-click opened the menu");
+
+        // The far-right column is outside the 34-wide cursor-anchored popup, so `hit_test` is `None`
+        // there while the menu is open — a genuine outside-click.
+        let outside_col = host.0 - 1;
+        assert!(
+            compositor
+                .hit_test(&model, outside_col, row, host.0, host.1)
+                .is_none(),
+            "the chosen point must be outside the open menu"
+        );
+        let press_outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: outside_col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &press_outside,
+        );
+        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        assert!(
+            model.workspace_context_menu().is_none(),
+            "an outside press dismissed the menu"
+        );
+    }
+
+    #[test]
+    fn open_context_menu_hover_tracks_highlight() {
+        // #46 (item 5): motion over a menu row moves the highlight. The sidebar hover path never
+        // knew about the open menu, so hovering the menu used to highlight NOTHING on it.
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        let row = (0..host.1)
+            .find(|row| {
+                matches!(
+                    compositor.hit_test(&model, 1, *row, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::Workspace { server_id, workspace_id })
+                        if server_id == remote_id && workspace_id == "remote-api"
+                )
+            })
+            .expect("remote workspace card row");
+        dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &down(MouseButton::Right, row),
+        );
+        assert_eq!(
+            model.workspace_context_menu().unwrap().selected,
+            0,
+            "menu opens on the first row"
+        );
+
+        // Find the painted rect of menu row index 1 and move the cursor onto it.
+        let (col, hover_row) = (0..host.0)
+            .flat_map(|c| (0..host.1).map(move |r| (c, r)))
+            .find(|&(c, r)| {
+                matches!(
+                    compositor.hit_test(&model, c, r, host.0, host.1),
+                    Some(compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 })
+                )
+            })
+            .expect("menu row 1 position");
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: col,
+            row: hover_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch =
+            dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &moved);
+        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        assert_eq!(
+            model.workspace_context_menu().unwrap().selected,
+            1,
+            "hover moved the highlight to row 1"
+        );
     }
 
     #[test]

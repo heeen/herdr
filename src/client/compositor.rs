@@ -2075,13 +2075,30 @@ fn render_client_shell(
     let terminal_runtimes = TerminalRuntimeRegistry::new();
     terminal
         .draw(|frame| {
-            crate::ui::render_sidebar(
-                &snapshot.app,
-                &terminal_runtimes,
-                frame,
-                snapshot.app.view.sidebar_rect,
-            );
-            render_filter_label(snapshot, frame);
+            // #46 (items 1 & 3): in collapsed mode render the dedicated mini strip, mirroring the
+            // server gate (`ui.rs`: `else if app.sidebar_collapsed { render_sidebar_collapsed }`).
+            // The old code ALWAYS called the EXPANDED `render_sidebar` (then clipped to the 4-col
+            // mini width), so the painted layout diverged from `collapsed_hit_test` (collapsed
+            // clicks selected nothing) and the expand affordance was the clipped "‹‹ collapse"
+            // label instead of the original "»" glyph. Rendering through `render_sidebar_collapsed`
+            // fixes both: render == hit-test, and the "»" expand icon matches the server original.
+            if snapshot.app.sidebar_collapsed {
+                crate::ui::render_sidebar_collapsed(
+                    &snapshot.app,
+                    frame,
+                    snapshot.app.view.sidebar_rect,
+                );
+            } else {
+                crate::ui::render_sidebar(
+                    &snapshot.app,
+                    &terminal_runtimes,
+                    frame,
+                    snapshot.app.view.sidebar_rect,
+                );
+                // The right-aligned filter label belongs to the expanded layout only; the 4-col
+                // mini strip has no room for it.
+                render_filter_label(snapshot, frame);
+            }
             if matches!(snapshot.app.mode, Mode::GlobalMenu) {
                 crate::ui::render_global_launcher_menu(&snapshot.app, frame);
             }

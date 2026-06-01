@@ -1903,7 +1903,10 @@ impl ClientSupervisorModel {
             display_name,
             disabled,
             connected,
-            selected: 0,
+            // #46 (item 5): start on the first ACTIONABLE row. Row 0 is the non-selectable
+            // `VersionReadout` (its action is a no-op `Redraw`); opening with it highlighted made the
+            // menu look dead and pressing Enter did nothing. Row 1 is `AddSpace` (always present).
+            selected: 1,
             remote_version,
             remote_protocol,
             anchor_col,
@@ -2606,6 +2609,17 @@ impl ClientSupervisorModel {
 
     pub(crate) fn close_client_overlay(&mut self) {
         self.client_overlay = ClientOverlayState::None;
+    }
+
+    /// #46 (items 5/6/7): whether a right-click CONTEXT MENU (workspace or host) is open. These two
+    /// overlays are modal and cursor-anchored over the sidebar, so the mouse pipeline must route
+    /// events to them BEFORE the sidebar hover/scroll/resize/reorder handlers (which otherwise claim
+    /// hover over the menu, wheel-scroll the sidebar beneath it, and steal divider-column clicks).
+    pub(crate) fn context_menu_open(&self) -> bool {
+        matches!(
+            self.client_overlay,
+            ClientOverlayState::WorkspaceContextMenu(_) | ClientOverlayState::HostContextMenu(_)
+        )
     }
 
     fn add_remote_form_mut(&mut self) -> Option<&mut AddRemoteForm> {
@@ -5737,7 +5751,9 @@ mod tests {
         assert_eq!(menu.display_name, "alpha");
         assert!(!menu.disabled);
         assert!(menu.connected);
-        assert_eq!(menu.selected, 0);
+        // #46 (item 5): opens on the first actionable row (1 == add-space), skipping the
+        // non-selectable version-readout at row 0.
+        assert_eq!(menu.selected, 1);
         assert_eq!(menu.anchor_col, 4);
         assert_eq!(menu.anchor_row, 5);
         // #44: a non-selectable version-readout row leads; then add/disable/disconnect; then update.
@@ -5852,14 +5868,16 @@ mod tests {
         model.open_host_context_menu(remote, "alpha".into(), 0, 0);
 
         // #44: Down advances through the 5-row menu (version/add/toggle/disconnect/update), clamped
-        // at the last row (index 4).
+        // at the last row (index 4). #46: the menu now OPENS on row 1 (add), skipping the
+        // non-actionable version readout, so the first Down lands on row 2.
+        assert_eq!(model.host_context_menu().unwrap().selected, 1);
         assert_eq!(
             model.handle_host_context_menu_key(press(KeyCode::Down)),
             HostContextOutcome::Redraw
         );
-        assert_eq!(model.host_context_menu().unwrap().selected, 1);
-        model.handle_host_context_menu_key(press(KeyCode::Char('j')));
         assert_eq!(model.host_context_menu().unwrap().selected, 2);
+        model.handle_host_context_menu_key(press(KeyCode::Char('j')));
+        assert_eq!(model.host_context_menu().unwrap().selected, 3);
         model.handle_host_context_menu_key(press(KeyCode::Down));
         model.handle_host_context_menu_key(press(KeyCode::Down));
         assert_eq!(model.host_context_menu().unwrap().selected, 4);

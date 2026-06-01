@@ -1407,7 +1407,10 @@ pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect
 }
 
 /// Collapsed sidebar: workspace glance on top, compact agent list below.
-pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
+// #46 (items 1 & 3): bumped to `pub(crate)` so the client compositor's `render_client_shell` can
+// gate on it (it previously always called the EXPANDED `render_sidebar`, so the collapsed client
+// view was the expanded layout clipped to the mini width — diverging from `collapsed_hit_test`).
+pub(crate) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
     let is_navigating = matches!(app.mode, Mode::Navigate);
 
     let p = &app.palette;
