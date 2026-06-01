@@ -3784,10 +3784,15 @@ async fn run_client_loop(
         // housekeeping cadence (idle behavior unchanged). The gate reads the cached model only
         // and performs no I/O; real input still pre-empts the deadline via `event_rx.recv()`.
         let wants_animation = state.compositor.is_some()
-            && state
+            && (state
                 .supervisor_model
                 .as_ref()
-                .is_some_and(compositor::sidebar_wants_animation);
+                .is_some_and(compositor::sidebar_wants_animation)
+                // #9: keep the 80ms wake alive while the collapse/expand width is mid-slide.
+                || state
+                    .compositor
+                    .as_ref()
+                    .is_some_and(compositor::ClientCompositor::sidebar_width_animating));
         let deadline =
             next_select_deadline(Instant::now(), state.last_animation_tick, wants_animation);
         let event = tokio::select! {
@@ -4753,15 +4758,22 @@ async fn run_client_loop(
                 // 3d47acd). When nothing is animating, `wants` is false and the tick never
                 // advances (zero idle recompose).
                 let wants = state.compositor.is_some()
-                    && state
+                    && (state
                         .supervisor_model
                         .as_ref()
-                        .is_some_and(compositor::sidebar_wants_animation);
+                        .is_some_and(compositor::sidebar_wants_animation)
+                        // #9: also tick while the collapse/expand width is sliding.
+                        || state
+                            .compositor
+                            .as_ref()
+                            .is_some_and(compositor::ClientCompositor::sidebar_width_animating));
                 if should_advance_animation(wants, now, state.last_animation_tick) {
                     if let (Some(c), Some(m)) =
                         (state.compositor.as_mut(), state.supervisor_model.as_ref())
                     {
                         c.advance_animation_tick(CLIENT_ANIMATION_TICK_STEP);
+                        // #9: advance the collapse/expand width slide one step (no-op once settled).
+                        c.step_sidebar_width_animation();
                         prune_and_seed_working_since(c, m, now);
                     }
                     state.last_animation_tick = now;
@@ -6861,6 +6873,50 @@ mod tests {
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             assert!(compositor.sidebar_collapsed_for_test());
         });
+    }
+
+    // #9 item 1: the DEFAULT two-step `prefix+b` collapse path (ctrl+b THEN b) must flip the CLIENT
+    // compositor's collapse state in client-compositor mode — never forwarded to the server's dead
+    // `AppState.sidebar_collapsed`. The only prior collapse test rebinds `toggle_sidebar` to a direct
+    // `alt+b` chord, so the shipped default prefix path was untested end-to-end. Feeds raw bytes
+    // (0x02 then 'b') and asserts the flip BOTH directions with nothing Forwarded to the server.
+    #[test]
+    fn prefix_b_collapse_toggles_sidebar_in_both_directions() {
+        with_client_keys_config(
+            "[keys]\nprefix = \"ctrl+b\"\ntoggle_sidebar = \"prefix+b\"\n",
+            || {
+                let (mut model, _) = mixed_remote_model();
+                let mut compositor = compositor::ClientCompositor::new(26);
+                assert!(!compositor.sidebar_collapsed_for_test());
+
+                // ctrl+b (0x02) arms prefix mode: swallowed (Redraw), nothing forwarded yet.
+                assert_eq!(
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    ClientInputDispatch::Redraw
+                );
+                assert!(compositor.prefix_armed());
+
+                // 'b' resolves the prefix-mode collapse: flips the CLIENT flag, disarms prefix, and
+                // is NOT forwarded to the server (a Redraw, never a Forward).
+                assert_eq!(
+                    press_char('b', &mut compositor, &mut model),
+                    ClientInputDispatch::Redraw
+                );
+                assert!(!compositor.prefix_armed());
+                assert!(compositor.sidebar_collapsed_for_test());
+
+                // ctrl+b then b again expands — flips back the other direction.
+                assert_eq!(
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    ClientInputDispatch::Redraw
+                );
+                assert_eq!(
+                    press_char('b', &mut compositor, &mut model),
+                    ClientInputDispatch::Redraw
+                );
+                assert!(!compositor.sidebar_collapsed_for_test());
+            },
+        );
     }
 
     // SAFETY: a normal/unbound key (a plain letter, NOT in prefix mode) is NOT intercepted — it is

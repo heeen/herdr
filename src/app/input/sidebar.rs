@@ -956,6 +956,9 @@ mod tests {
     #[test]
     fn agent_detail_hit_test_uses_three_configured_rows_per_entry() {
         let mut app = app_for_mouse_test();
+        // #9: the sidebar now reserves its bottom row for the collapse toggle button, so give the
+        // detail section one extra row to keep the same usable height this test asserts against.
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 21);
         let first = Workspace::test_new("one");
         let first_pane = first.tabs[0].root_pane;
 

@@ -34,6 +34,23 @@ const SIDEBAR_RESIZE_THROTTLE: std::time::Duration = std::time::Duration::from_m
 /// row index to a `Rename`/`Close` action); the two MUST stay in lockstep.
 const WORKSPACE_CONTEXT_MENU_ITEMS: [&str; 2] = ["rename", "close"];
 
+/// #9: the narrow width of the collapsed (mini) sidebar — a status-only glance strip showing each
+/// space's marker + agent status dot. Matches the SHARED renderer's `COLLAPSED_WIDTH` (num + space +
+/// dot + separator) so `render_sidebar_collapsed` lays out cleanly at this width.
+const MINI_SIDEBAR_WIDTH: u16 = 4;
+
+/// #9: fraction of the collapse/expand transition covered per gated 80ms Timer tick (≈4 ticks ≈
+/// 320ms end-to-end).
+const SIDEBAR_COLLAPSE_ANIM_STEP: f32 = 0.25;
+
+/// #9: round-interpolate a width between `full` (t=0) and `mini` (t=1).
+fn lerp_sidebar_width(full: u16, mini: u16, t: f32) -> u16 {
+    let t = t.clamp(0.0, 1.0);
+    let full = full as f32;
+    let mini = mini as f32;
+    (full + (mini - full) * t).round() as u16
+}
+
 /// #19: minimum pointer travel (in cells) before a workspace press becomes a drag-reorder, mirroring
 /// the monolithic host's `WORKSPACE_DRAG_THRESHOLD` (`src/app/input/mod.rs`).
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
@@ -193,8 +210,14 @@ pub(crate) struct ClientCompositor {
     agent_panel_scope: crate::app::state::AgentPanelScope,
     // #25: client-local collapsed-sidebar view state. The server never owns this; it is a per-client
     // view preference fed into `from_model` (sets `app.sidebar_collapsed`) so the SHARED renderer
-    // branches to the narrow collapsed layout and `hit_test` reads the collapsed geometry.
+    // branches to the narrow collapsed (mini) layout and `hit_test` reads the collapsed geometry.
     sidebar_collapsed: bool,
+    // #9: collapse/expand width-animation progress, 0.0 == fully expanded (full `sidebar_width`),
+    // 1.0 == fully collapsed (mini `MINI_SIDEBAR_WIDTH`). `effective_sidebar_width` interpolates the
+    // rendered+hit-tested width across this value so the sidebar SLIDES instead of snapping. The
+    // loop's gated 80ms Timer steps it toward `sidebar_collapse_target()`; decoupled from
+    // `sidebar_width` so a live resize drag never animates.
+    collapse_progress: f32,
     // #24: client-local prefix-mode flag. Mirrors the server's `Mode::Prefix` state machine so the
     // configured prefix key (a modified chord, e.g. `ctrl+b`) arms interception of the very next
     // key for prefix-bound sidebar-nav actions. Bare keys are never intercepted unless armed, so
@@ -336,6 +359,7 @@ impl ClientCompositor {
             hover: None,
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             sidebar_collapsed: false,
+            collapse_progress: 0.0,
             prefix_armed: false,
             prefix_pending_bytes: None,
             collapsed_space_keys: std::collections::HashSet::new(),
@@ -400,6 +424,34 @@ impl ClientCompositor {
     /// SHARED renderer onto its narrow collapsed layout. Client-local; no server traffic.
     pub(crate) fn toggle_sidebar_collapsed(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+    }
+
+    /// #9: the collapse-animation target — 1.0 (mini) when collapsed, 0.0 (full) when expanded.
+    fn sidebar_collapse_target(&self) -> f32 {
+        if self.sidebar_collapsed {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// #9: advance the collapse/expand width slide one tick toward the target. Driven by the loop's
+    /// gated 80ms Timer (alongside `advance_animation_tick`); a no-op once settled. Snaps the final
+    /// fractional step so the slide reaches the exact target instead of asymptoting.
+    pub(crate) fn step_sidebar_width_animation(&mut self) {
+        let target = self.sidebar_collapse_target();
+        let delta = target - self.collapse_progress;
+        if delta.abs() <= SIDEBAR_COLLAPSE_ANIM_STEP {
+            self.collapse_progress = target;
+        } else {
+            self.collapse_progress += SIDEBAR_COLLAPSE_ANIM_STEP * delta.signum();
+        }
+    }
+
+    /// #9: whether the collapse/expand width is mid-slide, so the loop keeps the 80ms animation wake
+    /// alive (via `next_select_deadline`) until it settles. Pairs with `sidebar_wants_animation`.
+    pub(crate) fn sidebar_width_animating(&self) -> bool {
+        (self.sidebar_collapse_target() - self.collapse_progress).abs() > f32::EPSILON
     }
 
     /// #22: toggle a worktree group's collapsed state in the client-local set (no server round-trip,
@@ -1202,7 +1254,13 @@ impl ClientCompositor {
         if host_width <= 1 {
             return 0;
         }
-        self.sidebar_width.min(host_width.saturating_sub(1))
+        // #9: interpolate between the full width and the mini width across `collapse_progress`, so
+        // the sidebar slides on collapse/expand. At rest (progress 0.0) this is exactly the old
+        // `sidebar_width.min(host-1)`. Both render and hit-test read this ONE value, so their
+        // geometry stays in lockstep frame-by-frame even mid-slide.
+        let mini = MINI_SIDEBAR_WIDTH.min(self.sidebar_width);
+        let width = lerp_sidebar_width(self.sidebar_width, mini, self.collapse_progress);
+        width.min(host_width.saturating_sub(1))
     }
 
     pub(crate) fn hit_test(
@@ -5798,7 +5856,40 @@ mod tests {
         assert!(!snap(&compositor).app.sidebar_collapsed);
     }
 
-    // The collapse/expand toggle is hittable in EXPANDED mode (so the user can collapse).
+    // #9 item 3: collapsing slides the sidebar width from full toward the mini width over several
+    // gated ticks, then settles exactly; expanding slides it back. `effective_sidebar_width` is the
+    // ONE value both render and hit-test read, so the slide stays geometry-consistent frame to frame.
+    #[test]
+    fn sidebar_width_slides_on_collapse_and_settles() {
+        let mut compositor = ClientCompositor::new(26);
+        let host = 80u16;
+        assert_eq!(compositor.effective_sidebar_width(host), 26);
+        assert!(!compositor.sidebar_width_animating());
+
+        compositor.toggle_sidebar_collapsed();
+        assert!(compositor.sidebar_width_animating(), "collapse starts a slide");
+        let mut prev = compositor.effective_sidebar_width(host);
+        let mut steps = 0;
+        while compositor.sidebar_width_animating() {
+            compositor.step_sidebar_width_animation();
+            let w = compositor.effective_sidebar_width(host);
+            assert!(w <= prev, "width must shrink monotonically while collapsing");
+            prev = w;
+            steps += 1;
+            assert!(steps < 20, "animation must terminate");
+        }
+        assert_eq!(compositor.effective_sidebar_width(host), MINI_SIDEBAR_WIDTH);
+
+        compositor.toggle_sidebar_collapsed();
+        assert!(compositor.sidebar_width_animating(), "expand starts a slide");
+        while compositor.sidebar_width_animating() {
+            compositor.step_sidebar_width_animation();
+        }
+        assert_eq!(compositor.effective_sidebar_width(host), 26);
+    }
+
+    // The collapse/expand toggle is hittable in EXPANDED mode (so the user can collapse), across the
+    // FULL width of the bottom row — #9 widened it from a 1×1 cell to a full-width button.
     #[test]
     fn expanded_toggle_rect_hits_toggle_target() {
         let (model, _local, _agent) = collapsed_model();
@@ -5813,11 +5904,15 @@ mod tests {
             Instant::now(),
         );
         let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
-        assert!(rect.width > 0);
-        assert_eq!(
-            compositor.hit_test(&model, rect.x, rect.y, host.0, host.1),
-            Some(SidebarHitTarget::CollapsedSidebarToggle)
-        );
+        assert!(rect.width > 1, "expanded toggle is a full-width row, not a 1×1 cell");
+        // hittable at the LEFT edge, the RIGHT edge, and the middle of the bottom row.
+        for x in [rect.x, rect.x + rect.width - 1, rect.x + rect.width / 2] {
+            assert_eq!(
+                compositor.hit_test(&model, x, rect.y, host.0, host.1),
+                Some(SidebarHitTarget::CollapsedSidebarToggle),
+                "toggle must be hittable at column {x}"
+            );
+        }
     }
 
     // In COLLAPSED mode the toggle rect still hit-tests to the toggle; clicking it (mirrored by the

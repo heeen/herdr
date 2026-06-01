@@ -56,7 +56,14 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
 }
 
 pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, Rect) {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    // #9: reserve the bottom row for the always-visible collapse toggle button (height − 1) so the
+    // workspace/agent sections never overlap it; width still drops the separator column.
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1),
+    );
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), Rect::default());
     }
@@ -68,7 +75,14 @@ pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, 
 }
 
 pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    // #9: mirror `expanded_sidebar_sections`' reserved bottom toggle row so the divider lands on the
+    // same boundary the renderer uses.
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1),
+    );
     if content.width == 0 || content.height < 6 {
         return Rect::default();
     }
@@ -1354,7 +1368,13 @@ pub(crate) fn compute_workspace_card_areas(
 
 /// Auto-scale sidebar width based on workspace identity + agent summary.
 pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect) {
-    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    // #9: reserve the bottom row for the collapse/expand toggle button (height − 1).
+    let content = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1),
+    );
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), None, Rect::default());
     }
@@ -2647,13 +2667,15 @@ fn render_agent_detail(
 }
 
 pub(crate) fn collapsed_sidebar_toggle_rect(area: Rect) -> Rect {
-    let bottom_y = area.y + area.height.saturating_sub(1);
+    // #9: a full-width bottom-row button (previously a centered 1×1 cell), so the collapse/expand
+    // control is mouse-hittable across the whole bottom row in BOTH expanded and collapsed modes.
+    // Leaves the rightmost separator column untouched. The sidebar section helpers reserve this row.
     let content_w = area.width.saturating_sub(1);
     if content_w == 0 || area.height == 0 {
         return Rect::default();
     }
-    let x = area.x + content_w / 2;
-    Rect::new(x, bottom_y, 1, 1)
+    let bottom_y = area.y + area.height.saturating_sub(1);
+    Rect::new(area.x, bottom_y, content_w, 1)
 }
 
 fn render_sidebar_toggle(
@@ -2663,9 +2685,9 @@ fn render_sidebar_toggle(
     collapsed: bool,
     p: &Palette,
 ) {
-    if !collapsed {
-        return;
-    }
+    // #9: draw the affordance in BOTH modes (it used to early-return when expanded, leaving an
+    // invisible 1×1 hit cell). Expanded shows a labeled `‹‹ collapse`; collapsed shows `»` (the mini
+    // strip is too narrow for a word). ratatui clips the label to the rect.
     let toggle_area = collapsed_sidebar_toggle_rect(area);
     if toggle_area == Rect::default() {
         return;
@@ -2675,7 +2697,8 @@ fn render_sidebar_toggle(
     } else {
         Style::default().fg(p.overlay0)
     };
-    frame.render_widget(Paragraph::new(Span::styled("»", icon_style)), toggle_area);
+    let label = if collapsed { "»" } else { "‹‹ collapse" };
+    frame.render_widget(Paragraph::new(Span::styled(label, icon_style)), toggle_area);
 }
 
 #[cfg(test)]
@@ -4139,10 +4162,59 @@ lines = [
 
     #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
+        // #9: the bottom row is reserved for the collapse toggle, so content height is 5 − 1 = 4,
+        // split into ws=2 + detail=2 (the divider/button stack never overlaps content).
         let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9);
 
-        assert_eq!(ws_area, Rect::new(0, 0, 19, 3));
-        assert_eq!(detail_area, Rect::new(0, 3, 19, 2));
+        assert_eq!(ws_area, Rect::new(0, 0, 19, 2));
+        assert_eq!(detail_area, Rect::new(0, 2, 19, 2));
+    }
+
+    // #9 item 2: both section layouts reserve the bottom row for the always-visible toggle button,
+    // so no workspace/agent/detail row ever overlaps the button (render == hit-test stays pinned).
+    #[test]
+    fn sidebar_sections_reserve_bottom_toggle_row() {
+        let area = Rect::new(0, 0, 26, 20);
+        let toggle = collapsed_sidebar_toggle_rect(area);
+        assert_eq!(toggle.y, area.y + area.height - 1);
+        assert!(toggle.width > 1, "toggle is a full-width row");
+
+        let (ws, detail) = expanded_sidebar_sections(area, 0.5);
+        assert!(ws.bottom() <= toggle.y, "expanded ws section must clear the toggle row");
+        assert!(detail.bottom() <= toggle.y, "expanded detail section must clear the toggle row");
+
+        let (cws, _, cdetail) = collapsed_sidebar_sections(area);
+        assert!(cws.bottom() <= toggle.y, "collapsed ws section must clear the toggle row");
+        assert!(cdetail.bottom() <= toggle.y, "collapsed detail section must clear the toggle row");
+    }
+
+    // #9 item 2: the toggle affordance is drawn in BOTH modes (it used to early-return when
+    // expanded, leaving an invisible cell): `collapse` label when expanded, `»` glyph when collapsed.
+    #[test]
+    fn sidebar_toggle_renders_label_in_both_modes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let app = crate::app::state::AppState::test_new();
+        let area = Rect::new(0, 0, 26, 6);
+        let toggle = collapsed_sidebar_toggle_rect(area);
+
+        let row_text = |collapsed: bool| -> String {
+            let mut term = Terminal::new(TestBackend::new(26, 6)).unwrap();
+            term.draw(|f| render_sidebar_toggle(&app, f, area, collapsed, &app.palette))
+                .unwrap();
+            let buf = term.backend().buffer();
+            (toggle.x..toggle.x + toggle.width)
+                .map(|x| buf[(x, toggle.y)].symbol().to_string())
+                .collect()
+        };
+
+        assert!(
+            row_text(false).contains("collapse"),
+            "expanded toggle must show a labeled collapse affordance"
+        );
+        assert!(
+            row_text(true).contains('»'),
+            "collapsed toggle must show an expand glyph"
+        );
     }
 
     #[test]
