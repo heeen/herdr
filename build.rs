@@ -56,6 +56,18 @@ fn build_commit(manifest_dir: &Path) -> String {
     .is_some()
     {
         commit.push_str("-dirty");
+        // Distinguish two DIFFERENT dirty trees at the same commit: a bare `-dirty` marker let the
+        // bundle-seed parity gate (`remote::bundle_seeds_platform`) treat divergent working trees
+        // as identical and seed a stale-content sibling binary. Append a short hash of the tracked
+        // diff so different uncommitted content yields a different build id.
+        if let Some(diff) = git_output(manifest_dir, &["diff", "HEAD"]) {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in diff.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            commit.push_str(&format!(".{:08x}", hash & 0xffff_ffff));
+        }
     }
     commit
 }

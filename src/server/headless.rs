@@ -1902,6 +1902,15 @@ impl HeadlessServer {
                 self.send_to_client(client_id, ServerMessage::Pong { nonce });
                 false
             }
+            ServerEvent::ClientRequestFullFrame { client_id } => {
+                // v14: the client's delta baseline desynced (a dropped/failed frame). Reset this
+                // client's render baseline so the next render is a full `Frame`, recovering without
+                // ever applying a delta onto a stale baseline. Re-render to push it promptly.
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.request_full_redraw();
+                }
+                true
+            }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
                 self.remove_client_and_resize_if_needed(client_id);

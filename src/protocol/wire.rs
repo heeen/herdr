@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
+/// recovery).
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -23,6 +25,13 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 /// Normal traffic keeps `MAX_FRAME_SIZE`; this larger cap is only for explicit
 /// image payloads that are naturally much larger after base64 encoding.
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
+/// Hard ceiling on the inflated size of a `ServerMessage::Compressed` payload. The wire frame is
+/// already bounded (`MAX_FRAME_SIZE`/`MAX_GRAPHICS_FRAME_SIZE`), but deflate can amplify ~1000×, so
+/// a bounded compressed frame could otherwise inflate to multiple GB and OOM the client. This cap
+/// sits well above any legitimate frame (a full graphics frame is ≤ ~32 MB raw; a full text frame a
+/// few MB) while turning a decompression bomb into a dropped message.
+pub const MAX_DECOMPRESSED_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -150,6 +159,13 @@ pub enum ClientMessage {
         /// Opaque token echoed back in the matching Pong.
         nonce: u64,
     },
+
+    /// Request a full re-baseline frame (v14). Sent when the client detects its cached frame
+    /// baseline no longer matches the server's (a `FrameDelta` whose `base_checksum` mismatches, or
+    /// a compressed frame that failed to inflate). The server resets the per-client render baseline
+    /// so its next render is a full `Frame`, recovering from a desync without showing wrong cells.
+    /// Appended last to keep the existing bincode wire tags stable.
+    RequestFullFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +243,11 @@ pub struct FrameDelta {
     pub hyperlinks: Vec<String>,
     /// Kitty graphics bytes to apply after the text frame.
     pub graphics: Vec<u8>,
+    /// [`frame_checksum`] of the baseline frame this delta was computed against (the server's
+    /// `last_frame`). The client refuses to apply the delta onto a baseline whose checksum differs,
+    /// so a dropped/failed prior frame can no longer silently desync the reconstructed display.
+    /// Appended last so older decoders that ignore trailing bytes stay tolerant.
+    pub base_checksum: u64,
 }
 
 /// A rendered frame to be displayed by the client.
@@ -337,6 +358,7 @@ impl FrameData {
             cursor: self.cursor.clone(),
             hyperlinks: self.hyperlinks.clone(),
             graphics: self.graphics.clone(),
+            base_checksum: frame_checksum(prev),
         })
     }
 
@@ -664,6 +686,42 @@ impl From<io::Error> for FramingError {
 /// benefit and the wrapper would only add overhead.
 pub const FRAME_COMPRESSION_THRESHOLD: usize = 256;
 
+/// Deterministic content checksum of a frame's cells + dimensions, computed identically on the
+/// server and client. A [`FrameDelta`] carries the checksum of the baseline it was built against;
+/// the client only applies the delta when its cached baseline hashes to the same value, so a
+/// dropped/failed prior frame can no longer silently reconstruct wrong cells. FNV-1a (64-bit) over
+/// width, height and each cell — graphics/cursor are excluded (they self-heal and would make a
+/// large graphics frame expensive to hash). Not cryptographic; only guards against accidental
+/// baseline drift.
+pub fn frame_checksum(frame: &FrameData) -> u64 {
+    fn fold(hash: &mut u64, bytes: &[u8]) {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            *hash ^= *byte as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fold(&mut hash, &frame.width.to_le_bytes());
+    fold(&mut hash, &frame.height.to_le_bytes());
+    for cell in &frame.cells {
+        fold(&mut hash, cell.symbol.as_bytes());
+        fold(&mut hash, &[0]); // symbol terminator so "ab"+"c" != "a"+"bc"
+        fold(&mut hash, &cell.fg.to_le_bytes());
+        fold(&mut hash, &cell.bg.to_le_bytes());
+        fold(&mut hash, &cell.modifier.to_le_bytes());
+        fold(&mut hash, &[cell.skip as u8]);
+        match cell.hyperlink {
+            Some(idx) => {
+                fold(&mut hash, &[1]);
+                fold(&mut hash, &idx.to_le_bytes());
+            }
+            None => fold(&mut hash, &[0]),
+        }
+    }
+    hash
+}
+
 /// Wrap a server message in `ServerMessage::Compressed` when its serialized form exceeds
 /// [`FRAME_COMPRESSION_THRESHOLD`]; otherwise return it unchanged. Deflate level 1 stays cheap on
 /// the render path while cutting verbose full frames ~10-30x. Returns the original on any encode
@@ -684,7 +742,11 @@ pub fn decompress_server_message(message: ServerMessage) -> ServerMessage {
     let ServerMessage::Compressed(bytes) = &message else {
         return message;
     };
-    let Ok(raw) = miniz_oxide::inflate::decompress_to_vec(bytes) else {
+    // Bound the inflated output: deflate can amplify a small (but wire-capped) compressed frame into
+    // gigabytes, so an attacker/buggy server could OOM the client. Past the cap, drop the message.
+    let Ok(raw) =
+        miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_DECOMPRESSED_MESSAGE_SIZE)
+    else {
         return message;
     };
     match bincode::serde::decode_from_slice::<ServerMessage, _>(&raw, bincode::config::standard()) {
@@ -862,6 +924,39 @@ mod tests {
         let delta = next.delta_from(&frame_of(&["a", "b"])).unwrap();
         // A baseline of the wrong size can't be updated by this delta.
         assert!(frame_of(&["a", "b", "c"]).with_delta(&delta).is_none());
+    }
+
+    #[test]
+    fn frame_checksum_is_stable_and_content_sensitive() {
+        // Deterministic for identical frames, different when any cell content changes.
+        assert_eq!(
+            frame_checksum(&frame_of(&["a", "b", "c"])),
+            frame_checksum(&frame_of(&["a", "b", "c"]))
+        );
+        assert_ne!(
+            frame_checksum(&frame_of(&["a", "b", "c"])),
+            frame_checksum(&frame_of(&["a", "X", "c"]))
+        );
+        // Same cells, different dimensions also diverge.
+        assert_ne!(
+            frame_checksum(&frame_of(&["a", "b"])),
+            frame_checksum(&frame_of(&["a", "b", "c"]))
+        );
+    }
+
+    #[test]
+    fn frame_delta_carries_its_baseline_checksum() {
+        // P2: the delta pins the checksum of the baseline it was built against, so the client can
+        // detect a desynced baseline (a dropped/failed prior frame) and refuse to apply onto it.
+        let prev = frame_of(&["a", "b", "c", "d"]);
+        let next = frame_of(&["a", "X", "c", "Y"]);
+        let delta = next.delta_from(&prev).expect("same dims yield a delta");
+        assert_eq!(delta.base_checksum, frame_checksum(&prev));
+        // A different (desynced) baseline of the same size has a different checksum, so the client's
+        // `frame_checksum(baseline) == delta.base_checksum` guard rejects it.
+        let desynced = frame_of(&["z", "z", "z", "z"]);
+        assert_eq!(desynced.width, prev.width);
+        assert_ne!(frame_checksum(&desynced), delta.base_checksum);
     }
 
     // ---- Round-trip: ClientMessage ----

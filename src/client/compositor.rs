@@ -1092,6 +1092,17 @@ impl ClientCompositor {
         host_width: u16,
         host_height: u16,
     ) -> Option<usize> {
+        // C2: a host reorder is only well-defined in the unfiltered ("all hosts") view, where each
+        // banner's `banner_idx` equals its position in `self.servers` — exactly the space
+        // `reorder_server` indexes. Under a single-server filter only one banner is visible, so a
+        // banner-space drop index would be mis-applied to the full server list (moving the wrong
+        // host). Refuse the reorder rather than commit a bogus slot.
+        if !matches!(
+            model.filter(),
+            crate::client::supervisor::ServerFilter::All
+        ) {
+            return None;
+        }
         let sidebar_width = self.effective_sidebar_width(host_width);
         if sidebar_width == 0 || host_height == 0 {
             return None;
@@ -1833,11 +1844,6 @@ impl ClientSidebarSnapshot {
                 per_ws_agent_routes.into_iter().flatten().collect()
             }
         };
-        app.workspace_scroll = crate::ui::normalized_workspace_scroll(
-            &app,
-            app.view.sidebar_rect,
-            compositor.workspace_scroll,
-        );
         let (_, detail_area) =
             crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
         app.agent_panel_scroll = compositor
@@ -1858,6 +1864,16 @@ impl ClientSidebarSnapshot {
             .map(|(_, spec)| spec)
             .collect();
         app.host_banner_active = model.host_banner_active();
+        // C1: normalize the workspace scroll AFTER the host-banner rows are populated above.
+        // `normalized_workspace_scroll` counts entries via `workspace_list_entries`, which only
+        // emits the HostBanner rows once `host_banner_rows` is set — running it earlier clamped the
+        // scroll to the banner-less row count (N-1) while the geometry/scrollbar below count N+B,
+        // so a multi-host list scrolled to its bottom could not hold its last rows in view.
+        app.workspace_scroll = crate::ui::normalized_workspace_scroll(
+            &app,
+            app.view.sidebar_rect,
+            compositor.workspace_scroll,
+        );
         // #19 (host half): the parallel `banner_idx -> server_id` map, built from the SAME
         // emission order as `host_banner_specs`, so hit-test and the drag preview resolve a banner
         // to its host. Carried on the snapshot for `hit_test`.

@@ -38,8 +38,13 @@ const MAGIC: &[u8; 8] = b"HERDRBND";
 const FORMAT_VERSION: u32 = 1;
 /// Fixed footer size: index_offset(8) + index_len(8) + format(4) + magic(8).
 const FOOTER_LEN: u64 = 28;
-/// deflate compression level used for appended binaries (matches the wire path).
+/// deflate compression level for appended binaries. Higher than the wire render path (level 1,
+/// chosen for latency) because packing is a one-shot offline step where a smaller bundle wins.
 const COMPRESSION_LEVEL: u8 = 6;
+/// Hard ceiling on a decompressed bundle entry. A herdr binary is tens of MB; this bounds the
+/// inflate so a corrupt/oversized `uncompressed_len` in the index can't drive an unbounded
+/// allocation (the entry's length + CRC are still verified against this output afterwards).
+const MAX_BUNDLE_PAYLOAD: usize = 1024 * 1024 * 1024;
 
 /// A single platform's binary carried inside a fat bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,16 +173,37 @@ pub(crate) fn read_self_index() -> io::Result<Option<BundleIndex>> {
 /// Extract and decompress one carried binary, verifying its length and CRC-32.
 pub(crate) fn extract_entry(path: &Path, entry: &BundleEntry) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
+    // Validate the entry's region against the actual file before allocating: `read_index` bounds
+    // only the index itself, so a corrupt/oversized `compressed_len` would otherwise drive a
+    // multi-GB `vec![0u8; ...]` (OOM) before `read_exact` could fail.
+    let file_len = file.metadata()?.len();
+    let in_bounds = entry
+        .offset
+        .checked_add(entry.compressed_len)
+        .is_some_and(|end| end <= file_len);
+    if !in_bounds {
+        return Err(io::Error::other(format!(
+            "{} entry is out of bounds (offset {} + len {} exceeds file {file_len})",
+            entry.asset_key(),
+            entry.offset,
+            entry.compressed_len,
+        )));
+    }
     file.seek(SeekFrom::Start(entry.offset))?;
     let mut compressed = vec![0u8; entry.compressed_len as usize];
     file.read_exact(&mut compressed)?;
 
-    let bytes = miniz_oxide::inflate::decompress_to_vec(&compressed).map_err(|err| {
-        io::Error::other(format!(
-            "failed to decompress {} payload: {err:?}",
-            entry.asset_key()
-        ))
-    })?;
+    // Bound the inflate too: cap at the claimed (but untrusted) uncompressed length, clamped to a
+    // sane ceiling, so a bogus `uncompressed_len` can't drive an unbounded allocation either.
+    let limit = (entry.uncompressed_len as usize).min(MAX_BUNDLE_PAYLOAD);
+    let bytes = miniz_oxide::inflate::decompress_to_vec_with_limit(&compressed, limit).map_err(
+        |err| {
+            io::Error::other(format!(
+                "failed to decompress {} payload: {err:?}",
+                entry.asset_key()
+            ))
+        },
+    )?;
     if bytes.len() as u64 != entry.uncompressed_len {
         return Err(io::Error::other(format!(
             "{} payload length mismatch: expected {}, got {}",

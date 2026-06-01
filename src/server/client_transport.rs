@@ -100,6 +100,8 @@ pub(crate) enum ServerEvent {
     ClientOpenKeybindHelp { client_id: u64 },
     /// A latency probe from a client; the server echoes `nonce` back in a `Pong` (issue #13).
     ClientPing { client_id: u64, nonce: u64 },
+    /// A client whose frame baseline desynced asks for a full re-baseline frame (v14).
+    ClientRequestFullFrame { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
@@ -158,6 +160,25 @@ pub(crate) fn handle_client_handshake(
         }
         Err(protocol::FramingError::Oversized { claimed, max }) => {
             warn!(client_id, claimed, max, "oversized handshake from client");
+            return Ok(());
+        }
+        Err(protocol::FramingError::Bincode(err)) => {
+            // SW3: bytes arrived but couldn't be DECODED — almost always protocol-version skew (e.g.
+            // an older client whose Hello layout predates a field added here). Bincode is positional,
+            // so the version field can't be read in isolation; instead reply with a version-mismatch
+            // Welcome (the Welcome shape is the stable handshake contract: variant 0, version +
+            // encoding + error) so the old client exits with a clear reason rather than an abrupt,
+            // undiagnosable close. A timeout / I/O error (no Hello sent) falls through to a silent
+            // close below — it's not a version problem.
+            debug!(client_id, err = %err, "failed to decode client hello; replying with version-mismatch Welcome");
+            let welcome = ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: Some(format!(
+                    "incompatible client protocol (server speaks v{PROTOCOL_VERSION}); update herdr"
+                )),
+            };
+            let _ = protocol::write_message(&mut stream, &welcome);
             return Ok(());
         }
         Err(err) => {
@@ -478,6 +499,7 @@ fn client_read_loop(
             ClientMessage::OpenSettings => ServerEvent::ClientOpenSettings { client_id },
             ClientMessage::OpenKeybindHelp => ServerEvent::ClientOpenKeybindHelp { client_id },
             ClientMessage::Ping { nonce } => ServerEvent::ClientPing { client_id, nonce },
+            ClientMessage::RequestFullFrame => ServerEvent::ClientRequestFullFrame { client_id },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;

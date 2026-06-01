@@ -224,10 +224,21 @@ impl RemoteTargetSnapshot {
     }
 
     /// Parse a generic ssh spec. A single bare token (no leading `-`, not the literal `ssh`)
-    /// means `ssh <token>`. Anything else — a leading `ssh`, multiple tokens, or any flag —
-    /// is treated as a full ssh argv: the destination is the last non-flag token and the
-    /// remaining options are preserved (they are emitted before the destination at connect time).
+    /// means `ssh <token>`. Anything else — a leading `ssh`, multiple tokens, or any flag — is
+    /// treated as a full ssh argv: the destination is the FIRST non-flag token that is not the value
+    /// of a preceding option flag, and the options are preserved (emitted before the destination at
+    /// connect time). A second bare token is rejected rather than silently swallowed as an option —
+    /// it would be an ssh remote command (herdr supplies its own), and treating it as an option made
+    /// `user@host extra` connect to `extra` while passing `user@host` as a flag.
     fn parse_ssh(input: &str) -> Result<Self, RemoteRegistryError> {
+        // Single-letter ssh options that consume the following token as their value (e.g. `-p 2222`,
+        // `-J jump`, `-L a:b:c`, `-o opt`). Used to tell an option's argument apart from the
+        // destination. From ssh(1); the attached form (`-p2222`) carries its value in the same token.
+        const SSH_FLAGS_WITH_ARG: &[char] = &[
+            'B', 'b', 'c', 'D', 'E', 'e', 'F', 'I', 'i', 'J', 'L', 'l', 'm', 'O', 'o', 'p', 'Q',
+            'R', 'S', 'W', 'w',
+        ];
+
         let tokens = shlex::split(input).ok_or(RemoteRegistryError::InvalidTarget)?;
         if tokens.is_empty() {
             return Err(RemoteRegistryError::InvalidTarget);
@@ -244,12 +255,34 @@ impl RemoteTargetSnapshot {
         if argv.first().is_some_and(|token| token == "ssh") {
             argv.remove(0);
         }
-        let destination_index = argv
-            .iter()
-            .rposition(|token| !token.starts_with('-'))
-            .ok_or(RemoteRegistryError::InvalidTarget)?;
-        let target = argv.remove(destination_index);
-        Ok(Self::Ssh { target, args: argv })
+
+        let mut options: Vec<String> = Vec::new();
+        let mut target: Option<String> = None;
+        let mut iter = argv.into_iter();
+        while let Some(token) = iter.next() {
+            if let Some(flag) = token.strip_prefix('-') {
+                let consumes_value = flag
+                    .chars()
+                    .next()
+                    .is_some_and(|c| flag.chars().count() == 1 && SSH_FLAGS_WITH_ARG.contains(&c));
+                options.push(token);
+                if consumes_value {
+                    if let Some(value) = iter.next() {
+                        options.push(value);
+                    }
+                }
+                continue;
+            }
+            if target.is_some() {
+                return Err(RemoteRegistryError::InvalidTarget);
+            }
+            target = Some(token);
+        }
+        let target = target.ok_or(RemoteRegistryError::InvalidTarget)?;
+        Ok(Self::Ssh {
+            target,
+            args: options,
+        })
     }
 
     pub fn canonical_key(&self) -> String {
@@ -330,14 +363,27 @@ mod tests {
 
     #[test]
     fn parses_full_ssh_command_with_flags() {
+        // `-L` and `-J` each consume their following value; `icedac` is the single destination.
         let target =
-            RemoteTargetSnapshot::parse("ssh -L 9000:localhost:9000 -J jump icedac iq-64").unwrap();
+            RemoteTargetSnapshot::parse("ssh -L 9000:localhost:9000 -J jump icedac").unwrap();
         assert_eq!(
             target,
-            ssh(
-                "iq-64",
-                &["-L", "9000:localhost:9000", "-J", "jump", "icedac"]
-            )
+            ssh("icedac", &["-L", "9000:localhost:9000", "-J", "jump"])
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_double_destination_ssh_spec() {
+        // R1: a stray non-flag token must not be silently absorbed as an option (which connected to
+        // the wrong host). A second bare token — `user@host extra`, or a trailing remote command —
+        // is rejected; herdr builds its own remote command.
+        assert_eq!(
+            RemoteTargetSnapshot::parse("user@host extra").unwrap_err(),
+            RemoteRegistryError::InvalidTarget
+        );
+        assert_eq!(
+            RemoteTargetSnapshot::parse("ssh -p 2222 host run-something").unwrap_err(),
+            RemoteRegistryError::InvalidTarget
         );
     }
 

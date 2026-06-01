@@ -1011,8 +1011,15 @@ impl ClientSupervisorModel {
     /// fetches. `set_summary` failing only means the main server is (impossibly) absent — ignore it
     /// rather than dropping the registry/ui-settings updates that already landed.
     pub(crate) fn apply_main_supervisor_snapshot(&mut self, snapshot: MainSupervisorSnapshot) {
-        self.sync_remote_registry(snapshot.remotes);
-        self.set_ui_settings(snapshot.ui_settings);
+        // Apply only the parts that were fetched successfully (see `fetch_main_supervisor_snapshot`):
+        // a failed remote.list / ui_settings leaves the prior registry / settings intact rather than
+        // clobbering them with an empty/default value.
+        if let Some(remotes) = snapshot.remotes {
+            self.sync_remote_registry(remotes);
+        }
+        if let Some(ui_settings) = snapshot.ui_settings {
+            self.set_ui_settings(ui_settings);
+        }
         let _ = self.set_summary(&ServerId::main(), snapshot.summary);
     }
 
@@ -2947,8 +2954,11 @@ pub(crate) fn request_ui_settings(
 /// applied back on the loop thread via [`ClientSupervisorModel::apply_main_supervisor_snapshot`],
 /// so the render/event-loop thread never blocks on the four local API round-trips.
 pub(crate) struct MainSupervisorSnapshot {
-    pub(crate) remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
-    pub(crate) ui_settings: crate::api::schema::UiSettingsInfo,
+    /// `None` when `remote.list` failed this refresh (older/mismatched server, transient timeout);
+    /// the apply step then keeps the existing registry instead of wiping it.
+    pub(crate) remotes: Option<Vec<crate::remote_registry::RemoteDefinitionSnapshot>>,
+    /// `None` when `server.ui_settings` failed this refresh; the apply step keeps prior settings.
+    pub(crate) ui_settings: Option<crate::api::schema::UiSettingsInfo>,
     pub(crate) summary: ServerSummary,
 }
 
@@ -2959,9 +2969,33 @@ pub(crate) struct MainSupervisorSnapshot {
 pub(crate) fn fetch_main_supervisor_snapshot(
     api: &mut impl SupervisorApi,
 ) -> Result<MainSupervisorSnapshot, String> {
-    let remotes = request_remote_list(api)?;
-    let ui_settings = request_ui_settings(api)?;
+    // The main summary (workspaces + agents) is the point of this refresh, so a failure here aborts.
+    // `remote.list` and `server.ui_settings` are INDEPENDENT and optional — an older/mismatched main
+    // server may not implement `remote.list` at all — so a failure in either must NOT block the
+    // others (mirrors `bootstrap_from_main_api`). Chaining all three with `?` previously let a
+    // missing `remote.list` permanently stop the main server's own workspace/agent + UI refresh.
     let summary = request_server_summary(api)?;
+    let remotes = match request_remote_list(api) {
+        Ok(remotes) => Some(remotes),
+        Err(err) => {
+            tracing::warn!(
+                err = %err,
+                "main supervisor refresh: remote.list failed (older/mismatched server?); \
+                 keeping the existing registry"
+            );
+            None
+        }
+    };
+    let ui_settings = match request_ui_settings(api) {
+        Ok(ui_settings) => Some(ui_settings),
+        Err(err) => {
+            tracing::warn!(
+                err = %err,
+                "main supervisor refresh: server.ui_settings failed; keeping the existing settings"
+            );
+            None
+        }
+    };
     Ok(MainSupervisorSnapshot {
         remotes,
         ui_settings,

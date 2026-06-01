@@ -469,6 +469,41 @@ fn dispatch_composited_input(
         }
     }
 
+    // #31 (multi-event): a single stdin read can coalesce several mouse reports (e.g. motion spam
+    // under ?1003h). The single-event arm above misses those, so they would forward the raw HOST
+    // column to the remote. Re-encode each content-area mouse event with the sidebar-translated
+    // column instead. Only all-mouse buffers take this path — buffers that also carry non-mouse
+    // bytes keep the raw-forward path below, since those bytes can't be reconstructed from the
+    // parsed events.
+    if events.len() > 1
+        && events
+            .iter()
+            .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
+    {
+        let sidebar_width = compositor.sidebar_width().min(host_size.0);
+        let mut forwarded = Vec::new();
+        for event in &events {
+            let crate::raw_input::RawInputEvent::Mouse(mouse) = event else {
+                continue;
+            };
+            // Drop coalesced sidebar-area events rather than forward them with a bogus column;
+            // precise per-event sidebar handling would need byte spans the parser doesn't expose.
+            if mouse.column < sidebar_width {
+                continue;
+            }
+            if let ClientInputDispatch::Forward(bytes) =
+                translate_content_mouse_input(Vec::new(), mouse, sidebar_width)
+            {
+                forwarded.extend_from_slice(&bytes);
+            }
+        }
+        return if forwarded.is_empty() {
+            ClientInputDispatch::Consumed
+        } else {
+            ClientInputDispatch::Forward(forwarded)
+        };
+    }
+
     ClientInputDispatch::Forward(data)
 }
 
@@ -684,18 +719,31 @@ fn step_agent_focus(
     model: &mut supervisor::ClientSupervisorModel,
     delta: isize,
 ) -> ClientInputDispatch {
+    // Each connected server independently reports a `focused` agent, so several rows can be focused
+    // at once. Anchor the step on the agent owned by the ACTIVE server (the one the user is on),
+    // falling back to the first focused row — mirroring `step_workspace_focus`. (Without the
+    // tie-break the anchor was whichever server reported last, so next/prev stepped from the wrong
+    // agent when more than one server was connected.)
+    let active_server = model.active_server_id().clone();
     let mut targets: Vec<(supervisor::ServerId, String)> = Vec::new();
     let mut focused_index = None;
+    let mut active_focused_index = None;
     for group in model.agent_groups() {
         for agent in group.agents {
             if agent.focused {
-                focused_index = Some(targets.len());
+                if focused_index.is_none() {
+                    focused_index = Some(targets.len());
+                }
+                if active_focused_index.is_none() && group.server_id == active_server {
+                    active_focused_index = Some(targets.len());
+                }
             }
             targets.push((group.server_id.clone(), agent.agent_id));
         }
     }
+    let current = active_focused_index.or(focused_index);
 
-    let Some((server_id, agent_id)) = step_focus_target(&targets, focused_index, delta) else {
+    let Some((server_id, agent_id)) = step_focus_target(&targets, current, delta) else {
         return ClientInputDispatch::Consumed;
     };
 
@@ -2441,6 +2489,7 @@ fn attach_secondary_client_stream(
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     server_writes: &mut HashMap<supervisor::ServerId, ServerWriteHandle>,
+    max_frame_size: usize,
 ) -> Result<(), ClientError> {
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     let read_tx = event_tx.clone();
@@ -2453,7 +2502,7 @@ fn attach_secondary_client_stream(
             rx_bytes,
             read_tx,
             &read_quit,
-            MAX_FRAME_SIZE,
+            max_frame_size,
         );
     });
     stream
@@ -3497,6 +3546,8 @@ fn teardown_secondary_connection(
     state.pending_secondary_connect_server_ids.remove(server_id);
     state.ssh_bridges.remove(server_id);
     state.secondary_retries.remove(server_id);
+    // Drop any in-flight ping nonce so a torn-down server leaves no stale entry behind.
+    state.pending_pings.remove(server_id);
 }
 
 /// #44: apply a one-click `UpdateRemoteFinished` to the client state. Always clears the host's
@@ -3658,6 +3709,8 @@ fn handle_server_write_failure(
         .pending_secondary_connect_server_ids
         .remove(&server_id);
     state.ssh_bridges.remove(&server_id);
+    // Drop any in-flight ping nonce for the failed server (its Pong will never arrive).
+    state.pending_pings.remove(&server_id);
     if let Some(model) = &mut state.supervisor_model {
         let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Disconnected);
     }
@@ -4016,12 +4069,11 @@ async fn run_client_loop(
     let main_server_id = supervisor::ServerId::main();
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     let main_rx = state.rx_counters.counter(&main_server_id);
+    // The same framing cap must apply to every server's reader (main AND secondaries) or a >2 MB
+    // graphics frame from a secondary would fail framing and flap the connection. `usize` is
+    // `Copy`, so each reader thread captures its own copy.
+    let max_frame_size = server_frame_size_cap(kitty_graphics_enabled);
     std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
         server_reader_thread(
             main_server_id,
             read_stream,
@@ -4054,7 +4106,7 @@ async fn run_client_loop(
                 secondary_rx,
                 secondary_read_tx,
                 &secondary_read_quit,
-                MAX_FRAME_SIZE,
+                max_frame_size,
             );
         });
         stream
@@ -4474,25 +4526,38 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::Compressed(_) => {
-                        debug!(server_id = ?server_id, "failed to inflate a compressed server frame; skipping");
+                        // The inner frame failed to inflate (corruption / over the decompression
+                        // cap), so we lost whatever it carried. Don't sit on a now-stale baseline:
+                        // ask the server to re-baseline with a full frame (v14).
+                        debug!(server_id = ?server_id, "failed to inflate a compressed server frame; requesting full re-baseline frame");
+                        if let Some(handle) = server_writes.get(&server_id) {
+                            let _ = queue_to_server(handle, ClientMessage::RequestFullFrame);
+                        }
                     }
                     ServerMessage::FrameDelta(delta) => {
                         // issue #13: reconstruct the full frame from this server's cached baseline.
-                        // If we have no baseline yet (shouldn't happen — the server sends a full frame
-                        // first), drop it and wait for the next full re-baseline frame.
-                        match state
-                            .frame_cache
-                            .get(&server_id)
-                            .and_then(|prev| prev.with_delta(&delta))
-                        {
+                        // The delta's `base_checksum` pins the exact baseline the server built it
+                        // against; if our cached frame hashes differently (a dropped/failed prior
+                        // frame) we must NOT apply onto it — that would silently render wrong cells.
+                        // Drop and ask the server to re-baseline with a full frame (v14).
+                        let reconstructed = state.frame_cache.get(&server_id).and_then(|prev| {
+                            (protocol::frame_checksum(prev) == delta.base_checksum)
+                                .then(|| prev.with_delta(&delta))
+                                .flatten()
+                        });
+                        match reconstructed {
                             Some(full) => {
                                 render_incoming_server_frame(&mut state, &server_id, full)
                             }
                             None => {
                                 debug!(
                                     server_id = ?server_id,
-                                    "dropping frame delta with no matching baseline; awaiting full frame"
+                                    "frame delta baseline desynced or missing; requesting full re-baseline frame"
                                 );
+                                if let Some(handle) = server_writes.get(&server_id) {
+                                    let _ =
+                                        queue_to_server(handle, ClientMessage::RequestFullFrame);
+                                }
                             }
                         }
                     }
@@ -4766,6 +4831,8 @@ async fn run_client_loop(
                             state.ssh_bridges.insert(server_id.clone(), bridge);
                         }
                         let rx_bytes = state.rx_counters.counter(&server_id);
+                        let max_frame_size =
+                            server_frame_size_cap(state.kitty_graphics_enabled);
                         if let Err(err) = attach_secondary_client_stream(
                             server_id.clone(),
                             connection.stream,
@@ -4773,6 +4840,7 @@ async fn run_client_loop(
                             &event_tx,
                             &should_quit,
                             &mut server_writes,
+                            max_frame_size,
                         ) {
                             let next_attempt = attempt.saturating_add(1);
                             schedule_secondary_retry(
@@ -4888,6 +4956,9 @@ async fn run_client_loop(
                         // Clone the (Arc-backed) counters registry up front so we can resolve the
                         // new server's byte counter without re-borrowing `state` inside the model borrow.
                         let rx_counters = state.rx_counters.clone();
+                        // Resolve the framing cap before the `&mut state.supervisor_model` borrow
+                        // below (which would otherwise block reading `state.kitty_graphics_enabled`).
+                        let max_frame_size = server_frame_size_cap(state.kitty_graphics_enabled);
                         if let Some(model) = &mut state.supervisor_model {
                             let server_id = model.add_secondary(success.remote);
                             if let Some(bridge) = success.bridge {
@@ -4901,6 +4972,7 @@ async fn run_client_loop(
                                 &event_tx,
                                 &should_quit,
                                 &mut server_writes,
+                                max_frame_size,
                             ) {
                                 Ok(()) => {
                                     let _ = model.set_connection_state(
@@ -5060,6 +5132,8 @@ async fn run_client_loop(
                     .pending_secondary_connect_server_ids
                     .remove(&server_id);
                 state.ssh_bridges.remove(&server_id);
+                // Drop any in-flight ping nonce so the disconnected server leaves no stale entry.
+                state.pending_pings.remove(&server_id);
                 if let Some(model) = &mut state.supervisor_model {
                     let _ = model.set_connection_state(
                         &server_id,
@@ -5277,6 +5351,17 @@ impl<R: io::Read> io::Read for CountingReader<R> {
 
 /// Blocking thread that reads ServerMessages from the server and sends them
 /// to the main event loop.
+/// Framing cap for a server reader thread. Graphics frames embed image bytes that can exceed
+/// `MAX_FRAME_SIZE`, so every reader (main and secondary) must use the larger cap when kitty
+/// graphics are enabled — otherwise a large graphics frame fails framing and flaps the connection.
+fn server_frame_size_cap(kitty_graphics_enabled: bool) -> usize {
+    if kitty_graphics_enabled {
+        MAX_GRAPHICS_FRAME_SIZE
+    } else {
+        MAX_FRAME_SIZE
+    }
+}
+
 fn server_reader_thread(
     server_id: supervisor::ServerId,
     stream: UnixStream,

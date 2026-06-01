@@ -103,8 +103,17 @@ for target in "${TARGETS[@]}"; do
   BINARY_ARGS+=(--binary "$os_arch=$bin")
 done
 
+if [[ ${#BINARY_ARGS[@]} -eq 0 ]]; then
+  echo "error: no cross-platform binaries to bundle — every target in TARGETS equals the host" \
+       "($HOST_TARGET), so there is nothing to pack." >&2
+  echo "       add a non-host target to TARGETS, or skip bundling on this host." >&2
+  exit 1
+fi
+
 echo
 echo "==> packing $OUTPUT"
+# BINARY_ARGS is guaranteed non-empty here, so the expansion is safe even under `set -u` on the
+# stock macOS bash 3.2 (which errors on an empty-array expansion).
 "$CARRIER" bundle pack --carrier "$CARRIER" --output "$OUTPUT" "${BINARY_ARGS[@]}"
 
 echo
