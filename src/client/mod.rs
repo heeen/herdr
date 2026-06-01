@@ -1851,6 +1851,14 @@ enum ClientLoopEvent {
         result: Result<supervisor::MainSupervisorSnapshot, String>,
         elapsed: Duration,
     },
+    /// #42: the one-time cold-start hydrate of the main-server supervisor model completed on a
+    /// worker thread. The cold-start bootstrap now paints a minimal main-only model immediately
+    /// (no blocking round-trips before the first frame); this event carries the fully-hydrated
+    /// model (registry + summary + ui-settings, with the same `remote.list`-failure degrade the
+    /// inline bootstrap used) to swap in once it arrives. A one-shot wholesale replace is safe here
+    /// because the minimal model carries no overlay/optimistic state the user could have set in the
+    /// sub-frame gap before hydrate lands.
+    MainSupervisorBootstrapped(Box<supervisor::ClientSupervisorModel>),
     /// Timer tick.
     Timer,
 }
@@ -2103,13 +2111,20 @@ fn run_client_with_mode(
 
 fn bootstrap_supervisor_for_client(
     direct_attach_requested: bool,
-    api: &mut impl supervisor::SupervisorApi,
+    _api: &mut impl supervisor::SupervisorApi,
 ) -> Result<Option<supervisor::ClientSupervisorModel>, String> {
     if direct_attach_requested {
         return Ok(None);
     }
 
-    supervisor::bootstrap_from_main_api(api, main_display_name_for_client()).map(Some)
+    // #42: paint-first. Build a minimal main-only model with ZERO blocking round-trips so the
+    // sidebar paints on the very first frame. The registry/summary/ui-settings hydrate off the UI
+    // thread via the one-shot `MainSupervisorBootstrapped` worker kicked off in `run_client_loop`
+    // (`spawn_main_supervisor_bootstrap`), then the 2s `MainSupervisorRefreshed` cadence keeps it
+    // fresh. On a cold/busy local server nothing blocks the first paint anymore.
+    Ok(Some(supervisor::ClientSupervisorModel::new(
+        main_display_name_for_client(),
+    )))
 }
 
 fn bootstrap_client_supervisor_model(
@@ -2965,6 +2980,29 @@ fn spawn_main_supervisor_refresh(
     });
 }
 
+/// #42: one-shot cold-start hydrate. The paint-first bootstrap (`bootstrap_supervisor_for_client`)
+/// returns a minimal main-only model so the first frame renders with no blocking round-trips; this
+/// worker then runs the full `bootstrap_from_main_api` (registry + summary + ui-settings, degrading
+/// gracefully if the server lacks `remote.list`) off the UI thread and posts the hydrated model to
+/// swap in. Fire-and-forget: a failed hydrate simply leaves the safe minimal model in place.
+fn spawn_main_supervisor_bootstrap(event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>) {
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let mut api = crate::api::client::ApiClient::local();
+        match supervisor::bootstrap_from_main_api(&mut api, main_display_name_for_client()) {
+            Ok(model) => {
+                let _ = event_tx
+                    .blocking_send(ClientLoopEvent::MainSupervisorBootstrapped(Box::new(model)));
+            }
+            Err(err) => warn!(
+                err = %err,
+                "cold-start supervisor hydrate failed off the UI thread; keeping the minimal \
+                 paint-first model (the 2s refresh will retry)"
+            ),
+        }
+    });
+}
+
 fn refresh_client_supervisor_summaries(
     model: &mut supervisor::ClientSupervisorModel,
     pending_main_refresh: &mut bool,
@@ -3639,6 +3677,14 @@ async fn run_client_loop(
 
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+
+    // #42: kick off the one-shot cold-start hydrate off the UI thread. `bootstrap_supervisor_for_client`
+    // painted a minimal main-only model so the first frame is already up; this fetches the full
+    // registry/summary/ui-settings and posts `MainSupervisorBootstrapped` to swap it in. Skipped in
+    // direct-attach mode (no client-owned supervisor model to hydrate).
+    if state.supervisor_model.is_some() {
+        spawn_main_supervisor_bootstrap(&event_tx);
+    }
 
     // Spawn the stdin reader thread.
     let stdin_quit = should_quit.clone();
@@ -4618,6 +4664,23 @@ async fn run_client_loop(
                         );
                     }
                 }
+            }
+            ClientLoopEvent::MainSupervisorBootstrapped(model) => {
+                // #42: the off-loop cold-start hydrate landed — swap the minimal paint-first model
+                // for the fully-hydrated one. A one-time wholesale replace is safe: at cold start
+                // the minimal model carries no overlay/optimistic state, and `active_server_id`
+                // defaults to main in both. The periodic `MainSupervisorRefreshed` cadence (and its
+                // surgical apply) takes over from here.
+                state.supervisor_model = Some(*model);
+                // #36: prune any retained frame_cache for a server the hydrated registry doesn't
+                // know (separate immutable-model borrow so it composes with &mut frame_cache).
+                if let Some(model) = &state.supervisor_model {
+                    state
+                        .frame_cache
+                        .retain(|server_id, _| model.contains_server(server_id));
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
@@ -5992,23 +6055,26 @@ mod tests {
     }
 
     #[test]
-    fn full_app_client_bootstraps_supervisor_from_main_api() {
+    fn full_app_client_bootstrap_is_paint_first_without_blocking_api_calls() {
+        // #42: cold-start must paint immediately. The bootstrap builds a minimal main-only model
+        // with ZERO blocking round-trips; the registry/summary/ui-settings hydrate off the UI
+        // thread via the one-shot `MainSupervisorBootstrapped` worker started in `run_client_loop`.
         let mut api = BootstrapApi::default();
 
         let model = bootstrap_supervisor_for_client(false, &mut api)
             .unwrap()
-            .expect("full app client should bootstrap supervisor");
+            .expect("full app client should bootstrap a minimal supervisor model");
 
-        assert_eq!(
-            api.requests,
-            vec![
-                "remote.list",
-                "workspace.list",
-                "agent.list",
-                "server.ui_settings"
-            ]
+        assert!(
+            api.requests.is_empty(),
+            "paint-first bootstrap must not block on any API round-trip, got {:?}",
+            api.requests
         );
         assert!(model.secondary_connection_plans().is_empty());
+        // the client-owned global menu (add remote / manage remotes) is available immediately,
+        // even before the registry hydrates — guards the old degrade-to-empty-registry behaviour.
+        assert!(model.client_global_menu_items().contains(&"add remote"));
+        assert!(model.client_global_menu_items().contains(&"manage remotes"));
     }
 
     #[test]
@@ -6026,7 +6092,10 @@ mod tests {
     }
 
     #[test]
-    fn client_bootstrap_leaves_secondary_summaries_for_async_refresh() {
+    fn client_bootstrap_defers_registry_and_secondaries_to_async_hydrate() {
+        // #42: even with remotes registered on the server, the paint-first bootstrap pulls nothing
+        // synchronously — the registry (and thus the secondary connection plans) arrive only once
+        // the off-loop `MainSupervisorBootstrapped` worker applies the fully-hydrated model.
         let mut api = BootstrapApi {
             remotes: vec![test_remote_definition("remote-dev", "dev")],
             ..BootstrapApi::default()
@@ -6034,18 +6103,14 @@ mod tests {
 
         let model = bootstrap_client_supervisor_model(false, &mut api)
             .unwrap()
-            .expect("full app client should bootstrap supervisor");
+            .expect("full app client should bootstrap a minimal supervisor model");
 
-        assert_eq!(
-            api.requests,
-            vec![
-                "remote.list",
-                "workspace.list",
-                "agent.list",
-                "server.ui_settings"
-            ]
+        assert!(
+            api.requests.is_empty(),
+            "paint-first bootstrap must not block on any API round-trip, got {:?}",
+            api.requests
         );
-        assert_eq!(model.secondary_connection_plans().len(), 1);
+        assert!(model.secondary_connection_plans().is_empty());
     }
 
     #[test]

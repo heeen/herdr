@@ -567,24 +567,6 @@ impl ClientSupervisorModel {
         self.ui_settings = ui_settings;
     }
 
-    pub(crate) fn refresh_main_ui_settings_from_api(
-        &mut self,
-        api: &mut impl SupervisorApi,
-    ) -> Result<(), String> {
-        let ui_settings = request_ui_settings(api)?;
-        self.set_ui_settings(ui_settings);
-        Ok(())
-    }
-
-    pub(crate) fn refresh_remote_registry_from_api(
-        &mut self,
-        api: &mut impl SupervisorApi,
-    ) -> Result<(), String> {
-        let remotes = request_remote_list(api)?;
-        self.sync_remote_registry(remotes);
-        Ok(())
-    }
-
     pub(crate) fn activate_main_server(&mut self) {
         self.close_new_workspace_picker();
         self.active_server_id = ServerId::main();
