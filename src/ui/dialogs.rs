@@ -1432,6 +1432,20 @@ pub(crate) fn render_workspace_context_menu_overlay(
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
+    // #33: render and hit-test must derive the SAME inner rect. The cursor-anchor refactor dropped
+    // the old `area`-based divergence assert; re-pin it at the new altitude by checking
+    // render_panel_shell's inset against the exact formula `workspace_context_menu_inner_rect_at`
+    // uses for hit-testing, so the two geometries can never silently diverge again.
+    debug_assert_eq!(
+        inner,
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        ),
+        "context menu render and hit-test geometry diverged"
+    );
     if inner.height < 4 {
         return;
     }
