@@ -917,6 +917,17 @@ impl ClientSupervisorModel {
             .map_err(|()| "main server is missing from supervisor model".to_string())
     }
 
+    /// #42: apply a [`MainSupervisorSnapshot`] fetched off the UI loop (registry + UI settings +
+    /// main summary). This is the on-loop-thread half of the async main refresh; it does the same
+    /// three applies the old inline `refresh_main_local_summaries` did, just without the blocking
+    /// fetches. `set_summary` failing only means the main server is (impossibly) absent — ignore it
+    /// rather than dropping the registry/ui-settings updates that already landed.
+    pub(crate) fn apply_main_supervisor_snapshot(&mut self, snapshot: MainSupervisorSnapshot) {
+        self.sync_remote_registry(snapshot.remotes);
+        self.set_ui_settings(snapshot.ui_settings);
+        let _ = self.set_summary(&ServerId::main(), snapshot.summary);
+    }
+
     pub(crate) fn new_workspace_route(&self) -> NewWorkspaceRoute {
         match &self.filter {
             ServerFilter::Server(id) => self.route_for_specific_server(id),
@@ -2557,6 +2568,33 @@ pub(crate) fn request_ui_settings(
     }
 }
 
+/// #42: a snapshot of the main (local) server's supervisor state — registry + UI settings + the
+/// main summary. Fetched off the UI loop (pure I/O via [`fetch_main_supervisor_snapshot`]) and
+/// applied back on the loop thread via [`ClientSupervisorModel::apply_main_supervisor_snapshot`],
+/// so the render/event-loop thread never blocks on the four local API round-trips.
+pub(crate) struct MainSupervisorSnapshot {
+    pub(crate) remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
+    pub(crate) ui_settings: crate::api::schema::UiSettingsInfo,
+    pub(crate) summary: ServerSummary,
+}
+
+/// #42: fetch the whole main-server supervisor snapshot in one worker-thread call. Pure blocking
+/// I/O — never call this on the render/event-loop thread (it issues `remote.list`,
+/// `server.ui_settings`, `workspace.list` + `agent.list` round-trips); spawn it and apply the
+/// result via `apply_main_supervisor_snapshot`.
+pub(crate) fn fetch_main_supervisor_snapshot(
+    api: &mut impl SupervisorApi,
+) -> Result<MainSupervisorSnapshot, String> {
+    let remotes = request_remote_list(api)?;
+    let ui_settings = request_ui_settings(api)?;
+    let summary = request_server_summary(api)?;
+    Ok(MainSupervisorSnapshot {
+        remotes,
+        ui_settings,
+        summary,
+    })
+}
+
 impl ServerSummary {
     fn from_api(
         workspaces: Vec<crate::api::schema::WorkspaceInfo>,
@@ -3047,6 +3085,43 @@ mod tests {
                 "add remote",
                 "manage remotes"
             ]
+        );
+    }
+
+    #[test]
+    fn fetch_and_apply_main_supervisor_snapshot_updates_registry_ui_and_summary() {
+        // #42: the off-loop fetch + on-loop apply must reproduce exactly what the old inline
+        // blocking refresh did — registry, ui-settings, and the main summary all land.
+        let ui = crate::api::schema::UiSettingsInfo {
+            sidebar_default_width: 41, // non-default marker proving ui-settings applied
+            ..Default::default()
+        };
+        let mut api = FakeSupervisorApi {
+            remotes: vec![ssh_remote("r1", "alpha", "alpha")],
+            workspaces: vec![workspace_info("ws-1", "one", true)],
+            agents: vec![],
+            ui_settings: ui,
+            ..FakeSupervisorApi::default()
+        };
+
+        let snapshot = fetch_main_supervisor_snapshot(&mut api).expect("snapshot");
+        let mut model = ClientSupervisorModel::new("local");
+        model.apply_main_supervisor_snapshot(snapshot);
+
+        assert!(
+            model.server_for_test(&ServerId::secondary("r1")).is_some(),
+            "registry applied"
+        );
+        assert_eq!(
+            model.ui_settings().sidebar_default_width,
+            41,
+            "ui-settings applied"
+        );
+        assert!(
+            model.workspace_rows().iter().any(|row| row.server_id
+                == ServerId::main()
+                && row.workspace_id.as_deref() == Some("ws-1")),
+            "main summary applied"
         );
     }
 

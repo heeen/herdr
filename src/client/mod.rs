@@ -113,6 +113,10 @@ struct ClientState {
     summary_subscription_server_ids: HashSet<supervisor::ServerId>,
     /// Secondary servers with a summary refresh already running off the UI loop.
     pending_summary_refresh_server_ids: HashSet<supervisor::ServerId>,
+    /// #42: whether a main-server supervisor refresh (registry + ui-settings + main summary) is
+    /// already running off the UI loop. Coalesces a connect-storm of refresh triggers into one
+    /// in-flight worker so the render thread issues O(1), not O(N-remotes), background refreshes.
+    pending_main_refresh: bool,
     /// Secondary servers with a client-stream connection attempt running off the UI loop.
     pending_secondary_connect_server_ids: HashSet<supervisor::ServerId>,
     /// Whether an add-remote submission is running off the UI loop.
@@ -1840,6 +1844,13 @@ enum ClientLoopEvent {
     },
     /// Server reader thread exited (connection lost).
     ServerDisconnected(supervisor::ServerId),
+    /// #42: the main-server supervisor refresh (registry + ui-settings + main summary) completed on
+    /// a worker thread. Applied on the loop thread so the four blocking local round-trips never run
+    /// on the render/event-loop thread (which froze the UI once per connecting remote).
+    MainSupervisorRefreshed {
+        result: Result<supervisor::MainSupervisorSnapshot, String>,
+        elapsed: Duration,
+    },
     /// Timer tick.
     Timer,
 }
@@ -2929,36 +2940,41 @@ fn add_remote_target_status_error_is_transient(error: &str) -> bool {
         || error.contains("no such file or directory")
 }
 
-/// item 6 (Area 6): the LOCAL main/registry/ui-settings refresh (Unix socket, no SSH RTT). This
-/// is the `refresh_client_supervisor_summaries` body MINUS the secondary fan-out. The Timer's 2s
-/// gate calls this directly so the per-secondary `due_secondary_summary_refreshes` loop is the
-/// single source of secondary cadence (the fan-out would duplicate it).
-fn refresh_main_local_summaries(model: &mut supervisor::ClientSupervisorModel) {
-    let mut api = crate::api::client::ApiClient::local();
-    if let Err(err) = model.refresh_remote_registry_from_api(&mut api) {
-        warn!(err = %err, "failed to refresh main server remote registry");
+/// #42: spawn the LOCAL main/registry/ui-settings/summary refresh OFF the UI loop. The render/
+/// event-loop thread used to make four blocking Unix-socket round-trips here, re-fired once per
+/// connecting remote — an O(N-remotes) freeze. Now a single worker thread fetches the snapshot and
+/// posts `MainSupervisorRefreshed`, applied back on the loop. `pending_main_refresh` coalesces a
+/// burst of triggers into one in-flight worker (the result handler clears it).
+fn spawn_main_supervisor_refresh(
+    pending_main_refresh: &mut bool,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    if *pending_main_refresh {
+        return;
     }
-    if let Err(err) = model.refresh_main_ui_settings_from_api(&mut api) {
-        warn!(err = %err, "failed to refresh main server UI settings");
-    }
-    if let Err(err) = model.refresh_main_summary_from_api(&mut api) {
-        warn!(err = %err, "failed to refresh main server summary");
-    }
+    *pending_main_refresh = true;
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        let mut api = crate::api::client::ApiClient::local();
+        let result = supervisor::fetch_main_supervisor_snapshot(&mut api);
+        let _ = event_tx.blocking_send(ClientLoopEvent::MainSupervisorRefreshed {
+            result,
+            elapsed: started_at.elapsed(),
+        });
+    });
 }
 
 fn refresh_client_supervisor_summaries(
     model: &mut supervisor::ClientSupervisorModel,
-    frame_cache: &mut HashMap<supervisor::ServerId, protocol::FrameData>,
+    pending_main_refresh: &mut bool,
     ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
     pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    refresh_main_local_summaries(model);
-    // #36: the registry sync above drops a remote that was deleted externally, but only the in-app
-    // Delete button tears a remote's stream down. Since #36 now RETAINS the last frame across an
-    // involuntary disconnect, prune any cached frame whose server is no longer in the model so a
-    // registry-removed remote can't leak its retained frame (or leave a dangling cache entry).
-    frame_cache.retain(|server_id, _| model.contains_server(server_id));
+    // #42: the main-server refresh is now async (posts `MainSupervisorRefreshed`); the #36
+    // frame_cache prune moved into that result handler, after the registry sync actually lands.
+    spawn_main_supervisor_refresh(pending_main_refresh, event_tx);
     let immediate_results = start_secondary_supervisor_summary_refreshes(
         model,
         ssh_bridges,
@@ -3178,7 +3194,7 @@ fn apply_remote_manage_request_finished(
             if let Some(model) = &mut state.supervisor_model {
                 refresh_client_supervisor_summaries(
                     model,
-                    &mut state.frame_cache,
+                    &mut state.pending_main_refresh,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3195,7 +3211,7 @@ fn apply_remote_manage_request_finished(
             if let Some(model) = &mut state.supervisor_model {
                 refresh_client_supervisor_summaries(
                     model,
-                    &mut state.frame_cache,
+                    &mut state.pending_main_refresh,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3214,7 +3230,7 @@ fn apply_remote_manage_request_finished(
                 model.remove_secondary(&server_id);
                 refresh_client_supervisor_summaries(
                     model,
-                    &mut state.frame_cache,
+                    &mut state.pending_main_refresh,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3611,6 +3627,7 @@ async fn run_client_loop(
         last_ping_at: Instant::now(),
         summary_subscription_server_ids: HashSet::new(),
         pending_summary_refresh_server_ids: HashSet::new(),
+        pending_main_refresh: false,
         pending_secondary_connect_server_ids: HashSet::new(),
         pending_add_remote: false,
         ssh_bridges,
@@ -4234,7 +4251,7 @@ async fn run_client_loop(
                             if let Some(model) = &mut state.supervisor_model {
                                 refresh_client_supervisor_summaries(
                                     model,
-                                    &mut state.frame_cache,
+                                    &mut state.pending_main_refresh,
                                     &state.ssh_bridges,
                                     &mut state.pending_summary_refresh_server_ids,
                                     &event_tx,
@@ -4375,7 +4392,7 @@ async fn run_client_loop(
                             state.last_summary_refresh.insert(server_id.clone(), now);
                             refresh_client_supervisor_summaries(
                                 model,
-                                &mut state.frame_cache,
+                                &mut state.pending_main_refresh,
                                 &state.ssh_bridges,
                                 &mut state.pending_summary_refresh_server_ids,
                                 &event_tx,
@@ -4478,7 +4495,7 @@ async fn run_client_loop(
                                     state.last_summary_refresh.insert(server_id.clone(), now);
                                     refresh_client_supervisor_summaries(
                                         model,
-                                        &mut state.frame_cache,
+                                        &mut state.pending_main_refresh,
                                         &state.ssh_bridges,
                                         &mut state.pending_summary_refresh_server_ids,
                                         &event_tx,
@@ -4573,6 +4590,35 @@ async fn run_client_loop(
                 schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                 render_cached_composited_frame(&mut state);
             }
+            ClientLoopEvent::MainSupervisorRefreshed { result, elapsed } => {
+                // #42: apply the off-loop main-server refresh on the loop thread. Clearing the
+                // pending flag re-arms the next trigger.
+                state.pending_main_refresh = false;
+                match result {
+                    Ok(snapshot) => {
+                        if let Some(model) = &mut state.supervisor_model {
+                            model.apply_main_supervisor_snapshot(snapshot);
+                        }
+                        // #36: prune the retained frame_cache for any remote the registry sync just
+                        // dropped (an externally-removed remote is never torn down here). Separate
+                        // immutable-model borrow so it composes with the &mut frame_cache.
+                        if let Some(model) = &state.supervisor_model {
+                            state
+                                .frame_cache
+                                .retain(|server_id, _| model.contains_server(server_id));
+                        }
+                        state.request_full_redraw();
+                        render_cached_composited_frame(&mut state);
+                    }
+                    Err(err) => {
+                        warn!(
+                            err = %err,
+                            elapsed_ms = elapsed.as_millis(),
+                            "main supervisor refresh failed off the UI loop",
+                        );
+                    }
+                }
+            }
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
                 let now = Instant::now();
@@ -4613,13 +4659,13 @@ async fn run_client_loop(
 
                 let mut did_local_refresh = false;
                 if supervisor_summary_refresh_due(now, state.last_supervisor_summary_refresh) {
-                    // The 2s gate now drives ONLY the local main/registry/ui-settings refresh
-                    // (Unix socket, no SSH RTT). The secondary fan-out is OMITTED — the per-
-                    // secondary `due` loop above is the single source of secondary cadence.
-                    if let Some(model) = &mut state.supervisor_model {
-                        refresh_main_local_summaries(model);
+                    // #42: the 2s gate now SPAWNS the local main/registry/ui-settings refresh off
+                    // the UI loop (posts MainSupervisorRefreshed) instead of blocking the loop on
+                    // four Unix-socket round-trips. The per-secondary `due` loop above remains the
+                    // single source of secondary cadence (no fan-out here).
+                    if state.supervisor_model.is_some() {
+                        spawn_main_supervisor_refresh(&mut state.pending_main_refresh, &event_tx);
                         state.last_supervisor_summary_refresh = now;
-                        state.request_full_redraw();
                     }
                     schedule_missing_secondary_stream_retries(&mut state, &server_writes, now);
                     if let Some(model) = &state.supervisor_model {
@@ -5286,6 +5332,7 @@ mod tests {
             last_ping_at: Instant::now(),
             summary_subscription_server_ids: HashSet::new(),
             pending_summary_refresh_server_ids: HashSet::new(),
+            pending_main_refresh: false,
             pending_secondary_connect_server_ids: HashSet::new(),
             pending_add_remote: false,
             ssh_bridges: HashMap::new(),
