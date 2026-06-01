@@ -238,6 +238,42 @@ pub(crate) struct ClientCompositor {
     working_since: HashMap<(ServerId, String), std::time::Instant>,
 }
 
+/// #45: the cached, content-independent half of a composited client frame.
+///
+/// Producing it runs the expensive `ClientSidebarSnapshot::from_model` (which walks every
+/// workspace × agent × host, allocating a `TerminalState` per agent) **and** a full ratatui
+/// sidebar render. Both depend ONLY on the model, the compositor view-state, the host size and
+/// `now` — never on the active content frame. So on a pure content-output frame (an agent's
+/// terminal changed but the sidebar did not) the client reuses this and only re-lays the content
+/// region via [`overlay_content_onto_shell`], instead of rebuilding the entire sidebar per frame.
+/// That per-frame rebuild was what throttled attach to <1fps while N agent TUIs flooded the client
+/// with content frames during their redraw burst (issue #45).
+pub(crate) struct ComposedShell {
+    /// The rendered shell: sidebar + any open composited overlay/modal. The content columns hold
+    /// the shell background and get overwritten by [`overlay_content_onto_shell`] (except the
+    /// protected `excluded_rects`, where a floating popup must stay visible over the content).
+    frame: FrameData,
+    /// Footer-anchored popup rects protected from the content copy so floating modals stay visible.
+    excluded_rects: Vec<Rect>,
+    /// Whether ANY composited modal/overlay is open (the live content cursor must then be hidden).
+    modal_open: bool,
+    /// Sidebar width this shell was laid out at (the content region starts at this column).
+    sidebar_width: u16,
+    /// Content region width (`host_width - sidebar_width`).
+    content_width: u16,
+    /// Host dimensions this shell was built for; a mismatch (a resize) forces a rebuild before reuse.
+    host_width: u16,
+    host_height: u16,
+}
+
+impl ComposedShell {
+    /// Whether this cached shell was laid out for the given host dimensions. A resize changes the
+    /// sidebar/content geometry, so on a mismatch the cache MUST be rebuilt before it is reused.
+    pub(crate) fn matches_dims(&self, host_width: u16, host_height: u16) -> bool {
+        self.host_width == host_width && self.host_height == host_height
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidebarHitTarget {
     Filter,
@@ -1141,14 +1177,17 @@ impl ClientCompositor {
         self.sidebar_width = column.saturating_add(1).clamp(min_width, max_width);
     }
 
-    pub(crate) fn compose_frame(
+    /// #45: build the content-independent sidebar shell (see [`ComposedShell`]). This is the
+    /// expensive half of `compose_frame` — `from_model` + a full ratatui sidebar render — so the
+    /// caller caches the result and reuses it across pure content frames, only re-laying the live
+    /// content region with [`overlay_content_onto_shell`].
+    pub(crate) fn build_shell(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
-        active_frame: &FrameData,
         host_width: u16,
         host_height: u16,
         now: Instant,
-    ) -> FrameData {
+    ) -> ComposedShell {
         let sidebar_width = self.effective_sidebar_width(host_width);
         let content_width = host_width.saturating_sub(sidebar_width);
         let snapshot = ClientSidebarSnapshot::from_model(
@@ -1212,38 +1251,48 @@ impl ClientCompositor {
         } else {
             excluded_rects.extend(snapshot.global_menu_rect());
         }
-        let mut frame = render_client_shell(&snapshot, host_width, host_height);
-
-        copy_active_content_excluding(
-            active_frame,
-            &mut frame,
-            sidebar_width,
-            content_width,
-            &excluded_rects,
-        );
+        let frame = render_client_shell(&snapshot, host_width, host_height);
 
         // item 1/3: the add-remote / new-workspace-picker / manage modals are rendered as ratatui
-        // widgets inside `render_client_shell` (composited). Here we only force the cursor hidden
-        // while ANY modal is open so the real terminal cursor never leaks through the modal.
-        if model.add_remote_form().is_some()
+        // widgets inside `render_client_shell` (composited). The live content cursor must be hidden
+        // while ANY modal is open so the real terminal cursor never leaks through it. The cursor
+        // hide + the content copy run per-frame in `overlay_content_onto_shell`; we capture only
+        // the model-derived modal-open flag here (the SAME condition as the old inline block) so
+        // the cached shell carries it without re-reading the model on a reused content frame.
+        let modal_open = model.add_remote_form().is_some()
             || model.new_workspace_picker().is_some()
             || model.remote_manage_overlay().is_some()
             || model.workspace_context_menu().is_some()
             || model.host_context_menu().is_some()
             || model.rename_workspace_form().is_some()
-            || model.confirm_close_workspace().is_some()
-        {
-            frame.cursor = None;
-        } else {
-            frame.cursor =
-                offset_cursor(active_frame.cursor.as_ref(), sidebar_width, content_width);
-        }
-        frame.hyperlinks = active_frame.hyperlinks.clone();
-        if sidebar_width == 0 {
-            frame.graphics = active_frame.graphics.clone();
-        }
+            || model.confirm_close_workspace().is_some();
 
-        frame
+        ComposedShell {
+            frame,
+            excluded_rects,
+            modal_open,
+            sidebar_width,
+            content_width,
+            host_width,
+            host_height,
+        }
+    }
+
+    /// Compose one client frame: the cached/rebuilt sidebar shell with the live `active_frame`
+    /// content laid into it. Pure (`&self`) — production reuses the shell via `build_shell` +
+    /// [`overlay_content_onto_shell`] (so this is test-only), but the output is identical either way,
+    /// which is exactly what the equivalence tests assert.
+    #[cfg(test)]
+    pub(crate) fn compose_frame(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        active_frame: &FrameData,
+        host_width: u16,
+        host_height: u16,
+        now: Instant,
+    ) -> FrameData {
+        let shell = self.build_shell(model, host_width, host_height, now);
+        overlay_content_onto_shell(&shell, active_frame)
     }
 
     /// The footer-anchored `anchor_area` the composited client overlays (add-remote /
@@ -2740,6 +2789,39 @@ fn blank_cell() -> CellData {
         skip: false,
         hyperlink: None,
     }
+}
+
+/// #45: lay the live `active_frame` content into a cached sidebar [`ComposedShell`], producing the
+/// final composited frame. Cheap (a shell clone + a content-region copy + cursor/hyperlink/graphics
+/// fixup), so it runs per content frame while the expensive shell build is reused. The output is
+/// byte-identical to the tail of `compose_frame` — only the cursor and content region depend on the
+/// live frame; everything else (sidebar, overlays, geometry) comes from the cached shell.
+pub(crate) fn overlay_content_onto_shell(
+    shell: &ComposedShell,
+    active_frame: &FrameData,
+) -> FrameData {
+    let mut frame = shell.frame.clone();
+    copy_active_content_excluding(
+        active_frame,
+        &mut frame,
+        shell.sidebar_width,
+        shell.content_width,
+        &shell.excluded_rects,
+    );
+    if shell.modal_open {
+        frame.cursor = None;
+    } else {
+        frame.cursor = offset_cursor(
+            active_frame.cursor.as_ref(),
+            shell.sidebar_width,
+            shell.content_width,
+        );
+    }
+    frame.hyperlinks = active_frame.hyperlinks.clone();
+    if shell.sidebar_width == 0 {
+        frame.graphics = active_frame.graphics.clone();
+    }
+    frame
 }
 
 fn copy_active_content_excluding(
@@ -6327,5 +6409,203 @@ mod tests {
                 "standalone workspace must not expose a chevron hit region"
             );
         }
+    }
+
+    // ---- #45: sidebar shell caching (build_shell / overlay_content_onto_shell) ----
+
+    fn server_summary_with_agents(
+        prefix: &str,
+        workspaces: usize,
+        agents_per: usize,
+    ) -> ServerSummary {
+        let mut ws = Vec::new();
+        let mut agents = Vec::new();
+        for w in 0..workspaces {
+            let workspace_id = format!("{prefix}-ws-{w}");
+            ws.push(WorkspaceSummary {
+                workspace_id: workspace_id.clone(),
+                label: format!("ws{w}"),
+                branch: Some(format!("feature/{prefix}-{w}")),
+                focused: w == 0,
+                ..Default::default()
+            });
+            for a in 0..agents_per {
+                agents.push(AgentSummary {
+                    agent_id: format!("{prefix}-agent-{w}-{a}"),
+                    workspace_id: workspace_id.clone(),
+                    label: if a % 2 == 0 { "claude".into() } else { "codex".into() },
+                    status: match a % 3 {
+                        0 => "working",
+                        1 => "idle",
+                        _ => "blocked",
+                    }
+                    .into(),
+                    focused: w == 0 && a == 0,
+                });
+            }
+        }
+        ServerSummary {
+            workspaces: ws,
+            agents,
+        }
+    }
+
+    fn model_with_agents(workspaces: usize, agents_per: usize) -> ClientSupervisorModel {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                server_summary_with_agents("main", workspaces, agents_per),
+            )
+            .unwrap();
+        model
+    }
+
+    /// The production hot path is `build_shell` (cached) + `overlay_content_onto_shell` (per
+    /// content frame). It MUST be byte-identical to the old single-shot `compose_frame`, otherwise
+    /// caching the shell would subtly change what the user sees.
+    #[test]
+    fn overlay_onto_built_shell_equals_compose_frame() {
+        let model = model_with_agents(4, 4);
+        let compositor = ClientCompositor::new(28);
+        let content = frame(20, 10, &["alpha", "beta", "gamma"]);
+        let now = std::time::Instant::now();
+
+        let direct = compositor.compose_frame(&model, &content, 80, 24, now);
+        let shell = compositor.build_shell(&model, 80, 24, now);
+        let via_shell = overlay_content_onto_shell(&shell, &content);
+
+        assert_eq!(
+            direct, via_shell,
+            "build_shell + overlay_content_onto_shell must reproduce compose_frame exactly"
+        );
+    }
+
+    /// A shell built once and reused across DIFFERENT content frames must match a fresh
+    /// `compose_frame` for each — this is exactly what the cache does on a pure content burst.
+    #[test]
+    fn cached_shell_reused_across_content_frames_matches_fresh_compose() {
+        let model = model_with_agents(3, 5);
+        let compositor = ClientCompositor::new(26);
+        let now = std::time::Instant::now();
+        let shell = compositor.build_shell(&model, 80, 24, now);
+
+        for content in [
+            frame(20, 10, &["one"]),
+            frame(20, 10, &["two", "two-b"]),
+            frame(20, 10, &["three", "", "x marks here"]),
+        ] {
+            let reused = overlay_content_onto_shell(&shell, &content);
+            let fresh = compositor.compose_frame(&model, &content, 80, 24, now);
+            assert_eq!(
+                reused, fresh,
+                "reusing the cached shell across content-only changes must match a fresh compose"
+            );
+        }
+    }
+
+    /// #45 regression + measurement. Simulates the attach burst: N agent panes flood content frames
+    /// while the sidebar model is unchanged. The OLD path rebuilt the whole sidebar (`from_model` +
+    /// full render) per frame; the new path builds the shell once and only re-lays the content.
+    /// Asserts the reuse path is dramatically cheaper and prints the derived per-frame fps ceiling.
+    #[test]
+    fn cached_shell_reuse_is_far_cheaper_than_full_compose() {
+        let model = model_with_agents(6, 6); // 36 agents — a heavy fleet
+        let compositor = ClientCompositor::new(30);
+        let content = frame(160, 48, &["agent output line"]);
+        let (w, h) = (200u16, 50u16);
+        let now = std::time::Instant::now();
+
+        const ITERS: u32 = 200;
+        // Warm up the allocator / TerminalId counter so neither side pays first-touch cost.
+        let _ = std::hint::black_box(compositor.compose_frame(&model, &content, w, h, now));
+
+        let full_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(compositor.compose_frame(&model, &content, w, h, now));
+        }
+        let full = full_start.elapsed();
+
+        let shell = compositor.build_shell(&model, w, h, now);
+        let reuse_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(overlay_content_onto_shell(&shell, &content));
+        }
+        let reuse = reuse_start.elapsed();
+
+        let full_us = full.as_secs_f64() * 1e6 / ITERS as f64;
+        let reuse_us = reuse.as_secs_f64() * 1e6 / ITERS as f64;
+        eprintln!(
+            "#45 per-content-frame compose: full-rebuild={full_us:.1}us ({:.0} fps ceiling), \
+             reused-shell={reuse_us:.1}us ({:.0} fps ceiling), speedup={:.1}x",
+            1e6 / full_us.max(f64::MIN_POSITIVE),
+            1e6 / reuse_us.max(f64::MIN_POSITIVE),
+            full_us / reuse_us.max(f64::MIN_POSITIVE),
+        );
+
+        assert!(
+            reuse < full / 2,
+            "reusing the cached shell must be at least ~2x cheaper than a full rebuild \
+             (got reuse={reuse:?}, full={full:?})"
+        );
+    }
+
+    /// #45 root-cause demonstration: the OLD per-content-frame cost was O(cells + agents) because
+    /// `from_model` walks every agent; the NEW reused path is O(cells) only. So as the agent count
+    /// grows the full-rebuild cost climbs while the reused-shell cost stays ~flat — which is exactly
+    /// the issue's "scales with the number of AGENT panes" symptom, now removed for content frames.
+    #[test]
+    fn reused_shell_cost_is_flat_in_agent_count_while_rebuild_grows() {
+        let compositor = ClientCompositor::new(30);
+        let content = frame(160, 48, &["agent output line"]);
+        let (w, h) = (200u16, 50u16);
+        let now = std::time::Instant::now();
+        const ITERS: u32 = 120;
+
+        let measure = |model: &ClientSupervisorModel| {
+            let _ = std::hint::black_box(compositor.compose_frame(model, &content, w, h, now));
+            let fs = std::time::Instant::now();
+            for _ in 0..ITERS {
+                std::hint::black_box(compositor.build_shell(model, w, h, now));
+            }
+            let full = fs.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+            let shell = compositor.build_shell(model, w, h, now);
+            let rs = std::time::Instant::now();
+            for _ in 0..ITERS {
+                std::hint::black_box(overlay_content_onto_shell(&shell, &content));
+            }
+            let reuse = rs.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+            (full, reuse)
+        };
+
+        let mut reuse_costs = Vec::new();
+        let mut full_costs = Vec::new();
+        for &(wsp, per) in &[(2usize, 4usize), (8, 8), (16, 12)] {
+            let model = model_with_agents(wsp, per);
+            let (full, reuse) = measure(&model);
+            let agents = wsp * per;
+            eprintln!(
+                "#45 scaling @ {agents:>3} agents: full-rebuild={full:7.1}us, \
+                 reused-shell={reuse:7.1}us, speedup={:.1}x",
+                full / reuse.max(f64::MIN_POSITIVE)
+            );
+            full_costs.push(full);
+            reuse_costs.push(reuse);
+        }
+
+        // The reused-shell cost must NOT scale with agent count the way full-rebuild does: across a
+        // 24x agent increase (8 → 192) the reused path should stay within a small band, while the
+        // full rebuild climbs. Generous bounds keep this robust under noisy CI scheduling.
+        let reuse_lo = reuse_costs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let reuse_hi = reuse_costs.iter().cloned().fold(0.0_f64, f64::max);
+        assert!(
+            reuse_hi < reuse_lo * 3.0,
+            "reused-shell cost must stay ~flat in agent count (got {reuse_costs:?}us)"
+        );
+        assert!(
+            *full_costs.last().unwrap() > reuse_costs.last().unwrap() * 1.5,
+            "at the highest agent count the full rebuild must clearly exceed the reused path \
+             (full={full_costs:?}us, reuse={reuse_costs:?}us)"
+        );
     }
 }

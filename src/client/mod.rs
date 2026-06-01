@@ -97,6 +97,18 @@ struct ClientState {
     last_supervisor_summary_refresh: Instant,
     /// Last semantic frame received from each connected server stream.
     frame_cache: HashMap<supervisor::ServerId, protocol::FrameData>,
+    /// #45: cached sidebar shell — the expensive `from_model` + full ratatui sidebar render. Rebuilt
+    /// only when the sidebar model/view/size changes: every `request_full_redraw` drops it, the
+    /// model/timer/animation paths (`render_cached_composited_frame`) rebuild it, and a host resize
+    /// is caught by `ComposedShell::matches_dims`. A pure content-output frame reuses it and only
+    /// re-lays the content region, removing the per-content-frame full-sidebar rebuild that throttled
+    /// attach to <1fps when many agent TUIs flooded the client with content frames (#45).
+    shell_cache: Option<compositor::ComposedShell>,
+    /// #45: kill switch for the sidebar shell cache, read once from `HERDR_DISABLE_SHELL_CACHE`.
+    /// When set, every content frame rebuilds the shell (the pre-#45 behavior) — a safety valve to
+    /// disable the optimization in the field without redeploying, and the A/B knob used to confirm
+    /// the speedup. Off (cache enabled) by default.
+    shell_cache_disabled: bool,
     /// issue #13: per-server cumulative downstream bytes (fed by reader threads).
     rx_counters: RxByteCounters,
     /// issue #13: last sampled (bytes, instant) per server, for deriving the banner bytes/sec rate.
@@ -164,10 +176,20 @@ struct ServerWriteHandle {
     tx: std::sync::mpsc::Sender<ClientMessage>,
 }
 
+/// #45: rolling window over which `accumulate_window` aggregates per-frame timing into one summary.
+const FRAME_STATS_WINDOW: Duration = Duration::from_millis(1000);
+
 #[derive(Debug, Default)]
 struct ClientFrameStats {
     last_render_duration: Option<Duration>,
     last_render_fps: Option<f64>,
+    // #45: rolling ~1s window accumulating the split frame-budget breakdown so a single summary
+    // line reports the sustained render fps during a burst (used to confirm attach holds ≥30fps).
+    window_started_at: Option<Instant>,
+    window_frames: u32,
+    window_total: Duration,
+    window_compose: Duration,
+    window_rebuilds: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -175,6 +197,17 @@ struct ClientFrameSample {
     render_duration: Duration,
     render_fps: f64,
     missed_sixty_fps_budget: bool,
+}
+
+/// #45: one closed frame-budget window — the sustained render fps over [`FRAME_STATS_WINDOW`] plus
+/// the average per-frame breakdown and how many of those frames rebuilt the sidebar shell.
+struct ClientFrameWindowSummary {
+    frames: u32,
+    elapsed: Duration,
+    fps: f64,
+    avg_total_ms: f64,
+    avg_compose_ms: f64,
+    rebuilds: u32,
 }
 
 impl ClientFrameStats {
@@ -188,6 +221,45 @@ impl ClientFrameStats {
         self.last_render_duration = Some(render_duration);
         self.last_render_fps = Some(render_fps);
         sample
+    }
+
+    /// #45: fold one frame's timing into the current window; return a summary (and reset the window)
+    /// once the window has spanned [`FRAME_STATS_WINDOW`]. Returns `None` mid-window.
+    fn accumulate_window(
+        &mut self,
+        now: Instant,
+        total: Duration,
+        compose: Duration,
+        shell_rebuilt: bool,
+    ) -> Option<ClientFrameWindowSummary> {
+        let started = *self.window_started_at.get_or_insert(now);
+        self.window_frames += 1;
+        self.window_total += total;
+        self.window_compose += compose;
+        if shell_rebuilt {
+            self.window_rebuilds += 1;
+        }
+
+        let elapsed = now.duration_since(started);
+        if elapsed < FRAME_STATS_WINDOW {
+            return None;
+        }
+
+        let frames = self.window_frames.max(1);
+        let summary = ClientFrameWindowSummary {
+            frames: self.window_frames,
+            elapsed,
+            fps: self.window_frames as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+            avg_total_ms: self.window_total.as_secs_f64() * 1000.0 / frames as f64,
+            avg_compose_ms: self.window_compose.as_secs_f64() * 1000.0 / frames as f64,
+            rebuilds: self.window_rebuilds,
+        };
+        self.window_started_at = Some(now);
+        self.window_frames = 0;
+        self.window_total = Duration::ZERO;
+        self.window_compose = Duration::ZERO;
+        self.window_rebuilds = 0;
+        Some(summary)
     }
 }
 
@@ -1611,6 +1683,10 @@ fn translate_content_mouse_input(
 impl ClientState {
     fn request_full_redraw(&mut self) {
         self.blit_encoder = render_ansi::BlitEncoder::new();
+        // #45: a full repaint is requested precisely when the sidebar model/view changed too (every
+        // such event handler calls this). Drop the cached shell so the next compose rebuilds it —
+        // otherwise a reused content frame would paint a stale sidebar over fresh model state.
+        self.shell_cache = None;
     }
 }
 
@@ -3834,39 +3910,41 @@ fn render_cached_composited_frame(state: &mut ClientState) {
         prune_and_seed_working_since(compositor, model, now);
     }
 
-    let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) else {
-        return;
-    };
-
-    let active_server_id = model.active_server_id().clone();
     // Response-first switching (issue #13): paint the target server's last-known frame instantly.
     // If we have never received a frame for it, fall back to a blank content frame so the switch
     // still repaints the new shell at once instead of holding the previous server's screen.
-    let active_frame = state
-        .frame_cache
-        .get(&active_server_id)
-        .cloned()
-        .unwrap_or_else(|| protocol::FrameData::blank(state.host_size.0, state.host_size.1));
-
-    let frame_data = compositor.compose_frame(
-        model,
-        &active_frame,
-        state.host_size.0,
-        state.host_size.1,
-        now,
-    );
-    let render_started_at = Instant::now();
-    let encoded = state.blit_encoder.encode(&frame_data, false);
-    let graphics = if state.kitty_graphics_enabled {
-        frame_data.graphics.as_slice()
-    } else {
-        &[]
+    let active_frame = {
+        let Some(model) = state.supervisor_model.as_ref() else {
+            return;
+        };
+        let active_server_id = model.active_server_id().clone();
+        state
+            .frame_cache
+            .get(&active_server_id)
+            .cloned()
+            .unwrap_or_else(|| protocol::FrameData::blank(state.host_size.0, state.host_size.1))
     };
-    let mut stdout = io::stdout();
-    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-    let _ = stdout.flush();
-    state.blit_encoder.commit(frame_data, encoded);
-    record_client_frame_sample(state, render_started_at.elapsed());
+
+    // #45: this repaint was driven by a model/view/timer/animation change (every caller of
+    // `render_cached_composited_frame` is such a path), so force a fresh shell (rebuild = true) and
+    // repopulate the cache that the following pure content frames will reuse.
+    let compose_started = Instant::now();
+    let shell_rebuilt = if let (Some(comp), Some(model)) =
+        (state.compositor.as_ref(), state.supervisor_model.as_ref())
+    {
+        ensure_shell_cache(comp, model, &mut state.shell_cache, state.host_size, true, now)
+    } else {
+        return;
+    };
+    let Some(frame_data) = state
+        .shell_cache
+        .as_ref()
+        .map(|shell| compositor::overlay_content_onto_shell(shell, &active_frame))
+    else {
+        return;
+    };
+    let compose_elapsed = compose_started.elapsed();
+    flush_composited_frame(state, frame_data, compose_elapsed, shell_rebuilt);
 }
 
 /// Cache a server's freshly-received full frame and, if it is the active server, composite + flush
@@ -3876,7 +3954,9 @@ fn render_incoming_server_frame(
     server_id: &supervisor::ServerId,
     mut frame_data: protocol::FrameData,
 ) {
-    if let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) {
+    let mut compose_elapsed = Duration::ZERO;
+    let mut shell_rebuilt = false;
+    if let (Some(comp), Some(model)) = (&state.compositor, &state.supervisor_model) {
         let active_server_id = model.active_server_id().clone();
         // #15 (part b): always keep the per-server frame cache fresh (so a later focus switch can
         // paint the latest frame instantly), but only the ACTIVE server's frame is composed +
@@ -3893,26 +3973,84 @@ fn render_incoming_server_frame(
         else {
             return;
         };
-        frame_data = compositor.compose_frame(
+        // #45: a pure content-output frame — the sidebar model is unchanged since the last compose,
+        // so reuse the cached shell (rebuild = false) and only re-lay the content region. A host
+        // resize (dims mismatch) or any model change (which dropped the cache via
+        // `request_full_redraw`) transparently forces a rebuild. This is the hot path that
+        // previously rebuilt the entire sidebar (`from_model` + full sidebar render) on EVERY
+        // content frame and throttled attach to <1fps as agent TUIs flooded content frames (#45).
+        let compose_started = Instant::now();
+        shell_rebuilt = ensure_shell_cache(
+            comp,
             model,
-            active_frame,
-            state.host_size.0,
-            state.host_size.1,
-            Instant::now(),
+            &mut state.shell_cache,
+            state.host_size,
+            state.shell_cache_disabled,
+            compose_started,
         );
+        let shell = state
+            .shell_cache
+            .as_ref()
+            .expect("ensure_shell_cache populates the cache");
+        frame_data = compositor::overlay_content_onto_shell(shell, active_frame);
+        compose_elapsed = compose_started.elapsed();
     }
-    let render_started_at = Instant::now();
+    flush_composited_frame(state, frame_data, compose_elapsed, shell_rebuilt);
+}
+
+/// #45: ensure `shell_cache` holds a sidebar shell valid for the current model/view and host size,
+/// running the expensive rebuild (`from_model` + full sidebar render) only when forced (`rebuild`)
+/// or when the cached shell was laid out for different host dimensions (a resize). Returns whether
+/// a rebuild happened, for the frame-budget breakdown. Takes the compositor/model/cache as disjoint
+/// borrows so the hot content-frame path can call it while still holding a borrow of `frame_cache`.
+fn ensure_shell_cache(
+    compositor: &compositor::ClientCompositor,
+    model: &supervisor::ClientSupervisorModel,
+    shell_cache: &mut Option<compositor::ComposedShell>,
+    host_size: (u16, u16),
+    rebuild: bool,
+    now: Instant,
+) -> bool {
+    let (host_width, host_height) = host_size;
+    let fresh = rebuild
+        || !shell_cache
+            .as_ref()
+            .is_some_and(|shell| shell.matches_dims(host_width, host_height));
+    if fresh {
+        *shell_cache = Some(compositor.build_shell(model, host_width, host_height, now));
+    }
+    fresh
+}
+
+/// #45: encode, write and flush a composited client frame, recording the split frame-budget
+/// breakdown (compose / encode / flush). Shared tail of the cached-redraw and incoming-frame paths.
+fn flush_composited_frame(
+    state: &mut ClientState,
+    frame_data: protocol::FrameData,
+    compose_elapsed: Duration,
+    shell_rebuilt: bool,
+) {
+    let encode_started = Instant::now();
     let encoded = state.blit_encoder.encode(&frame_data, false);
-    let mut stdout = io::stdout();
+    let encode_elapsed = encode_started.elapsed();
     let graphics = if state.kitty_graphics_enabled {
         frame_data.graphics.as_slice()
     } else {
         &[]
     };
+    let flush_started = Instant::now();
+    let mut stdout = io::stdout();
     let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
     let _ = stdout.flush();
+    let flush_elapsed = flush_started.elapsed();
     state.blit_encoder.commit(frame_data, encoded);
-    record_client_frame_sample(state, render_started_at.elapsed());
+    record_client_frame_sample_split(
+        state,
+        compose_elapsed,
+        encode_elapsed,
+        flush_elapsed,
+        shell_rebuilt,
+    );
 }
 
 /// How often the downstream-throughput sampler converts cumulative byte counters into a
@@ -3951,14 +4089,48 @@ fn sample_download_rates(state: &mut ClientState, now: Instant) {
     }
 }
 
-fn record_client_frame_sample(state: &mut ClientState, render_duration: Duration) {
-    let sample = state.frame_stats.record_render_duration(render_duration);
+/// #45: record one composited frame's split timing (compose / encode / flush) and, once per ~1s
+/// window of active rendering, emit a frame-budget summary (fps, average breakdown, and how many
+/// frames rebuilt the sidebar shell vs reused it). The split moves the timer to BEFORE compose —
+/// the old budget log started its timer after `compose_frame`, hiding the `from_model` cost that
+/// was the actual hot spot (#45). The periodic summary is the signal used to confirm attach holds
+/// ≥30fps. Both lines log at debug (run with `HERDR_LOG=herdr=debug` to observe); idle windows with
+/// no rendered frames emit nothing.
+fn record_client_frame_sample_split(
+    state: &mut ClientState,
+    compose_elapsed: Duration,
+    encode_elapsed: Duration,
+    flush_elapsed: Duration,
+    shell_rebuilt: bool,
+) {
+    let total = compose_elapsed + encode_elapsed + flush_elapsed;
+    let now = Instant::now();
+    let sample = state.frame_stats.record_render_duration(total);
     if sample.missed_sixty_fps_budget {
         debug!(
-            render_ms = sample.render_duration.as_secs_f64() * 1000.0,
+            total_ms = total.as_secs_f64() * 1000.0,
+            compose_ms = compose_elapsed.as_secs_f64() * 1000.0,
+            encode_ms = encode_elapsed.as_secs_f64() * 1000.0,
+            flush_ms = flush_elapsed.as_secs_f64() * 1000.0,
+            shell_rebuilt,
             render_fps = sample.render_fps,
             frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
             "client frame render missed 60fps budget"
+        );
+    }
+    if let Some(summary) =
+        state
+            .frame_stats
+            .accumulate_window(now, total, compose_elapsed, shell_rebuilt)
+    {
+        debug!(
+            frames = summary.frames,
+            window_ms = summary.elapsed.as_secs_f64() * 1000.0,
+            fps = summary.fps,
+            avg_total_ms = summary.avg_total_ms,
+            avg_compose_ms = summary.avg_compose_ms,
+            shell_rebuilds = summary.rebuilds,
+            "client frame-budget window summary"
         );
     }
 }
@@ -4007,6 +4179,8 @@ async fn run_client_loop(
         supervisor_model,
         last_supervisor_summary_refresh: Instant::now(),
         frame_cache: HashMap::new(),
+        shell_cache: None,
+        shell_cache_disabled: std::env::var_os("HERDR_DISABLE_SHELL_CACHE").is_some(),
         rx_counters: RxByteCounters::default(),
         server_rx_sample: HashMap::new(),
         last_rx_sample_at: Instant::now(),
@@ -5913,6 +6087,8 @@ mod tests {
             supervisor_model: Some(model),
             last_supervisor_summary_refresh: Instant::now(),
             frame_cache: HashMap::new(),
+            shell_cache: None,
+            shell_cache_disabled: false,
             rx_counters: RxByteCounters::default(),
             server_rx_sample: HashMap::new(),
             last_rx_sample_at: Instant::now(),
@@ -5931,6 +6107,29 @@ mod tests {
             last_animation_tick: Instant::now(),
             last_summary_refresh: HashMap::new(),
         }
+    }
+
+    /// #45: any model/view change funnels through `request_full_redraw`, which must drop the cached
+    /// sidebar shell so the next compose rebuilds it. A reused content frame on a stale cache would
+    /// otherwise paint an out-of-date sidebar over fresh model state.
+    #[test]
+    fn request_full_redraw_drops_cached_shell() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+        let mut state = test_client_state_with_model(model);
+        let compositor = compositor::ClientCompositor::default();
+        let shell = {
+            let model = state.supervisor_model.as_ref().expect("model present");
+            compositor.build_shell(model, 80, 24, Instant::now())
+        };
+        state.shell_cache = Some(shell);
+        assert!(state.shell_cache.is_some());
+
+        state.request_full_redraw();
+
+        assert!(
+            state.shell_cache.is_none(),
+            "request_full_redraw must drop the cached shell so the sidebar can't go stale (#45)"
+        );
     }
 
     struct EnvVarsRemovedGuard {
