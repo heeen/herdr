@@ -73,7 +73,17 @@ echo "zig:         $("$ZIG_BIN" version) ($ZIG_BIN)"
 echo "output:      $OUTPUT"
 echo
 
+# build.rs links the vendored libghostty-vt static lib DIRECTLY from the shared in-repo path
+# vendor/libghostty-vt/zig-out/lib (it is not copied into a per-target OUT_DIR). On a warm tree the
+# next target therefore links the PREVIOUS target's wrong-arch `.a` (`ld.lld: ... is incompatible`)
+# unless zig's shared output + cache are cleared before each target build. Clear them before every
+# target so each one regenerates and links its own arch's lib.
+clean_libghostty_shared_artifacts() {
+  rm -rf "$ROOT_DIR/vendor/libghostty-vt/zig-out" "$ROOT_DIR/vendor/libghostty-vt/.zig-cache"
+}
+
 echo "==> building native carrier ($HOST_TARGET)"
+clean_libghostty_shared_artifacts
 cargo build --release --locked --target "$HOST_TARGET"
 CARRIER="$ROOT_DIR/target/$HOST_TARGET/release/herdr"
 test -x "$CARRIER" || {
@@ -94,6 +104,7 @@ for target in "${TARGETS[@]}"; do
   }
   echo "==> cross-building $target ($os_arch)"
   rustup target add "$target" >/dev/null 2>&1 || true
+  clean_libghostty_shared_artifacts
   cargo zigbuild --release --locked --target "$target"
   bin="$ROOT_DIR/target/$target/release/herdr"
   test -f "$bin" || {
