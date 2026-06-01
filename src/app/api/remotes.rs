@@ -137,6 +137,7 @@ mod tests {
             app.state.sidebar_section_split,
             app.state.collapsed_space_keys.clone(),
             app.state.remote_registry.clone(),
+            &app.state.pane_id_aliases,
         )
     }
 

@@ -604,6 +604,19 @@ impl ClientSupervisorModel {
         &mut self,
         remotes: Vec<crate::remote_registry::RemoteDefinitionSnapshot>,
     ) {
+        // #40: capture the current client-local host ordering BEFORE the rebuild so a user's
+        // host drag-reorder survives this registry-driven sync. Secondaries are re-sorted by their
+        // prior position below; genuinely-new remotes (absent from this map) sort last in the
+        // registry's own order. Without this, the secondaries were pushed in registry iteration
+        // order and a drag-reorder snapped back on the next poll.
+        let prior_secondary_order: std::collections::HashMap<ServerId, usize> = self
+            .servers
+            .iter()
+            .filter(|server| server.role == ServerRole::Secondary)
+            .enumerate()
+            .map(|(idx, server)| (server.id.clone(), idx))
+            .collect();
+
         let mut next_servers: Vec<ManagedServer> = self
             .servers
             .iter()
@@ -611,6 +624,7 @@ impl ClientSupervisorModel {
             .cloned()
             .collect();
 
+        let mut next_secondaries: Vec<ManagedServer> = Vec::new();
         for definition in remotes {
             let id = ServerId::secondary(definition.id.clone());
             let existing = self
@@ -629,8 +643,18 @@ impl ClientSupervisorModel {
             // re-enabled remote keeps its prior state — the toggle-success handler explicitly
             // sets it to `Connecting` so the now-ungated plans pick it back up.
             server.disabled = definition.disabled;
-            next_servers.push(server);
+            next_secondaries.push(server);
         }
+
+        // #40: stable-sort the rebuilt secondaries back into the client-local order. `sort_by_key`
+        // is stable, so genuinely-new remotes (`usize::MAX`) retain their registry order at the end.
+        next_secondaries.sort_by_key(|server| {
+            prior_secondary_order
+                .get(&server.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        next_servers.extend(next_secondaries);
 
         self.servers = next_servers;
         self.reconcile_selected_servers();
@@ -1516,6 +1540,25 @@ impl ClientSupervisorModel {
         vec!["rename", "close"]
     }
 
+    /// #41: whether `(server_id, workspace_id)` may be individually drag-reordered. A worktree-
+    /// grouped space (any row carrying a `worktree_key` — parent or linked checkout) is NOT
+    /// reorderable: its rendered position is owned by the worktree grouping, so a storage move would
+    /// not change what the user sees, producing the "indicator shown but drop does nothing" bug. The
+    /// monolithic sidebar blocks the same case via `worktree_space().is_none()`; this mirrors it so
+    /// the client arms a drag (and paints the drop indicator) only where a drop will take effect.
+    pub(crate) fn workspace_is_reorderable(&self, server_id: &ServerId, workspace_id: &str) -> bool {
+        self.server(server_id)
+            .and_then(|server| {
+                server
+                    .summaries
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.workspace_id == workspace_id)
+            })
+            .map(|ws| ws.worktree_key.is_none())
+            .unwrap_or(false)
+    }
+
     /// #23: the current label of `(server_id, workspace_id)` from the cached summaries, used by the
     /// right-click handler to capture the label for the context menu (rename prefill / close text).
     /// Falls back to `None` when the server or workspace is not in the model.
@@ -2163,6 +2206,12 @@ impl ClientSupervisorModel {
 
     fn server(&self, id: &ServerId) -> Option<&ManagedServer> {
         self.servers.iter().find(|server| &server.id == id)
+    }
+
+    /// Whether `id` is still a live server in the model. Used by the client to prune per-server
+    /// state (e.g. #36's retained `frame_cache`) for a remote dropped by a registry sync.
+    pub(crate) fn contains_server(&self, id: &ServerId) -> bool {
+        self.server(id).is_some()
     }
 
     #[cfg(test)]
@@ -4697,6 +4746,160 @@ mod tests {
             .expect("disabled secondary row");
         assert!(row.disabled);
         assert_eq!(row.label, "alpha disabled");
+    }
+
+    #[test]
+    fn host_reorder_survives_remote_registry_sync() {
+        // #40: a host drag-reorder must NOT snap back to registry order on the next sync.
+        let mut model = ClientSupervisorModel::new("local");
+        model.sync_remote_registry(vec![
+            ssh_remote("r1", "alpha", "alpha"),
+            ssh_remote("r2", "bravo", "bravo"),
+            ssh_remote("r3", "charlie", "charlie"),
+        ]);
+        // host_banner_server_ids reflects the visible host order (main first when multi-host).
+        assert_eq!(
+            model.host_banner_server_ids(),
+            vec![
+                ServerId::main(),
+                ServerId::secondary("r1"),
+                ServerId::secondary("r2"),
+                ServerId::secondary("r3"),
+            ]
+        );
+
+        // Drag r3 to the slot right after main (insert index 1 among the ordered host list).
+        assert!(model.reorder_server(&ServerId::secondary("r3"), 1));
+        let reordered = vec![
+            ServerId::main(),
+            ServerId::secondary("r3"),
+            ServerId::secondary("r1"),
+            ServerId::secondary("r2"),
+        ];
+        assert_eq!(model.host_banner_server_ids(), reordered);
+
+        // The registry poll lands again in its own (r1, r2, r3) order — the client-local drag
+        // order must persist instead of being clobbered.
+        model.sync_remote_registry(vec![
+            ssh_remote("r1", "alpha", "alpha"),
+            ssh_remote("r2", "bravo", "bravo"),
+            ssh_remote("r3", "charlie", "charlie"),
+        ]);
+        assert_eq!(model.host_banner_server_ids(), reordered);
+    }
+
+    #[test]
+    fn newly_added_remote_appends_after_reordered_hosts() {
+        // #40: a genuinely-new remote still appears, at the end, without disturbing the drag order.
+        let mut model = ClientSupervisorModel::new("local");
+        model.sync_remote_registry(vec![
+            ssh_remote("r1", "alpha", "alpha"),
+            ssh_remote("r2", "bravo", "bravo"),
+        ]);
+        assert!(model.reorder_server(&ServerId::secondary("r2"), 1));
+        // Sync adds r3 alongside the existing two.
+        model.sync_remote_registry(vec![
+            ssh_remote("r1", "alpha", "alpha"),
+            ssh_remote("r2", "bravo", "bravo"),
+            ssh_remote("r3", "charlie", "charlie"),
+        ]);
+        assert_eq!(
+            model.host_banner_server_ids(),
+            vec![
+                ServerId::main(),
+                ServerId::secondary("r2"),
+                ServerId::secondary("r1"),
+                ServerId::secondary("r3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn disconnected_host_keeps_individual_greyed_space_rows() {
+        // #36: a host that WAS connected (has summaries) keeps its individual space rows — greyed —
+        // when it drops, instead of collapsing to a single "unavailable" placeholder.
+        let mut model = ClientSupervisorModel::new("local");
+        let id = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model.set_connection_state(&id, ConnectionState::Connected).unwrap();
+        model
+            .set_summary(
+                &id,
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "ws-a".into(),
+                            label: "soma-work".into(),
+                            branch: None,
+                            focused: true,
+                            worktree_key: None,
+                            worktree_is_linked: false,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "ws-b".into(),
+                            label: "scratch".into(),
+                            branch: None,
+                            focused: false,
+                            worktree_key: None,
+                            worktree_is_linked: false,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        // Drop the connection — summaries are intentionally retained.
+        model.set_connection_state(&id, ConnectionState::Disconnected).unwrap();
+
+        let rows: Vec<_> = model
+            .workspace_rows()
+            .into_iter()
+            .filter(|row| row.server_id == id)
+            .collect();
+        // Both individual spaces still listed (NOT a single placeholder), and greyed (disabled).
+        assert_eq!(rows.len(), 2, "individual spaces persist, no placeholder collapse");
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-a"));
+        assert_eq!(rows[1].workspace_id.as_deref(), Some("ws-b"));
+        assert!(rows.iter().all(|row| row.disabled), "rows greyed while disconnected");
+    }
+
+    #[test]
+    fn worktree_grouped_space_is_not_reorderable() {
+        // #41: a worktree-grouped space must not arm a drag (storage move == visual no-op when
+        // regrouped under its parent); a standalone space stays reorderable.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "plain".into(),
+                            label: "plain".into(),
+                            branch: None,
+                            focused: false,
+                            worktree_key: None,
+                            worktree_is_linked: false,
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "wt-child".into(),
+                            label: "wt-child".into(),
+                            branch: None,
+                            focused: false,
+                            worktree_key: Some("repo-1".into()),
+                            worktree_is_linked: true,
+                        },
+                    ],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(model.workspace_is_reorderable(&ServerId::main(), "plain"));
+        assert!(!model.workspace_is_reorderable(&ServerId::main(), "wt-child"));
+        // Unknown workspace / server are not reorderable (no panic, false).
+        assert!(!model.workspace_is_reorderable(&ServerId::main(), "missing"));
+        assert!(!model.workspace_is_reorderable(&ServerId::secondary("nope"), "plain"));
     }
 
     #[test]

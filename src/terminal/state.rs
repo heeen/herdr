@@ -193,7 +193,14 @@ impl TerminalState {
         if process_exited
             && self.hook_authority_not_newer_than(now)
             && self.hook_authority.as_ref().is_some_and(|authority| {
-                crate::detect::parse_agent_label(&authority.agent_label) == agent
+                // #37: clear stale hook authority on process exit when it is no
+                // longer backed by a live process. Either the exiting process was
+                // this very agent (label matches the just-detected agent), or no
+                // agent is detected on screen any more (`agent` is None) so a
+                // leftover "working" hook must not persist. We still never clobber
+                // a hook report that is newer than this exit observation.
+                let authority_agent = crate::detect::parse_agent_label(&authority.agent_label);
+                authority_agent == agent || agent.is_none()
             })
         {
             self.hook_authority = None;
@@ -683,9 +690,17 @@ impl TerminalState {
     }
 
     pub fn is_agent_terminal(&self) -> bool {
-        self.agent_name.is_some()
-            || self.effective_agent_label().is_some()
-            || self.launch_argv.is_some()
+        // #37: classify a terminal as an agent only when a *live* agent signal is
+        // present, not merely a leftover launch record. `launch_argv` is a static
+        // description of how the pane was first spawned; it survives the agent
+        // process exiting (for panes that do not respawn a shell), so keying off
+        // it kept finished/non-agent panes showing as agents in the sidebar.
+        //
+        // `agent_name` is an explicit, deliberate marker (set by orchestration or
+        // the user) and stays authoritative. `effective_agent_label()` reflects a
+        // live hook authority or a currently-detected agent; both are cleared when
+        // the agent goes away, so they are safe live signals.
+        self.agent_name.is_some() || self.effective_agent_label().is_some()
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
@@ -764,6 +779,21 @@ impl TerminalState {
         }
 
         self.state = state;
+        // #37: trace effective agent state transitions so false positives /
+        // stuck "working" states are debuggable from the server log. Only fires
+        // on an actual change (the early-return above filters no-ops).
+        tracing::debug!(
+            subsystem = "agent",
+            event = "agent.state.transition",
+            terminal = %self.id,
+            previous_agent = ?previous_agent_label,
+            agent = ?agent_label,
+            previous_state = ?previous_state,
+            state = ?state,
+            has_hook_authority = self.hook_authority.is_some(),
+            detected_agent = ?self.detected_agent,
+            "effective agent state changed"
+        );
         Some(EffectiveStateChange {
             previous_agent_label,
             previous_known_agent,
@@ -2414,5 +2444,167 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    // #6: the stored sequence must only advance on a *successfully applied*
+    // report. A rejected report leaves the sequence untouched so the agent can
+    // replay a corrected payload at the same sequence; an accepted report
+    // consumes the sequence so a genuine duplicate at that sequence is dropped.
+
+    #[test]
+    fn rejected_then_corrected_report_at_same_sequence_is_accepted() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+
+        // Caller rejects this report: the label conflicts with the detected agent.
+        let rejected = terminal.set_hook_authority(
+            "herdr:codex".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(42),
+        );
+        assert!(rejected.is_none());
+        assert!(terminal.hook_authority.is_none());
+
+        // A corrected report at the SAME sequence must still be accepted because
+        // the rejected one never advanced the stored sequence.
+        let accepted = terminal.set_hook_authority(
+            "herdr:codex".into(),
+            "codex".into(),
+            AgentState::Working,
+            None,
+            Some(42),
+        );
+        assert!(accepted.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn accepted_report_consumes_sequence_so_same_sequence_is_a_duplicate() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+
+        let accepted = terminal.set_hook_authority(
+            "herdr:codex".into(),
+            "codex".into(),
+            AgentState::Working,
+            None,
+            Some(42),
+        );
+        assert!(accepted.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+
+        // A second report at the now-consumed sequence is a duplicate and is
+        // rejected even though its payload differs — the Working state is kept.
+        let duplicate = terminal.set_hook_authority(
+            "herdr:codex".into(),
+            "codex".into(),
+            AgentState::Idle,
+            None,
+            Some(42),
+        );
+        assert!(duplicate.is_none());
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    // #37: a leftover launch_argv must NOT keep a finished/non-agent pane
+    // classified as an agent. Only a live agent signal (agent_name or an
+    // effective agent label) counts.
+
+    #[test]
+    fn launch_argv_alone_is_not_an_agent_terminal() {
+        let terminal = TerminalState::new(TerminalId::alloc(), "/tmp".into())
+            .with_launch_argv(vec!["claude".into()]);
+
+        assert!(
+            !terminal.is_agent_terminal(),
+            "a leftover launch record must not classify a finished pane as an agent",
+        );
+    }
+
+    #[test]
+    fn live_detected_agent_is_an_agent_terminal() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert!(terminal.is_agent_terminal());
+
+        // When the agent goes away, the pane is no longer an agent terminal.
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(!terminal.is_agent_terminal());
+    }
+
+    #[test]
+    fn explicit_agent_name_is_an_agent_terminal() {
+        let mut terminal = test_terminal();
+        terminal.set_agent_name("planner".into());
+        assert!(terminal.is_agent_terminal());
+    }
+
+    // #37: process exit must reliably clear a stale "working" hook authority even
+    // when the agent has fully disappeared from the screen (detected agent None).
+
+    #[test]
+    fn process_exit_clears_working_hook_when_agent_fully_gone() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_hook_authority_with_custom_status_at(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            None,
+            None,
+            Some(1),
+            now,
+        );
+
+        // The agent process exits and no agent is detected on screen any more.
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            now + Duration::from_secs(1),
+        );
+
+        assert!(terminal.hook_authority.is_none());
+        assert!(!terminal.is_agent_terminal());
+        assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn process_exit_does_not_clear_newer_hook_when_agent_gone() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+
+        // A stale process-exit observation must not clobber a hook report that is
+        // newer than the exit.
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            now,
+        );
+        terminal.set_hook_authority_with_custom_status_at(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            None,
+            None,
+            Some(1),
+            now + Duration::from_secs(1),
+        );
+
+        assert!(terminal.hook_authority.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
     }
 }

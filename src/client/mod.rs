@@ -990,9 +990,13 @@ fn dispatch_composited_mouse_input(
         }
     }
 
-    if let Some(outcome) =
-        compositor.handle_sidebar_resize_mouse(mouse, host_size.0, host_size.1, model.ui_settings())
-    {
+    if let Some(outcome) = compositor.handle_sidebar_resize_mouse(
+        mouse,
+        host_size.0,
+        host_size.1,
+        model.ui_settings(),
+        Instant::now(),
+    ) {
         // #26: the outcome decides resize vs redraw — a drag or a double-click reset changes the
         // content width (resize the remote PTY); beginning/ending a drag only redraws.
         return match outcome {
@@ -1128,7 +1132,14 @@ fn dispatch_composited_mouse_input(
             workspace_id,
         } = &target
         {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            // #41: only arm a drag-reorder on a space the client can actually move. A worktree-
+            // grouped space is regrouped under its parent on render, so a storage reorder would be a
+            // visual no-op — arming it painted a drop indicator that "did nothing" on release. Skip
+            // the press for grouped spaces (matching the monolithic `worktree_space().is_none()`
+            // guard); the click still focuses-on-down via `dispatch_sidebar_hit_target` below.
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && model.workspace_is_reorderable(server_id, workspace_id)
+            {
                 compositor.begin_workspace_press(
                     server_id.clone(),
                     workspace_id.clone(),
@@ -2937,11 +2948,17 @@ fn refresh_main_local_summaries(model: &mut supervisor::ClientSupervisorModel) {
 
 fn refresh_client_supervisor_summaries(
     model: &mut supervisor::ClientSupervisorModel,
+    frame_cache: &mut HashMap<supervisor::ServerId, protocol::FrameData>,
     ssh_bridges: &HashMap<supervisor::ServerId, crate::remote::RemoteBridge>,
     pending_summary_refresh_server_ids: &mut HashSet<supervisor::ServerId>,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     refresh_main_local_summaries(model);
+    // #36: the registry sync above drops a remote that was deleted externally, but only the in-app
+    // Delete button tears a remote's stream down. Since #36 now RETAINS the last frame across an
+    // involuntary disconnect, prune any cached frame whose server is no longer in the model so a
+    // registry-removed remote can't leak its retained frame (or leave a dangling cache entry).
+    frame_cache.retain(|server_id, _| model.contains_server(server_id));
     let immediate_results = start_secondary_supervisor_summary_refreshes(
         model,
         ssh_bridges,
@@ -3161,6 +3178,7 @@ fn apply_remote_manage_request_finished(
             if let Some(model) = &mut state.supervisor_model {
                 refresh_client_supervisor_summaries(
                     model,
+                    &mut state.frame_cache,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3177,6 +3195,7 @@ fn apply_remote_manage_request_finished(
             if let Some(model) = &mut state.supervisor_model {
                 refresh_client_supervisor_summaries(
                     model,
+                    &mut state.frame_cache,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3195,6 +3214,7 @@ fn apply_remote_manage_request_finished(
                 model.remove_secondary(&server_id);
                 refresh_client_supervisor_summaries(
                     model,
+                    &mut state.frame_cache,
                     &state.ssh_bridges,
                     &mut state.pending_summary_refresh_server_ids,
                     event_tx,
@@ -3282,7 +3302,11 @@ fn handle_server_write_failure(
         "secondary server write failed; marking it disconnected"
     );
     server_writes.remove(&server_id);
-    state.frame_cache.remove(&server_id);
+    // #36: DON'T drop the last frame on an involuntary disconnect. Keep `frame_cache` so a switch to
+    // this (now greyed) host paints its last screen — selectable/copyable — instead of a blank, and
+    // so reconnect can transition from the cached frame to live without a blank flash. The retained
+    // summaries keep the host's individual space rows listed (greyed) rather than collapsing to one
+    // placeholder. A voluntary disable/delete still clears the cache via `teardown_secondary_connection`.
     state.summary_subscription_server_ids.remove(&server_id);
     state.pending_summary_refresh_server_ids.remove(&server_id);
     state
@@ -3449,8 +3473,17 @@ fn render_incoming_server_frame(
     mut frame_data: protocol::FrameData,
 ) {
     if let (Some(compositor), Some(model)) = (&state.compositor, &state.supervisor_model) {
-        state.frame_cache.insert(server_id.clone(), frame_data);
         let active_server_id = model.active_server_id().clone();
+        // #15 (part b): always keep the per-server frame cache fresh (so a later focus switch can
+        // paint the latest frame instantly), but only the ACTIVE server's frame is composed +
+        // encoded + flushed. A background server's content frame changes nothing the user can see —
+        // the sidebar is summary-driven and the content area shows only the active server — so
+        // decoding/encoding it was pure waste and let a fast background remote back up the event
+        // loop one stale frame at a time. Mirror the `Terminal` handler's active-server early-skip.
+        state.frame_cache.insert(server_id.clone(), frame_data);
+        if &active_server_id != server_id {
+            return;
+        }
         let Some(active_frame) =
             select_composited_render_frame(&state.frame_cache, &active_server_id, server_id)
         else {
@@ -4045,7 +4078,7 @@ async fn run_client_loop(
                     ServerMessage::ServerShutdown { reason } => {
                         if server_id != supervisor::ServerId::main() {
                             server_writes.remove(&server_id);
-                            state.frame_cache.remove(&server_id);
+                            // #36: keep the last frame so the greyed host shows its final screen.
                             state.summary_subscription_server_ids.remove(&server_id);
                             state.pending_summary_refresh_server_ids.remove(&server_id);
                             state
@@ -4201,6 +4234,7 @@ async fn run_client_loop(
                             if let Some(model) = &mut state.supervisor_model {
                                 refresh_client_supervisor_summaries(
                                     model,
+                                    &mut state.frame_cache,
                                     &state.ssh_bridges,
                                     &mut state.pending_summary_refresh_server_ids,
                                     &event_tx,
@@ -4341,6 +4375,7 @@ async fn run_client_loop(
                             state.last_summary_refresh.insert(server_id.clone(), now);
                             refresh_client_supervisor_summaries(
                                 model,
+                                &mut state.frame_cache,
                                 &state.ssh_bridges,
                                 &mut state.pending_summary_refresh_server_ids,
                                 &event_tx,
@@ -4443,6 +4478,7 @@ async fn run_client_loop(
                                     state.last_summary_refresh.insert(server_id.clone(), now);
                                     refresh_client_supervisor_summaries(
                                         model,
+                                        &mut state.frame_cache,
                                         &state.ssh_bridges,
                                         &mut state.pending_summary_refresh_server_ids,
                                         &event_tx,
@@ -4520,7 +4556,7 @@ async fn run_client_loop(
                     )));
                 }
                 server_writes.remove(&server_id);
-                state.frame_cache.remove(&server_id);
+                // #36: preserve the last frame on involuntary disconnect (see handle_server_write_failure).
                 state.summary_subscription_server_ids.remove(&server_id);
                 state.pending_summary_refresh_server_ids.remove(&server_id);
                 state
@@ -8332,6 +8368,40 @@ mod tests {
     }
 
     #[test]
+    fn background_server_frame_is_cached_but_not_rendered() {
+        // #15 (part b): a frame from a NON-active server updates the cache (so a later focus switch
+        // can paint it instantly) but must NOT trigger a compose/encode/flush — only the active
+        // server renders. `frame_stats.last_render_duration` is the render observable.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(test_remote_definition("remote-x", "x"));
+        model
+            .set_active_server(supervisor::ServerId::main())
+            .unwrap();
+        let mut state = test_client_state_with_model(model);
+        state.compositor = Some(compositor::ClientCompositor::new(26));
+
+        // Background (remote) frame: cached, but no render.
+        render_incoming_server_frame(&mut state, &remote_id, test_frame(20));
+        assert!(
+            state.frame_cache.contains_key(&remote_id),
+            "background frame must still be cached for instant switch"
+        );
+        assert!(
+            state.frame_stats.last_render_duration.is_none(),
+            "a background server's frame must not be composed/encoded/flushed"
+        );
+
+        // Active (main) frame: cached AND rendered.
+        let main = supervisor::ServerId::main();
+        render_incoming_server_frame(&mut state, &main, test_frame(30));
+        assert!(state.frame_cache.contains_key(&main));
+        assert!(
+            state.frame_stats.last_render_duration.is_some(),
+            "the active server's frame renders"
+        );
+    }
+
+    #[test]
     fn secondary_write_failure_disconnects_server_without_failing_client() {
         let now = Instant::now();
         let mut model = supervisor::ClientSupervisorModel::new("local");
@@ -8353,7 +8423,9 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(!state.frame_cache.contains_key(&remote_id));
+        // #36: the last frame is PRESERVED across an involuntary disconnect (so the greyed host can
+        // still paint its last screen / be copied, and reconnect has no blank flash).
+        assert!(state.frame_cache.contains_key(&remote_id));
         assert!(!state.summary_subscription_server_ids.contains(&remote_id));
         assert_eq!(
             state.supervisor_model.as_ref().unwrap().active_server_id(),

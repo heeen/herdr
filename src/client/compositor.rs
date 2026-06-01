@@ -22,6 +22,12 @@ pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 /// `DOUBLE_CLICK_WINDOW` (`src/app/input/mouse.rs`).
 const DIVIDER_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// #17: latest-wins throttle for the width-divider drag. A drag emits a content/PTY resize at most
+/// once per this interval (the sidebar still reflows locally every tick); the final settled size is
+/// always flushed on release. ~100ms ≈ 10 resizes/sec, well under the ~60/sec a raw drag produced
+/// that collapsed multi-server rendering to <5 fps.
+const SIDEBAR_RESIZE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// #23: the two fixed workspace context-menu rows, in render order. Kept here (ui-side strings) so
 /// the renderer and the geometry/hit-test that derive their row count from `.len()` cannot drift.
 /// Mirrors `ClientSupervisorModel::workspace_context_menu_items` (the supervisor side that maps a
@@ -167,6 +173,11 @@ pub(crate) struct ClientCompositor {
     resizing_section: bool,
     // #26: instant of the last left-press on the width divider, for double-click reset detection.
     last_divider_down: Option<Instant>,
+    // #17: instant of the last PTY-resize we emitted during the CURRENT width-divider drag. The
+    // sidebar reflows locally every drag tick, but the (expensive) remote PTY resize is latest-wins
+    // throttled to `SIDEBAR_RESIZE_THROTTLE`; the final settled size is always flushed on release.
+    // `None` between gestures so the first drag tick of a new drag resizes immediately.
+    last_resize_emitted: Option<Instant>,
     // #19: in-progress press on a workspace card, promoted to a drag-reorder past the threshold.
     workspace_press: Option<WorkspacePress>,
     // #19 (host half): in-progress press on a host banner, promoted to a host drag-reorder past
@@ -317,6 +328,7 @@ impl ClientCompositor {
             section_split: None,
             resizing_section: false,
             last_divider_down: None,
+            last_resize_emitted: None,
             workspace_press: None,
             host_press: None,
             scrollbar_drag: None,
@@ -465,6 +477,7 @@ impl ClientCompositor {
         host_width: u16,
         host_height: u16,
         settings: &crate::api::schema::UiSettingsInfo,
+        now: Instant,
     ) -> Option<SidebarResizeOutcome> {
         use crossterm::event::{MouseButton, MouseEventKind};
 
@@ -475,13 +488,14 @@ impl ClientCompositor {
                 // #26: a second press on the divider within the double-click window resets the
                 // width to the configured default (mirrors the host's divider double-click), rather
                 // than starting another drag. Clear the timestamp so a third click can't chain.
-                let now = Instant::now();
                 let double_click = self
                     .last_divider_down
                     .is_some_and(|prev| now.duration_since(prev) <= DIVIDER_DOUBLE_CLICK_WINDOW);
                 if double_click {
                     self.resizing_sidebar = false;
                     self.last_divider_down = None;
+                    // #17: a reset is a single settled size — clear the throttle so it ships now.
+                    self.last_resize_emitted = None;
                     self.sidebar_width = settings
                         .sidebar_default_width
                         .clamp(settings.sidebar_min_width, settings.sidebar_max_width);
@@ -491,6 +505,8 @@ impl ClientCompositor {
                 } else {
                     self.resizing_sidebar = true;
                     self.last_divider_down = Some(now);
+                    // #17: a fresh drag — clear the throttle so its first tick resizes immediately.
+                    self.last_resize_emitted = None;
                     // Starting a drag does not change the width yet — only redraw.
                     Some(SidebarResizeOutcome::Redraw)
                 }
@@ -507,11 +523,29 @@ impl ClientCompositor {
                     settings.sidebar_max_width,
                 );
                 let (cols, rows) = self.content_size(host_width, host_height);
-                Some(SidebarResizeOutcome::Resized(cols, rows))
+                // #17: latest-wins coalescing. Recompose the sidebar locally every tick (Redraw is
+                // cheap and client-local), but only push the expensive remote PTY resize at most once
+                // per SIDEBAR_RESIZE_THROTTLE. Intermediate ticks return Redraw so the divider still
+                // tracks the cursor without flooding every server with un-coalesced resizes (which
+                // each force a full-frame baseline reset + PTY reflow). The final size is flushed on Up.
+                let due = self
+                    .last_resize_emitted
+                    .map_or(true, |prev| now.duration_since(prev) >= SIDEBAR_RESIZE_THROTTLE);
+                if due {
+                    self.last_resize_emitted = Some(now);
+                    Some(SidebarResizeOutcome::Resized(cols, rows))
+                } else {
+                    Some(SidebarResizeOutcome::Redraw)
+                }
             }
             MouseEventKind::Up(MouseButton::Left) if self.resizing_sidebar => {
                 self.resizing_sidebar = false;
-                Some(SidebarResizeOutcome::Redraw)
+                // #17: always flush the final settled size on release, even if the last drag tick was
+                // throttled to a local-only Redraw — the committed size must match where the user
+                // released the divider (no stale size). Clear the throttle for the next gesture.
+                self.last_resize_emitted = None;
+                let (cols, rows) = self.content_size(host_width, host_height);
+                Some(SidebarResizeOutcome::Resized(cols, rows))
             }
             _ => None,
         }
@@ -3295,8 +3329,9 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
 
+        let t0 = Instant::now();
         assert_eq!(
-            compositor.handle_sidebar_resize_mouse(&press(25), 80, 24, settings),
+            compositor.handle_sidebar_resize_mouse(&press(25), 80, 24, settings, t0),
             Some(SidebarResizeOutcome::Redraw)
         );
         assert_eq!(compositor.sidebar_width(), 26);
@@ -3309,20 +3344,21 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
         assert!(matches!(
-            compositor.handle_sidebar_resize_mouse(&drag, 80, 24, settings),
+            compositor.handle_sidebar_resize_mouse(&drag, 80, 24, settings, t0),
             Some(SidebarResizeOutcome::Resized(..))
         ));
         assert_eq!(compositor.sidebar_width(), 19);
 
         // Two quick presses on the NEW divider column (18) → reset to default, reported as a
         // resize. The drag cleared the press timestamp, so the first of these starts a fresh
-        // double-click window (redraw) and the second triggers the reset.
+        // double-click window (redraw) and the second triggers the reset. Both presses share a `now`
+        // inside the double-click window.
         assert_eq!(
-            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings),
+            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings, t0),
             Some(SidebarResizeOutcome::Redraw)
         );
         assert!(matches!(
-            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings),
+            compositor.handle_sidebar_resize_mouse(&press(18), 80, 24, settings, t0),
             Some(SidebarResizeOutcome::Resized(..))
         ));
         assert_eq!(
@@ -3331,6 +3367,73 @@ mod tests {
                 .sidebar_default_width
                 .clamp(settings.sidebar_min_width, settings.sidebar_max_width)
         );
+    }
+
+    // #17: a width-divider drag must coalesce its (expensive) remote PTY resizes latest-wins —
+    // emit one immediately, throttle intermediate ticks to local-only Redraw, and ALWAYS flush the
+    // final settled size on release so the committed size matches where the divider was let go.
+    #[test]
+    fn divider_drag_coalesces_resizes_and_flushes_on_release() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let model = single_server_two_ws_model();
+        let mut compositor = ClientCompositor::new(26);
+        let settings = model.ui_settings();
+        let t0 = Instant::now();
+
+        let down = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 25, // divider at sidebar_width(26) - 1
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let drag = |column: u16| crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let up = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 20,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // Press starts the drag (no resize yet) and clears the throttle.
+        assert_eq!(
+            compositor.handle_sidebar_resize_mouse(&down, 80, 24, settings, t0),
+            Some(SidebarResizeOutcome::Redraw)
+        );
+
+        // First drag tick resizes immediately (throttle was cleared).
+        assert!(matches!(
+            compositor.handle_sidebar_resize_mouse(&drag(24), 80, 24, settings, t0),
+            Some(SidebarResizeOutcome::Resized(..))
+        ));
+
+        // A second tick 40ms later is within the 100ms throttle → local-only Redraw, no PTY resize.
+        let t_soon = t0 + std::time::Duration::from_millis(40);
+        assert_eq!(
+            compositor.handle_sidebar_resize_mouse(&drag(22), 80, 24, settings, t_soon),
+            Some(SidebarResizeOutcome::Redraw)
+        );
+        // ...but the sidebar still tracks the cursor locally every tick.
+        assert_eq!(compositor.sidebar_width(), 23);
+
+        // A tick past the throttle window resizes again (latest-wins).
+        let t_late = t0 + std::time::Duration::from_millis(120);
+        assert!(matches!(
+            compositor.handle_sidebar_resize_mouse(&drag(21), 80, 24, settings, t_late),
+            Some(SidebarResizeOutcome::Resized(..))
+        ));
+
+        // Release always flushes the final settled size as a resize (even though the previous tick
+        // already resized) so the committed size can never be stale.
+        let t_up = t0 + std::time::Duration::from_millis(125);
+        assert!(matches!(
+            compositor.handle_sidebar_resize_mouse(&up, 80, 24, settings, t_up),
+            Some(SidebarResizeOutcome::Resized(..))
+        ));
     }
 
     // #19: `block_insert_global_index` resolves a render-order drop to a GLOBAL index slot. The

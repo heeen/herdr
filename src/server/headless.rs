@@ -630,6 +630,9 @@ impl HeadlessServer {
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
             self.app.state.remote_registry.clone(),
+            // #37: carry the cumulative pane-id alias map across the live handoff so an agent's
+            // spawn-time HERDR_PANE_ID keeps resolving (otherwise pane.report_agent fails post-handoff).
+            &self.app.state.pane_id_aliases,
         );
 
         let mut handoff_entries = Vec::new();

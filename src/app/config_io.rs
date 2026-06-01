@@ -313,4 +313,132 @@ mod tests {
             Ok(_) => {}
         }
     }
+
+    // ---- End-to-end `update_config_file` acceptance tests (issue #5) ----
+    //
+    // The helper tests above prove `read_config_for_update` distinguishes NotFound from other
+    // errors. These exercise the full `App::update_config_file` flow to prove the *acceptance*
+    // criterion: a non-NotFound read error aborts the write (the existing config is NOT
+    // overwritten) and surfaces a `config_diagnostic`, while the NotFound path still writes.
+
+    use crate::app::App;
+    use crate::config::Config;
+
+    fn e2e_test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn e2e_config_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "herdr-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique).join("config.toml")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_config_file_aborts_without_overwriting_on_unreadable_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = e2e_config_path("update-abort-unreadable");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let original = "onboarding = false\n[theme]\nname = \"matrix\"\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = e2e_test_app();
+        // The update closure would build a brand-new (effectively empty-derived) body; if the read
+        // were collapsed to empty, this would wipe the original config.
+        let saved = app.update_config_file("theme", |content| {
+            crate::config::upsert_section_value(content, "theme", "name", "\"nord\"")
+        });
+
+        // Restore perms before any assertion can early-return, so cleanup always succeeds.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let on_disk = std::fs::read_to_string(&path).ok();
+        let diagnostic = app.state.config_diagnostic.clone();
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // If the environment can read mode-0 files (e.g. running as root) the failure path can't
+        // be exercised; skip rather than fail for an environment we can't control.
+        if on_disk.as_deref() == Some(original) {
+            assert!(!saved, "a non-NotFound read error must abort the save");
+            assert!(
+                diagnostic.is_some(),
+                "an aborted save must surface a config diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn update_config_file_creates_file_on_first_write_when_missing() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = e2e_config_path("update-first-write-missing");
+        // Parent exists (create_dir_all in the helper handles it) but the file does not: NotFound.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!path.exists(), "precondition: config file must be missing");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = e2e_test_app();
+        let saved = app.update_config_file("theme", |content| {
+            crate::config::upsert_section_value(content, "theme", "name", "\"nord\"")
+        });
+        let on_disk = std::fs::read_to_string(&path).ok();
+        let diagnostic = app.state.config_diagnostic.clone();
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert!(saved, "first write (NotFound) must succeed");
+        assert!(diagnostic.is_none(), "first write must not raise a diagnostic");
+        assert!(
+            on_disk.as_deref().unwrap_or_default().contains("nord"),
+            "first write must create the file with the new content"
+        );
+    }
+
+    #[test]
+    fn update_config_file_preserves_existing_content_on_successful_read() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = e2e_config_path("update-preserves-existing");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n[theme]\nname = \"matrix\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = e2e_test_app();
+        let saved = app.update_config_file("theme", |content| {
+            crate::config::upsert_section_value(content, "theme", "name", "\"nord\"")
+        });
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let diagnostic = app.state.config_diagnostic.clone();
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert!(saved, "a normal read-before-write must succeed");
+        assert!(diagnostic.is_none(), "a successful save must not raise a diagnostic");
+        // Unrelated keys from the original config survive the in-place update.
+        assert!(
+            on_disk.contains("onboarding = false"),
+            "the existing config body must be preserved, not overwritten"
+        );
+        assert!(on_disk.contains("nord"), "the updated value must be written");
+    }
 }

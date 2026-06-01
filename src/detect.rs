@@ -353,8 +353,27 @@ fn detect_cline(content: &str) -> AgentState {
         return AgentState::Idle;
     }
 
-    // Cline defaults to working (unlike most agents that default to idle)
-    AgentState::Working
+    // #37: require a positive working signal instead of defaulting to Working.
+    // A blank/ambiguous Cline screen (or stale scrollback) previously produced a
+    // false "working" agent in the sidebar. Cline prints a live cancel/streaming
+    // control while a request is in flight; treat only those as Working.
+    if has_cline_working_signal(&lower) {
+        return AgentState::Working;
+    }
+
+    AgentState::Idle
+}
+
+/// Positive working signals for Cline. Cline renders an "API Request" / "Cline is
+/// working" status while a turn is in flight; none of these appear on an idle or
+/// empty screen. A bare `esc to cancel` / `(esc)` is deliberately NOT a signal: it
+/// also appears on idle confirmation prompts (e.g. "press enter to confirm or esc
+/// to cancel"), which would re-introduce the very #37 phantom-working state this
+/// fix removes.
+fn has_cline_working_signal(lower_content: &str) -> bool {
+    lower_content.contains("cline is working")
+        || lower_content.contains("api request")
+        || (lower_content.contains("cancel") && lower_content.contains("streaming"))
 }
 
 fn detect_opencode(content: &str) -> AgentState {
@@ -2115,9 +2134,25 @@ mod tests {
     }
 
     #[test]
-    fn cline_defaults_to_working() {
-        // Cline's default is working (unlike other agents)
-        assert_eq!(detect_cline("some random output"), AgentState::Working);
+    fn cline_without_signal_defaults_to_idle() {
+        // #37: an ambiguous/blank Cline screen must NOT default to Working — that
+        // produced phantom "working" agents in the sidebar. Without a positive
+        // working signal the pane is treated as Idle.
+        assert_eq!(detect_cline("some random output"), AgentState::Idle);
+        assert_eq!(detect_cline(""), AgentState::Idle);
+    }
+
+    #[test]
+    fn cline_working_with_positive_signal() {
+        // #37: Cline is Working only when a live working signal is on screen.
+        assert_eq!(
+            detect_cline("Cline is working...\nesc to cancel"),
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_cline("API Request in progress"),
+            AgentState::Working
+        );
     }
 
     // ---- OpenCode ----

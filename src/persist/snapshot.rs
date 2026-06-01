@@ -30,6 +30,14 @@ pub struct SessionSnapshot {
     pub collapsed_space_keys: std::collections::HashSet<String>,
     #[serde(default)]
     pub remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
+    /// #37: cumulative pane-id alias map (original spawn-time raw → current raw) carried across a
+    /// live handoff. An agent's `HERDR_PANE_ID` env is fixed at spawn; each handoff re-allocates
+    /// pane ids, so without persisting the prior aliases the original id stops resolving after the
+    /// SECOND id-changing handoff and every `pane.report_agent` then fails (`pane_not_found`),
+    /// dropping authoritative state. Persisting + composing this map keeps the original id resolving
+    /// across any number of handoffs. `#[serde(default)]` → older snapshots restore as today.
+    #[serde(default)]
+    pub pane_id_aliases: std::collections::HashMap<u32, u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,6 +186,8 @@ struct RawSessionSnapshot {
     collapsed_space_keys: std::collections::HashSet<String>,
     #[serde(default)]
     remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
+    #[serde(default)]
+    pane_id_aliases: std::collections::HashMap<u32, u32>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -195,6 +205,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
         remote_registry: raw.remote_registry,
+        pane_id_aliases: raw.pane_id_aliases,
     })
 }
 
@@ -259,6 +270,7 @@ pub fn capture(
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
     remote_registry: crate::remote_registry::RemoteRegistrySnapshot,
+    pane_id_aliases: &std::collections::HashMap<u32, crate::layout::PaneId>,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -273,6 +285,12 @@ pub fn capture(
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
         remote_registry,
+        // #37: lower the app's live alias map (orig spawn raw -> current PaneId) to the wire form
+        // here, so every caller passes its `pane_id_aliases` directly instead of re-deriving this.
+        pane_id_aliases: pane_id_aliases
+            .iter()
+            .map(|(orig, current)| (*orig, current.raw()))
+            .collect(),
     }
 }
 
@@ -527,6 +545,7 @@ mod tests {
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
             state.remote_registry.clone(),
+            &state.pane_id_aliases,
         )
     }
 
@@ -547,6 +566,7 @@ mod tests {
     #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
+            pane_id_aliases: std::collections::HashMap::new(),
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
@@ -583,6 +603,7 @@ mod tests {
     #[test]
     fn snapshot_round_trip_preserves_remote_registry_definitions_only() {
         let snap = SessionSnapshot {
+            pane_id_aliases: std::collections::HashMap::new(),
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
@@ -663,6 +684,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            pane_id_aliases: std::collections::HashMap::new(),
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
@@ -1197,6 +1219,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            pane_id_aliases: std::collections::HashMap::new(),
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
