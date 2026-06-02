@@ -148,6 +148,14 @@ struct ClientState {
     pending_update_remote: HashSet<supervisor::ServerId>,
     /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
     last_animation_tick: Instant,
+    /// #48: a sidebar hover changed the highlighted row but its render is DEFERRED (latest-wins
+    /// coalescing). The select loop flushes it within one frame budget via `next_select_deadline`,
+    /// so a fast motion sweep that floods one `Moved` per crossed row renders at most once per
+    /// frame instead of once per event. Cleared by every composited frame (`flush_composited_frame`).
+    pending_hover_render: bool,
+    /// #48: when the last composited frame was flushed. Anchors the hover-render frame-budget clamp
+    /// in `next_select_deadline` so deferred hover repaints are capped at ~60fps.
+    last_composited_render_at: Instant,
     /// item 6 (Area 6): last time each connected secondary's summary refresh was STARTED. Drives
     /// the adaptive cadence in `due_secondary_summary_refreshes` (400ms active / 2s background)
     /// and is recorded on start and on completion so a slow SSH fetch does not stack.
@@ -342,6 +350,13 @@ enum ClientInputDispatch {
     },
     DetachAll,
     Redraw,
+    /// #48: a sidebar hover changed the highlighted row — a presentation-only change of a couple of
+    /// cells, NOT a model/view mutation. Distinguished from [`Redraw`] so the main loop takes the
+    /// lightweight `request_hover_redraw` path (rebuild the shell so the new highlight is painted by
+    /// the one render source of truth, but PRESERVE the blit-encoder diff baseline so only the ~2
+    /// changed rows are written — never a full-screen repaint) instead of the `request_full_redraw`
+    /// sledgehammer a genuine model change needs.
+    HoverRedraw,
     Consumed,
 }
 
@@ -1105,7 +1120,11 @@ fn dispatch_composited_mouse_input(
             let next =
                 compositor.hover_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
             return if compositor.set_hover(next) {
-                ClientInputDispatch::Redraw
+                // #48: a hover change is presentation-only — a couple of highlighted cells, not a
+                // model/view mutation. Route it to the lightweight `HoverRedraw` path (rebuild the
+                // shell so the new highlight paints, but keep the blit diff baseline so only the
+                // changed rows hit the terminal) instead of the full-redraw `Redraw` sledgehammer.
+                ClientInputDispatch::HoverRedraw
             } else {
                 ClientInputDispatch::Consumed
             };
@@ -1659,6 +1678,20 @@ impl ClientState {
         // #45: a full repaint is requested precisely when the sidebar model/view changed too (every
         // such event handler calls this). Drop the cached shell so the next compose rebuilds it —
         // otherwise a reused content frame would paint a stale sidebar over fresh model state.
+        self.shell_cache = None;
+    }
+
+    /// #48: the lightweight redraw for a sidebar HOVER change (a presentation-only highlight of a
+    /// couple of cells). It drops the cached shell — like [`request_full_redraw`] — so the rebuild
+    /// repaints the moved highlight through the one render source of truth (the hover is baked into
+    /// the shell when `build_shell` mirrors `compositor.set_hover`'s truth into the rendered
+    /// snapshot, so a stale cache would show the old highlight). But UNLIKE
+    /// `request_full_redraw` it does NOT reset the blit encoder: the diff baseline is preserved, so
+    /// the next frame writes only the ~2 changed rows to the terminal instead of re-encoding +
+    /// flushing the entire screen. Resetting it (as the old `Redraw` path did) turned every
+    /// mouse-motion event that crossed a row boundary into a full-screen repaint, dropping fast
+    /// motion to <1fps (#48).
+    fn request_hover_redraw(&mut self) {
         self.shell_cache = None;
     }
 }
@@ -3447,13 +3480,25 @@ fn next_select_deadline(
     now: Instant,
     last_animation_tick: Instant,
     wants_animation: bool,
+    pending_hover_render: bool,
+    last_composited_render_at: Instant,
 ) -> Instant {
     let housekeeping = now + Duration::from_millis(100);
-    if wants_animation {
+    let mut deadline = if wants_animation {
         housekeeping.min(last_animation_tick + CLIENT_ANIMATION_INTERVAL)
     } else {
         housekeeping
+    };
+    // #48: a sidebar hover defers its render (latest-wins coalescing) instead of repainting per
+    // motion event. Wake within one frame budget of the last composited frame to flush the pending
+    // hover highlight — capped at 60fps so a fast motion sweep that floods one `Moved` per crossed
+    // row renders at most once per frame, never once per event. `.max(now)` keeps the deadline in
+    // the present (not the past) when more than a budget has already elapsed → flush next tick.
+    if pending_hover_render {
+        let hover_deadline = (last_composited_render_at + CLIENT_60FPS_FRAME_BUDGET).max(now);
+        deadline = deadline.min(hover_deadline);
     }
+    deadline
 }
 
 /// item 5: whether the gated animation step should advance the tick this Timer event. True only
@@ -4017,6 +4062,11 @@ fn flush_composited_frame(
     let _ = stdout.flush();
     let flush_elapsed = flush_started.elapsed();
     state.blit_encoder.commit(frame_data, encoded);
+    // #48: any composited frame we flush already reflects the compositor's current hover, so a
+    // deferred hover repaint is no longer outstanding. Stamp the time so the hover-render clamp in
+    // `next_select_deadline` paces the NEXT deferred repaint off this frame (capping it at ~60fps).
+    state.pending_hover_render = false;
+    state.last_composited_render_at = Instant::now();
     record_client_frame_sample_split(
         state,
         compose_elapsed,
@@ -4170,6 +4220,8 @@ async fn run_client_loop(
         manually_disconnected: HashSet::new(),
         pending_update_remote: HashSet::new(),
         last_animation_tick: Instant::now(),
+        pending_hover_render: false,
+        last_composited_render_at: Instant::now(),
         last_summary_refresh: HashMap::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
@@ -4291,8 +4343,13 @@ async fn run_client_loop(
                     .compositor
                     .as_ref()
                     .is_some_and(compositor::ClientCompositor::sidebar_width_animating));
-        let deadline =
-            next_select_deadline(Instant::now(), state.last_animation_tick, wants_animation);
+        let deadline = next_select_deadline(
+            Instant::now(),
+            state.last_animation_tick,
+            wants_animation,
+            state.pending_hover_render,
+            state.last_composited_render_at,
+        );
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => ClientLoopEvent::Timer,
@@ -4551,6 +4608,18 @@ async fn run_client_loop(
                             ClientInputDispatch::Redraw => {
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::HoverRedraw => {
+                                // #48: a sidebar hover is presentation-only. Drop the shell cache so
+                                // the rebuild paints the new highlight, but KEEP the blit baseline so
+                                // only the changed rows are written (no full-screen repaint). The
+                                // render is DEFERRED (latest-wins): a fast motion sweep floods one
+                                // `Moved` per crossed row, so instead of repainting per event we mark
+                                // a render pending and let `next_select_deadline` flush it within one
+                                // frame budget — at most one repaint per frame, tracking the cursor.
+                                state.request_hover_redraw();
+                                state.pending_hover_render = true;
                                 continue;
                             }
                             ClientInputDispatch::Consumed => continue,
@@ -5340,6 +5409,21 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
                 let now = Instant::now();
+                // #48: flush a deferred (coalesced) sidebar hover repaint. The HoverRedraw dispatch
+                // only marks this pending and drops the shell cache; the actual rebuild + diff-write
+                // happens here, gated by the frame-budget deadline `next_select_deadline` set — so a
+                // motion-event flood collapses to at most one repaint per frame (latest-wins). The
+                // render reads the compositor's current hover, so intermediate positions are simply
+                // skipped. `render_cached_composited_frame` → `flush_composited_frame` clears the
+                // flag, so housekeeping below that itself repaints won't double-render.
+                if state.pending_hover_render {
+                    // Clear BEFORE rendering: `flush_composited_frame` clears it on the normal path,
+                    // but clearing here too keeps a `render_cached_composited_frame` early-return
+                    // (model/compositor absent) from leaving the flag set — which would busy-spin the
+                    // frame-budget-clamped deadline. Defensive; that path is unreachable today.
+                    state.pending_hover_render = false;
+                    render_cached_composited_frame(&mut state);
+                }
                 sample_download_rates(&mut state, now);
                 // issue #13: probe each connected server's latency over its persistent stream.
                 if now.duration_since(state.last_ping_at) >= SERVER_PING_INTERVAL {
@@ -6115,6 +6199,8 @@ mod tests {
             manually_disconnected: HashSet::new(),
             pending_update_remote: HashSet::new(),
             last_animation_tick: Instant::now(),
+            pending_hover_render: false,
+            last_composited_render_at: Instant::now(),
             last_summary_refresh: HashMap::new(),
         }
     }
@@ -6139,6 +6225,64 @@ mod tests {
         assert!(
             state.shell_cache.is_none(),
             "request_full_redraw must drop the cached shell so the sidebar can't go stale (#45)"
+        );
+    }
+
+    /// #48: helper — commit a baseline frame into a state's blit encoder, then report whether
+    /// re-encoding a one-cell-changed frame is a full repaint (`true`) or a diff (`false`). A diff
+    /// proves the blit baseline survived; a full write proves it was reset.
+    fn next_encode_is_full_after(
+        state: &mut ClientState,
+        reset: impl FnOnce(&mut ClientState),
+    ) -> bool {
+        let baseline = protocol::FrameData::blank(80, 24);
+        let encoded = state.blit_encoder.encode(&baseline, false);
+        state.blit_encoder.commit(baseline.clone(), encoded);
+        reset(state);
+        let mut next = baseline.clone();
+        next.cells[0].symbol = "X".into();
+        state.blit_encoder.encode(&next, false).full
+    }
+
+    /// #48: a sidebar hover is presentation-only. Like `request_full_redraw` it drops the cached
+    /// shell (so the rebuild repaints the moved highlight), but UNLIKE it the blit-encoder diff
+    /// baseline is PRESERVED — so the next frame writes only the changed rows, not the whole screen.
+    /// Resetting the baseline on every hover was the <1fps regression this issue fixes.
+    #[test]
+    fn request_hover_redraw_drops_shell_but_keeps_blit_baseline() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+        let mut state = test_client_state_with_model(model);
+        let compositor = compositor::ClientCompositor::default();
+        let shell = {
+            let model = state.supervisor_model.as_ref().expect("model present");
+            compositor.build_shell(model, 80, 24, Instant::now())
+        };
+        state.shell_cache = Some(shell);
+
+        let next_is_full = next_encode_is_full_after(&mut state, |s| s.request_hover_redraw());
+
+        assert!(
+            state.shell_cache.is_none(),
+            "#48: hover redraw must drop the cached shell so the moved highlight is repainted"
+        );
+        assert!(
+            !next_is_full,
+            "#48: hover redraw must PRESERVE the blit diff baseline (no full-screen repaint)"
+        );
+    }
+
+    /// Counterpart locking the contrast: a genuine model change (`request_full_redraw`) DOES reset
+    /// the blit baseline, so the following frame is a full repaint. This is what a hover must NOT do.
+    #[test]
+    fn request_full_redraw_resets_blit_baseline() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+        let mut state = test_client_state_with_model(model);
+
+        let next_is_full = next_encode_is_full_after(&mut state, |s| s.request_full_redraw());
+
+        assert!(
+            next_is_full,
+            "request_full_redraw must reset the blit baseline so the next frame is a full repaint"
         );
     }
 
@@ -8412,10 +8556,11 @@ mod tests {
         let host = (60u16, 24u16);
         let row = remote_workspace_row(&compositor, &model, &remote_id, host);
 
-        // first motion over the row → Redraw (hover changed from None).
+        // #48: first motion over the row → HoverRedraw (hover changed from None) — the lightweight,
+        // diff-only path, NOT a full Redraw.
         assert_eq!(
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
+            ClientInputDispatch::HoverRedraw
         );
         assert!(matches!(
             compositor.hover(),
@@ -8438,12 +8583,13 @@ mod tests {
         // establish a sidebar hover.
         assert_eq!(
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
+            ClientInputDispatch::HoverRedraw
         );
-        // motion into the content area clears the hover → exactly one Redraw.
+        // motion into the content area clears the hover → exactly one HoverRedraw (#48: clearing the
+        // highlight is still a presentation-only change).
         assert_eq!(
             dispatch_composited_input(moved_bytes(40, 3), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
+            ClientInputDispatch::HoverRedraw
         );
         assert_eq!(compositor.hover(), None);
         // #31: a second content motion (no prior hover) falls through to
@@ -8488,7 +8634,9 @@ mod tests {
             assert!(
                 matches!(
                     dispatch,
-                    ClientInputDispatch::Redraw | ClientInputDispatch::Consumed
+                    ClientInputDispatch::HoverRedraw
+                        | ClientInputDispatch::Redraw
+                        | ClientInputDispatch::Consumed
                 ),
                 "hover motion produced non-hover dispatch {dispatch:?} at row {row}"
             );
@@ -9872,21 +10020,46 @@ mod tests {
         let last = now - Duration::from_millis(30);
 
         // Active: min(now + 100ms housekeeping, last + 80ms animation). last + 80ms = now + 50ms
-        // is sooner, so it wins.
-        let active = next_select_deadline(now, last, true);
+        // is sooner, so it wins. (No hover render pending → hover clamp is inert.)
+        let active = next_select_deadline(now, last, true, false, now);
         assert_eq!(active, last + CLIENT_ANIMATION_INTERVAL);
         assert_eq!(active, now + Duration::from_millis(50));
 
         // Inactive: always the 100ms housekeeping deadline (idle behavior unchanged).
-        let idle = next_select_deadline(now, last, false);
+        let idle = next_select_deadline(now, last, false, false, now);
         assert_eq!(idle, now + Duration::from_millis(100));
 
         // Active but the animation deadline is further out than housekeeping → housekeeping
         // wins. last + 80ms must exceed now + 100ms, i.e. last is >20ms in the future.
         let far_last = now + Duration::from_millis(50);
-        let active_far = next_select_deadline(now, far_last, true);
+        let active_far = next_select_deadline(now, far_last, true, false, now);
         assert_eq!(active_far, now + Duration::from_millis(100));
         assert!(far_last + CLIENT_ANIMATION_INTERVAL > now + Duration::from_millis(100));
+    }
+
+    /// #48: a pending hover render clamps the select deadline to within one frame budget of the
+    /// last composited frame, so the deferred (latest-wins) hover highlight flushes at ≤60fps —
+    /// never the 100ms housekeeping latency, and never once-per-motion-event.
+    #[test]
+    fn next_select_deadline_clamps_to_frame_budget_for_pending_hover() {
+        let now = Instant::now();
+        let last_anim = now - Duration::from_millis(30);
+
+        // Last composited frame was a full budget ago → flush on the very next tick (≈ now), not at
+        // the 100ms housekeeping deadline.
+        let stale = now - CLIENT_60FPS_FRAME_BUDGET;
+        let due = next_select_deadline(now, last_anim, false, true, stale);
+        assert_eq!(due, now, "an overdue pending hover must flush immediately (clamped to now)");
+
+        // Mid-budget: deadline rides last_render + one frame budget, well under 100ms housekeeping.
+        let recent = now - Duration::from_millis(5);
+        let soon = next_select_deadline(now, last_anim, false, true, recent);
+        assert_eq!(soon, recent + CLIENT_60FPS_FRAME_BUDGET);
+        assert!(soon < now + Duration::from_millis(100));
+
+        // No hover pending → the clamp is inert (idle/animation behavior unchanged).
+        let inert = next_select_deadline(now, last_anim, false, false, stale);
+        assert_eq!(inert, now + Duration::from_millis(100));
     }
 
     #[test]
