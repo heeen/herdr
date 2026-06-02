@@ -516,7 +516,9 @@ fn render_content_and_overlays(
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
-        Mode::GlobalMenu if include_global_surfaces => render_global_launcher_menu(app, frame),
+        Mode::GlobalMenu if include_global_surfaces => {
+            render_global_launcher_menu(app, frame, app.global_menu_rect())
+        }
         Mode::GlobalMenu => {}
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, frame),

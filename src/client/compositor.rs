@@ -228,8 +228,20 @@ pub(crate) struct ClientCompositor {
     // `from_model` (sets `app.collapsed_space_keys`) so the SHARED grouping renderer collapses the
     // right groups.
     collapsed_space_keys: std::collections::HashSet<String>,
+    // #47: an in-progress drag of the open client menu's top border. `Some` between the mousedown on
+    // the title row and the button release; carries the press origin + the menu's offset at press, so
+    // each motion sets the new offset = start_offset + (mouse - start). Cleared on release/close.
+    menu_drag: Option<ClientMenuDrag>,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
+}
+
+/// #47: the in-progress state of dragging the open client menu's top border to reposition it.
+#[derive(Debug, Clone, Copy)]
+struct ClientMenuDrag {
+    start_col: u16,
+    start_row: u16,
+    start_offset: (i16, i16),
 }
 
 /// #45: the cached, content-independent half of a composited client frame.
@@ -395,6 +407,7 @@ impl ClientCompositor {
             prefix_armed: false,
             prefix_pending_bytes: None,
             collapsed_space_keys: std::collections::HashSet::new(),
+            menu_drag: None,
             working_since: HashMap::new(),
         }
     }
@@ -1234,16 +1247,9 @@ impl ClientCompositor {
                 menu.kind,
                 crate::client::supervisor::ClientMenuKind::GlobalLauncher
             ) {
-                excluded_rects.extend(snapshot.global_menu_rect());
+                excluded_rects.extend(launcher_menu_rect(&snapshot, host_width, host_height));
             } else {
-                excluded_rects.extend(crate::ui::client_menu_popup_rect_at(
-                    menu.anchor_col,
-                    menu.anchor_row,
-                    menu.items.len(),
-                    client_menu_header_rows(menu),
-                    host_width,
-                    host_height,
-                ));
+                excluded_rects.extend(context_menu_popup_rect(menu, host_width, host_height));
             }
         } else if snapshot.rename_workspace.is_some() {
             excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
@@ -1394,7 +1400,8 @@ impl ClientCompositor {
                 menu.kind,
                 crate::client::supervisor::ClientMenuKind::GlobalLauncher
             ) {
-                return global_menu_item_index_at(&snapshot.app, x, y)
+                return launcher_menu_rect(&snapshot, host_width, host_height)
+                    .and_then(|rect| global_menu_item_index_at(&snapshot.app, rect, x, y))
                     .map(|index| SidebarHitTarget::ClientMenuRow { index });
             }
             return hit_test_client_menu(&snapshot, host_width, host_height, x, y);
@@ -1617,6 +1624,91 @@ impl ClientCompositor {
         }
 
         hover_test_agent_panel(&snapshot, x, y)
+    }
+
+    /// #47: the open client menu's CURRENT popup rect (its default position shifted by any drag
+    /// offset, clamped on-screen), or `None` when no menu is open / it does not fit. The launcher
+    /// uses its `global_menu_rect` dropdown; the context menus use the cursor-anchored helper.
+    fn client_menu_popup_rect(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<Rect> {
+        let sidebar_width = self.effective_sidebar_width(host_width);
+        if sidebar_width == 0 || host_height == 0 {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            sidebar_width,
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let menu = snapshot.client_menu.as_ref()?;
+        if matches!(
+            menu.kind,
+            crate::client::supervisor::ClientMenuKind::GlobalLauncher
+        ) {
+            launcher_menu_rect(&snapshot, host_width, host_height)
+        } else {
+            context_menu_popup_rect(menu, host_width, host_height)
+        }
+    }
+
+    /// #47: feed a mouse event to the open client menu's TOP-BORDER drag-to-move. A left-press on the
+    /// popup's top border row starts a drag; each `Drag` moves the menu by the pointer delta (the new
+    /// offset = the offset at press + travel); the release ends it. Returns `Some(changed)` when the
+    /// event was part of a drag (the caller redraws iff changed and does NOT also select/dismiss), or
+    /// `None` when the event is not drag-related (the caller continues its normal handling). A press
+    /// anywhere but the top border returns `None`, so row-select / outside-dismiss still work.
+    pub(crate) fn handle_client_menu_drag(
+        &mut self,
+        model: &mut crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<bool> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if model.client_menu().is_none() {
+            self.menu_drag = None;
+            return None;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let popup = self.client_menu_popup_rect(model, host_width, host_height)?;
+                let on_top_border = mouse.row == popup.y
+                    && mouse.column >= popup.x
+                    && mouse.column < popup.x.saturating_add(popup.width);
+                if !on_top_border {
+                    return None;
+                }
+                let start_offset = model.client_menu().map(|menu| menu.drag_offset)?;
+                self.menu_drag = Some(ClientMenuDrag {
+                    start_col: mouse.column,
+                    start_row: mouse.row,
+                    start_offset,
+                });
+                Some(false)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let drag = self.menu_drag?;
+                let dx = mouse.column as i32 - drag.start_col as i32;
+                let dy = mouse.row as i32 - drag.start_row as i32;
+                let next = (
+                    (drag.start_offset.0 as i32 + dx) as i16,
+                    (drag.start_offset.1 as i32 + dy) as i16,
+                );
+                let changed = model.client_menu().map(|menu| menu.drag_offset) != Some(next);
+                model.set_client_menu_drag_offset(next);
+                Some(changed)
+            }
+            MouseEventKind::Up(_) => self.menu_drag.take().map(|_| false),
+            _ => None,
+        }
     }
 }
 
@@ -2030,12 +2122,6 @@ impl ClientSidebarSnapshot {
         }
     }
 
-    /// #47: the open global launcher's original dropdown rect (the AppState surface), or `None` when
-    /// the launcher is closed. Used by render-exclusion + (indirectly) hit-test so the launcher keeps
-    /// its exact original geometry while staying a unified `ClientMenu`.
-    fn global_menu_rect(&self) -> Option<Rect> {
-        matches!(self.app.mode, Mode::GlobalMenu).then(|| self.app.global_menu_rect())
-    }
 }
 
 /// #47: the header-line count for a client menu's geometry — 2 when it carries a target sub-header
@@ -2158,9 +2244,9 @@ fn render_client_shell(
             // #47: the global launcher keeps its ORIGINAL look — render it through the unchanged
             // `render_global_launcher_menu` dropdown surface (driven by the AppState `Mode::GlobalMenu`
             // mapping above), so the "menu" button looks exactly as it always did (button-anchored, no
-            // modal header, badge dots). Gated on `Mode::GlobalMenu`, set only for an open launcher.
-            if matches!(snapshot.app.mode, Mode::GlobalMenu) {
-                crate::ui::render_global_launcher_menu(&snapshot.app, frame);
+            // modal header, badge dots). `launcher_menu_rect` applies any drag offset (clamped).
+            if let Some(rect) = launcher_menu_rect(snapshot, host_width, host_height) {
+                crate::ui::render_global_launcher_menu(&snapshot.app, frame, rect);
             }
             // #47: render the two right-click CONTEXT menus (workspace / host) through the unified
             // overlay. The launcher is excluded (it renders above via its original surface). At most
@@ -2173,14 +2259,7 @@ fn render_client_shell(
                     crate::client::supervisor::ClientMenuKind::GlobalLauncher
                 ) {
                     let header_rows = client_menu_header_rows(menu);
-                    if let Some(popup) = crate::ui::client_menu_popup_rect_at(
-                        menu.anchor_col,
-                        menu.anchor_row,
-                        menu.items.len(),
-                        header_rows,
-                        host_width,
-                        host_height,
-                    ) {
+                    if let Some(popup) = context_menu_popup_rect(menu, host_width, host_height) {
                         let rows: Vec<crate::ui::ClientMenuRowView> = menu
                             .items
                             .iter()
@@ -2483,14 +2562,14 @@ fn hit_test_client_menu(
     let menu = snapshot.client_menu.as_ref()?;
     let count = menu.items.len();
     let header_rows = client_menu_header_rows(menu);
-    let inner = crate::ui::client_menu_inner_rect_at(
-        menu.anchor_col,
-        menu.anchor_row,
-        count,
-        header_rows,
-        host_width,
-        host_height,
-    )?;
+    // Derive the inner rect from the (drag-shifted) popup so render == hit-test even after a drag.
+    let popup = context_menu_popup_rect(menu, host_width, host_height)?;
+    let inner = Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
     // Mirror the renderer's `inner.height < 4` bail (render_client_menu_overlay) so a host too short
     // to actually draw the rows also hit-tests to nothing — otherwise a tiny terminal would map
     // clicks to invisible rows that were never painted.
@@ -2506,15 +2585,63 @@ fn hit_test_client_menu(
     None
 }
 
-/// #47: resolve a position to a 0-based item index in the open GLOBAL LAUNCHER, against its ORIGINAL
-/// `global_menu_rect` dropdown geometry (so click/hover match the unchanged `render_global_launcher_menu`
-/// layout). `None` when the launcher is closed or the position misses its inner item rows. The
-/// hit-test dispatch maps the result to the unified `ClientMenuRow { index }`.
-fn global_menu_item_index_at(app: &crate::app::AppState, x: u16, y: u16) -> Option<usize> {
-    if !matches!(app.mode, Mode::GlobalMenu) {
+/// #47: the open CONTEXT menu's current popup rect — its cursor-anchored `client_menu_popup_rect_at`
+/// base, shifted by the menu's drag offset (clamped on-screen). `None` when it does not fit.
+fn context_menu_popup_rect(
+    menu: &crate::client::supervisor::ClientMenu,
+    host_width: u16,
+    host_height: u16,
+) -> Option<Rect> {
+    let base = crate::ui::client_menu_popup_rect_at(
+        menu.anchor_col,
+        menu.anchor_row,
+        menu.items.len(),
+        client_menu_header_rows(menu),
+        host_width,
+        host_height,
+    )?;
+    Some(shift_menu_rect(base, menu.drag_offset, host_width, host_height))
+}
+
+/// #47: clamp `base` shifted by a drag `offset` (cols, rows) so the popup stays fully on-screen. Used
+/// by every menu render/hit-test/exclusion site so a dragged menu's geometry stays consistent.
+fn shift_menu_rect(base: Rect, offset: (i16, i16), host_width: u16, host_height: u16) -> Rect {
+    let max_x = host_width.saturating_sub(base.width) as i32;
+    let max_y = host_height.saturating_sub(base.height) as i32;
+    let x = (base.x as i32 + offset.0 as i32).clamp(0, max_x.max(0)) as u16;
+    let y = (base.y as i32 + offset.1 as i32).clamp(0, max_y.max(0)) as u16;
+    Rect::new(x, y, base.width, base.height)
+}
+
+/// #47: the open global launcher's current popup rect — its original `global_menu_rect` dropdown,
+/// shifted by the menu's drag offset (clamped on-screen). `None` when no launcher is open.
+fn launcher_menu_rect(snapshot: &ClientSidebarSnapshot, host_width: u16, host_height: u16) -> Option<Rect> {
+    if !matches!(snapshot.app.mode, Mode::GlobalMenu) {
         return None;
     }
-    let rect = app.global_menu_rect();
+    let offset = snapshot
+        .client_menu
+        .as_ref()
+        .map(|menu| menu.drag_offset)
+        .unwrap_or((0, 0));
+    Some(shift_menu_rect(
+        snapshot.app.global_menu_rect(),
+        offset,
+        host_width,
+        host_height,
+    ))
+}
+
+/// #47: resolve a position to a 0-based item index in the open GLOBAL LAUNCHER, against its (possibly
+/// drag-shifted) `global_menu_rect` dropdown geometry — so click/hover match the unchanged
+/// `render_global_launcher_menu` layout. `None` when the position misses the inner item rows. The
+/// hit-test dispatch maps the result to the unified `ClientMenuRow { index }`.
+fn global_menu_item_index_at(
+    app: &crate::app::AppState,
+    rect: Rect,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
     let inner_x = rect.x.saturating_add(1);
     let inner_y = rect.y.saturating_add(1);
     let inner_right = rect.x.saturating_add(rect.width).saturating_sub(1);
@@ -5904,6 +6031,86 @@ mod tests {
         // the far-left sidebar column misses the menu → None (modal owns the whole rect).
         assert_eq!(
             compositor.hit_test(&model, 0, rect.y + 1, host.0, host.1),
+            None
+        );
+    }
+
+    #[test]
+    fn dragging_menu_top_border_repositions_the_popup() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut model, remote_id) = mixed_supervisor_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 16u16);
+        // a cursor-anchored host context menu, anchored well inside the screen so it can move freely.
+        model.open_host_context_menu(remote_id, "x".into(), 10, 4);
+
+        let before = compositor
+            .client_menu_popup_rect(&model, host.0, host.1)
+            .expect("popup fits");
+        let ev = |kind, col, row| MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        // a press on the popup's TOP BORDER row starts a drag (no offset change yet).
+        assert_eq!(
+            compositor.handle_client_menu_drag(
+                &mut model,
+                &ev(MouseEventKind::Down(MouseButton::Left), before.x + 2, before.y),
+                host.0,
+                host.1,
+            ),
+            Some(false)
+        );
+        // dragging +3 cols / +2 rows moves the popup by exactly that, and the offset accumulates.
+        assert_eq!(
+            compositor.handle_client_menu_drag(
+                &mut model,
+                &ev(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    before.x + 2 + 3,
+                    before.y + 2,
+                ),
+                host.0,
+                host.1,
+            ),
+            Some(true)
+        );
+        assert_eq!(model.client_menu().unwrap().drag_offset, (3, 2));
+        let after = compositor
+            .client_menu_popup_rect(&model, host.0, host.1)
+            .expect("popup fits");
+        assert_eq!((after.x, after.y), (before.x + 3, before.y + 2));
+        // render == hit-test after the drag: a row now hit-tests at the SHIFTED position.
+        let inner_y = after.y + 1; // header row
+        assert!(matches!(
+            compositor.hit_test(&model, after.x + 2, inner_y + 2, host.0, host.1),
+            Some(SidebarHitTarget::ClientMenuRow { .. })
+        ));
+        // releasing ends the drag.
+        assert_eq!(
+            compositor.handle_client_menu_drag(
+                &mut model,
+                &ev(MouseEventKind::Up(MouseButton::Left), after.x + 5, after.y + 2),
+                host.0,
+                host.1,
+            ),
+            Some(false)
+        );
+        // a press that is NOT on the top border returns None, so row-select / dismiss still run.
+        assert_eq!(
+            compositor.handle_client_menu_drag(
+                &mut model,
+                &ev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    after.x + 2,
+                    after.y + 3,
+                ),
+                host.0,
+                host.1,
+            ),
             None
         );
     }

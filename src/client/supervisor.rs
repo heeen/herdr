@@ -194,6 +194,10 @@ pub(crate) struct ClientMenu {
     pub(crate) anchor_row: u16,
     /// The highlighted row.
     pub(crate) selected: usize,
+    /// #47: a client-local drag offset (cols, rows) applied to the popup's default position. `(0, 0)`
+    /// at open; dragging the popup's top border accumulates here so the menu can be repositioned.
+    /// Render, hit-test, and the content-exclusion rect all shift the default rect by this.
+    pub(crate) drag_offset: (i16, i16),
     /// The ordered rows, with their labels + per-row selectable flag + action baked at open time
     /// (so a state-dependent label like "disable"/"enable" and its action can never drift apart).
     pub(crate) items: Vec<ClientMenuItem>,
@@ -1206,6 +1210,7 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
+            drag_offset: (0, 0),
             items,
         });
     }
@@ -1231,6 +1236,14 @@ impl ClientSupervisorModel {
         if let Some(menu) = self.client_menu_mut() {
             let count = menu.items.len();
             menu.selected = index.min(count.saturating_sub(1));
+        }
+    }
+
+    /// #47: set the open menu's drag offset (cols, rows from its default position), used while the
+    /// user drags the popup's top border to reposition it. A no-op when no menu is open.
+    pub(crate) fn set_client_menu_drag_offset(&mut self, offset: (i16, i16)) {
+        if let Some(menu) = self.client_menu_mut() {
+            menu.drag_offset = offset;
         }
     }
 
@@ -1866,6 +1879,7 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
+            drag_offset: (0, 0),
             items,
         });
     }
@@ -1953,6 +1967,7 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
+            drag_offset: (0, 0),
             items,
         });
     }
