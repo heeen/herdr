@@ -270,6 +270,70 @@ pub(crate) struct ComposedShell {
     /// Host dimensions this shell was built for; a mismatch (a resize) forces a rebuild before reuse.
     host_width: u16,
     host_height: u16,
+    /// #56: the cell geometry + theme colors for every hover/selection highlight. The shell is
+    /// rendered with NO hover baked in (so it stays valid across hover changes); the highlight is
+    /// painted per-frame by [`apply_hover_overlay`] from THIS geometry + the live hover target. The
+    /// geometry depends only on the model/view/size, exactly like the shell, so it is cached with it.
+    hover: HoverGeometry,
+}
+
+/// #56: per-frame hover/selection highlight geometry, carried on the (hover-less) cached shell so a
+/// hover change repaints via [`apply_hover_overlay`] instead of rebuilding the shell. Every rect is
+/// derived from the SAME `ClientSidebarSnapshot` geometry the renderer and `hit_test`/`hover_test`
+/// share, and the equivalence tests (Seam 1) pin the painted result cell-identical to the old
+/// hover-baked render so the two geometries can never silently drift.
+#[derive(Clone, Default)]
+pub(crate) struct HoverGeometry {
+    /// `hover_bg` packed — the subtle theme-derived bg lift shared by the workspace-card, agent-row
+    /// and new-workspace-picker-row hovers.
+    hover_bg: u32,
+    /// The affordance fg lift (`overlay0` → `subtext0`, both packed) for the filter label, the
+    /// new/menu buttons and the agent-scope toggle. Painted as a conditional recolor so only the
+    /// affordance glyphs (already `overlay0`) lift, never the surrounding cells.
+    affordance_from: u32,
+    affordance_to: u32,
+    /// Workspace cards paintable on hover: `(ws_idx, list_bottom-clipped rect)`. Selected / active /
+    /// dragged cards are EXCLUDED here (their bg already wins over hover, so hovering them is a no-op).
+    workspace_cards: Vec<(usize, Rect)>,
+    /// Agent-panel rows paintable on hover: `(route_idx, full multi-line row rect)`. The active row
+    /// is EXCLUDED (its `surface_dim` bg wins over hover).
+    agent_rows: Vec<(usize, Rect)>,
+    /// New-workspace-picker destination rows paintable on hover: `(row, row rect)`. The keyboard
+    /// `selected` row is EXCLUDED (its bg wins; hover never overrides it).
+    picker_rows: Vec<(usize, Rect)>,
+    /// Affordance fg-lift rects, present only when the affordance is actually drawn (mirrors the
+    /// renderer's `mouse_capture` / layout draw gates, so paint == hover-test).
+    filter: Option<Rect>,
+    new_button: Option<Rect>,
+    menu_button: Option<Rect>,
+    scope_toggle: Option<Rect>,
+    /// The open client menu's selected-row paint (None when no menu is open). Carries the per-row
+    /// cell geometry + the selection style so the overlay lifts whichever row the model now selects.
+    menu: Option<MenuHoverGeometry>,
+}
+
+/// #56: the open-menu selected-row highlight, painted by the overlay so a menu-selection change does
+/// not rebuild the shell (#55). The launcher and the context menus paint the selection differently,
+/// so each carries the cells it actually styles.
+#[derive(Clone)]
+enum MenuHoverGeometry {
+    /// The global launcher dropdown: the selected row styles ONLY its text-span cells (badge +
+    /// label) — `fg`/`bg` packed, plus BOLD — leaving the row's padding at the panel bg.
+    Launcher { rows: Vec<Rect>, fg: u32, bg: u32 },
+    /// A workspace/host context menu: the selected row styles its FULL row rect (`fg`/`bg` packed +
+    /// BOLD) and swaps the leading marker cell to "›".
+    Context { rows: Vec<Rect>, fg: u32, bg: u32 },
+}
+
+/// #56: whether `build_shell_inner` bakes the live hover/selection into the rendered shell. Production
+/// uses `Hoverless` (the highlight is painted per-frame by [`apply_hover_overlay`]); `Baked` is the
+/// pre-#56 behavior, constructed only by the `#[cfg(test)]` `build_shell_hover_baked` as the Seam-1
+/// equivalence golden — hence `Baked` is "never constructed" in a non-test build.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum ShellHoverMode {
+    Hoverless,
+    Baked,
 }
 
 impl ComposedShell {
@@ -1199,6 +1263,11 @@ impl ClientCompositor {
     /// expensive half of `compose_frame` — `from_model` + a full ratatui sidebar render — so the
     /// caller caches the result and reuses it across pure content frames, only re-laying the live
     /// content region with [`overlay_content_onto_shell`].
+    ///
+    /// #56: the shell is rendered with NO hover/selection highlight baked in, and the highlight is
+    /// painted per-frame by [`apply_hover_overlay`] from the [`HoverGeometry`] this carries. So the
+    /// cached shell stays valid across hover changes (a hover no longer drops the cache) — only a
+    /// genuine model/view/size change rebuilds it.
     pub(crate) fn build_shell(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
@@ -1206,9 +1275,35 @@ impl ClientCompositor {
         host_height: u16,
         now: Instant,
     ) -> ComposedShell {
+        self.build_shell_inner(model, host_width, host_height, now, ShellHoverMode::Hoverless)
+    }
+
+    /// #56: the old, hover-BAKED shell build — kept only as the equivalence golden for the Seam-1
+    /// tests, which assert it is cell-identical to `build_shell` + [`apply_hover_overlay`]. The
+    /// compositor's current hover (`set_hover`) and the model's menu selection are baked into the
+    /// render, exactly as before #56.
+    #[cfg(test)]
+    pub(crate) fn build_shell_hover_baked(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+        now: Instant,
+    ) -> ComposedShell {
+        self.build_shell_inner(model, host_width, host_height, now, ShellHoverMode::Baked)
+    }
+
+    fn build_shell_inner(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+        now: Instant,
+        hover_mode: ShellHoverMode,
+    ) -> ComposedShell {
         let sidebar_width = self.effective_sidebar_width(host_width);
         let content_width = host_width.saturating_sub(sidebar_width);
-        let snapshot = ClientSidebarSnapshot::from_model(
+        let mut snapshot = ClientSidebarSnapshot::from_model(
             model,
             self,
             sidebar_width,
@@ -1216,6 +1311,20 @@ impl ClientCompositor {
             host_height,
             now,
         );
+        // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
+        // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
+        let hover = compute_hover_geometry(&snapshot, host_width, host_height);
+        // #56: render the shell with NO hover/selection highlight — `from_model` mirrored the live
+        // hover (`compositor.set_hover`) and the menu selection into the snapshot; strip them so the
+        // cached shell carries no highlight and the per-frame overlay paints whichever row is hovered.
+        // A no-match sentinel (`len`) leaves every menu row unselected (render compares `idx == sel`).
+        if matches!(hover_mode, ShellHoverMode::Hoverless) {
+            snapshot.app.set_sidebar_hover(None);
+            snapshot.app.global_menu.highlighted = snapshot.app.global_menu_labels().len();
+            if let Some(menu) = snapshot.client_menu.as_mut() {
+                menu.selected = menu.items.len();
+            }
+        }
         // The composited client overlays (add-remote / new-workspace picker / manage-remotes) float
         // over the live content like the global launcher menu: they are footer-anchored popups (NOT
         // centered, full-screen-dimmed modals). The content copy must protect EXACTLY the open
@@ -1265,6 +1374,7 @@ impl ClientCompositor {
             content_width,
             host_width,
             host_height,
+            hover,
         }
     }
 
@@ -2920,6 +3030,367 @@ fn blank_cell() -> CellData {
         modifier: 0,
         skip: false,
         hyperlink: None,
+    }
+}
+
+/// #56: derive the hover/selection highlight geometry from the (hover-less) snapshot. Every rect
+/// mirrors the renderer's layout — workspace cards, agent-panel rows, affordances, picker rows, open
+/// menu rows — so [`apply_hover_overlay`] paints cell-identical to the old hover-baked render. The
+/// Seam-1 equivalence tests pin that identity, so the two geometries cannot silently drift.
+fn compute_hover_geometry(
+    snapshot: &ClientSidebarSnapshot,
+    host_width: u16,
+    host_height: u16,
+) -> HoverGeometry {
+    use crate::protocol::color_to_u32;
+    let app = &snapshot.app;
+    let p = &app.palette;
+    let mut geom = HoverGeometry {
+        hover_bg: color_to_u32(p.hover_bg()),
+        affordance_from: color_to_u32(p.overlay0),
+        affordance_to: color_to_u32(p.subtext0),
+        ..HoverGeometry::default()
+    };
+
+    // The open client menu owns the highlight (the sidebar is inert beneath it). Its rows are
+    // overlay popups, so they paint regardless of the collapsed/expanded sidebar state below.
+    if let Some(menu) = snapshot.client_menu.as_ref() {
+        geom.menu = compute_menu_hover_geometry(snapshot, menu, host_width, host_height);
+    }
+
+    // The new-workspace picker (a footer popup) hovers before the sidebar too — capture its
+    // destination rows here so they paint in either sidebar layout. Selected row excluded (its bg
+    // wins; hover never overrides it — see `render_new_workspace_picker_overlay`).
+    if let Some((dests, selected)) = snapshot.new_workspace_picker.as_ref() {
+        if let Some(inner) =
+            open_overlay_popup_rect(snapshot, host_width, host_height).and_then(panel_inner_rect)
+        {
+            if inner.height >= 4 {
+                let selected = (*selected).min(dests.len().saturating_sub(1));
+                let max_rows = inner.height.saturating_sub(3) as usize;
+                for row_index in 0..dests.len().min(max_rows) {
+                    if row_index == selected {
+                        continue;
+                    }
+                    geom.picker_rows
+                        .push((row_index, crate::ui::new_workspace_picker_row_rect(inner, row_index)));
+                }
+            }
+        }
+    }
+
+    // The collapsed mini strip paints no hover highlight, and an open menu/picker makes the sidebar
+    // inert — in both cases the sidebar-target rects below are never consulted, so skip them.
+    if app.sidebar_collapsed {
+        return geom;
+    }
+
+    let (ws_area, detail_area) =
+        crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+
+    // -- workspace cards: bg-fill `hover_bg`, suppressing selected / active / dragged (those bgs win
+    // over hover in `render_workspace_list`). The fill is clipped to the list bottom, like the render.
+    let list_bottom = ws_area.y.saturating_add(ws_area.height.saturating_sub(1));
+    let is_navigating = matches!(app.mode, crate::app::state::Mode::Navigate);
+    let dragged_ws_idx = match app.drag.as_ref().map(|d| &d.target) {
+        Some(crate::app::state::DragTarget::WorkspaceReorder { source_ws_idx, .. }) => {
+            Some(*source_ws_idx)
+        }
+        _ => None,
+    };
+    for card in &app.view.workspace_card_areas {
+        let i = card.ws_idx;
+        let selected = i == app.selected && is_navigating;
+        let is_active = Some(i) == app.active;
+        let is_dragged = dragged_ws_idx == Some(i);
+        if selected || is_active || is_dragged {
+            continue;
+        }
+        // disabled remotes / `None`-id placeholders are not hoverable (mirrors `hover_test`).
+        if let Some(route) = snapshot.workspace_routes.get(i) {
+            if route.disabled || route.workspace_id.is_none() {
+                continue;
+            }
+        }
+        if let Some(rect) = clip_rect_to_bottom(card.rect, list_bottom) {
+            geom.workspace_cards.push((i, rect));
+        }
+    }
+
+    // -- agent-panel rows: bg-fill `hover_bg`, suppressing the active row (its `surface_dim` wins).
+    // Geometry mirrors `hover_test_agent_panel`: stride = entry_rows + 1, row `i` at body.y+i*stride.
+    let metrics = crate::ui::agent_panel_scroll_metrics(app, detail_area);
+    let body =
+        crate::ui::agent_panel_body_rect(detail_area, crate::ui::should_show_scrollbar(metrics));
+    let entry_rows = crate::ui::agent_panel_entry_row_count(app);
+    if body.width > 0 && body.height > 0 && entry_rows > 0 {
+        let stride = entry_rows.saturating_add(1);
+        let body_bottom = body.y.saturating_add(body.height);
+        let entries = crate::ui::agent_panel_entries(app);
+        for (route_idx, entry) in entries.iter().enumerate().skip(app.agent_panel_scroll) {
+            let local = (route_idx - app.agent_panel_scroll) as u16;
+            let row_y = body.y.saturating_add(local.saturating_mul(stride));
+            if row_y.saturating_add(entry_rows) > body_bottom {
+                break;
+            }
+            // only a real agent route resolves (matches `hover_test_agent_panel`).
+            if snapshot.agent_routes.get(route_idx).is_none() {
+                continue;
+            }
+            if app.is_active_pane(entry.ws_idx, entry.tab_idx, entry.pane_id) {
+                continue;
+            }
+            geom.agent_rows
+                .push((route_idx, Rect::new(body.x, row_y, body.width, entry_rows)));
+        }
+    }
+
+    // -- affordance fg-lifts (overlay0 → subtext0), present only when actually drawn (mirrors the
+    // renderer's draw gates so paint == hover-test).
+    let filter_rect = filter_label_rect(app.view.sidebar_rect, &snapshot.filter_label);
+    if filter_rect != Rect::default() {
+        geom.filter = Some(filter_rect);
+    }
+    if app.mouse_capture {
+        geom.new_button = Some(app.sidebar_new_button_rect());
+        geom.menu_button = Some(app.global_launcher_rect());
+    }
+    let toggle_rect = crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_scope);
+    if toggle_rect != Rect::default() {
+        geom.scope_toggle = Some(toggle_rect);
+    }
+
+    geom
+}
+
+/// #56: the open-menu selected-row paint geometry. The launcher styles only the row's text span; a
+/// context menu styles the full row + a "›" marker. Both derive their rects from the SAME helpers
+/// `render_client_shell` and `hit_test` use, so the highlight tracks the painted/clickable rows.
+fn compute_menu_hover_geometry(
+    snapshot: &ClientSidebarSnapshot,
+    menu: &crate::client::supervisor::ClientMenu,
+    host_width: u16,
+    host_height: u16,
+) -> Option<MenuHoverGeometry> {
+    use crate::protocol::color_to_u32;
+    let app = &snapshot.app;
+    let p = &app.palette;
+    if matches!(
+        menu.kind,
+        crate::client::supervisor::ClientMenuKind::GlobalLauncher
+    ) {
+        let inner = panel_inner_rect(launcher_menu_rect(snapshot, host_width, host_height)?)?;
+        let inner_bottom = inner.y.saturating_add(inner.height);
+        let mut rows = Vec::new();
+        for (idx, item) in app.global_menu_labels().iter().enumerate() {
+            let y = inner.y.saturating_add(idx as u16);
+            if y >= inner_bottom {
+                break;
+            }
+            let width = launcher_menu_line_width(app, item).min(inner.width);
+            rows.push(Rect::new(inner.x, y, width, 1));
+        }
+        // `panel_contrast_fg`: the launcher selected fg falls back to `surface_dim` on a Reset bg.
+        let contrast_fg = match p.panel_bg {
+            ratatui::style::Color::Reset => p.surface_dim,
+            color => color,
+        };
+        Some(MenuHoverGeometry::Launcher {
+            rows,
+            fg: color_to_u32(contrast_fg),
+            bg: color_to_u32(p.accent),
+        })
+    } else {
+        let popup =
+            context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height)?;
+        let inner = panel_inner_rect(popup)?;
+        if inner.height < 4 {
+            return None;
+        }
+        let header_rows = client_menu_header_rows(menu);
+        let max_rows = inner.height.saturating_sub(header_rows) as usize;
+        let rows = (0..menu.items.len().min(max_rows))
+            .map(|row_index| crate::ui::client_menu_row_rect(inner, header_rows, row_index))
+            .collect();
+        Some(MenuHoverGeometry::Context {
+            rows,
+            fg: color_to_u32(p.text),
+            bg: color_to_u32(p.surface0),
+        })
+    }
+}
+
+/// The rendered display width of one launcher menu row (badge + label), matching the `Line` that
+/// `render_global_launcher_menu` builds — so the selected-row overlay covers exactly the styled span.
+fn launcher_menu_line_width(app: &crate::app::AppState, item: &str) -> u16 {
+    use ratatui::text::{Line, Span};
+    let mut spans = Vec::new();
+    if app.global_menu_item_has_badge(item) {
+        spans.push(Span::raw(" ●"));
+    }
+    spans.push(Span::raw(format!(" {item} ")));
+    Line::from(spans).width() as u16
+}
+
+/// The bordered inner rect of a `render_panel_shell` popup (inset 1 on every side), or None when the
+/// popup is too small to have an interior — the SAME inset the panel renders / hit-test derives.
+fn panel_inner_rect(popup: Rect) -> Option<Rect> {
+    if popup.width < 2 || popup.height < 2 {
+        return None;
+    }
+    Some(Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width - 2,
+        popup.height - 2,
+    ))
+}
+
+/// Intersect `rect` with the half-open `[.., list_bottom)` band, matching the workspace-list render's
+/// `if y >= list_bottom break` clip. Returns None when nothing remains visible.
+fn clip_rect_to_bottom(rect: Rect, list_bottom: u16) -> Option<Rect> {
+    if rect.width == 0 || rect.y >= list_bottom {
+        return None;
+    }
+    let height = (rect.y.saturating_add(rect.height)).min(list_bottom) - rect.y;
+    (height > 0).then(|| Rect::new(rect.x, rect.y, rect.width, height))
+}
+
+/// #56: paint the hover/selection highlight onto a composited frame from the cached shell's
+/// [`HoverGeometry`] + the live hover target / menu selection. Cheap (touches only the highlighted
+/// cells) and idempotent, so it runs every frame like the content/cursor overlay — a hover change
+/// just recomposes from the SAME cached shell instead of rebuilding it (#48/#55/#56).
+pub(crate) fn apply_hover_overlay(
+    frame: &mut FrameData,
+    shell: &ComposedShell,
+    hover: Option<crate::app::state::SidebarHoverTarget>,
+    menu_selected: Option<usize>,
+) {
+    use crate::app::state::SidebarHoverTarget;
+    let geom = &shell.hover;
+
+    // An open menu owns the highlight (the sidebar is inert beneath it): paint the model's selected
+    // row and stop — the sidebar hover is `None` here anyway (`hover_test` yields to the menu).
+    if let Some(menu) = geom.menu.as_ref() {
+        if let Some(selected) = menu_selected {
+            paint_menu_selection(frame, menu, selected);
+        }
+        return;
+    }
+
+    let Some(target) = hover else {
+        return;
+    };
+    match target {
+        SidebarHoverTarget::Workspace { ws_idx } => {
+            if let Some((_, rect)) = geom.workspace_cards.iter().find(|(i, _)| *i == ws_idx) {
+                fill_rect_bg(frame, *rect, geom.hover_bg);
+            }
+        }
+        SidebarHoverTarget::AgentRoute { route_idx } => {
+            if let Some((_, rect)) = geom.agent_rows.iter().find(|(i, _)| *i == route_idx) {
+                fill_rect_bg(frame, *rect, geom.hover_bg);
+            }
+        }
+        SidebarHoverTarget::NewWorkspaceDestination { row } => {
+            if let Some((_, rect)) = geom.picker_rows.iter().find(|(i, _)| *i == row as usize) {
+                fill_rect_bg(frame, *rect, geom.hover_bg);
+            }
+        }
+        SidebarHoverTarget::Filter => recolor_affordance(frame, geom.filter, geom),
+        SidebarHoverTarget::New => recolor_affordance(frame, geom.new_button, geom),
+        SidebarHoverTarget::Menu => recolor_affordance(frame, geom.menu_button, geom),
+        SidebarHoverTarget::ScopeToggle => recolor_affordance(frame, geom.scope_toggle, geom),
+        // `AgentMono` is the monolithic pane-keyed variant (the client resolves `AgentRoute`);
+        // `HostBanner`/`Divider` paint no highlight today (so the overlay is a no-op, matching render).
+        SidebarHoverTarget::AgentMono { .. }
+        | SidebarHoverTarget::HostBanner { .. }
+        | SidebarHoverTarget::Divider => {}
+    }
+}
+
+fn recolor_affordance(frame: &mut FrameData, rect: Option<Rect>, geom: &HoverGeometry) {
+    if let Some(rect) = rect {
+        recolor_rect_fg(frame, rect, geom.affordance_from, geom.affordance_to);
+    }
+}
+
+fn frame_cell_mut(frame: &mut FrameData, x: u16, y: u16) -> Option<&mut CellData> {
+    if x >= frame.width || y >= frame.height {
+        return None;
+    }
+    frame
+        .cells
+        .get_mut(y as usize * frame.width as usize + x as usize)
+}
+
+/// Patch only the bg of every cell in `rect` (fg/symbol/modifier untouched) — the
+/// `set_style(Style::default().bg(..))` the workspace-card / agent-row / picker-row hovers apply.
+fn fill_rect_bg(frame: &mut FrameData, rect: Rect, bg: u32) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            if let Some(cell) = frame_cell_mut(frame, x, y) {
+                cell.bg = bg;
+            }
+        }
+    }
+}
+
+/// Recolor only the cells in `rect` whose fg equals `from`, to `to` — the affordance fg-lift
+/// (overlay0 → subtext0). The conditional keeps the result cell-identical: only the affordance glyph
+/// cells (drawn `overlay0`) lift, never the surrounding cells.
+fn recolor_rect_fg(frame: &mut FrameData, rect: Rect, from: u32, to: u32) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            if let Some(cell) = frame_cell_mut(frame, x, y) {
+                if cell.fg == from {
+                    cell.fg = to;
+                }
+            }
+        }
+    }
+}
+
+fn paint_menu_selection(frame: &mut FrameData, menu: &MenuHoverGeometry, selected: usize) {
+    let bold = ratatui::style::Modifier::BOLD.bits();
+    match menu {
+        MenuHoverGeometry::Launcher { rows, fg, bg } => {
+            let Some(rect) = row_for_selection(rows, selected) else {
+                return;
+            };
+            paint_menu_row_style(frame, rect, *fg, *bg, bold);
+        }
+        MenuHoverGeometry::Context { rows, fg, bg } => {
+            let Some(rect) = row_for_selection(rows, selected) else {
+                return;
+            };
+            paint_menu_row_style(frame, rect, *fg, *bg, bold);
+            // the selected context-menu row swaps its leading marker " " → "›".
+            if let Some(cell) = frame_cell_mut(frame, rect.x, rect.y) {
+                cell.symbol = "›".to_string();
+            }
+        }
+    }
+}
+
+fn row_for_selection(rows: &[Rect], selected: usize) -> Option<Rect> {
+    if rows.is_empty() {
+        return None;
+    }
+    rows.get(selected.min(rows.len() - 1)).copied()
+}
+
+/// Patch fg+bg and OR in BOLD over the row's cells — exactly the menu selection `Style` patched onto
+/// the row by the renderer's `Paragraph::style(..)` (fg/bg replaced, BOLD added).
+fn paint_menu_row_style(frame: &mut FrameData, rect: Rect, fg: u32, bg: u32, bold: u16) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            if let Some(cell) = frame_cell_mut(frame, x, y) {
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.modifier |= bold;
+            }
+        }
     }
 }
 
@@ -5153,18 +5624,25 @@ mod tests {
 
     #[test]
     fn client_global_menu_hover_moves_highlight_render() {
-        // #47: moving the highlight (as a hover `Moved` does via `set_client_menu_selected`) repaints
-        // the highlight bg onto the newly selected row and clears it from the old one — the launcher
-        // keeps its original `render_global_launcher_menu` surface, which renders `selected` the same.
+        // #47/#56: moving the highlight (as a hover `Moved` does via `set_client_menu_selected`)
+        // repaints the highlight bg onto the newly selected row and clears it from the old one.
+        // #56: the launcher shell is rendered with NO selection; the highlight is painted per-frame by
+        // `apply_hover_overlay` from the model's selection, so a selection move never rebuilds the shell.
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
 
         let mut model = ClientSupervisorModel::new("local");
-        model.open_client_global_menu(0, 0); // selected defaults to index 0.
-        let before = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
-
-        model.set_client_menu_selected(2);
-        let after = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+        model.open_client_global_menu(0, 0);
+        let now = std::time::Instant::now();
+        // One cached hover-less shell; the selection is painted by the overlay each frame (#56).
+        let shell = compositor.build_shell(&model, 60, 16, now);
+        let compose_with_selection = |selected: usize| {
+            let mut frame = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut frame, &shell, None, Some(selected));
+            frame
+        };
+        let before = compose_with_selection(0);
+        let after = compose_with_selection(2);
 
         // The launcher renders at its original `global_menu_rect` dropdown, with rows starting one
         // cell inside the top border (rect.y + 1) — no modal header.
@@ -6746,6 +7224,184 @@ mod tests {
             direct, via_shell,
             "build_shell + overlay_content_onto_shell must reproduce compose_frame exactly"
         );
+    }
+
+    /// #56 (Seam 1): a hover-less shell + the per-frame hover overlay must be CELL-IDENTICAL to the
+    /// old shell that baked the hover into `from_model`. Workspace-card case: hovering a plain
+    /// (non-selected/active/dragged) card lifts its bg to `hover_bg`.
+    #[test]
+    fn hover_overlay_workspace_card_equals_baked_compose() {
+        let model = model_with_agents(4, 4);
+        let mut compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["alpha", "beta"]);
+        let target = crate::app::state::SidebarHoverTarget::Workspace { ws_idx: 1 };
+        compositor.set_hover(Some(target));
+
+        // golden: the OLD path that bakes the hover into the rendered shell.
+        let baked = compositor.build_shell_hover_baked(&model, 80, 24, now);
+        let golden = overlay_content_onto_shell(&baked, &content);
+
+        // new: a hover-less shell, composed, then the per-frame hover overlay painted on top.
+        let shell = compositor.build_shell(&model, 80, 24, now);
+        let bare = overlay_content_onto_shell(&shell, &content);
+        assert_ne!(
+            bare, golden,
+            "sanity: hovering ws 1 must actually paint a highlight (else the test is vacuous)"
+        );
+        let mut overlaid = bare;
+        apply_hover_overlay(&mut overlaid, &shell, Some(target), None);
+        assert_eq!(
+            overlaid, golden,
+            "#56: hover-less shell + overlay must equal the baked compose for a workspace card"
+        );
+    }
+
+    /// #56 (Seam 1): for EVERY sidebar hover target the hover-less shell exposes (workspace cards,
+    /// agent rows, the filter label, the new/menu buttons, the scope toggle), painting it via the
+    /// overlay must be cell-identical to the old shell that baked that hover — and must actually
+    /// change something (no vacuous pass). One cached hover-less shell serves them all.
+    #[test]
+    fn hover_overlay_matches_baked_for_every_sidebar_target() {
+        use crate::app::state::SidebarHoverTarget;
+        let model = model_with_agents(4, 4);
+        let mut compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["x"]);
+
+        let shell = compositor.build_shell(&model, 80, 24, now);
+        let bare = overlay_content_onto_shell(&shell, &content);
+
+        let mut targets: Vec<SidebarHoverTarget> = Vec::new();
+        targets.extend(
+            shell
+                .hover
+                .workspace_cards
+                .iter()
+                .map(|(i, _)| SidebarHoverTarget::Workspace { ws_idx: *i }),
+        );
+        targets.extend(
+            shell
+                .hover
+                .agent_rows
+                .iter()
+                .map(|(i, _)| SidebarHoverTarget::AgentRoute { route_idx: *i }),
+        );
+        if shell.hover.filter.is_some() {
+            targets.push(SidebarHoverTarget::Filter);
+        }
+        if shell.hover.new_button.is_some() {
+            targets.push(SidebarHoverTarget::New);
+        }
+        if shell.hover.menu_button.is_some() {
+            targets.push(SidebarHoverTarget::Menu);
+        }
+        if shell.hover.scope_toggle.is_some() {
+            targets.push(SidebarHoverTarget::ScopeToggle);
+        }
+        assert!(
+            targets.len() >= 4,
+            "the test model must expose workspace + agent + affordance targets, got {targets:?}"
+        );
+
+        for target in targets {
+            compositor.set_hover(Some(target));
+            let baked = compositor.build_shell_hover_baked(&model, 80, 24, now);
+            let golden = overlay_content_onto_shell(&baked, &content);
+
+            let mut overlaid = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut overlaid, &shell, Some(target), None);
+            assert_eq!(overlaid, golden, "#56: overlay != baked for {target:?}");
+            assert_ne!(
+                overlaid, bare,
+                "#56: hovering {target:?} must actually paint a highlight"
+            );
+        }
+    }
+
+    /// #56 (Seam 1, open-menu launcher): the global launcher renders with NO row selected in the
+    /// cached shell; the overlay lifts whichever row the model selects, cell-identical to the old
+    /// selection-baked render — for every row.
+    #[test]
+    fn hover_overlay_launcher_selection_matches_baked() {
+        let mut model = model_with_agents(4, 4);
+        model.open_client_global_menu(0, 0);
+        let compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["x"]);
+        let row_count = model.client_menu().expect("menu open").items.len();
+        assert!(row_count > 1, "launcher should have multiple rows");
+
+        let shell = compositor.build_shell(&model, 80, 24, now);
+        let bare = overlay_content_onto_shell(&shell, &content);
+        for sel in 0..row_count {
+            model.set_client_menu_selected(sel);
+            let baked = compositor.build_shell_hover_baked(&model, 80, 24, now);
+            let golden = overlay_content_onto_shell(&baked, &content);
+
+            let mut overlaid = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut overlaid, &shell, None, Some(sel));
+            assert_eq!(overlaid, golden, "#56: launcher overlay != baked for row {sel}");
+            assert_ne!(overlaid, bare, "#56: launcher row {sel} must paint a highlight");
+        }
+    }
+
+    /// #56 (Seam 1, open-menu context): a host context menu renders with NO row selected in the
+    /// cached shell; the overlay paints the model's selected row (full-row style + "›" marker)
+    /// cell-identical to the old selection-baked render — for every row.
+    #[test]
+    fn hover_overlay_context_menu_selection_matches_baked() {
+        let mut model = model_with_agents(4, 4);
+        model.open_host_context_menu(ServerId::main(), "local".into(), 0, 0);
+        let compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["x"]);
+        let row_count = model.client_menu().expect("menu open").items.len();
+        assert!(row_count > 1, "host context menu should have multiple rows");
+
+        let shell = compositor.build_shell(&model, 80, 24, now);
+        for sel in 0..row_count {
+            model.set_client_menu_selected(sel);
+            let baked = compositor.build_shell_hover_baked(&model, 80, 24, now);
+            let golden = overlay_content_onto_shell(&baked, &content);
+
+            let mut overlaid = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut overlaid, &shell, None, Some(sel));
+            assert_eq!(
+                overlaid, golden,
+                "#56: context-menu overlay != baked for row {sel}"
+            );
+        }
+    }
+
+    /// #56 (Seam 1b, no-rebuild invariant): the cached hover-less shell is reused ACROSS hover
+    /// changes — overlaying different hover targets onto ONE long-lived shell matches building a
+    /// fresh shell each time. The highlight lives in the overlay, never the shell, so a hover change
+    /// never needs the O(hosts×agents) `build_shell` rebuild.
+    #[test]
+    fn hover_overlay_reuses_one_shell_across_hover_changes() {
+        use crate::app::state::SidebarHoverTarget;
+        let model = model_with_agents(4, 4);
+        let compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["x"]);
+        // Built ONCE — then reused for every hover below (mirrors `shell_cache` across HoverRedraws).
+        let cached = compositor.build_shell(&model, 80, 24, now);
+
+        for ws_idx in [1usize, 2usize] {
+            let target = SidebarHoverTarget::Workspace { ws_idx };
+            let mut reused = overlay_content_onto_shell(&cached, &content);
+            apply_hover_overlay(&mut reused, &cached, Some(target), None);
+
+            let fresh = compositor.build_shell(&model, 80, 24, now);
+            let mut fresh_overlaid = overlay_content_onto_shell(&fresh, &content);
+            apply_hover_overlay(&mut fresh_overlaid, &fresh, Some(target), None);
+
+            assert_eq!(
+                reused, fresh_overlaid,
+                "#56: the cached hover-less shell must be reusable across hover changes (ws {ws_idx})"
+            );
+        }
     }
 
     /// A shell built once and reused across DIFFERENT content frames must match a fresh

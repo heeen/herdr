@@ -1022,8 +1022,17 @@ fn dispatch_client_overlay_input(
             dispatch = next;
             break;
         }
-        if matches!(next, ClientInputDispatch::Redraw) {
-            dispatch = ClientInputDispatch::Redraw;
+        // Promote a repaint over the `Consumed` default. `Redraw` (a model/view change) wins over
+        // `HoverRedraw` (#56: a presentation-only menu-selection move → recompose from the cached
+        // shell + overlay, no rebuild) when both occur for one input batch.
+        match next {
+            ClientInputDispatch::Redraw => dispatch = ClientInputDispatch::Redraw,
+            ClientInputDispatch::HoverRedraw
+                if !matches!(dispatch, ClientInputDispatch::Redraw) =>
+            {
+                dispatch = ClientInputDispatch::HoverRedraw;
+            }
+            _ => {}
         }
     }
     dispatch
@@ -1367,7 +1376,11 @@ fn dispatch_open_client_menu_mouse(
                     ClientInputDispatch::Consumed
                 } else {
                     model.set_client_menu_selected(index);
-                    ClientInputDispatch::Redraw
+                    // #56: moving the highlighted menu row is a presentation-only change of a couple
+                    // of cells — route it to the lightweight `HoverRedraw` path (recompose from the
+                    // cached hover-less shell + repaint the selected row via the overlay) instead of
+                    // the `Redraw` sledgehammer that rebuilt the whole shell behind the menu (#55).
+                    ClientInputDispatch::HoverRedraw
                 }
             }
             // Motion off the rows leaves the highlight where it is — a hover OUTSIDE the menu does
@@ -1681,18 +1694,23 @@ impl ClientState {
         self.shell_cache = None;
     }
 
-    /// #48: the lightweight redraw for a sidebar HOVER change (a presentation-only highlight of a
-    /// couple of cells). It drops the cached shell — like [`request_full_redraw`] — so the rebuild
-    /// repaints the moved highlight through the one render source of truth (the hover is baked into
-    /// the shell when `build_shell` mirrors `compositor.set_hover`'s truth into the rendered
-    /// snapshot, so a stale cache would show the old highlight). But UNLIKE
-    /// `request_full_redraw` it does NOT reset the blit encoder: the diff baseline is preserved, so
-    /// the next frame writes only the ~2 changed rows to the terminal instead of re-encoding +
-    /// flushing the entire screen. Resetting it (as the old `Redraw` path did) turned every
-    /// mouse-motion event that crossed a row boundary into a full-screen repaint, dropping fast
-    /// motion to <1fps (#48).
+    /// #56: the lightweight redraw for a HOVER / open-menu-selection change (a presentation-only
+    /// highlight of a couple of cells). It preserves BOTH the cached shell AND the blit diff
+    /// baseline:
+    ///
+    /// - The shell is rendered hover-less (#56), so it stays valid across hover changes — the
+    ///   highlight is painted per-frame by `apply_hover_overlay`, not baked into the shell. Keeping
+    ///   the cache means a hover NEVER triggers the O(hosts×agents) `build_shell` rebuild that made
+    ///   hover lag scale with the fleet (the #48 fix still rebuilt the shell; #56 removes that).
+    /// - The blit encoder is NOT reset, so the next frame writes only the ~2 changed rows to the
+    ///   terminal instead of re-encoding + flushing the whole screen (the original #48 win).
+    ///
+    /// All it does is mark a coalesced repaint pending (latest-wins): the actual recompose is
+    /// deferred to the frame-budget deadline and flushed by
+    /// `recompose_composited_frame(state, /*rebuild=*/false)` — content + hover overlay from the SAME
+    /// cached hover-less shell. It deliberately touches NEITHER cache (that is the whole point).
     fn request_hover_redraw(&mut self) {
-        self.shell_cache = None;
+        self.pending_hover_render = true;
     }
 }
 
@@ -3918,6 +3936,18 @@ fn select_composited_render_frame<'a>(
 }
 
 fn render_cached_composited_frame(state: &mut ClientState) {
+    // #45: every caller here is a model/view/timer/animation change, so force a fresh hover-less
+    // shell and repopulate the cache the following pure content frames reuse.
+    recompose_composited_frame(state, true);
+}
+
+/// #56: compose the cached shell + live content + the per-frame hover overlay, then flush.
+///
+/// `rebuild = true` forces a fresh hover-less shell (a genuine model/view/size change). A
+/// hover/menu-selection repaint passes `false`: the cached hover-less shell is still valid (the
+/// highlight was never baked into it), so we skip the expensive `build_shell` and just re-lay the
+/// content + repaint the highlight via [`compositor::apply_hover_overlay`] (#48/#55/#56).
+fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
     // item 5: take &mut access to the compositor so we can refresh the working-since map before
     // the immutable compose borrow — keeps the live duration timer fresh on every compose, not
     // just animation ticks (render itself stays pure; the map upkeep performs no I/O).
@@ -3943,22 +3973,26 @@ fn render_cached_composited_frame(state: &mut ClientState) {
             .unwrap_or_else(|| protocol::FrameData::blank(state.host_size.0, state.host_size.1))
     };
 
-    // #45: this repaint was driven by a model/view/timer/animation change (every caller of
-    // `render_cached_composited_frame` is such a path), so force a fresh shell (rebuild = true) and
-    // repopulate the cache that the following pure content frames will reuse.
     let compose_started = Instant::now();
     let shell_rebuilt = if let (Some(comp), Some(model)) =
         (state.compositor.as_ref(), state.supervisor_model.as_ref())
     {
-        ensure_shell_cache(comp, model, &mut state.shell_cache, state.host_size, true, now)
+        ensure_shell_cache(comp, model, &mut state.shell_cache, state.host_size, rebuild, now)
     } else {
         return;
     };
-    let Some(frame_data) = state
-        .shell_cache
+    // #56: the live hover target + open-menu selection paint the highlight overlay (the shell itself
+    // is hover-less). Read them before the immutable shell borrow below.
+    let hover = state.compositor.as_ref().and_then(|comp| comp.hover());
+    let menu_selected = state
+        .supervisor_model
         .as_ref()
-        .map(|shell| compositor::overlay_content_onto_shell(shell, &active_frame))
-    else {
+        .and_then(|model| model.client_menu().map(|menu| menu.selected));
+    let Some(frame_data) = state.shell_cache.as_ref().map(|shell| {
+        let mut frame = compositor::overlay_content_onto_shell(shell, &active_frame);
+        compositor::apply_hover_overlay(&mut frame, shell, hover, menu_selected);
+        frame
+    }) else {
         return;
     };
     let compose_elapsed = compose_started.elapsed();
@@ -4011,6 +4045,15 @@ fn render_incoming_server_frame(
             .as_ref()
             .expect("ensure_shell_cache populates the cache");
         frame_data = compositor::overlay_content_onto_shell(shell, active_frame);
+        // #56: paint the current hover/selection highlight onto the composited frame (like the
+        // cursor) so it survives a content-only repaint — a busy workspace streaming content keeps
+        // the hovered row highlighted without rebuilding the shell.
+        compositor::apply_hover_overlay(
+            &mut frame_data,
+            shell,
+            comp.hover(),
+            model.client_menu().map(|menu| menu.selected),
+        );
         compose_elapsed = compose_started.elapsed();
     }
     flush_composited_frame(state, frame_data, compose_elapsed, shell_rebuilt);
@@ -4611,15 +4654,15 @@ async fn run_client_loop(
                                 continue;
                             }
                             ClientInputDispatch::HoverRedraw => {
-                                // #48: a sidebar hover is presentation-only. Drop the shell cache so
-                                // the rebuild paints the new highlight, but KEEP the blit baseline so
-                                // only the changed rows are written (no full-screen repaint). The
-                                // render is DEFERRED (latest-wins): a fast motion sweep floods one
-                                // `Moved` per crossed row, so instead of repainting per event we mark
-                                // a render pending and let `next_select_deadline` flush it within one
-                                // frame budget — at most one repaint per frame, tracking the cursor.
+                                // #48/#56: a sidebar hover OR an open-menu selection change is
+                                // presentation-only. #56: KEEP both the cached hover-less shell (no
+                                // `build_shell` rebuild — the highlight is painted by the overlay) AND
+                                // the blit baseline (only the changed rows are written, no full-screen
+                                // repaint). The render is DEFERRED (latest-wins): a fast motion sweep
+                                // floods one `Moved` per crossed row, so instead of repainting per
+                                // event we mark a render pending and let `next_select_deadline` flush
+                                // it within one frame budget — at most one repaint per frame.
                                 state.request_hover_redraw();
-                                state.pending_hover_render = true;
                                 continue;
                             }
                             ClientInputDispatch::Consumed => continue,
@@ -5409,20 +5452,22 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
                 let now = Instant::now();
-                // #48: flush a deferred (coalesced) sidebar hover repaint. The HoverRedraw dispatch
-                // only marks this pending and drops the shell cache; the actual rebuild + diff-write
-                // happens here, gated by the frame-budget deadline `next_select_deadline` set — so a
-                // motion-event flood collapses to at most one repaint per frame (latest-wins). The
-                // render reads the compositor's current hover, so intermediate positions are simply
-                // skipped. `render_cached_composited_frame` → `flush_composited_frame` clears the
-                // flag, so housekeeping below that itself repaints won't double-render.
+                // #48/#56: flush a deferred (coalesced) hover / menu-selection repaint. The
+                // HoverRedraw dispatch only marks this pending (it preserves the cached shell AND the
+                // blit baseline); the actual recompose + diff-write happens here, gated by the
+                // frame-budget deadline `next_select_deadline` set — so a motion-event flood collapses
+                // to at most one repaint per frame (latest-wins). #56: this recomposes from the SAME
+                // cached hover-less shell (`rebuild = false`) and repaints the highlight via the
+                // overlay — NO `build_shell` rebuild — so hover stays smooth no matter the fleet size.
+                // The render reads the compositor's current hover, so intermediate positions are
+                // simply skipped. `flush_composited_frame` clears the flag.
                 if state.pending_hover_render {
                     // Clear BEFORE rendering: `flush_composited_frame` clears it on the normal path,
-                    // but clearing here too keeps a `render_cached_composited_frame` early-return
+                    // but clearing here too keeps a `recompose_composited_frame` early-return
                     // (model/compositor absent) from leaving the flag set — which would busy-spin the
                     // frame-budget-clamped deadline. Defensive; that path is unreachable today.
                     state.pending_hover_render = false;
-                    render_cached_composited_frame(&mut state);
+                    recompose_composited_frame(&mut state, false);
                 }
                 sample_download_rates(&mut state, now);
                 // issue #13: probe each connected server's latency over its persistent stream.
@@ -6244,12 +6289,13 @@ mod tests {
         state.blit_encoder.encode(&next, false).full
     }
 
-    /// #48: a sidebar hover is presentation-only. Like `request_full_redraw` it drops the cached
-    /// shell (so the rebuild repaints the moved highlight), but UNLIKE it the blit-encoder diff
-    /// baseline is PRESERVED — so the next frame writes only the changed rows, not the whole screen.
-    /// Resetting the baseline on every hover was the <1fps regression this issue fixes.
+    /// #56 (Seam 2): a hover / open-menu-selection change is presentation-only and must PRESERVE both
+    /// caches — the cached hover-less shell (so no `build_shell` rebuild: the highlight is painted by
+    /// the per-frame overlay, never baked) AND the blit-encoder diff baseline (so only the changed
+    /// rows are written, not the whole screen). The #48 fix still dropped the shell (rebuilding it on
+    /// every hover, which #56 removes so hover stays smooth no matter how many remotes are connected).
     #[test]
-    fn request_hover_redraw_drops_shell_but_keeps_blit_baseline() {
+    fn request_hover_redraw_keeps_shell_and_blit_baseline() {
         let model = supervisor::ClientSupervisorModel::new("local");
         let mut state = test_client_state_with_model(model);
         let compositor = compositor::ClientCompositor::default();
@@ -6262,12 +6308,12 @@ mod tests {
         let next_is_full = next_encode_is_full_after(&mut state, |s| s.request_hover_redraw());
 
         assert!(
-            state.shell_cache.is_none(),
-            "#48: hover redraw must drop the cached shell so the moved highlight is repainted"
+            state.shell_cache.is_some(),
+            "#56: hover redraw must KEEP the cached hover-less shell (no O(hosts×agents) rebuild)"
         );
         assert!(
             !next_is_full,
-            "#48: hover redraw must PRESERVE the blit diff baseline (no full-screen repaint)"
+            "#56: hover redraw must PRESERVE the blit diff baseline (no full-screen repaint)"
         );
     }
 
@@ -7255,7 +7301,9 @@ mod tests {
         };
         let dispatch =
             dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &moved);
-        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        // #56: a menu-selection move is presentation-only — HoverRedraw (recompose from the cached
+        // hover-less shell + overlay the selected row), not the shell-rebuilding Redraw it once was.
+        assert!(matches!(dispatch, ClientInputDispatch::HoverRedraw));
         assert_eq!(
             model.client_menu().unwrap().selected,
             1,
@@ -8813,9 +8861,11 @@ mod tests {
 
     #[test]
     fn composited_moved_over_open_global_menu_moves_highlight() {
-        // item 7: motion over the open client menu moves the highlight to the hovered row (mirrors
-        // the monolithic host) and repaints; identical motion coalesces; motion off the menu leaves
-        // the highlight put. The menu stays open throughout (motion never activates or closes it).
+        // item 7 / #56: motion over the open client menu moves the highlight to the hovered row
+        // (mirrors the monolithic host) and repaints; identical motion coalesces; motion off the menu
+        // leaves the highlight put. The menu stays open throughout (motion never activates or closes
+        // it). #56: a selection-only move is now `HoverRedraw` (recompose from the cached hover-less
+        // shell + overlay the selected row), NOT `Redraw` (which rebuilt the whole shell behind it).
         let (mut model, _) = mixed_remote_model();
         model.open_client_global_menu(0, 0);
         assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
@@ -8826,7 +8876,7 @@ mod tests {
         // original `global_menu_rect` dropdown geometry, so row i sits at y = rect.y + 1 + i).
         assert_eq!(
             dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
+            ClientInputDispatch::HoverRedraw
         );
         assert_eq!(model.client_menu().map(|m| m.selected), Some(1));
         // a second identical motion is coalesced (no change) → Consumed.
@@ -8837,7 +8887,7 @@ mod tests {
         // motion onto row index 2 moves the highlight 1 → 2.
         assert_eq!(
             dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
+            ClientInputDispatch::HoverRedraw
         );
         assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
         // motion off the menu (far-left column) leaves the highlight put → Consumed.

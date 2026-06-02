@@ -1449,10 +1449,13 @@ pub(crate) fn render_client_menu_overlay(
         );
     }
 
-    let selected = view.selected.min(view.rows.len().saturating_sub(1));
+    // #56: an out-of-range `selected` (the sentinel the hover-less shell passes) highlights NO row —
+    // the per-frame hover overlay paints whichever row the model selects, so the cached shell stays
+    // valid across menu-selection changes. A real (in-range) selection still highlights here, which is
+    // exactly the baked golden the Seam-1 equivalence test compares the overlay against.
     let max_rows = inner.height.saturating_sub(header_rows) as usize;
     for (row_index, row) in view.rows.iter().enumerate().take(max_rows) {
-        let is_selected = row_index == selected;
+        let is_selected = row_index == view.selected;
         let marker = if is_selected { "›" } else { " " };
         let text = format!("{marker} {}", row.label);
         let style = if is_selected {
