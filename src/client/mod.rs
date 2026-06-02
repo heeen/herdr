@@ -8658,27 +8658,27 @@ mod tests {
         let mut compositor = compositor::ClientCompositor::new(26);
         let host = (60u16, 16u16);
 
-        // #47: the launcher anchors at (0,0) with a "menu" title header, so row index i sits at
-        // y = 2 + i. motion onto menu row index 1 (y=3) moves the highlight 0 → 1 and repaints.
+        // motion onto menu row index 1 moves the highlight 0 → 1 and repaints (launcher keeps its
+        // original `global_menu_rect` dropdown geometry, so row i sits at y = rect.y + 1 + i).
         assert_eq!(
-            dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
+            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
             ClientInputDispatch::Redraw
         );
         assert_eq!(model.client_menu().map(|m| m.selected), Some(1));
         // a second identical motion is coalesced (no change) → Consumed.
         assert_eq!(
-            dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
+            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
             ClientInputDispatch::Consumed
         );
-        // motion onto row index 2 (y=4) moves the highlight 1 → 2.
+        // motion onto row index 2 moves the highlight 1 → 2.
         assert_eq!(
-            dispatch_composited_input(moved_bytes(21, 4), &mut compositor, &mut model, host),
+            dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
             ClientInputDispatch::Redraw
         );
         assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
-        // motion off the menu (a column right of the popup) leaves the highlight put → Consumed.
+        // motion off the menu (far-left column) leaves the highlight put → Consumed.
         assert_eq!(
-            dispatch_composited_input(moved_bytes(40, 2), &mut compositor, &mut model, host),
+            dispatch_composited_input(moved_bytes(1, 2), &mut compositor, &mut model, host),
             ClientInputDispatch::Consumed
         );
         assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
@@ -8690,10 +8690,10 @@ mod tests {
         model.open_client_global_menu(0, 0);
         let mut compositor = compositor::ClientCompositor::new(26);
 
-        // #47: the launcher anchors at (0,0) with a "menu" title header, so row i sits at y = 2 + i
-        // (SGR row = y + 1): settings idx0 → SGR row 3, keybinds idx1 → 4, reload idx2 → 5, …
+        // The launcher keeps its original `global_menu_rect` dropdown geometry, so row i sits at
+        // SGR row (rect.y + 1 + i + 1): settings idx0 → SGR row 2, keybinds idx1 → 3, reload idx2 → 4…
         let settings = dispatch_composited_input(
-            b"\x1b[<0;22;3M".to_vec(),
+            b"\x1b[<0;22;2M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8709,7 +8709,7 @@ mod tests {
 
         model.open_client_global_menu(0, 0);
         let keybinds = dispatch_composited_input(
-            b"\x1b[<0;22;4M".to_vec(),
+            b"\x1b[<0;22;3M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8725,7 +8725,7 @@ mod tests {
 
         model.open_client_global_menu(0, 0);
         let reload = dispatch_composited_input(
-            b"\x1b[<0;22;5M".to_vec(),
+            b"\x1b[<0;22;4M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8747,7 +8747,7 @@ mod tests {
 
         model.open_client_global_menu(0, 0);
         let detach = dispatch_composited_input(
-            b"\x1b[<0;22;6M".to_vec(),
+            b"\x1b[<0;22;5M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8767,9 +8767,9 @@ mod tests {
 
         model.open_client_global_menu(0, 0);
         let mut compositor = compositor::ClientCompositor::new(26);
-        // #47: settings (idx0) sits at y=2 under the launcher's "menu" header → SGR row 3.
+        // settings (idx0) sits at the launcher's first dropdown row → SGR row 2.
         let dispatch = dispatch_composited_input(
-            b"\x1b[<0;22;3M".to_vec(),
+            b"\x1b[<0;22;2M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
