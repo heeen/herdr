@@ -7531,4 +7531,70 @@ mod tests {
              (full={full_costs:?}us, reuse={reuse_costs:?}us)"
         );
     }
+
+    /// #56 regression + measurement (the multi-remote load the PRD calls out). A HOVER change used to
+    /// rebuild the whole shell — `build_shell` = `from_model` (O(hosts×agents), a `TerminalState` per
+    /// agent) + a full ratatui render — on EVERY mouse move; now it recomposes from the cached
+    /// hover-less shell and repaints only the highlight via `apply_hover_overlay`. This measures the
+    /// per-hover cost under a heavy 64-agent fleet and asserts the overlay repaint is dramatically
+    /// cheaper than the old rebuild — i.e. the O(hosts×agents) cost is OFF the hover path.
+    #[test]
+    fn hover_overlay_repaint_is_far_cheaper_than_shell_rebuild() {
+        use crate::app::state::SidebarHoverTarget;
+        let model = model_with_agents(8, 8); // 64 agents — a heavy fleet (the #56 scaling concern)
+        let compositor = ClientCompositor::new(30);
+        let content = frame(160, 48, &["agent output line"]);
+        let (w, h) = (200u16, 50u16);
+        let now = std::time::Instant::now();
+        const ITERS: u32 = 200;
+
+        // The cached hover-less shell — built once per model change, reused across every hover.
+        let shell = compositor.build_shell(&model, w, h, now);
+        let targets: Vec<SidebarHoverTarget> = shell
+            .hover
+            .workspace_cards
+            .iter()
+            .take(2)
+            .map(|(i, _)| SidebarHoverTarget::Workspace { ws_idx: *i })
+            .collect();
+        assert_eq!(targets.len(), 2, "need two hoverable cards to simulate a sweep");
+
+        // Warm up so neither side pays first-touch allocator cost.
+        let _ = std::hint::black_box(compositor.build_shell(&model, w, h, now));
+
+        // OLD per-hover cost: rebuild the shell, then compose (the #48 behavior — a hover rebuilt the
+        // whole sidebar behind the cheap diff-write).
+        let old_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let rebuilt = compositor.build_shell(&model, w, h, now);
+            std::hint::black_box(overlay_content_onto_shell(&rebuilt, &content));
+        }
+        let old = old_start.elapsed();
+
+        // NEW per-hover cost (#56): recompose from the cached shell + repaint the highlight overlay.
+        // Alternate the hovered card every iteration to exercise a real cursor sweep.
+        let new_start = std::time::Instant::now();
+        for i in 0..ITERS {
+            let mut frame = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut frame, &shell, Some(targets[i as usize % 2]), None);
+            std::hint::black_box(frame);
+        }
+        let new = new_start.elapsed();
+
+        let old_us = old.as_secs_f64() * 1e6 / ITERS as f64;
+        let new_us = new.as_secs_f64() * 1e6 / ITERS as f64;
+        eprintln!(
+            "#56 per-hover repaint @ 64 agents: shell-rebuild(old)={old_us:.1}us ({:.0} fps ceiling), \
+             cached+overlay(new)={new_us:.1}us ({:.0} fps ceiling), speedup={:.1}x",
+            1e6 / old_us.max(f64::MIN_POSITIVE),
+            1e6 / new_us.max(f64::MIN_POSITIVE),
+            old_us / new_us.max(f64::MIN_POSITIVE),
+        );
+
+        assert!(
+            new < old / 2,
+            "#56: a hover repaint (cached shell + overlay) must be far cheaper than a shell rebuild \
+             (new={new:?}, old={old:?})"
+        );
+    }
 }
