@@ -194,10 +194,6 @@ pub(crate) struct ClientMenu {
     pub(crate) anchor_row: u16,
     /// The highlighted row.
     pub(crate) selected: usize,
-    /// #47: a client-local drag offset (cols, rows) applied to the popup's default position. `(0, 0)`
-    /// at open; dragging the popup's top border accumulates here so the menu can be repositioned.
-    /// Render, hit-test, and the content-exclusion rect all shift the default rect by this.
-    pub(crate) drag_offset: (i16, i16),
     /// The ordered rows, with their labels + per-row selectable flag + action baked at open time
     /// (so a state-dependent label like "disable"/"enable" and its action can never drift apart).
     pub(crate) items: Vec<ClientMenuItem>,
@@ -556,6 +552,12 @@ pub(crate) struct ClientSupervisorModel {
     ui_settings: crate::api::schema::UiSettingsInfo,
     new_workspace_picker: Option<NewWorkspacePickerState>, // item 1 (was new_workspace_picker_destinations)
     client_overlay: ClientOverlayState,
+    // #47: the ONE drag offset (cols, rows) shared by EVERY client overlay (the three menus +
+    // add-remote / manage-remotes / new-workspace picker / rename / confirm-close). Reset to (0, 0)
+    // whenever any overlay opens or closes, so a dragged overlay never carries its offset to the
+    // next. Render, hit-test, and the content-exclusion rect all shift the open overlay's default
+    // popup by this (clamped on-screen). Dragging the popup's top border accumulates here.
+    overlay_drag_offset: (i16, i16),
     optimistic_focus: Option<(ServerId, OptimisticFocusTarget)>, // item 6 (always None in C0)
     /// #44: per-host live "update" provisioning progress line, keyed by `ServerId` so the banner
     /// sub-line targets the right host. Populated by `set_update_progress` from the update worker's
@@ -639,6 +641,7 @@ impl ClientSupervisorModel {
             ui_settings: crate::api::schema::UiSettingsInfo::default(),
             new_workspace_picker: None,
             client_overlay: ClientOverlayState::None,
+            overlay_drag_offset: (0, 0),
             optimistic_focus: None,
             update_progress: std::collections::HashMap::new(),
         }
@@ -1181,6 +1184,18 @@ impl ClientSupervisorModel {
         matches!(self.client_overlay, ClientOverlayState::Menu(_))
     }
 
+    /// #47: whether ANY client overlay is open — the three menus plus the add-remote / manage-remotes
+    /// / new-workspace-picker / rename / confirm-close forms. Used by the shared top-border drag so
+    /// every overlay can be repositioned with one mechanism.
+    pub(crate) fn any_overlay_open(&self) -> bool {
+        self.client_menu().is_some()
+            || self.add_remote_form().is_some()
+            || self.new_workspace_picker().is_some()
+            || self.remote_manage_overlay().is_some()
+            || self.rename_workspace_form().is_some()
+            || self.confirm_close_workspace().is_some()
+    }
+
     /// #47: the first selectable row — the initial highlight, so a menu never opens on a
     /// non-actionable row (e.g. the host version readout). Falls back to 0 when none are selectable.
     fn first_selectable_index(items: &[ClientMenuItem]) -> usize {
@@ -1202,6 +1217,7 @@ impl ClientSupervisorModel {
             })
             .collect();
         self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
         let selected = Self::first_selectable_index(&items);
         self.client_overlay = ClientOverlayState::Menu(ClientMenu {
             kind: ClientMenuKind::GlobalLauncher,
@@ -1210,7 +1226,6 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
-            drag_offset: (0, 0),
             items,
         });
     }
@@ -1239,12 +1254,17 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// #47: set the open menu's drag offset (cols, rows from its default position), used while the
-    /// user drags the popup's top border to reposition it. A no-op when no menu is open.
-    pub(crate) fn set_client_menu_drag_offset(&mut self, offset: (i16, i16)) {
-        if let Some(menu) = self.client_menu_mut() {
-            menu.drag_offset = offset;
-        }
+    /// #47: the shared overlay drag offset (cols, rows from the open overlay's default position).
+    /// `(0, 0)` at open; accumulated while dragging the popup's top border.
+    pub(crate) fn overlay_drag_offset(&self) -> (i16, i16) {
+        self.overlay_drag_offset
+    }
+
+    /// #47: set the open overlay's drag offset, used while the user drags the popup's top border to
+    /// reposition it. Applies to WHICHEVER overlay is open (menu / form / picker / manage) — one
+    /// mechanism for all.
+    pub(crate) fn set_overlay_drag_offset(&mut self, offset: (i16, i16)) {
+        self.overlay_drag_offset = offset;
     }
 
     /// #47: translate a key press into a typed outcome — the single keyboard handler for all three
@@ -1375,6 +1395,7 @@ impl ClientSupervisorModel {
 
     pub(crate) fn open_add_remote_form(&mut self) {
         self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
         self.client_overlay = ClientOverlayState::AddRemote(AddRemoteForm {
             target: String::new(),
             name: String::new(),
@@ -1575,6 +1596,7 @@ impl ClientSupervisorModel {
     /// Open the management overlay with a fresh selection clamped to the current secondary rows.
     pub(crate) fn open_remote_manage_overlay(&mut self) {
         self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
         self.client_overlay = ClientOverlayState::ManageRemotes(RemoteManageOverlay {
             selected: 0,
             scroll: 0,
@@ -1867,6 +1889,7 @@ impl ClientSupervisorModel {
             },
         ];
         self.new_workspace_picker = None;
+        self.overlay_drag_offset = (0, 0);
         let selected = Self::first_selectable_index(&items);
         self.client_overlay = ClientOverlayState::Menu(ClientMenu {
             kind: ClientMenuKind::Workspace {
@@ -1879,7 +1902,6 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
-            drag_offset: (0, 0),
             items,
         });
     }
@@ -1967,7 +1989,6 @@ impl ClientSupervisorModel {
             anchor_col,
             anchor_row,
             selected,
-            drag_offset: (0, 0),
             items,
         });
     }
@@ -1996,6 +2017,7 @@ impl ClientSupervisorModel {
             },
             _ => return,
         };
+        self.overlay_drag_offset = (0, 0);
         self.client_overlay = ClientOverlayState::RenameWorkspace(form);
     }
 
@@ -2107,6 +2129,7 @@ impl ClientSupervisorModel {
             },
             _ => return,
         };
+        self.overlay_drag_offset = (0, 0);
         self.client_overlay = ClientOverlayState::ConfirmCloseWorkspace(confirm);
     }
 
@@ -2541,6 +2564,8 @@ impl ClientSupervisorModel {
 
     pub(crate) fn close_client_overlay(&mut self) {
         self.client_overlay = ClientOverlayState::None;
+        // #47: a closed overlay carries no drag offset to the next one.
+        self.overlay_drag_offset = (0, 0);
     }
 
     fn add_remote_form_mut(&mut self) -> Option<&mut AddRemoteForm> {

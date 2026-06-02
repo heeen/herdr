@@ -383,6 +383,9 @@ struct ClientSidebarSnapshot {
     // #23: the rename / confirm-close follow-on overlays a workspace menu row promotes into.
     rename_workspace: Option<crate::client::supervisor::RenameWorkspaceForm>,
     confirm_close_workspace: Option<crate::client::supervisor::ConfirmCloseWorkspace>,
+    // #47: the one drag offset (cols, rows) shared by EVERY overlay, cloned from the model. Render,
+    // hit-test, and the content-exclusion rect shift the open overlay's default popup by this.
+    overlay_drag_offset: (i16, i16),
 }
 
 impl ClientCompositor {
@@ -1227,34 +1230,15 @@ impl ClientCompositor {
         // have). This is exactly what `overlay_anchor_area` returns.
         let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
         let mut excluded_rects: Vec<Rect> = Vec::new();
-        if model.add_remote_form().is_some() {
-            excluded_rects.extend(crate::ui::add_remote_popup_rect(anchor_area));
-        } else if let Some((dests, _)) = snapshot.new_workspace_picker.as_ref() {
-            excluded_rects.extend(crate::ui::new_workspace_picker_popup_rect(
-                anchor_area,
-                dests.len(),
-            ));
-        } else if let Some((overlay, rows)) = snapshot.remote_manage.as_ref() {
-            excluded_rects.extend(crate::ui::remote_manage_popup_rect(anchor_area, rows.len()));
+        // #47: protect the open overlay's (drag-shifted) popup so it floats over the content
+        // cell-for-cell — ONE source of truth (`open_overlay_popup_rect`) for every overlay's current
+        // rect (the three menus + the five footer forms), keeping render == hit-test == exclusion.
+        excluded_rects.extend(open_overlay_popup_rect(&snapshot, host_width, host_height));
+        // the manage delete-confirm sub-popup stays centered on top of the (possibly dragged) list.
+        if let Some((overlay, _)) = snapshot.remote_manage.as_ref() {
             if overlay.confirm_delete.is_some() {
                 excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
             }
-        } else if let Some(menu) = snapshot.client_menu.as_ref() {
-            // #47: protect the open client menu's popup rect (SAME geometry the renderer uses) so it
-            // floats over the content cell-for-cell. The launcher keeps its original button-anchored
-            // `global_menu_rect` surface; the two context menus use the cursor-anchored helper.
-            if matches!(
-                menu.kind,
-                crate::client::supervisor::ClientMenuKind::GlobalLauncher
-            ) {
-                excluded_rects.extend(launcher_menu_rect(&snapshot, host_width, host_height));
-            } else {
-                excluded_rects.extend(context_menu_popup_rect(menu, host_width, host_height));
-            }
-        } else if snapshot.rename_workspace.is_some() {
-            excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
-        } else if snapshot.confirm_close_workspace.is_some() {
-            excluded_rects.extend(crate::ui::confirm_close_workspace_popup_rect(anchor_area));
         }
         let frame = render_client_shell(&snapshot, host_width, host_height);
 
@@ -1378,16 +1362,21 @@ impl ClientCompositor {
         // `add_remote_inner_rect` + the button-rect helpers) over the SAME `anchor_area`,
         // guaranteeing render == hit_test.
         let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
-        if let Some(target) = hit_test_new_workspace_picker(&snapshot, anchor_area, x, y) {
-            return Some(target);
-        }
-        if let Some(target) = hit_test_add_remote(&snapshot, anchor_area, x, y) {
-            return Some(target);
-        }
-        // item 3 (Area 5): the manage overlay intercepts the whole host rect first (so a click on
-        // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
-        if snapshot.remote_manage.is_some() {
-            return hit_test_remote_manage(&snapshot, anchor_area, x, y);
+        // #47: every overlay hit-tests against its (drag-shifted) popup — the SAME rect the renderer
+        // draws — so a dragged overlay's targets follow it and render == hit-test.
+        let overlay_popup = open_overlay_popup_rect(&snapshot, host_width, host_height);
+        if let Some(popup) = overlay_popup {
+            if let Some(target) = hit_test_new_workspace_picker(&snapshot, popup, x, y) {
+                return Some(target);
+            }
+            if let Some(target) = hit_test_add_remote(&snapshot, popup, x, y) {
+                return Some(target);
+            }
+            // item 3 (Area 5): the manage overlay intercepts the whole host rect first (so a click on
+            // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
+            if snapshot.remote_manage.is_some() {
+                return hit_test_remote_manage(&snapshot, popup, anchor_area, x, y);
+            }
         }
         // #47: the open client menu (launcher / workspace / host) is modal — when open it owns the
         // whole host rect (its own row targets or none), so a click on a sidebar row beneath never
@@ -1406,11 +1395,13 @@ impl ClientCompositor {
             }
             return hit_test_client_menu(&snapshot, host_width, host_height, x, y);
         }
-        if snapshot.rename_workspace.is_some() {
-            return hit_test_rename_workspace(&snapshot, anchor_area, x, y);
-        }
-        if snapshot.confirm_close_workspace.is_some() {
-            return hit_test_confirm_close_workspace(&snapshot, anchor_area, x, y);
+        if let Some(popup) = overlay_popup {
+            if snapshot.rename_workspace.is_some() {
+                return hit_test_rename_workspace(&snapshot, popup, x, y);
+            }
+            if snapshot.confirm_close_workspace.is_some() {
+                return hit_test_confirm_close_workspace(&snapshot, popup, x, y);
+            }
         }
 
         if x >= sidebar_width {
@@ -1553,10 +1544,11 @@ impl ClientCompositor {
         );
 
         // The new-workspace picker is a footer-anchored popup (item 1), so it hovers before the
-        // sidebar-width guard — the SAME order/geometry `hit_test` uses for it.
-        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
-        if let Some(target) = hover_test_new_workspace_picker(&snapshot, anchor_area, x, y) {
-            return Some(target);
+        // sidebar-width guard — the SAME (drag-shifted) popup geometry `hit_test` uses for it.
+        if let Some(popup) = open_overlay_popup_rect(&snapshot, host_width, host_height) {
+            if let Some(target) = hover_test_new_workspace_picker(&snapshot, popup, x, y) {
+                return Some(target);
+            }
         }
         // While the picker is open the dimmed sidebar beneath is inert (matches `hit_test`).
         if snapshot.new_workspace_picker.is_some() {
@@ -1626,10 +1618,11 @@ impl ClientCompositor {
         hover_test_agent_panel(&snapshot, x, y)
     }
 
-    /// #47: the open client menu's CURRENT popup rect (its default position shifted by any drag
-    /// offset, clamped on-screen), or `None` when no menu is open / it does not fit. The launcher
-    /// uses its `global_menu_rect` dropdown; the context menus use the cursor-anchored helper.
-    fn client_menu_popup_rect(
+    /// #47: the CURRENT popup rect of whichever client overlay is open — its default position shifted
+    /// by the shared drag offset (clamped on-screen), or `None` when nothing is open / it does not
+    /// fit. Covers ALL overlays: the launcher dropdown, the cursor-anchored context menus, and the
+    /// footer-anchored add-remote / picker / manage / rename / confirm forms.
+    fn open_overlay_popup_rect(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
         host_width: u16,
@@ -1647,24 +1640,17 @@ impl ClientCompositor {
             host_height,
             Instant::now(),
         );
-        let menu = snapshot.client_menu.as_ref()?;
-        if matches!(
-            menu.kind,
-            crate::client::supervisor::ClientMenuKind::GlobalLauncher
-        ) {
-            launcher_menu_rect(&snapshot, host_width, host_height)
-        } else {
-            context_menu_popup_rect(menu, host_width, host_height)
-        }
+        open_overlay_popup_rect(&snapshot, host_width, host_height)
     }
 
-    /// #47: feed a mouse event to the open client menu's TOP-BORDER drag-to-move. A left-press on the
-    /// popup's top border row starts a drag; each `Drag` moves the menu by the pointer delta (the new
-    /// offset = the offset at press + travel); the release ends it. Returns `Some(changed)` when the
-    /// event was part of a drag (the caller redraws iff changed and does NOT also select/dismiss), or
-    /// `None` when the event is not drag-related (the caller continues its normal handling). A press
-    /// anywhere but the top border returns `None`, so row-select / outside-dismiss still work.
-    pub(crate) fn handle_client_menu_drag(
+    /// #47: feed a mouse event to the open overlay's TOP-BORDER drag-to-move. A left-press on the
+    /// popup's top border row starts a drag; each `Drag` moves the overlay by the pointer delta (the
+    /// new offset = the offset at press + travel, clamped so the popup stays on-screen); the release
+    /// ends it. Returns `Some(changed)` when the event was part of a drag (the caller redraws iff
+    /// changed and does NOT also select/dismiss), or `None` when the event is not drag-related (the
+    /// caller continues its normal handling). A press anywhere but the top border returns `None`, so
+    /// row-select / button-clicks / outside-dismiss still work. ONE handler for every overlay.
+    pub(crate) fn handle_overlay_drag(
         &mut self,
         model: &mut crate::client::supervisor::ClientSupervisorModel,
         mouse: &crossterm::event::MouseEvent,
@@ -1673,24 +1659,23 @@ impl ClientCompositor {
     ) -> Option<bool> {
         use crossterm::event::{MouseButton, MouseEventKind};
 
-        if model.client_menu().is_none() {
+        if !model.any_overlay_open() {
             self.menu_drag = None;
             return None;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let popup = self.client_menu_popup_rect(model, host_width, host_height)?;
+                let popup = self.open_overlay_popup_rect(model, host_width, host_height)?;
                 let on_top_border = mouse.row == popup.y
                     && mouse.column >= popup.x
                     && mouse.column < popup.x.saturating_add(popup.width);
                 if !on_top_border {
                     return None;
                 }
-                let start_offset = model.client_menu().map(|menu| menu.drag_offset)?;
                 self.menu_drag = Some(ClientMenuDrag {
                     start_col: mouse.column,
                     start_row: mouse.row,
-                    start_offset,
+                    start_offset: model.overlay_drag_offset(),
                 });
                 Some(false)
             }
@@ -1699,11 +1684,11 @@ impl ClientCompositor {
                 let dx = mouse.column as i32 - drag.start_col as i32;
                 let dy = mouse.row as i32 - drag.start_row as i32;
                 let next = (
-                    (drag.start_offset.0 as i32 + dx) as i16,
-                    (drag.start_offset.1 as i32 + dy) as i16,
+                    (drag.start_offset.0 as i32 + dx).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    (drag.start_offset.1 as i32 + dy).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 );
-                let changed = model.client_menu().map(|menu| menu.drag_offset) != Some(next);
-                model.set_client_menu_drag_offset(next);
+                let changed = model.overlay_drag_offset() != next;
+                model.set_overlay_drag_offset(next);
                 Some(changed)
             }
             MouseEventKind::Up(_) => self.menu_drag.take().map(|_| false),
@@ -2117,6 +2102,7 @@ impl ClientSidebarSnapshot {
             // baked item labels/flags from the same clone. The rename / confirm-close follow-on
             // overlays are still carried separately.
             client_menu: model.client_menu().cloned(),
+            overlay_drag_offset: model.overlay_drag_offset(),
             rename_workspace: model.rename_workspace_form().cloned(),
             confirm_close_workspace: model.confirm_close_workspace().cloned(),
         }
@@ -2180,6 +2166,9 @@ fn render_client_shell(
             // compositor maps the ui-owned snapshot carriers into ui view structs here (no
             // supervisor types reach `ui`).
             let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+            // #47: the (drag-shifted) popup rect of whichever overlay is open — render every overlay
+            // at THIS rect so a dragged overlay moves and render == hit-test == drag geometry.
+            let overlay_popup = open_overlay_popup_rect(snapshot, host_width, host_height);
             if let Some((dests, selected)) = &snapshot.new_workspace_picker {
                 let views: Vec<crate::ui::DestinationView> = dests
                     .iter()
@@ -2195,14 +2184,16 @@ fn render_client_shell(
                     }) => Some(row as usize),
                     _ => None,
                 };
-                crate::ui::render_new_workspace_picker_overlay(
-                    &snapshot.app.palette,
-                    &views,
-                    *selected,
-                    hovered_row,
-                    frame,
-                    anchor_area,
-                );
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_new_workspace_picker_overlay(
+                        &snapshot.app.palette,
+                        &views,
+                        *selected,
+                        hovered_row,
+                        frame,
+                        popup,
+                    );
+                }
             }
             if let Some(form) = &snapshot.add_remote_form {
                 let view = crate::ui::AddRemoteOverlayView {
@@ -2219,27 +2210,32 @@ fn render_client_shell(
                         .as_ref()
                         .map(|confirm| confirm.destination.as_str()),
                 };
-                crate::ui::render_add_remote_overlay(
-                    &snapshot.app.palette,
-                    &view,
-                    frame,
-                    anchor_area,
-                );
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_add_remote_overlay(
+                        &snapshot.app.palette,
+                        &view,
+                        frame,
+                        popup,
+                    );
+                }
             }
             // item 3 (Area 5): render the remote-management overlay as a footer-anchored popup. The
             // compositor maps the supervisor rows into ui-owned views here (no supervisor types
             // reach `ui`).
             if let Some((overlay, rows)) = &snapshot.remote_manage {
                 let views = model_remote_manage_row_views(rows);
-                crate::ui::render_remote_manage_overlay(
-                    &snapshot.app.palette,
-                    &views,
-                    overlay.selected,
-                    overlay.scroll,
-                    overlay.confirm_delete.as_deref(),
-                    frame,
-                    anchor_area,
-                );
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_remote_manage_overlay(
+                        &snapshot.app.palette,
+                        &views,
+                        overlay.selected,
+                        overlay.scroll,
+                        overlay.confirm_delete.as_deref(),
+                        frame,
+                        popup,
+                        anchor_area,
+                    );
+                }
             }
             // #47: the global launcher keeps its ORIGINAL look — render it through the unchanged
             // `render_global_launcher_menu` dropdown surface (driven by the AppState `Mode::GlobalMenu`
@@ -2259,7 +2255,7 @@ fn render_client_shell(
                     crate::client::supervisor::ClientMenuKind::GlobalLauncher
                 ) {
                     let header_rows = client_menu_header_rows(menu);
-                    if let Some(popup) = context_menu_popup_rect(menu, host_width, host_height) {
+                    if let Some(popup) = context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height) {
                         let rows: Vec<crate::ui::ClientMenuRowView> = menu
                             .items
                             .iter()
@@ -2285,21 +2281,25 @@ fn render_client_shell(
                 }
             }
             if let Some(form) = &snapshot.rename_workspace {
-                crate::ui::render_rename_workspace_overlay(
-                    &snapshot.app.palette,
-                    &form.label,
-                    form.error.as_deref(),
-                    frame,
-                    anchor_area,
-                );
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_rename_workspace_overlay(
+                        &snapshot.app.palette,
+                        &form.label,
+                        form.error.as_deref(),
+                        frame,
+                        popup,
+                    );
+                }
             }
             if let Some(confirm) = &snapshot.confirm_close_workspace {
-                crate::ui::render_confirm_close_workspace_overlay(
-                    &snapshot.app.palette,
-                    &confirm.label,
-                    frame,
-                    anchor_area,
-                );
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_confirm_close_workspace_overlay(
+                        &snapshot.app.palette,
+                        &confirm.label,
+                        frame,
+                        popup,
+                    );
+                }
             }
         })
         .expect("render to TestBackend should not fail");
@@ -2400,12 +2400,12 @@ fn model_remote_manage_row_views(
 /// + `new_workspace_picker_button_rects`) over the same `full_rect`, so render == hit_test.
 fn hit_test_new_workspace_picker(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    popup: Rect,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     let (destinations, _) = snapshot.new_workspace_picker.as_ref()?;
-    let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, destinations.len())?;
+    let inner = popup_inner(popup);
 
     // buttons take precedence over the (overlapping) actions row.
     let (confirm_rect, cancel_rect) = crate::ui::new_workspace_picker_button_rects(inner);
@@ -2436,12 +2436,12 @@ fn hit_test_new_workspace_picker(
 /// use, so render == hover_test for the modal rows.
 fn hover_test_new_workspace_picker(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    popup: Rect,
     x: u16,
     y: u16,
 ) -> Option<crate::app::state::SidebarHoverTarget> {
     let (destinations, _) = snapshot.new_workspace_picker.as_ref()?;
-    let inner = crate::ui::new_workspace_picker_inner_rect(full_rect, destinations.len())?;
+    let inner = popup_inner(popup);
     let max_rows = inner.height.saturating_sub(3) as usize;
     for row_index in 0..destinations.len().min(max_rows) {
         let row = crate::ui::new_workspace_picker_row_rect(inner, row_index);
@@ -2460,12 +2460,12 @@ fn hover_test_new_workspace_picker(
 /// form is closed or the click misses. Uses the shared fixed `add_remote_inner_rect` geometry.
 fn hit_test_add_remote(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    popup: Rect,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     snapshot.add_remote_form.as_ref()?;
-    let inner = crate::ui::add_remote_inner_rect(full_rect)?;
+    let inner = popup_inner(popup);
     let (submit_rect, cancel_rect) = crate::ui::add_remote_button_rects(inner);
     if rect_contains(submit_rect, x, y) {
         return Some(SidebarHitTarget::AddRemoteSubmit);
@@ -2483,21 +2483,17 @@ fn hit_test_add_remote(
 /// (`remote_manage_inner_rect`/`_row_rect`/`_confirm_*`), guaranteeing render == hit_test.
 fn hit_test_remote_manage(
     snapshot: &ClientSidebarSnapshot,
+    popup: Rect,
     full_rect: Rect,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     let (overlay, rows) = snapshot.remote_manage.as_ref()?;
 
-    // delete-confirm sub-state: only the popup buttons are hit-testable.
+    // delete-confirm sub-state: only the (still-centered) popup buttons are hit-testable.
     if overlay.confirm_delete.is_some() {
-        let popup = crate::ui::remote_manage_confirm_popup_rect(full_rect)?;
-        let inner = Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        );
+        let confirm_popup = crate::ui::remote_manage_confirm_popup_rect(full_rect)?;
+        let inner = popup_inner(confirm_popup);
         let (delete_rect, cancel_rect) = crate::ui::remote_manage_confirm_button_rects(inner);
         if rect_contains(delete_rect, x, y) {
             return Some(SidebarHitTarget::RemoteManageConfirmDelete);
@@ -2508,7 +2504,8 @@ fn hit_test_remote_manage(
         return None;
     }
 
-    let inner = crate::ui::remote_manage_inner_rect(full_rect, rows.len())?;
+    // main list: inner derives from the (drag-shifted) popup so render == hit-test.
+    let inner = popup_inner(popup);
 
     // footer hint row hosts the `add` affordance (whole footer row).
     let footer = Rect::new(
@@ -2563,7 +2560,7 @@ fn hit_test_client_menu(
     let count = menu.items.len();
     let header_rows = client_menu_header_rows(menu);
     // Derive the inner rect from the (drag-shifted) popup so render == hit-test even after a drag.
-    let popup = context_menu_popup_rect(menu, host_width, host_height)?;
+    let popup = context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height)?;
     let inner = Rect::new(
         popup.x + 1,
         popup.y + 1,
@@ -2589,6 +2586,7 @@ fn hit_test_client_menu(
 /// base, shifted by the menu's drag offset (clamped on-screen). `None` when it does not fit.
 fn context_menu_popup_rect(
     menu: &crate::client::supervisor::ClientMenu,
+    offset: (i16, i16),
     host_width: u16,
     host_height: u16,
 ) -> Option<Rect> {
@@ -2600,7 +2598,61 @@ fn context_menu_popup_rect(
         host_width,
         host_height,
     )?;
-    Some(shift_menu_rect(base, menu.drag_offset, host_width, host_height))
+    Some(shift_menu_rect(base, offset, host_width, host_height))
+}
+
+/// #47: the footer-anchored area the form overlays (add-remote / picker / manage / rename / confirm)
+/// anchor their popups within. Spans the host top down to the sidebar footer row.
+fn overlay_footer_anchor_area(snapshot: &ClientSidebarSnapshot, host_width: u16) -> Rect {
+    Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y)
+}
+
+/// #47: the CURRENT popup rect of whichever client overlay is open — its default position shifted by
+/// the shared drag offset (clamped on-screen). Covers every overlay (the three menus + the five
+/// footer forms), so render, hit-test, the content-exclusion rect, and the top-border drag all read
+/// ONE source of truth. `None` when nothing is open / the popup does not fit.
+fn open_overlay_popup_rect(
+    snapshot: &ClientSidebarSnapshot,
+    host_width: u16,
+    host_height: u16,
+) -> Option<Rect> {
+    let offset = snapshot.overlay_drag_offset;
+    if let Some(menu) = snapshot.client_menu.as_ref() {
+        return if matches!(
+            menu.kind,
+            crate::client::supervisor::ClientMenuKind::GlobalLauncher
+        ) {
+            launcher_menu_rect(snapshot, host_width, host_height)
+        } else {
+            context_menu_popup_rect(menu, offset, host_width, host_height)
+        };
+    }
+    let anchor_area = overlay_footer_anchor_area(snapshot, host_width);
+    let base = if snapshot.add_remote_form.is_some() {
+        crate::ui::add_remote_popup_rect(anchor_area)
+    } else if let Some((dests, _)) = snapshot.new_workspace_picker.as_ref() {
+        crate::ui::new_workspace_picker_popup_rect(anchor_area, dests.len())
+    } else if let Some((_, rows)) = snapshot.remote_manage.as_ref() {
+        crate::ui::remote_manage_popup_rect(anchor_area, rows.len())
+    } else if snapshot.rename_workspace.is_some() {
+        crate::ui::rename_workspace_popup_rect(anchor_area)
+    } else if snapshot.confirm_close_workspace.is_some() {
+        crate::ui::confirm_close_workspace_popup_rect(anchor_area)
+    } else {
+        None
+    }?;
+    Some(shift_menu_rect(base, offset, host_width, host_height))
+}
+
+/// #47: the bordered-panel inner rect of a popup — the same inset `render_panel_shell` produces, so
+/// hit-test (which has no frame) derives the SAME inner as render.
+fn popup_inner(popup: Rect) -> Rect {
+    Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    )
 }
 
 /// #47: clamp `base` shifted by a drag `offset` (cols, rows) so the popup stays fully on-screen. Used
@@ -2619,14 +2671,9 @@ fn launcher_menu_rect(snapshot: &ClientSidebarSnapshot, host_width: u16, host_he
     if !matches!(snapshot.app.mode, Mode::GlobalMenu) {
         return None;
     }
-    let offset = snapshot
-        .client_menu
-        .as_ref()
-        .map(|menu| menu.drag_offset)
-        .unwrap_or((0, 0));
     Some(shift_menu_rect(
         snapshot.app.global_menu_rect(),
-        offset,
+        snapshot.overlay_drag_offset,
         host_width,
         host_height,
     ))
@@ -2653,16 +2700,16 @@ fn global_menu_item_index_at(
     (index < app.global_menu_labels().len()).then_some(index)
 }
 
-/// #23: hit-test the rename overlay's submit/cancel buttons. Geometry comes from the shared
-/// `rename_workspace_inner_rect` + `rename_workspace_button_rects`, so render == hit_test.
+/// #23/#47: hit-test the rename overlay's submit/cancel buttons. Inner derives from the (drag-
+/// shifted) `popup` via `popup_inner` + `rename_workspace_button_rects`, so render == hit_test.
 fn hit_test_rename_workspace(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    popup: Rect,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     snapshot.rename_workspace.as_ref()?;
-    let inner = crate::ui::rename_workspace_inner_rect(full_rect)?;
+    let inner = popup_inner(popup);
     let (submit_rect, cancel_rect) = crate::ui::rename_workspace_button_rects(inner);
     if rect_contains(submit_rect, x, y) {
         return Some(SidebarHitTarget::RenameWorkspaceSubmit);
@@ -2677,18 +2724,12 @@ fn hit_test_rename_workspace(
 /// shared `confirm_close_workspace_popup_rect` + `confirm_close_workspace_button_rects`.
 fn hit_test_confirm_close_workspace(
     snapshot: &ClientSidebarSnapshot,
-    full_rect: Rect,
+    popup: Rect,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     snapshot.confirm_close_workspace.as_ref()?;
-    let popup = crate::ui::confirm_close_workspace_popup_rect(full_rect)?;
-    let inner = Rect::new(
-        popup.x + 1,
-        popup.y + 1,
-        popup.width.saturating_sub(2),
-        popup.height.saturating_sub(2),
-    );
+    let inner = popup_inner(popup);
     let (confirm_rect, cancel_rect) = crate::ui::confirm_close_workspace_button_rects(inner);
     if rect_contains(confirm_rect, x, y) {
         return Some(SidebarHitTarget::ConfirmCloseWorkspaceConfirm);
@@ -6045,7 +6086,7 @@ mod tests {
         model.open_host_context_menu(remote_id, "x".into(), 10, 4);
 
         let before = compositor
-            .client_menu_popup_rect(&model, host.0, host.1)
+            .open_overlay_popup_rect(&model, host.0, host.1)
             .expect("popup fits");
         let ev = |kind, col, row| MouseEvent {
             kind,
@@ -6056,7 +6097,7 @@ mod tests {
 
         // a press on the popup's TOP BORDER row starts a drag (no offset change yet).
         assert_eq!(
-            compositor.handle_client_menu_drag(
+            compositor.handle_overlay_drag(
                 &mut model,
                 &ev(MouseEventKind::Down(MouseButton::Left), before.x + 2, before.y),
                 host.0,
@@ -6066,7 +6107,7 @@ mod tests {
         );
         // dragging +3 cols / +2 rows moves the popup by exactly that, and the offset accumulates.
         assert_eq!(
-            compositor.handle_client_menu_drag(
+            compositor.handle_overlay_drag(
                 &mut model,
                 &ev(
                     MouseEventKind::Drag(MouseButton::Left),
@@ -6078,9 +6119,9 @@ mod tests {
             ),
             Some(true)
         );
-        assert_eq!(model.client_menu().unwrap().drag_offset, (3, 2));
+        assert_eq!(model.overlay_drag_offset(), (3, 2));
         let after = compositor
-            .client_menu_popup_rect(&model, host.0, host.1)
+            .open_overlay_popup_rect(&model, host.0, host.1)
             .expect("popup fits");
         assert_eq!((after.x, after.y), (before.x + 3, before.y + 2));
         // render == hit-test after the drag: a row now hit-tests at the SHIFTED position.
@@ -6091,7 +6132,7 @@ mod tests {
         ));
         // releasing ends the drag.
         assert_eq!(
-            compositor.handle_client_menu_drag(
+            compositor.handle_overlay_drag(
                 &mut model,
                 &ev(MouseEventKind::Up(MouseButton::Left), after.x + 5, after.y + 2),
                 host.0,
@@ -6101,7 +6142,7 @@ mod tests {
         );
         // a press that is NOT on the top border returns None, so row-select / dismiss still run.
         assert_eq!(
-            compositor.handle_client_menu_drag(
+            compositor.handle_overlay_drag(
                 &mut model,
                 &ev(
                     MouseEventKind::Down(MouseButton::Left),
@@ -6112,6 +6153,66 @@ mod tests {
                 host.1,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn dragging_a_footer_form_overlay_repositions_it() {
+        // #47: the SAME top-border drag works for the footer FORM overlays, not just the menus — here
+        // the add-remote form moves and its submit button hit-tests at the shifted position.
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (80u16, 24u16);
+
+        let before = compositor
+            .open_overlay_popup_rect(&model, host.0, host.1)
+            .expect("popup fits");
+        let ev = |kind, col, row| MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        // press the top border, then drag -4 cols / -3 rows (up-left).
+        assert_eq!(
+            compositor.handle_overlay_drag(
+                &mut model,
+                &ev(MouseEventKind::Down(MouseButton::Left), before.x + 2, before.y),
+                host.0,
+                host.1,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            compositor.handle_overlay_drag(
+                &mut model,
+                &ev(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    before.x.saturating_sub(2),
+                    before.y.saturating_sub(3),
+                ),
+                host.0,
+                host.1,
+            ),
+            Some(true)
+        );
+        let after = compositor
+            .open_overlay_popup_rect(&model, host.0, host.1)
+            .expect("popup fits");
+        // the popup moved up-left (clamped to the screen).
+        assert!(after.x < before.x || after.y < before.y, "popup moved");
+        // a button inside the dragged form still hit-tests (render == hit-test after the drag).
+        let inner = popup_inner(after);
+        let (submit, cancel) = crate::ui::add_remote_button_rects(inner);
+        assert_eq!(
+            compositor.hit_test(&model, submit.x, submit.y, host.0, host.1),
+            Some(SidebarHitTarget::AddRemoteSubmit)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel.x, cancel.y, host.0, host.1),
+            Some(SidebarHitTarget::AddRemoteCancel)
         );
     }
 

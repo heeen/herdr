@@ -852,19 +852,12 @@ pub(crate) fn render_add_remote_overlay(
     palette: &Palette,
     view: &AddRemoteOverlayView,
     frame: &mut Frame,
-    area: Rect,
+    popup: Rect,
 ) {
-    let Some(popup) = add_remote_popup_rect(area) else {
-        return;
-    };
+    // #47: the caller passes the (drag-shifted) popup rect directly.
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    debug_assert_eq!(
-        Some(inner),
-        add_remote_inner_rect(area),
-        "add-remote render and hit-test geometry diverged"
-    );
     if inner.height < 5 {
         return;
     }
@@ -991,22 +984,13 @@ pub(crate) fn render_new_workspace_picker_overlay(
     selected: usize,
     hovered_row: Option<usize>,
     frame: &mut Frame,
-    area: Rect,
+    popup: Rect,
 ) {
-    // Draw the accent-bordered panel shell. Its inner rect is identical to
-    // `new_workspace_picker_inner_rect(area, count)` (both derive from the same
-    // `new_workspace_picker_popup_rect(area, count)`), so render geometry == hit-test geometry.
-    let Some(popup) = new_workspace_picker_popup_rect(area, destinations.len()) else {
-        return;
-    };
+    // #47: the caller passes the (drag-shifted) popup rect directly; inner is its bordered inset, so
+    // render geometry == hit-test geometry (both derive from the same popup).
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    debug_assert_eq!(
-        Some(inner),
-        new_workspace_picker_inner_rect(area, destinations.len()),
-        "picker render and hit-test geometry diverged"
-    );
     if inner.height < 4 {
         return;
     }
@@ -1147,19 +1131,14 @@ pub(crate) fn render_remote_manage_overlay(
     scroll: usize,
     confirm_delete: Option<&str>,
     frame: &mut Frame,
+    popup: Rect,
     area: Rect,
 ) {
-    let Some(popup) = remote_manage_popup_rect(area, rows.len()) else {
-        return;
-    };
+    // #47: the caller passes the (drag-shifted) main-list popup directly; `area` is kept only for the
+    // centered confirm-delete sub-popup, which stays centered (the drag moves the list behind it).
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    debug_assert_eq!(
-        Some(inner),
-        remote_manage_inner_rect(area, rows.len()),
-        "manage overlay render and hit-test geometry diverged"
-    );
     if inner.height < 4 {
         return;
     }
@@ -1377,17 +1356,6 @@ pub(crate) fn rename_workspace_popup_rect(area: Rect) -> Option<Rect> {
     bottom_left_popup_rect(area, 48, 7)
 }
 
-/// Fixed inner rect for the rename overlay. Returns `None` when the host is too small.
-pub(crate) fn rename_workspace_inner_rect(area: Rect) -> Option<Rect> {
-    rename_workspace_popup_rect(area).map(|popup| {
-        Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        )
-    })
-}
 
 /// The (save, cancel) button rects inside the rename overlay's inner rect. Mirrors
 /// `add_remote_button_rects`.
@@ -1513,19 +1481,13 @@ pub(crate) fn render_rename_workspace_overlay(
     label: &str,
     error: Option<&str>,
     frame: &mut Frame,
-    area: Rect,
+    popup: Rect,
 ) {
-    let Some(popup) = rename_workspace_popup_rect(area) else {
-        return;
-    };
+    // #47: the caller passes the (drag-shifted) popup rect directly; inner is its bordered inset, the
+    // SAME `render_panel_shell` inset hit-test derives, so render == hit-test even after a drag.
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    debug_assert_eq!(
-        Some(inner),
-        rename_workspace_inner_rect(area),
-        "rename render and hit-test geometry diverged"
-    );
     if inner.height < 4 {
         return;
     }
@@ -1577,11 +1539,9 @@ pub(crate) fn render_confirm_close_workspace_overlay(
     palette: &Palette,
     label: &str,
     frame: &mut Frame,
-    area: Rect,
+    popup: Rect,
 ) {
-    let Some(popup) = confirm_close_workspace_popup_rect(area) else {
-        return;
-    };
+    // #47: the caller passes the (drag-shifted) popup rect directly.
     let Some(inner) = render_panel_shell(frame, popup, palette.red, palette.panel_bg) else {
         return;
     };

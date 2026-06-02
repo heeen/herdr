@@ -68,7 +68,7 @@ pub(crate) use self::{
         remote_manage_confirm_button_rects, remote_manage_confirm_popup_rect,
         remote_manage_inner_rect, remote_manage_popup_rect, remote_manage_row_rect,
         remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
-        rename_workspace_button_rects, rename_workspace_inner_rect, rename_workspace_popup_rect,
+        rename_workspace_button_rects, rename_workspace_popup_rect,
         client_menu_inner_rect_at, client_menu_popup_rect_at, client_menu_row_rect,
         render_add_remote_overlay, render_client_menu_overlay,
         render_confirm_close_workspace_overlay, render_new_workspace_picker_overlay,

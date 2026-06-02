@@ -1069,6 +1069,20 @@ fn dispatch_composited_mouse_input(
     host_size: (u16, u16),
     mouse: &MouseEvent,
 ) -> ClientInputDispatch {
+    // #47: dragging ANY open overlay's top border repositions it. Handle it FIRST, ahead of every
+    // other handler (menu select, form buttons, sidebar) — for ALL overlays (the three menus + the
+    // add-remote / picker / manage / rename / confirm forms), one mechanism. A press anywhere but the
+    // top border returns `None` and falls through to the normal handling below.
+    if let Some(changed) =
+        compositor.handle_overlay_drag(model, mouse, host_size.0, host_size.1)
+    {
+        return if changed {
+            ClientInputDispatch::Redraw
+        } else {
+            ClientInputDispatch::Consumed
+        };
+    }
+
     // #46/#47: an open client menu (launcher / workspace / host) is MODAL — it renders topmost, so it
     // must be topmost in the EVENT pipeline too. Route every mouse event to it FIRST, ahead of the
     // sidebar motion/resize/scroll/reorder handlers below (which otherwise highlight rows UNDER the
@@ -1324,17 +1338,8 @@ fn dispatch_open_client_menu_mouse(
     host_size: (u16, u16),
     mouse: &MouseEvent,
 ) -> ClientInputDispatch {
-    // #47: dragging the popup's top border repositions the menu — this takes precedence over the
-    // row-select / outside-dismiss logic below (a press on the title row is neither). A press
-    // anywhere else returns `None` here and falls through to the normal handling.
-    if let Some(changed) = compositor.handle_client_menu_drag(model, mouse, host_size.0, host_size.1)
-    {
-        return if changed {
-            ClientInputDispatch::Redraw
-        } else {
-            ClientInputDispatch::Consumed
-        };
-    }
+    // #47: top-border drag-to-move is handled at the top of `dispatch_composited_mouse_input` (for
+    // ALL overlays, before this menu-modal path), so a title-row press never reaches here.
     let target = compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
     match mouse.kind {
         MouseEventKind::Moved => match target {
