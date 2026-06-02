@@ -171,14 +171,104 @@ pub(crate) struct SummarySubscriptionPlan {
     pub(crate) target: ServerConnectionTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientGlobalMenuAction {
+/// #47: the one model behind all three client-rendered side menus — the global launcher (the
+/// sidebar "menu" button), the workspace right-click context menu, and the host right-click context
+/// menu. One render path, one hit-test, one hover resolver, one keyboard handler, one dismiss — so
+/// the cross-cutting behavior (renders topmost AND is topmost in the event pipeline, mouse-over
+/// highlights, click selects, outside-press dismisses, keyboard up/down/enter/esc) holds for all
+/// three by construction instead of being re-implemented (and drifting) per menu. Replaces the three
+/// separate `ClientOverlayState` variants (`GlobalMenu` / `WorkspaceContextMenu` / `HostContextMenu`)
+/// and their three render/hit-test/keyboard worlds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientMenu {
+    /// Which menu this is + the per-menu context a selected row needs to act on (server / workspace).
+    pub(crate) kind: ClientMenuKind,
+    /// The panel header title ("menu" / "workspace" / "host").
+    pub(crate) title: &'static str,
+    /// Optional sub-header under the title — the workspace label / host name. `None` for the global
+    /// launcher (which has no target), which also drops the sub-header row from the geometry.
+    pub(crate) subheader: Option<String>,
+    /// The anchor cell: the right-click cursor for the context menus, the clicked menu-button cell
+    /// for the launcher. Both render and hit-test derive the popup rect from this (clamped to screen).
+    pub(crate) anchor_col: u16,
+    pub(crate) anchor_row: u16,
+    /// The highlighted row.
+    pub(crate) selected: usize,
+    /// The ordered rows, with their labels + per-row selectable flag + action baked at open time
+    /// (so a state-dependent label like "disable"/"enable" and its action can never drift apart).
+    pub(crate) items: Vec<ClientMenuItem>,
+}
+
+/// #47: one row of a [`ClientMenu`]. `selectable` is false for non-actionable rows (the host
+/// version readout); such rows still render and can be hovered, but activating one is a no-op and
+/// the initial highlight skips them. `action` is resolved at open time so the row order is the only
+/// source of truth (no hard-coded index → action mapping that can drift when rows are added).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientMenuItem {
+    pub(crate) label: String,
+    pub(crate) selectable: bool,
+    pub(crate) action: ClientMenuAction,
+}
+
+/// #47: which client menu, plus the context an activated row needs. The launcher carries no target;
+/// the context menus carry the server (+ workspace) the action routes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientMenuKind {
+    GlobalLauncher,
+    Workspace {
+        server_id: ServerId,
+        workspace_id: String,
+        label: String,
+    },
+    Host {
+        server_id: ServerId,
+    },
+}
+
+/// #47: the per-row action, baked at open time. The host rows bake their connection-dependent shape
+/// here (e.g. `HostToggleEnabled { enabled }`, or `Noop` for an add-space/update row whose host is
+/// disconnected) so [`select_client_menu_item`](ClientSupervisorModel::select_client_menu_item) is a
+/// pure lookup. `Noop` rows keep the menu open (matching the old version-readout / disconnected
+/// behavior).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientMenuAction {
+    Noop,
+    // global launcher
     Settings,
     Keybinds,
     ReloadConfig,
     Detach,
-    AddRemote,
-    ManageRemotes, // item 3 (Area 5)
+    OpenAddRemote,
+    OpenManageRemotes,
+    // workspace context menu
+    OpenRename,
+    OpenConfirmClose,
+    // host context menu
+    HostAddSpace,
+    HostToggleEnabled { enabled: bool },
+    HostDisconnect,
+    HostReconnect,
+    HostUpdate,
+}
+
+/// #47: the typed outcome of activating a [`ClientMenu`] row, mapped by the client loop into a
+/// `ClientInputDispatch`. The launcher's overlay-opening rows (`add remote` / `manage remotes`) and
+/// the workspace rename/close rows open their follow-on overlay inside
+/// [`select_client_menu_item`](ClientSupervisorModel::select_client_menu_item) and report `Redraw`;
+/// the rest carry the context the loop needs (the menu is already closed by `select`). Merges the
+/// old `ClientGlobalMenuAction` / `WorkspaceContextOutcome` / `HostContextOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClientMenuOutcome {
+    Redraw,
+    Settings,
+    Keybinds,
+    ReloadConfig,
+    Detach,
+    HostAddSpace(ServerId),
+    HostToggleEnabled { remote_id: String, enabled: bool },
+    HostDisconnect(ServerId),
+    HostReconnect(ServerId),
+    HostUpdate(ServerId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,34 +323,16 @@ pub(crate) enum AddRemoteFormOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientOverlayState {
     None,
-    GlobalMenu { highlighted: usize },
+    // #47: the single slot for all three client-rendered side menus (global launcher / workspace
+    // context / host context). Collapses the old `GlobalMenu` / `WorkspaceContextMenu` /
+    // `HostContextMenu` variants onto one `ClientMenu` — one render/hit-test/hover/keyboard/dismiss.
+    Menu(ClientMenu),
     AddRemote(AddRemoteForm),
     ManageRemotes(RemoteManageOverlay), // item 3 (Area 5)
-    // #23: per-workspace context menu and its two follow-on overlays (rename / confirm-close).
-    // All client-local; the action routes to the owning server via the existing workspace.* API.
-    WorkspaceContextMenu(WorkspaceContextMenu),
+    // #23: the two follow-on overlays a workspace context-menu row promotes into (rename /
+    // confirm-close). All client-local; the action routes to the owning server via workspace.* API.
     RenameWorkspace(RenameWorkspaceForm),
     ConfirmCloseWorkspace(ConfirmCloseWorkspace),
-    // #43: per-host context menu (add-space / enable-disable / disconnect-reconnect). Mirrors the
-    // workspace context menu (#33) but anchored to a host banner; actions route to the registry
-    // (enable/disable) or the live stream (disconnect/reconnect) or the owning server (add-space).
-    HostContextMenu(HostContextMenu),
-}
-
-/// #23: a right-click context menu over a workspace card, listing `Rename`/`Close` for the
-/// captured `(server_id, workspace_id)`. `label` is the workspace's current label, carried so the
-/// rename prefill and the close-confirm text need no second lookup. Mirrors `RemoteManageOverlay`
-/// (a small list overlay), but anchored to a single workspace target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceContextMenu {
-    pub(crate) server_id: ServerId,
-    pub(crate) workspace_id: String,
-    pub(crate) label: String,
-    pub(crate) selected: usize,
-    // #33: the right-click cursor position, so the popup anchors at the cursor (clamped to screen)
-    // instead of a fixed footer corner. Render and hit-test both derive geometry from this.
-    pub(crate) anchor_col: u16,
-    pub(crate) anchor_row: u16,
 }
 
 /// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
@@ -280,68 +352,6 @@ pub(crate) struct ConfirmCloseWorkspace {
     pub(crate) server_id: ServerId,
     pub(crate) workspace_id: String,
     pub(crate) label: String,
-}
-
-/// #23: the typed outcome of a key press in the context menu. The client loop opens the follow-on
-/// overlay (`Rename`/`Close`) or just redraws. Mirrors `RemoteManageOutcome`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WorkspaceContextOutcome {
-    Redraw,
-    OpenRename,
-    OpenConfirmClose,
-}
-
-/// #43: a right-click context menu over a host banner, listing `add new space` /
-/// `enable`-`disable` / `disconnect`-`reconnect` for the captured `server_id`. `disabled` and
-/// `connected` are captured at open time so the labels (which flip with state) and the geometry row
-/// count derive from one source. Mirrors `WorkspaceContextMenu`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostContextMenu {
-    pub(crate) server_id: ServerId,
-    pub(crate) display_name: String,
-    pub(crate) disabled: bool,
-    pub(crate) connected: bool,
-    pub(crate) selected: usize,
-    // #44: the remote's runtime version/protocol captured at open time, so the version-readout row
-    // label (and its ⚠ mismatch marker) are stable while the menu is open. Mirrors how `disabled`/
-    // `connected` are snapshotted so the row list and the action mapping share one source.
-    pub(crate) remote_version: Option<String>,
-    pub(crate) remote_protocol: Option<u32>,
-    // #43: the right-click cursor position, so the popup anchors at the cursor (clamped to screen).
-    // Render and hit-test both derive geometry from this. Mirrors `WorkspaceContextMenu`.
-    pub(crate) anchor_col: u16,
-    pub(crate) anchor_row: u16,
-}
-
-/// #43: the typed outcome of selecting a host context-menu row. `AddSpace` carries the `server_id`
-/// the client turns into a `workspace.create` round-trip (resolved via the public route helper, as
-/// `route_for_specific_server` is private). `ToggleEnabled` flips the registry `disabled` flag via
-/// the existing `remote.set_enabled` path. `Disconnect`/`Reconnect` drop/restore the live stream
-/// WITHOUT touching `disabled`. Mirrors `WorkspaceContextOutcome`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HostContextOutcome {
-    Redraw,
-    AddSpace(ServerId),
-    ToggleEnabled { remote_id: String, enabled: bool },
-    Disconnect(ServerId),
-    Reconnect(ServerId),
-    /// #44: reinstall the LOCAL client's herdr onto this remote by reusing the add-remote
-    /// provisioning flow (NOT an internet download). Returned only for the "update" row when the
-    /// host is connected; otherwise the row selects to `Redraw`.
-    Update(ServerId),
-}
-
-/// #44: the ordered host context-menu row kinds. The version readout (top) is non-selectable; the
-/// rest map 1:1 to `HostContextOutcome` actions. Both the label list and the index→action mapping
-/// derive from the SAME ordered Vec of these (see `host_context_menu_rows`), so no hard-coded
-/// integer index can drift from the row order when rows are added/removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostMenuRow {
-    VersionReadout,
-    AddSpace,
-    ToggleEnabled,
-    Disconnect,
-    Update,
 }
 
 /// #23: the typed outcome of a key press in the rename overlay. `Submit` carries the
@@ -1111,102 +1121,242 @@ impl ClientSupervisorModel {
         self.choose_new_workspace_destination(&server_id)
     }
 
-    pub(crate) fn client_global_menu_items(&self) -> Vec<&'static str> {
-        vec![
-            "settings",
-            "keybinds",
-            "reload config",
-            "detach",
-            "add remote",
-            "manage remotes",
+    /// #47: the global launcher rows, in render order, as (label, action) pairs — the single source
+    /// of truth for both the labels (`client_global_menu_items`) and the menu the launcher opens
+    /// (`open_client_global_menu`), so they cannot drift. Every launcher row is selectable.
+    fn global_launcher_rows() -> [(&'static str, ClientMenuAction); 6] {
+        [
+            ("settings", ClientMenuAction::Settings),
+            ("keybinds", ClientMenuAction::Keybinds),
+            ("reload config", ClientMenuAction::ReloadConfig),
+            ("detach", ClientMenuAction::Detach),
+            ("add remote", ClientMenuAction::OpenAddRemote),
+            ("manage remotes", ClientMenuAction::OpenManageRemotes),
         ]
     }
 
-    pub(crate) fn client_global_menu_highlighted(&self) -> Option<usize> {
-        match self.client_overlay {
-            ClientOverlayState::GlobalMenu { highlighted } => Some(highlighted),
+    /// #47: the launcher row labels, in render order. Mirrors the server launcher
+    /// (`global_menu_labels`); `client_global_menu_uses_server_launcher_items` pins the two together.
+    pub(crate) fn client_global_menu_items(&self) -> Vec<&'static str> {
+        Self::global_launcher_rows()
+            .iter()
+            .map(|(label, _)| *label)
+            .collect()
+    }
+
+    // ----- #47: the unified client menu (global launcher / workspace context / host context) ------
+
+    /// #47: the open client menu, or `None`. The single accessor behind all three menus' render,
+    /// hit-test, hover, keyboard and dismiss paths.
+    pub(crate) fn client_menu(&self) -> Option<&ClientMenu> {
+        match &self.client_overlay {
+            ClientOverlayState::Menu(menu) => Some(menu),
             ClientOverlayState::None
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
-    pub(crate) fn open_client_global_menu(&mut self) {
+    fn client_menu_mut(&mut self) -> Option<&mut ClientMenu> {
+        match &mut self.client_overlay {
+            ClientOverlayState::Menu(menu) => Some(menu),
+            ClientOverlayState::None
+            | ClientOverlayState::AddRemote(_)
+            | ClientOverlayState::ManageRemotes(_)
+            | ClientOverlayState::RenameWorkspace(_)
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+        }
+    }
+
+    /// #46/#47: whether any client menu is open. The mouse pipeline routes events to it FIRST — it
+    /// renders topmost, so it must be topmost in the event pipeline too. Now covers ALL three menus
+    /// (the launcher was the gap #46's per-menu guard left open). Replaces `context_menu_open`.
+    pub(crate) fn client_menu_open(&self) -> bool {
+        matches!(self.client_overlay, ClientOverlayState::Menu(_))
+    }
+
+    /// #47: the first selectable row — the initial highlight, so a menu never opens on a
+    /// non-actionable row (e.g. the host version readout). Falls back to 0 when none are selectable.
+    fn first_selectable_index(items: &[ClientMenuItem]) -> usize {
+        items
+            .iter()
+            .position(|item| item.selectable)
+            .unwrap_or(0)
+    }
+
+    /// #47: open the global launcher menu, anchored at the clicked menu-button cell. The launcher has
+    /// no target sub-header.
+    pub(crate) fn open_client_global_menu(&mut self, anchor_col: u16, anchor_row: u16) {
+        let items: Vec<ClientMenuItem> = Self::global_launcher_rows()
+            .into_iter()
+            .map(|(label, action)| ClientMenuItem {
+                label: label.to_string(),
+                selectable: true,
+                action,
+            })
+            .collect();
         self.new_workspace_picker = None;
-        self.client_overlay = ClientOverlayState::GlobalMenu { highlighted: 0 };
+        let selected = Self::first_selectable_index(&items);
+        self.client_overlay = ClientOverlayState::Menu(ClientMenu {
+            kind: ClientMenuKind::GlobalLauncher,
+            title: "menu",
+            subheader: None,
+            anchor_col,
+            anchor_row,
+            selected,
+            items,
+        });
     }
 
-    pub(crate) fn move_client_global_menu_next(&mut self) {
-        let item_count = self.client_global_menu_items().len();
-        if let ClientOverlayState::GlobalMenu { highlighted } = &mut self.client_overlay {
-            *highlighted = (*highlighted + 1).min(item_count.saturating_sub(1));
+    /// #47: motion/keyboard highlight movement, shared by all three menus. Down clamps to the last
+    /// row; Up saturates at the first. Both can pass over a non-selectable row (matching the old
+    /// per-menu nav); activating one is the no-op (`select_client_menu_item`).
+    pub(crate) fn move_client_menu_next(&mut self) {
+        if let Some(menu) = self.client_menu_mut() {
+            let count = menu.items.len();
+            menu.selected = (menu.selected + 1).min(count.saturating_sub(1));
         }
     }
 
-    pub(crate) fn move_client_global_menu_prev(&mut self) {
-        if let ClientOverlayState::GlobalMenu { highlighted } = &mut self.client_overlay {
-            *highlighted = highlighted.saturating_sub(1);
+    pub(crate) fn move_client_menu_prev(&mut self) {
+        if let Some(menu) = self.client_menu_mut() {
+            menu.selected = menu.selected.saturating_sub(1);
         }
     }
 
-    /// item 7: motion over an open global menu moves the highlight to the hovered row (mirrors the
-    /// monolithic host's `MenuListState::hover`): `Some(idx)` snaps the highlight there, `None`
-    /// (off the menu) leaves it put. Returns whether the highlight changed, so the client `Moved`
-    /// arm can repaint only on a real move. A no-op when the menu is closed.
-    pub(crate) fn hover_client_global_menu_item(&mut self, idx: Option<usize>) -> bool {
-        let Some(idx) = idx else {
-            return false;
-        };
-        let item_count = self.client_global_menu_items().len();
-        if let ClientOverlayState::GlobalMenu { highlighted } = &mut self.client_overlay {
-            let next = idx.min(item_count.saturating_sub(1));
-            if *highlighted != next {
-                *highlighted = next;
-                return true;
-            }
+    /// #47: mouse-driven selection — clamp and set the highlighted row (shared by all three menus).
+    pub(crate) fn set_client_menu_selected(&mut self, index: usize) {
+        if let Some(menu) = self.client_menu_mut() {
+            let count = menu.items.len();
+            menu.selected = index.min(count.saturating_sub(1));
         }
-        false
     }
 
-    pub(crate) fn accept_client_global_menu_item(&mut self) -> Option<ClientGlobalMenuAction> {
-        let highlighted = self.client_global_menu_highlighted()?;
-        self.select_client_global_menu_item(highlighted)
-    }
-
-    pub(crate) fn select_client_global_menu_item(
+    /// #47: translate a key press into a typed outcome — the single keyboard handler for all three
+    /// menus. Up/Down (and k/j) move, Enter activates the highlighted row, Esc dismisses.
+    pub(crate) fn handle_client_menu_key(
         &mut self,
-        index: usize,
-    ) -> Option<ClientGlobalMenuAction> {
-        match index {
-            0 => {
+        key: crate::input::TerminalKey,
+    ) -> ClientMenuOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return ClientMenuOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
                 self.close_client_overlay();
-                Some(ClientGlobalMenuAction::Settings)
+                ClientMenuOutcome::Redraw
             }
-            1 => {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_client_menu_prev();
+                ClientMenuOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_client_menu_next();
+                ClientMenuOutcome::Redraw
+            }
+            KeyCode::Enter => self.accept_client_menu_item(),
+            _ => ClientMenuOutcome::Redraw,
+        }
+    }
+
+    pub(crate) fn accept_client_menu_item(&mut self) -> ClientMenuOutcome {
+        let Some(selected) = self.client_menu().map(|menu| menu.selected) else {
+            return ClientMenuOutcome::Redraw;
+        };
+        self.select_client_menu_item(selected)
+    }
+
+    /// #47: activate row `index` — the single selection path for all three menus. A non-selectable
+    /// or `Noop` row keeps the menu open and just redraws. Overlay-opening rows (`add remote` /
+    /// `manage remotes` / workspace rename / workspace close) open their follow-on overlay here and
+    /// report `Redraw`; the rest close the menu and carry the context the client loop needs.
+    pub(crate) fn select_client_menu_item(&mut self, index: usize) -> ClientMenuOutcome {
+        let Some(menu) = self.client_menu() else {
+            return ClientMenuOutcome::Redraw;
+        };
+        let Some(item) = menu.items.get(index) else {
+            return ClientMenuOutcome::Redraw;
+        };
+        if !item.selectable {
+            return ClientMenuOutcome::Redraw;
+        }
+        let action = item.action.clone();
+        let host_server_id = match &menu.kind {
+            ClientMenuKind::Host { server_id } => Some(server_id.clone()),
+            ClientMenuKind::GlobalLauncher | ClientMenuKind::Workspace { .. } => None,
+        };
+        match action {
+            ClientMenuAction::Noop => ClientMenuOutcome::Redraw,
+            ClientMenuAction::Settings => {
                 self.close_client_overlay();
-                Some(ClientGlobalMenuAction::Keybinds)
+                ClientMenuOutcome::Settings
             }
-            2 => {
+            ClientMenuAction::Keybinds => {
                 self.close_client_overlay();
-                Some(ClientGlobalMenuAction::ReloadConfig)
+                ClientMenuOutcome::Keybinds
             }
-            3 => {
+            ClientMenuAction::ReloadConfig => {
                 self.close_client_overlay();
-                Some(ClientGlobalMenuAction::Detach)
+                ClientMenuOutcome::ReloadConfig
             }
-            4 => {
+            ClientMenuAction::Detach => {
+                self.close_client_overlay();
+                ClientMenuOutcome::Detach
+            }
+            ClientMenuAction::OpenAddRemote => {
                 self.open_add_remote_form();
-                Some(ClientGlobalMenuAction::AddRemote)
+                ClientMenuOutcome::Redraw
             }
-            5 => {
+            ClientMenuAction::OpenManageRemotes => {
                 self.open_remote_manage_overlay();
-                Some(ClientGlobalMenuAction::ManageRemotes)
+                ClientMenuOutcome::Redraw
             }
-            _ => None,
+            ClientMenuAction::OpenRename => {
+                self.open_rename_workspace();
+                ClientMenuOutcome::Redraw
+            }
+            ClientMenuAction::OpenConfirmClose => {
+                self.open_confirm_close_workspace();
+                ClientMenuOutcome::Redraw
+            }
+            ClientMenuAction::HostAddSpace => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(ClientMenuOutcome::HostAddSpace)
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
+            ClientMenuAction::HostToggleEnabled { enabled } => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(|id| ClientMenuOutcome::HostToggleEnabled {
+                        remote_id: id.registry_id().to_string(),
+                        enabled,
+                    })
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
+            ClientMenuAction::HostDisconnect => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(ClientMenuOutcome::HostDisconnect)
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
+            ClientMenuAction::HostReconnect => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(ClientMenuOutcome::HostReconnect)
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
+            ClientMenuAction::HostUpdate => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(ClientMenuOutcome::HostUpdate)
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
         }
     }
 
@@ -1227,12 +1377,10 @@ impl ClientSupervisorModel {
         match &self.client_overlay {
             ClientOverlayState::AddRemote(form) => Some(form),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1426,12 +1574,10 @@ impl ClientSupervisorModel {
         match &self.client_overlay {
             ClientOverlayState::ManageRemotes(overlay) => Some(overlay),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1439,12 +1585,10 @@ impl ClientSupervisorModel {
         match &mut self.client_overlay {
             ClientOverlayState::ManageRemotes(overlay) => Some(overlay),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -1645,11 +1789,6 @@ impl ClientSupervisorModel {
 
     // ----- #23: workspace context menu + rename + confirm-close overlays ----------------------
 
-    /// #23: the two fixed context-menu rows, in render order. Mirrors `client_global_menu_items`.
-    pub(crate) fn workspace_context_menu_items(&self) -> Vec<&'static str> {
-        vec!["rename", "close"]
-    }
-
     /// #41: whether `(server_id, workspace_id)` may be individually drag-reordered. A worktree-
     /// grouped space (any row carrying a `worktree_key` — parent or linked checkout) is NOT
     /// reorderable: its rendered position is owned by the worktree grouping, so a storage move would
@@ -1702,183 +1841,44 @@ impl ClientSupervisorModel {
         anchor_col: u16,
         anchor_row: u16,
     ) {
+        let items = vec![
+            ClientMenuItem {
+                label: "rename".to_string(),
+                selectable: true,
+                action: ClientMenuAction::OpenRename,
+            },
+            ClientMenuItem {
+                label: "close".to_string(),
+                selectable: true,
+                action: ClientMenuAction::OpenConfirmClose,
+            },
+        ];
         self.new_workspace_picker = None;
-        self.client_overlay = ClientOverlayState::WorkspaceContextMenu(WorkspaceContextMenu {
-            server_id,
-            workspace_id,
-            label,
-            selected: 0,
+        let selected = Self::first_selectable_index(&items);
+        self.client_overlay = ClientOverlayState::Menu(ClientMenu {
+            kind: ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                label: label.clone(),
+            },
+            title: "workspace",
+            subheader: Some(label),
             anchor_col,
             anchor_row,
+            selected,
+            items,
         });
-    }
-
-    pub(crate) fn workspace_context_menu(&self) -> Option<&WorkspaceContextMenu> {
-        match &self.client_overlay {
-            ClientOverlayState::WorkspaceContextMenu(menu) => Some(menu),
-            ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
-        }
-    }
-
-    fn workspace_context_menu_mut(&mut self) -> Option<&mut WorkspaceContextMenu> {
-        match &mut self.client_overlay {
-            ClientOverlayState::WorkspaceContextMenu(menu) => Some(menu),
-            ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
-        }
-    }
-
-    pub(crate) fn move_workspace_context_menu_next(&mut self) {
-        let count = self.workspace_context_menu_items().len();
-        if let Some(menu) = self.workspace_context_menu_mut() {
-            menu.selected = (menu.selected + 1).min(count.saturating_sub(1));
-        }
-    }
-
-    pub(crate) fn move_workspace_context_menu_prev(&mut self) {
-        if let Some(menu) = self.workspace_context_menu_mut() {
-            menu.selected = menu.selected.saturating_sub(1);
-        }
-    }
-
-    /// #23: mouse-driven selection — clamp and set the highlighted context-menu row.
-    pub(crate) fn set_workspace_context_menu_selected(&mut self, index: usize) {
-        let count = self.workspace_context_menu_items().len();
-        if let Some(menu) = self.workspace_context_menu_mut() {
-            menu.selected = index.min(count.saturating_sub(1));
-        }
-    }
-
-    /// #23: resolve a context-menu row index into an action, opening the matching follow-on overlay.
-    /// `0 -> Rename`, `1 -> Close`. Mirrors `select_client_global_menu_item`.
-    pub(crate) fn select_workspace_context_menu_item(
-        &mut self,
-        index: usize,
-    ) -> WorkspaceContextOutcome {
-        match index {
-            0 => {
-                self.open_rename_workspace();
-                WorkspaceContextOutcome::OpenRename
-            }
-            1 => {
-                self.open_confirm_close_workspace();
-                WorkspaceContextOutcome::OpenConfirmClose
-            }
-            _ => WorkspaceContextOutcome::Redraw,
-        }
-    }
-
-    pub(crate) fn accept_workspace_context_menu_item(&mut self) -> WorkspaceContextOutcome {
-        let Some(selected) = self.workspace_context_menu().map(|menu| menu.selected) else {
-            return WorkspaceContextOutcome::Redraw;
-        };
-        self.select_workspace_context_menu_item(selected)
-    }
-
-    /// #23: translate a context-menu key press into a typed outcome. Mirrors
-    /// `handle_remote_manage_key`: Up/Down (and j/k) move, Enter activates, Esc closes.
-    pub(crate) fn handle_workspace_context_menu_key(
-        &mut self,
-        key: crate::input::TerminalKey,
-    ) -> WorkspaceContextOutcome {
-        use crossterm::event::{KeyCode, KeyEventKind};
-
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return WorkspaceContextOutcome::Redraw;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.close_client_overlay();
-                WorkspaceContextOutcome::Redraw
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_workspace_context_menu_prev();
-                WorkspaceContextOutcome::Redraw
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_workspace_context_menu_next();
-                WorkspaceContextOutcome::Redraw
-            }
-            KeyCode::Enter => self.accept_workspace_context_menu_item(),
-            _ => WorkspaceContextOutcome::Redraw,
-        }
     }
 
     // ----- #43/#44: host context menu (version readout / add-space / enable-disable /
     // disconnect-reconnect / update) ---------------------------------------------------------------
 
-    /// #44: the ordered host context-menu rows for the currently-open menu. SINGLE SOURCE OF TRUTH:
-    /// both `host_context_menu_items` (labels + row count for geometry) and
-    /// `select_host_context_menu_item` (index → action) derive from this same ordered list, so the
-    /// non-selectable version-readout row (top) and the "update" row (bottom) can never drift from
-    /// the action mapping. Empty when no host menu is open.
-    fn host_context_menu_rows(&self) -> Vec<HostMenuRow> {
-        if self.host_context_menu().is_none() {
-            return Vec::new();
-        }
-        vec![
-            HostMenuRow::VersionReadout,
-            HostMenuRow::AddSpace,
-            HostMenuRow::ToggleEnabled,
-            HostMenuRow::Disconnect,
-            HostMenuRow::Update,
-        ]
-    }
-
-    /// #43/#44: the host context-menu row labels in render order. DYNAMIC: the version readout, the
-    /// toggle label, and the disconnect/reconnect label all flip with the captured menu state, so
-    /// this Vec is the SINGLE source of the row count for the cursor-anchored geometry. Built from
-    /// `host_context_menu_rows` so labels and the action mapping share one ordered list.
-    pub(crate) fn host_context_menu_items(&self) -> Vec<String> {
-        let Some(menu) = self.host_context_menu() else {
-            return Vec::new();
-        };
-        let (version_label, is_mismatch) = host_version_readout(
-            menu.remote_version.as_deref(),
-            menu.remote_protocol,
-        );
-        let disabled = menu.disabled;
-        let connected = menu.connected;
-        self.host_context_menu_rows()
-            .into_iter()
-            .map(|row| match row {
-                HostMenuRow::VersionReadout => {
-                    if is_mismatch {
-                        format!("⚠ {version_label}")
-                    } else {
-                        version_label.clone()
-                    }
-                }
-                HostMenuRow::AddSpace => "add new space".to_string(),
-                HostMenuRow::ToggleEnabled => {
-                    if disabled { "enable" } else { "disable" }.to_string()
-                }
-                HostMenuRow::Disconnect => if connected {
-                    "disconnect"
-                } else {
-                    "reconnect"
-                }
-                .to_string(),
-                HostMenuRow::Update => "update".to_string(),
-            })
-            .collect()
-    }
-
-    /// #43: open the host context menu for `server_id`, capturing the host's current `disabled` flag
-    /// and whether its connection is live (so the labels and the add-space availability reflect the
-    /// state at open time). Mirrors `open_workspace_context_menu`.
+    /// #43/#44: open the host context menu for `server_id`, baking each row's label AND action from
+    /// the host's `disabled`/`connected`/version captured at open time. The version readout is a
+    /// non-selectable info row; add-space/update degrade to a no-op action when disconnected (the row
+    /// stays so the menu shape is stable). Baking label+action together means the dynamic
+    /// "disable"/"enable" + "disconnect"/"reconnect" labels can never drift from what a press does.
+    /// Mirrors `open_workspace_context_menu`.
     pub(crate) fn open_host_context_menu(
         &mut self,
         server_id: ServerId,
@@ -1897,150 +1897,64 @@ impl ClientSupervisorModel {
                 )
             })
             .unwrap_or((false, false, None, None));
+        let (version_label, is_mismatch) =
+            host_version_readout(remote_version.as_deref(), remote_protocol);
+        let items = vec![
+            ClientMenuItem {
+                label: if is_mismatch {
+                    format!("⚠ {version_label}")
+                } else {
+                    version_label
+                },
+                selectable: false,
+                action: ClientMenuAction::Noop,
+            },
+            ClientMenuItem {
+                label: "add new space".to_string(),
+                selectable: true,
+                action: if connected {
+                    ClientMenuAction::HostAddSpace
+                } else {
+                    ClientMenuAction::Noop
+                },
+            },
+            ClientMenuItem {
+                label: if disabled { "enable" } else { "disable" }.to_string(),
+                selectable: true,
+                action: ClientMenuAction::HostToggleEnabled { enabled: disabled },
+            },
+            ClientMenuItem {
+                label: if connected { "disconnect" } else { "reconnect" }.to_string(),
+                selectable: true,
+                action: if connected {
+                    ClientMenuAction::HostDisconnect
+                } else {
+                    ClientMenuAction::HostReconnect
+                },
+            },
+            ClientMenuItem {
+                label: "update".to_string(),
+                selectable: true,
+                action: if connected {
+                    ClientMenuAction::HostUpdate
+                } else {
+                    ClientMenuAction::Noop
+                },
+            },
+        ];
         self.new_workspace_picker = None;
-        self.client_overlay = ClientOverlayState::HostContextMenu(HostContextMenu {
-            server_id,
-            display_name,
-            disabled,
-            connected,
-            // #46 (item 5): start on the first ACTIONABLE row. Row 0 is the non-selectable
-            // `VersionReadout` (its action is a no-op `Redraw`); opening with it highlighted made the
-            // menu look dead and pressing Enter did nothing. Row 1 is `AddSpace` (always present).
-            selected: 1,
-            remote_version,
-            remote_protocol,
+        // #46 (item 5): start on the first ACTIONABLE row — `first_selectable_index` skips the
+        // non-selectable version readout (row 0), so the menu never opens looking dead.
+        let selected = Self::first_selectable_index(&items);
+        self.client_overlay = ClientOverlayState::Menu(ClientMenu {
+            kind: ClientMenuKind::Host { server_id },
+            title: "host",
+            subheader: Some(display_name),
             anchor_col,
             anchor_row,
+            selected,
+            items,
         });
-    }
-
-    pub(crate) fn host_context_menu(&self) -> Option<&HostContextMenu> {
-        match &self.client_overlay {
-            ClientOverlayState::HostContextMenu(menu) => Some(menu),
-            ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
-        }
-    }
-
-    fn host_context_menu_mut(&mut self) -> Option<&mut HostContextMenu> {
-        match &mut self.client_overlay {
-            ClientOverlayState::HostContextMenu(menu) => Some(menu),
-            ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
-            | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
-        }
-    }
-
-    pub(crate) fn move_host_context_menu_next(&mut self) {
-        let count = self.host_context_menu_items().len();
-        if let Some(menu) = self.host_context_menu_mut() {
-            menu.selected = (menu.selected + 1).min(count.saturating_sub(1));
-        }
-    }
-
-    pub(crate) fn move_host_context_menu_prev(&mut self) {
-        if let Some(menu) = self.host_context_menu_mut() {
-            menu.selected = menu.selected.saturating_sub(1);
-        }
-    }
-
-    /// #43: mouse-driven selection — clamp and set the highlighted host context-menu row.
-    pub(crate) fn set_host_context_menu_selected(&mut self, index: usize) {
-        let count = self.host_context_menu_items().len();
-        if let Some(menu) = self.host_context_menu_mut() {
-            menu.selected = index.min(count.saturating_sub(1));
-        }
-    }
-
-    /// #43/#44: resolve a host context-menu row index into an action by looking up the row KIND at
-    /// `index` in the SAME ordered list `host_context_menu_items` renders (`host_context_menu_rows`)
-    /// — never a hard-coded integer. The version-readout row is non-actionable (`Redraw`); add-space
-    /// and update require a live connection (else `Redraw`); toggle flips the registry disabled flag;
-    /// disconnect/reconnect drop/restore the live stream. Mirrors `select_workspace_context_menu_item`.
-    pub(crate) fn select_host_context_menu_item(&mut self, index: usize) -> HostContextOutcome {
-        let Some(row) = self.host_context_menu_rows().get(index).copied() else {
-            return HostContextOutcome::Redraw;
-        };
-        let Some(menu) = self.host_context_menu() else {
-            return HostContextOutcome::Redraw;
-        };
-        let server_id = menu.server_id.clone();
-        let disabled = menu.disabled;
-        let connected = menu.connected;
-        match row {
-            HostMenuRow::VersionReadout => HostContextOutcome::Redraw,
-            HostMenuRow::AddSpace => {
-                if connected {
-                    HostContextOutcome::AddSpace(server_id)
-                } else {
-                    HostContextOutcome::Redraw
-                }
-            }
-            HostMenuRow::ToggleEnabled => HostContextOutcome::ToggleEnabled {
-                remote_id: server_id.registry_id().to_string(),
-                enabled: disabled,
-            },
-            HostMenuRow::Disconnect => {
-                if connected {
-                    HostContextOutcome::Disconnect(server_id)
-                } else {
-                    HostContextOutcome::Reconnect(server_id)
-                }
-            }
-            HostMenuRow::Update => {
-                if connected {
-                    HostContextOutcome::Update(server_id)
-                } else {
-                    HostContextOutcome::Redraw
-                }
-            }
-        }
-    }
-
-    pub(crate) fn accept_host_context_menu_item(&mut self) -> HostContextOutcome {
-        let Some(selected) = self.host_context_menu().map(|menu| menu.selected) else {
-            return HostContextOutcome::Redraw;
-        };
-        self.select_host_context_menu_item(selected)
-    }
-
-    /// #43: translate a host context-menu key press into a typed outcome. Mirrors
-    /// `handle_workspace_context_menu_key`: Up/Down (and j/k) move, Enter activates, Esc closes.
-    pub(crate) fn handle_host_context_menu_key(
-        &mut self,
-        key: crate::input::TerminalKey,
-    ) -> HostContextOutcome {
-        use crossterm::event::{KeyCode, KeyEventKind};
-
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return HostContextOutcome::Redraw;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.close_client_overlay();
-                HostContextOutcome::Redraw
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_host_context_menu_prev();
-                HostContextOutcome::Redraw
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_host_context_menu_next();
-                HostContextOutcome::Redraw
-            }
-            KeyCode::Enter => self.accept_host_context_menu_item(),
-            _ => HostContextOutcome::Redraw,
-        }
     }
 
     /// #43: public wrapper over the private `route_for_specific_server`, so the client loop can
@@ -2050,17 +1964,22 @@ impl ClientSupervisorModel {
         self.route_for_specific_server(id)
     }
 
-    /// #23: transition the open context menu into the rename overlay, prefilled with the captured
-    /// label. A no-op (closes) when no context menu is open. Mirrors `open_add_remote_form`.
+    /// #23/#47: transition the open workspace context menu into the rename overlay, prefilled with
+    /// the captured label. A no-op when the open menu is not a workspace menu. Reads the
+    /// `(server_id, workspace_id, label)` from the `ClientMenu`'s `Workspace` kind.
     pub(crate) fn open_rename_workspace(&mut self) {
-        let Some(menu) = self.workspace_context_menu() else {
-            return;
-        };
-        let form = RenameWorkspaceForm {
-            server_id: menu.server_id.clone(),
-            workspace_id: menu.workspace_id.clone(),
-            label: menu.label.clone(),
-            error: None,
+        let form = match self.client_menu().map(|menu| &menu.kind) {
+            Some(ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                label,
+            }) => RenameWorkspaceForm {
+                server_id: server_id.clone(),
+                workspace_id: workspace_id.clone(),
+                label: label.clone(),
+                error: None,
+            },
+            _ => return,
         };
         self.client_overlay = ClientOverlayState::RenameWorkspace(form);
     }
@@ -2069,12 +1988,10 @@ impl ClientSupervisorModel {
         match &self.client_overlay {
             ClientOverlayState::RenameWorkspace(form) => Some(form),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -2082,12 +1999,10 @@ impl ClientSupervisorModel {
         match &mut self.client_overlay {
             ClientOverlayState::RenameWorkspace(form) => Some(form),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -2165,13 +2080,17 @@ impl ClientSupervisorModel {
     /// #23: transition the open context menu into the close-confirm overlay. A no-op (closes) when
     /// no context menu is open. Mirrors `begin_remote_manage_delete`.
     pub(crate) fn open_confirm_close_workspace(&mut self) {
-        let Some(menu) = self.workspace_context_menu() else {
-            return;
-        };
-        let confirm = ConfirmCloseWorkspace {
-            server_id: menu.server_id.clone(),
-            workspace_id: menu.workspace_id.clone(),
-            label: menu.label.clone(),
+        let confirm = match self.client_menu().map(|menu| &menu.kind) {
+            Some(ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                label,
+            }) => ConfirmCloseWorkspace {
+                server_id: server_id.clone(),
+                workspace_id: workspace_id.clone(),
+                label: label.clone(),
+            },
+            _ => return,
         };
         self.client_overlay = ClientOverlayState::ConfirmCloseWorkspace(confirm);
     }
@@ -2180,12 +2099,10 @@ impl ClientSupervisorModel {
         match &self.client_overlay {
             ClientOverlayState::ConfirmCloseWorkspace(confirm) => Some(confirm),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
-            | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::RenameWorkspace(_) => None,
         }
     }
 
@@ -2611,27 +2528,14 @@ impl ClientSupervisorModel {
         self.client_overlay = ClientOverlayState::None;
     }
 
-    /// #46 (items 5/6/7): whether a right-click CONTEXT MENU (workspace or host) is open. These two
-    /// overlays are modal and cursor-anchored over the sidebar, so the mouse pipeline must route
-    /// events to them BEFORE the sidebar hover/scroll/resize/reorder handlers (which otherwise claim
-    /// hover over the menu, wheel-scroll the sidebar beneath it, and steal divider-column clicks).
-    pub(crate) fn context_menu_open(&self) -> bool {
-        matches!(
-            self.client_overlay,
-            ClientOverlayState::WorkspaceContextMenu(_) | ClientOverlayState::HostContextMenu(_)
-        )
-    }
-
     fn add_remote_form_mut(&mut self) -> Option<&mut AddRemoteForm> {
         match &mut self.client_overlay {
             ClientOverlayState::AddRemote(form) => Some(form),
             ClientOverlayState::None
-            | ClientOverlayState::GlobalMenu { .. }
+            | ClientOverlayState::Menu(_)
             | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::WorkspaceContextMenu(_)
             | ClientOverlayState::RenameWorkspace(_)
-            | ClientOverlayState::ConfirmCloseWorkspace(_)
-            | ClientOverlayState::HostContextMenu(_) => None,
+            | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
         }
     }
 
@@ -4883,9 +4787,9 @@ mod tests {
     fn client_global_menu_uses_server_launcher_items() {
         let mut model = ClientSupervisorModel::new("local");
 
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
 
-        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
         assert_eq!(
             model.client_global_menu_items(),
             [
@@ -4898,13 +4802,11 @@ mod tests {
             ]
         );
         for _ in 0..4 {
-            model.move_client_global_menu_next();
+            model.move_client_menu_next();
         }
-        assert_eq!(model.client_global_menu_highlighted(), Some(4));
-        assert_eq!(
-            model.accept_client_global_menu_item(),
-            Some(ClientGlobalMenuAction::AddRemote)
-        );
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(4));
+        // #47: "add remote" opens the add-remote overlay and reports Redraw (one outcome type).
+        assert_eq!(model.accept_client_menu_item(), ClientMenuOutcome::Redraw);
         assert_eq!(
             model.add_remote_form(),
             Some(&AddRemoteForm {
@@ -4920,28 +4822,23 @@ mod tests {
     }
 
     #[test]
-    fn hover_client_global_menu_item_moves_highlight() {
+    fn set_client_menu_selected_moves_highlight() {
         let mut model = ClientSupervisorModel::new("local");
-        // a no-op when the menu is closed (and reports no change).
-        assert!(!model.hover_client_global_menu_item(Some(2)));
-        assert_eq!(model.client_global_menu_highlighted(), None);
+        // a no-op when the menu is closed.
+        model.set_client_menu_selected(2);
+        assert_eq!(model.client_menu().map(|m| m.selected), None);
 
-        model.open_client_global_menu();
-        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+        model.open_client_global_menu(0, 0);
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
 
-        // Some(idx) snaps the highlight and reports the change; re-hovering the same row is a no-op.
-        assert!(model.hover_client_global_menu_item(Some(2)));
-        assert_eq!(model.client_global_menu_highlighted(), Some(2));
-        assert!(!model.hover_client_global_menu_item(Some(2)));
+        // setting snaps the highlight to the hovered row.
+        model.set_client_menu_selected(2);
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
 
-        // None (off the menu) leaves the highlight put.
-        assert!(!model.hover_client_global_menu_item(None));
-        assert_eq!(model.client_global_menu_highlighted(), Some(2));
-
-        // an out-of-range index clamps to the last item (and reports the change from row 2).
-        assert!(model.hover_client_global_menu_item(Some(99)));
+        // an out-of-range index clamps to the last item.
+        model.set_client_menu_selected(99);
         assert_eq!(
-            model.client_global_menu_highlighted(),
+            model.client_menu().map(|m| m.selected),
             Some(model.client_global_menu_items().len() - 1)
         );
     }
@@ -5550,8 +5447,9 @@ mod tests {
     fn global_menu_includes_manage_remotes() {
         let mut model = ClientSupervisorModel::new("local");
         assert!(model.client_global_menu_items().contains(&"manage remotes"));
-        let action = model.select_client_global_menu_item(5);
-        assert_eq!(action, Some(ClientGlobalMenuAction::ManageRemotes));
+        model.open_client_global_menu(0, 0);
+        // #47: "manage remotes" (index 5) opens the manage overlay and reports Redraw.
+        assert_eq!(model.select_client_menu_item(5), ClientMenuOutcome::Redraw);
         assert!(model.remote_manage_overlay().is_some());
     }
 
@@ -5588,6 +5486,15 @@ mod tests {
         )
     }
 
+    /// #47: the open client menu's row labels, in render order — replaces the old per-menu
+    /// `host_context_menu_items()` / `workspace_context_menu_items()` for tests that assert labels.
+    fn menu_labels(model: &ClientSupervisorModel) -> Vec<String> {
+        model
+            .client_menu()
+            .map(|menu| menu.items.iter().map(|item| item.label.clone()).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn open_workspace_context_menu_captures_target_and_label() {
         use crossterm::event::KeyCode;
@@ -5597,12 +5504,19 @@ mod tests {
 
         model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label, 0, 0);
 
-        let menu = model.workspace_context_menu().expect("menu open");
-        assert_eq!(menu.server_id, server_id);
-        assert_eq!(menu.workspace_id, "ws-1");
-        assert_eq!(menu.label, "feature");
+        let menu = model.client_menu().expect("menu open");
+        assert_eq!(
+            menu.kind,
+            ClientMenuKind::Workspace {
+                server_id: server_id.clone(),
+                workspace_id: "ws-1".into(),
+                label: "feature".into(),
+            }
+        );
+        assert_eq!(menu.subheader.as_deref(), Some("feature"));
         assert_eq!(menu.selected, 0);
-        assert_eq!(model.workspace_context_menu_items(), ["rename", "close"]);
+        let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["rename", "close"]);
 
         // a missing workspace yields no label.
         assert!(model.workspace_label(&server_id, "nope").is_none());
@@ -5617,16 +5531,16 @@ mod tests {
 
         // Down moves to "close", k clamps back to "rename".
         assert_eq!(
-            model.handle_workspace_context_menu_key(press(KeyCode::Down)),
-            WorkspaceContextOutcome::Redraw
+            model.handle_client_menu_key(press(KeyCode::Down)),
+            ClientMenuOutcome::Redraw
         );
-        assert_eq!(model.workspace_context_menu().unwrap().selected, 1);
-        model.handle_workspace_context_menu_key(press(KeyCode::Char('k')));
-        assert_eq!(model.workspace_context_menu().unwrap().selected, 0);
+        assert_eq!(model.client_menu().unwrap().selected, 1);
+        model.handle_client_menu_key(press(KeyCode::Char('k')));
+        assert_eq!(model.client_menu().unwrap().selected, 0);
 
         // Esc dismisses.
-        model.handle_workspace_context_menu_key(press(KeyCode::Esc));
-        assert!(model.workspace_context_menu().is_none());
+        model.handle_client_menu_key(press(KeyCode::Esc));
+        assert!(model.client_menu().is_none());
     }
 
     #[test]
@@ -5636,14 +5550,14 @@ mod tests {
         model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
 
         assert_eq!(
-            model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
-            WorkspaceContextOutcome::OpenRename
+            model.handle_client_menu_key(press(KeyCode::Enter)),
+            ClientMenuOutcome::Redraw
         );
         let form = model.rename_workspace_form().expect("rename overlay open");
         assert_eq!(form.server_id, server_id);
         assert_eq!(form.workspace_id, "ws-1");
         assert_eq!(form.label, "feature", "prefilled with current label");
-        assert!(model.workspace_context_menu().is_none());
+        assert!(model.client_menu().is_none());
     }
 
     #[test]
@@ -5651,7 +5565,7 @@ mod tests {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
         model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), String::new(), 0, 0);
-        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
+        model.handle_client_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         for ch in "next".chars() {
             model.handle_rename_workspace_key(press(KeyCode::Char(ch)));
@@ -5674,7 +5588,7 @@ mod tests {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
         model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
-        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> rename overlay
+        model.handle_client_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         // clear the prefilled label with Ctrl-U, then Enter must NOT submit.
         model.handle_rename_workspace_key(ctrl_u());
@@ -5698,10 +5612,10 @@ mod tests {
         let (mut model, server_id) = model_with_workspace();
         model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
         // select "close" (index 1) then Enter -> confirm overlay.
-        model.handle_workspace_context_menu_key(press(KeyCode::Down));
+        model.handle_client_menu_key(press(KeyCode::Down));
         assert_eq!(
-            model.handle_workspace_context_menu_key(press(KeyCode::Enter)),
-            WorkspaceContextOutcome::OpenConfirmClose
+            model.handle_client_menu_key(press(KeyCode::Enter)),
+            ClientMenuOutcome::Redraw
         );
         let confirm = model
             .confirm_close_workspace()
@@ -5725,8 +5639,8 @@ mod tests {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
         model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
-        model.handle_workspace_context_menu_key(press(KeyCode::Down));
-        model.handle_workspace_context_menu_key(press(KeyCode::Enter)); // -> confirm overlay
+        model.handle_client_menu_key(press(KeyCode::Down));
+        model.handle_client_menu_key(press(KeyCode::Enter)); // -> confirm overlay
 
         // 'n' cancels with no request and closes the overlay.
         let outcome = model.handle_confirm_close_workspace_key(press(KeyCode::Char('n')));
@@ -5746,11 +5660,17 @@ mod tests {
             .unwrap();
 
         model.open_host_context_menu(remote.clone(), "alpha".into(), 4, 5);
-        let menu = model.host_context_menu().expect("host menu open");
-        assert_eq!(menu.server_id, remote);
-        assert_eq!(menu.display_name, "alpha");
-        assert!(!menu.disabled);
-        assert!(menu.connected);
+        let menu = model.client_menu().expect("host menu open");
+        assert_eq!(
+            menu.kind,
+            ClientMenuKind::Host {
+                server_id: remote.clone()
+            }
+        );
+        assert_eq!(menu.subheader.as_deref(), Some("alpha"));
+        // the version-readout row (0) is non-selectable; connected + enabled state shows in the
+        // baked labels asserted below ("disable" / "disconnect").
+        assert!(!menu.items[0].selectable);
         // #46 (item 5): opens on the first actionable row (1 == add-space), skipping the
         // non-selectable version-readout at row 0.
         assert_eq!(menu.selected, 1);
@@ -5758,7 +5678,7 @@ mod tests {
         assert_eq!(menu.anchor_row, 5);
         // #44: a non-selectable version-readout row leads; then add/disable/disconnect; then update.
         assert_eq!(
-            model.host_context_menu_items(),
+            menu_labels(&model),
             ["unknown", "add new space", "disable", "disconnect", "update"]
         );
 
@@ -5769,11 +5689,9 @@ mod tests {
             .set_connection_state(&remote, ConnectionState::Disconnected)
             .unwrap();
         model.open_host_context_menu(remote.clone(), "beta".into(), 0, 0);
-        let menu = model.host_context_menu().expect("host menu open");
-        assert!(menu.disabled);
-        assert!(!menu.connected);
+        // A disabled + disconnected host flips both toggle labels ("enable" / "reconnect").
         assert_eq!(
-            model.host_context_menu_items(),
+            menu_labels(&model),
             ["unknown", "add new space", "enable", "reconnect", "update"]
         );
     }
@@ -5785,10 +5703,10 @@ mod tests {
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(disabled_ssh_remote("r1", "alpha", "alpha"));
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
-        assert_eq!(model.host_context_menu_items()[2], "enable");
+        assert_eq!(menu_labels(&model)[2], "enable");
         assert_eq!(
-            model.select_host_context_menu_item(2),
-            HostContextOutcome::ToggleEnabled {
+            model.select_client_menu_item(2),
+            ClientMenuOutcome::HostToggleEnabled {
                 remote_id: "r1".into(),
                 enabled: true,
             }
@@ -5798,10 +5716,10 @@ mod tests {
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
-        assert_eq!(model.host_context_menu_items()[2], "disable");
+        assert_eq!(menu_labels(&model)[2], "disable");
         assert_eq!(
-            model.select_host_context_menu_item(2),
-            HostContextOutcome::ToggleEnabled {
+            model.select_client_menu_item(2),
+            ClientMenuOutcome::HostToggleEnabled {
                 remote_id: "r1".into(),
                 enabled: false,
             }
@@ -5811,30 +5729,25 @@ mod tests {
     #[test]
     fn host_context_menu_add_space_unavailable_when_disconnected() {
         // #44 row order: 0=version readout, 1=add space, 2=toggle, 3=disconnect/reconnect, 4=update.
-        // Disconnected host: add-space (row 1) is a no-op redraw; the version row (0) also redraws;
-        // the disconnect row (3) reconnects instead; update (4) is a no-op redraw when disconnected.
+        // #47: activating a terminal row closes the menu (it has done its job), so re-open before
+        // each selection. Disconnected host: add-space (1) and update (4) are no-op redraws; the
+        // version row (0) is non-selectable (redraw); the disconnect row (3) reconnects instead.
         let mut model = ClientSupervisorModel::new("local");
         let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
         model
             .set_connection_state(&remote, ConnectionState::Disconnected)
             .unwrap();
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(model.select_client_menu_item(0), ClientMenuOutcome::Redraw);
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(model.select_client_menu_item(1), ClientMenuOutcome::Redraw);
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
         assert_eq!(
-            model.select_host_context_menu_item(0),
-            HostContextOutcome::Redraw
+            model.select_client_menu_item(3),
+            ClientMenuOutcome::HostReconnect(remote.clone())
         );
-        assert_eq!(
-            model.select_host_context_menu_item(1),
-            HostContextOutcome::Redraw
-        );
-        assert_eq!(
-            model.select_host_context_menu_item(3),
-            HostContextOutcome::Reconnect(remote.clone())
-        );
-        assert_eq!(
-            model.select_host_context_menu_item(4),
-            HostContextOutcome::Redraw
-        );
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        assert_eq!(model.select_client_menu_item(4), ClientMenuOutcome::Redraw);
 
         // Connected host: add-space (row 1) yields AddSpace; row 3 disconnects; row 4 updates.
         let mut model = ClientSupervisorModel::new("local");
@@ -5844,16 +5757,18 @@ mod tests {
             .unwrap();
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
         assert_eq!(
-            model.select_host_context_menu_item(1),
-            HostContextOutcome::AddSpace(remote.clone())
+            model.select_client_menu_item(1),
+            ClientMenuOutcome::HostAddSpace(remote.clone())
         );
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
         assert_eq!(
-            model.select_host_context_menu_item(3),
-            HostContextOutcome::Disconnect(remote.clone())
+            model.select_client_menu_item(3),
+            ClientMenuOutcome::HostDisconnect(remote.clone())
         );
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
         assert_eq!(
-            model.select_host_context_menu_item(4),
-            HostContextOutcome::Update(remote.clone())
+            model.select_client_menu_item(4),
+            ClientMenuOutcome::HostUpdate(remote.clone())
         );
     }
 
@@ -5870,26 +5785,26 @@ mod tests {
         // #44: Down advances through the 5-row menu (version/add/toggle/disconnect/update), clamped
         // at the last row (index 4). #46: the menu now OPENS on row 1 (add), skipping the
         // non-actionable version readout, so the first Down lands on row 2.
-        assert_eq!(model.host_context_menu().unwrap().selected, 1);
+        assert_eq!(model.client_menu().unwrap().selected, 1);
         assert_eq!(
-            model.handle_host_context_menu_key(press(KeyCode::Down)),
-            HostContextOutcome::Redraw
+            model.handle_client_menu_key(press(KeyCode::Down)),
+            ClientMenuOutcome::Redraw
         );
-        assert_eq!(model.host_context_menu().unwrap().selected, 2);
-        model.handle_host_context_menu_key(press(KeyCode::Char('j')));
-        assert_eq!(model.host_context_menu().unwrap().selected, 3);
-        model.handle_host_context_menu_key(press(KeyCode::Down));
-        model.handle_host_context_menu_key(press(KeyCode::Down));
-        assert_eq!(model.host_context_menu().unwrap().selected, 4);
-        model.handle_host_context_menu_key(press(KeyCode::Down));
-        assert_eq!(model.host_context_menu().unwrap().selected, 4);
+        assert_eq!(model.client_menu().unwrap().selected, 2);
+        model.handle_client_menu_key(press(KeyCode::Char('j')));
+        assert_eq!(model.client_menu().unwrap().selected, 3);
+        model.handle_client_menu_key(press(KeyCode::Down));
+        model.handle_client_menu_key(press(KeyCode::Down));
+        assert_eq!(model.client_menu().unwrap().selected, 4);
+        model.handle_client_menu_key(press(KeyCode::Down));
+        assert_eq!(model.client_menu().unwrap().selected, 4);
         // k moves back up.
-        model.handle_host_context_menu_key(press(KeyCode::Char('k')));
-        assert_eq!(model.host_context_menu().unwrap().selected, 3);
+        model.handle_client_menu_key(press(KeyCode::Char('k')));
+        assert_eq!(model.client_menu().unwrap().selected, 3);
 
         // Esc dismisses.
-        model.handle_host_context_menu_key(press(KeyCode::Esc));
-        assert!(model.host_context_menu().is_none());
+        model.handle_client_menu_key(press(KeyCode::Esc));
+        assert!(model.client_menu().is_none());
     }
 
     // ----- #44: remote version/protocol readout + one-click update -------------------------------
@@ -5949,7 +5864,7 @@ mod tests {
         model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
 
         // The items list STARTS with the version readout row and CONTAINS "update".
-        let items = model.host_context_menu_items();
+        let items = menu_labels(&model);
         assert_eq!(items.first().map(String::as_str), Some(
             format!("v0.6.4 · proto {local}").as_str()
         ));
@@ -5960,8 +5875,8 @@ mod tests {
 
         // The version-readout row (index 0) is non-actionable -> Redraw.
         assert_eq!(
-            model.select_host_context_menu_item(0),
-            HostContextOutcome::Redraw
+            model.select_client_menu_item(0),
+            ClientMenuOutcome::Redraw
         );
 
         // Selecting the update row index returns Update(server_id) for a connected host.
@@ -5970,8 +5885,8 @@ mod tests {
             .position(|item| item == "update")
             .expect("update row present");
         assert_eq!(
-            model.select_host_context_menu_item(update_index),
-            HostContextOutcome::Update(remote.clone())
+            model.select_client_menu_item(update_index),
+            ClientMenuOutcome::HostUpdate(remote.clone())
         );
     }
 
@@ -5986,7 +5901,7 @@ mod tests {
         // A stale protocol flags a ⚠ marker on the readout row.
         model.set_remote_runtime_info(&remote, Some("0.6.0".into()), Some(local.wrapping_add(1)));
         model.open_host_context_menu(remote, "alpha".into(), 0, 0);
-        let first = model.host_context_menu_items()[0].clone();
+        let first = menu_labels(&model)[0].clone();
         assert!(first.starts_with("⚠ "), "mismatched proto marks ⚠: {first:?}");
     }
 

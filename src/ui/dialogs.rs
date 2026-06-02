@@ -80,20 +80,22 @@ pub(crate) struct RemoteManageRowView<'a> {
     pub disabled: bool,
 }
 
-/// #23: ui-owned view for the workspace context menu. `label` is the workspace name shown as the
-/// modal sub-header; `rows` are the menu item labels. Holds only borrowed strings (no supervisor
-/// type), per the layering rule.
-pub(crate) struct WorkspaceContextMenuView<'a> {
-    pub label: &'a str,
-    pub rows: &'a [&'a str],
+/// #47: ui-owned view for the one client menu (global launcher / workspace context / host context).
+/// `title` is the panel header ("menu" / "workspace" / "host"); `subheader` is the optional target
+/// line under it (workspace label / host name), `None` for the launcher. `rows` are the menu rows.
+/// Holds only borrowed strings (no supervisor type), per the layering rule.
+pub(crate) struct ClientMenuView<'a> {
+    pub title: &'a str,
+    pub subheader: Option<&'a str>,
+    pub rows: &'a [ClientMenuRowView<'a>],
+    pub selected: usize,
 }
 
-/// #43: ui-owned view for the host context menu. `display_name` is the host name shown as the modal
-/// sub-header; `rows` are the (state-dependent) menu item labels. Holds only borrowed strings (no
-/// supervisor type), per the layering rule. Mirrors `WorkspaceContextMenuView`.
-pub(crate) struct HostContextMenuView<'a> {
-    pub display_name: &'a str,
-    pub rows: &'a [String],
+/// #47: one ui-owned row of a [`ClientMenuView`]. `selectable` is false for non-actionable rows
+/// (the host version readout), which render dimmer.
+pub(crate) struct ClientMenuRowView<'a> {
+    pub label: &'a str,
+    pub selectable: bool,
 }
 
 fn truncate_text(text: &str, max_width: usize) -> String {
@@ -1302,31 +1304,37 @@ fn render_remote_manage_confirm(
     );
 }
 
-// ----- #23: workspace context menu + rename + confirm-close geometry/render -------------------
-// Single-source-of-truth geometry for the three #23 overlays, mirroring the add-remote /
-// manage-remotes modals above. Both the renderer and `ClientCompositor::hit_test` derive every
-// row/button rect from these helpers, so render geometry == hit-test geometry.
+// ----- #47: the one client menu (launcher / workspace context / host context) geometry/render ----
+// Single-source-of-truth geometry, mirroring the add-remote / manage-remotes modals above. Both the
+// renderer and `ClientCompositor::hit_test` derive every row rect from these helpers, so render
+// geometry == hit-test geometry. `header_rows` is 1 for the launcher (title only) or 2 for the
+// context menus (title + target sub-header), so the row offset and popup height track the sub-header.
 
-/// The context-menu popup height for `count` rows: header + the workspace-name sub-row + one row
-/// per item + vertical margins, clamped to a sane band. Used by BOTH the inner-rect helper and the
-/// renderer so they cannot diverge. Mirrors `picker_popup_height`.
-fn workspace_context_menu_popup_height(count: usize) -> u16 {
-    (count as u16).saturating_add(4).clamp(6, 12)
+/// #47: the client-menu popup height for `count` rows + `header_rows` header lines + top/bottom
+/// borders, clamped to a sane band. Used by BOTH the inner-rect helper and the renderer so they
+/// cannot diverge. For `header_rows == 2` this is the old `count + 4`, preserving the context-menu
+/// size; for `header_rows == 1` (launcher) it is `count + 3`.
+fn client_menu_popup_height(count: usize, header_rows: u16) -> u16 {
+    (count as u16)
+        .saturating_add(header_rows)
+        .saturating_add(2)
+        .clamp(6, 12)
 }
 
-/// #33: the outer popup rect for the workspace context menu — cursor-anchored, clamped to the full
-/// screen. The popup's top-left sits at the right-click cursor, shifting left/up near the
-/// right/bottom edges so it stays fully visible (matching the server-rendered menu's
-/// clamp-to-screen behaviour). Used by BOTH render and hit-test so their geometry stays in lockstep.
-pub(crate) fn workspace_context_menu_popup_rect_at(
+/// #47: the outer popup rect for the client menu — anchor-anchored, clamped to the full screen. The
+/// popup's top-left sits at the anchor cell (right-click cursor / clicked menu-button cell), shifting
+/// left/up near the right/bottom edges so it stays fully visible. Used by BOTH render and hit-test so
+/// their geometry stays in lockstep.
+pub(crate) fn client_menu_popup_rect_at(
     anchor_col: u16,
     anchor_row: u16,
     count: usize,
+    header_rows: u16,
     host_width: u16,
     host_height: u16,
 ) -> Option<Rect> {
     let popup_w = 34u16.min(host_width.saturating_sub(2));
-    let popup_h = workspace_context_menu_popup_height(count).min(host_height.saturating_sub(1));
+    let popup_h = client_menu_popup_height(count, header_rows).min(host_height.saturating_sub(1));
     if popup_w < 4 || popup_h < 4 {
         return None;
     }
@@ -1335,31 +1343,32 @@ pub(crate) fn workspace_context_menu_popup_rect_at(
     Some(Rect::new(popup_x, popup_y, popup_w, popup_h))
 }
 
-/// #33: shared inner rect for the cursor-anchored context menu. Returns `None` when the host is too
+/// #47: shared inner rect for the anchor-anchored client menu. Returns `None` when the host is too
 /// small for the popup.
-pub(crate) fn workspace_context_menu_inner_rect_at(
+pub(crate) fn client_menu_inner_rect_at(
     anchor_col: u16,
     anchor_row: u16,
     count: usize,
+    header_rows: u16,
     host_width: u16,
     host_height: u16,
 ) -> Option<Rect> {
-    workspace_context_menu_popup_rect_at(anchor_col, anchor_row, count, host_width, host_height).map(
-        |popup| {
+    client_menu_popup_rect_at(anchor_col, anchor_row, count, header_rows, host_width, host_height)
+        .map(|popup| {
             Rect::new(
                 popup.x + 1,
                 popup.y + 1,
                 popup.width.saturating_sub(2),
                 popup.height.saturating_sub(2),
             )
-        },
-    )
+        })
 }
 
-/// The rect for menu row `row_index` inside the context menu's inner rect. Rows start two lines
-/// below the inner top (header + workspace-name sub-row). Used by BOTH render and hit-test.
-pub(crate) fn workspace_context_menu_row_rect(inner: Rect, row_index: usize) -> Rect {
-    let y = inner.y.saturating_add(2 + row_index as u16);
+/// #47: the rect for menu row `row_index` inside the client menu's inner rect. Rows start
+/// `header_rows` lines below the inner top (title [+ target sub-header]). Used by BOTH render and
+/// hit-test.
+pub(crate) fn client_menu_row_rect(inner: Rect, header_rows: u16, row_index: usize) -> Rect {
+    let y = inner.y.saturating_add(header_rows + row_index as u16);
     Rect::new(inner.x, y, inner.width, 1)
 }
 
@@ -1426,24 +1435,24 @@ pub(crate) fn confirm_close_workspace_button_rects(inner: Rect) -> (Rect, Rect) 
     (rects[0], rects[1])
 }
 
-/// #23: render the workspace context menu as a footer-anchored accent panel — a selectable list of
-/// menu items with the workspace name as a sub-header. Geometry comes from
-/// `workspace_context_menu_inner_rect`/`_row_rect` so it matches `hit_test`. Mirrors
-/// `render_new_workspace_picker_overlay`.
-pub(crate) fn render_workspace_context_menu_overlay(
+/// #47: render the one client menu (launcher / workspace context / host context) as an
+/// anchor-anchored accent panel — a title header, an optional target sub-header, then a selectable
+/// list of rows. Geometry comes from `client_menu_inner_rect_at` / `client_menu_row_rect` (the SAME
+/// helpers `hit_test` uses) so render == hit-test. `header_rows` is 1 (launcher: title only) or 2
+/// (context menus: title + sub-header). Non-selectable rows (the host version readout) render dimmer.
+pub(crate) fn render_client_menu_overlay(
     palette: &Palette,
-    view: &WorkspaceContextMenuView,
-    selected: usize,
+    view: &ClientMenuView,
     frame: &mut Frame,
     popup: Rect,
+    header_rows: u16,
 ) {
     let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
         return;
     };
-    // #33: render and hit-test must derive the SAME inner rect. The cursor-anchor refactor dropped
-    // the old `area`-based divergence assert; re-pin it at the new altitude by checking
-    // render_panel_shell's inset against the exact formula `workspace_context_menu_inner_rect_at`
-    // uses for hit-testing, so the two geometries can never silently diverge again.
+    // #33/#47: render and hit-test must derive the SAME inner rect — re-pin the divergence assert at
+    // the exact formula `client_menu_inner_rect_at` uses for hit-testing, so the two geometries can
+    // never silently diverge again.
     debug_assert_eq!(
         inner,
         Rect::new(
@@ -1452,7 +1461,7 @@ pub(crate) fn render_workspace_context_menu_overlay(
             popup.width.saturating_sub(2),
             popup.height.saturating_sub(2),
         ),
-        "context menu render and hit-test geometry diverged"
+        "client menu render and hit-test geometry diverged"
     );
     if inner.height < 4 {
         return;
@@ -1461,101 +1470,37 @@ pub(crate) fn render_workspace_context_menu_overlay(
     render_modal_header(
         frame,
         Rect::new(inner.x, inner.y, inner.width, 1),
-        "workspace",
+        view.title,
         palette,
     );
-    frame.render_widget(
-        Paragraph::new(format!(" {}", truncate_text(view.label, inner.width as usize)))
-            .style(Style::default().fg(palette.overlay0)),
-        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
-    );
-
-    let selected = selected.min(view.rows.len().saturating_sub(1));
-    let max_rows = inner.height.saturating_sub(2) as usize;
-    for (row_index, label) in view.rows.iter().enumerate().take(max_rows) {
-        let is_selected = row_index == selected;
-        let marker = if is_selected { "›" } else { " " };
-        let text = format!("{marker} {label}");
-        let style = if is_selected {
-            Style::default()
-                .fg(palette.text)
-                .bg(palette.surface0)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(palette.subtext0)
-        };
-        let row = workspace_context_menu_row_rect(inner, row_index);
+    if let Some(subheader) = view.subheader {
         frame.render_widget(
-            Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
-            row,
+            Paragraph::new(format!(" {}", truncate_text(subheader, inner.width as usize)))
+                .style(Style::default().fg(palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
         );
     }
-}
 
-/// #43: render the host context menu as a cursor-anchored accent panel — a selectable list of menu
-/// items with the host name as a sub-header. REUSES the workspace context-menu geometry helpers
-/// wholesale (`workspace_context_menu_row_rect` etc.), since they are label-agnostic and
-/// count-parameterised. Mirrors `render_workspace_context_menu_overlay`.
-pub(crate) fn render_host_context_menu_overlay(
-    palette: &Palette,
-    view: &HostContextMenuView,
-    selected: usize,
-    frame: &mut Frame,
-    popup: Rect,
-) {
-    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
-        return;
-    };
-    // #43: render and hit-test must derive the SAME inner rect — re-pin the divergence assert at the
-    // exact formula `workspace_context_menu_inner_rect_at` uses for hit-testing (the host menu
-    // shares those helpers), so the two geometries can never silently diverge.
-    debug_assert_eq!(
-        inner,
-        Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        ),
-        "context menu render and hit-test geometry diverged"
-    );
-    if inner.height < 4 {
-        return;
-    }
-
-    render_modal_header(
-        frame,
-        Rect::new(inner.x, inner.y, inner.width, 1),
-        "host",
-        palette,
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {}",
-            truncate_text(view.display_name, inner.width as usize)
-        ))
-        .style(Style::default().fg(palette.overlay0)),
-        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
-    );
-
-    let selected = selected.min(view.rows.len().saturating_sub(1));
-    let max_rows = inner.height.saturating_sub(2) as usize;
-    for (row_index, label) in view.rows.iter().enumerate().take(max_rows) {
+    let selected = view.selected.min(view.rows.len().saturating_sub(1));
+    let max_rows = inner.height.saturating_sub(header_rows) as usize;
+    for (row_index, row) in view.rows.iter().enumerate().take(max_rows) {
         let is_selected = row_index == selected;
         let marker = if is_selected { "›" } else { " " };
-        let text = format!("{marker} {label}");
+        let text = format!("{marker} {}", row.label);
         let style = if is_selected {
             Style::default()
                 .fg(palette.text)
                 .bg(palette.surface0)
                 .add_modifier(Modifier::BOLD)
-        } else {
+        } else if row.selectable {
             Style::default().fg(palette.subtext0)
+        } else {
+            Style::default().fg(palette.overlay0)
         };
-        let row = workspace_context_menu_row_rect(inner, row_index);
+        let row_rect = client_menu_row_rect(inner, header_rows, row_index);
         frame.render_widget(
             Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
-            row,
+            row_rect,
         );
     }
 }
@@ -1693,8 +1638,7 @@ mod tests {
     use super::{
         add_remote_button_rects, add_remote_inner_rect, confirm_close_overlay_text,
         new_workspace_picker_button_rects, new_workspace_picker_inner_rect,
-        new_workspace_picker_row_rect, workspace_context_menu_inner_rect_at,
-        workspace_context_menu_popup_rect_at,
+        client_menu_inner_rect_at, client_menu_popup_rect_at, new_workspace_picker_row_rect,
     };
 
     fn rects_are_disjoint(a: Rect, b: Rect) -> bool {
@@ -1704,7 +1648,7 @@ mod tests {
     #[test]
     fn workspace_context_menu_anchors_at_cursor() {
         // #33: the popup's top-left sits at the right-click cursor when it fits on screen.
-        let popup = workspace_context_menu_popup_rect_at(10, 4, 2, 80, 24)
+        let popup = client_menu_popup_rect_at(10, 4, 2, 2, 80, 24)
             .expect("popup fits on an 80x24 host");
         assert_eq!((popup.x, popup.y), (10, 4), "anchored at the cursor");
     }
@@ -1713,7 +1657,7 @@ mod tests {
     fn workspace_context_menu_clamps_to_screen_near_edges() {
         // #33: a cursor near the right/bottom edge shifts the popup left/up so it stays fully
         // on-screen (matching the server-rendered menu's clamp-to-screen behaviour).
-        let popup = workspace_context_menu_popup_rect_at(79, 23, 2, 80, 24)
+        let popup = client_menu_popup_rect_at(79, 23, 2, 2, 80, 24)
             .expect("popup fits on an 80x24 host");
         assert!(
             popup.x + popup.width <= 80,
@@ -1730,8 +1674,8 @@ mod tests {
         // #33: render and hit-test both derive the inner rect from the SAME popup-at helper, so the
         // inner rect must be exactly the bordered-panel inset (popup + 1 / - 2) — keeping render and
         // hit-test geometry in lockstep now that the divergence debug_assert is gone.
-        let popup = workspace_context_menu_popup_rect_at(10, 4, 2, 80, 24).unwrap();
-        let inner = workspace_context_menu_inner_rect_at(10, 4, 2, 80, 24).unwrap();
+        let popup = client_menu_popup_rect_at(10, 4, 2, 2, 80, 24).unwrap();
+        let inner = client_menu_inner_rect_at(10, 4, 2, 2, 80, 24).unwrap();
         assert_eq!(
             inner,
             Rect::new(
@@ -1747,7 +1691,7 @@ mod tests {
     fn workspace_context_menu_returns_none_on_tiny_host() {
         // #33: a host too small for the popup yields None, so render draws nothing and hit-test
         // resolves nothing (no clicks land on an unpainted menu).
-        assert!(workspace_context_menu_popup_rect_at(0, 0, 2, 4, 4).is_none());
+        assert!(client_menu_popup_rect_at(0, 0, 2, 2, 4, 4).is_none());
     }
 
     fn rect_within(child: Rect, parent: Rect) -> bool {

@@ -362,47 +362,66 @@ fn dispatch_for_remote_manage_outcome(
     }
 }
 
-/// #43: map a `HostContextOutcome` from the model into the client input dispatch, closing the host
-/// context-menu overlay for the action arms (the menu has done its job). `AddSpace` resolves through
-/// the public route helper into a `workspace.create` ApiRequest on that host (same Immediate refresh
-/// the New button uses); `ToggleEnabled` reuses the existing `SetRemoteEnabled` registry path;
-/// `Disconnect`/`Reconnect` emit the new stream-only dispatches. `Redraw` just redraws.
-fn dispatch_for_host_context_outcome(
+/// #47: map a `ClientMenuOutcome` into the client input dispatch — the single handler for all three
+/// menus. The overlay-opening launcher rows (`add remote` / `manage remotes`) and the workspace
+/// rename/close rows already opened their follow-on overlay inside `select_client_menu_item` and
+/// report `Redraw`; the rest already closed the menu and carry the context to route. `Settings` /
+/// `Keybinds` activate the main server then open the matching server surface; `ReloadConfig` /
+/// `Detach` reuse the existing dispatches; the host rows reuse the add-space ApiRequest (same
+/// Immediate refresh the New button uses) / `SetRemoteEnabled` / Disconnect-Reconnect / Update paths.
+fn dispatch_for_client_menu_outcome(
     model: &mut supervisor::ClientSupervisorModel,
-    outcome: supervisor::HostContextOutcome,
+    outcome: supervisor::ClientMenuOutcome,
 ) -> ClientInputDispatch {
     match outcome {
-        supervisor::HostContextOutcome::Redraw => ClientInputDispatch::Redraw,
-        supervisor::HostContextOutcome::AddSpace(server_id) => {
-            let dispatch = model
-                .route_for_server(&server_id)
-                .api_request("client:workspace-create")
-                .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
-                    server_id,
-                    refresh: ClientApiRefreshPolicy::Immediate,
-                    request: Box::new(request),
-                })
-                .unwrap_or(ClientInputDispatch::Redraw);
-            model.close_client_overlay();
-            dispatch
+        supervisor::ClientMenuOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::ClientMenuOutcome::Settings => {
+            model.activate_main_server();
+            ClientInputDispatch::ServerControl {
+                server_id: supervisor::ServerId::main(),
+                message: ClientMessage::OpenSettings,
+            }
         }
-        supervisor::HostContextOutcome::ToggleEnabled { remote_id, enabled } => {
-            model.close_client_overlay();
+        supervisor::ClientMenuOutcome::Keybinds => {
+            model.activate_main_server();
+            ClientInputDispatch::ServerControl {
+                server_id: supervisor::ServerId::main(),
+                message: ClientMessage::OpenKeybindHelp,
+            }
+        }
+        supervisor::ClientMenuOutcome::ReloadConfig => ClientInputDispatch::ApiRequest {
+            server_id: supervisor::ServerId::main(),
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:reload-config".into(),
+                method: crate::api::schema::Method::ServerReloadConfig(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            }),
+        },
+        supervisor::ClientMenuOutcome::Detach => ClientInputDispatch::DetachAll,
+        supervisor::ClientMenuOutcome::HostAddSpace(server_id) => model
+            .route_for_server(&server_id)
+            .api_request("client:workspace-create")
+            .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                server_id,
+                refresh: ClientApiRefreshPolicy::Immediate,
+                request: Box::new(request),
+            })
+            .unwrap_or(ClientInputDispatch::Redraw),
+        supervisor::ClientMenuOutcome::HostToggleEnabled { remote_id, enabled } => {
             ClientInputDispatch::SetRemoteEnabled { remote_id, enabled }
         }
-        supervisor::HostContextOutcome::Disconnect(server_id) => {
-            model.close_client_overlay();
+        supervisor::ClientMenuOutcome::HostDisconnect(server_id) => {
             ClientInputDispatch::DisconnectRemote { server_id }
         }
-        supervisor::HostContextOutcome::Reconnect(server_id) => {
-            model.close_client_overlay();
+        supervisor::ClientMenuOutcome::HostReconnect(server_id) => {
             ClientInputDispatch::ReconnectRemote { server_id }
         }
         // #44: reinstall the local herdr onto this remote by reusing the add-remote provisioning
         // flow (no internet download). The worker is spawned in the loop where the bridge map and
         // event channel are in scope.
-        supervisor::HostContextOutcome::Update(server_id) => {
-            model.close_client_overlay();
+        supervisor::ClientMenuOutcome::HostUpdate(server_id) => {
             ClientInputDispatch::UpdateRemote { server_id }
         }
     }
@@ -515,11 +534,9 @@ fn dispatch_composited_input(
     host_size: (u16, u16),
 ) -> ClientInputDispatch {
     if model.add_remote_form().is_some()
-        || model.client_global_menu_highlighted().is_some()
+        || model.client_menu().is_some()
         || model.new_workspace_picker().is_some()
         || model.remote_manage_overlay().is_some()
-        || model.workspace_context_menu().is_some()
-        || model.host_context_menu().is_some()
         || model.rename_workspace_form().is_some()
         || model.confirm_close_workspace().is_some()
     {
@@ -939,10 +956,12 @@ fn dispatch_client_overlay_input(
                     }
                 }
             }
-            crate::raw_input::RawInputEvent::Key(key)
-                if model.client_global_menu_highlighted().is_some() =>
-            {
-                dispatch_client_global_menu_key(model, key)
+            // #47: the one client menu (launcher / workspace / host) — a single key handler. Delegates
+            // to `handle_client_menu_key` and maps its outcome through the SAME helper the mouse path
+            // uses.
+            crate::raw_input::RawInputEvent::Key(key) if model.client_menu().is_some() => {
+                let outcome = model.handle_client_menu_key(key);
+                dispatch_for_client_menu_outcome(model, outcome)
             }
             crate::raw_input::RawInputEvent::Key(key) if model.new_workspace_picker().is_some() => {
                 dispatch_new_workspace_picker_key(model, key)
@@ -951,28 +970,6 @@ fn dispatch_client_overlay_input(
                 if model.remote_manage_overlay().is_some() =>
             {
                 dispatch_for_remote_manage_outcome(model.handle_remote_manage_key(key))
-            }
-            // #23: workspace context menu / rename / confirm-close key + paste handling. Each
-            // delegates to the supervisor key handler and maps its typed outcome into a dispatch
-            // (mirrors the add-remote / remote-manage arms above).
-            crate::raw_input::RawInputEvent::Key(key)
-                if model.workspace_context_menu().is_some() =>
-            {
-                match model.handle_workspace_context_menu_key(key) {
-                    supervisor::WorkspaceContextOutcome::Redraw
-                    | supervisor::WorkspaceContextOutcome::OpenRename
-                    | supervisor::WorkspaceContextOutcome::OpenConfirmClose => {
-                        ClientInputDispatch::Redraw
-                    }
-                }
-            }
-            // #43: host context-menu key handling. Delegates to the supervisor key handler and maps
-            // its typed outcome through the SAME helper the mouse path uses.
-            crate::raw_input::RawInputEvent::Key(key)
-                if model.host_context_menu().is_some() =>
-            {
-                let outcome = model.handle_host_context_menu_key(key);
-                dispatch_for_host_context_outcome(model, outcome)
             }
             crate::raw_input::RawInputEvent::Key(key)
                 if model.rename_workspace_form().is_some() =>
@@ -1015,38 +1012,6 @@ fn dispatch_client_overlay_input(
         }
     }
     dispatch
-}
-
-fn dispatch_client_global_menu_key(
-    model: &mut supervisor::ClientSupervisorModel,
-    key: crate::input::TerminalKey,
-) -> ClientInputDispatch {
-    if !matches!(
-        key.kind,
-        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-    ) {
-        return ClientInputDispatch::Consumed;
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            model.close_client_overlay();
-            ClientInputDispatch::Redraw
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            model.move_client_global_menu_prev();
-            ClientInputDispatch::Redraw
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            model.move_client_global_menu_next();
-            ClientInputDispatch::Redraw
-        }
-        KeyCode::Enter => {
-            let action = model.accept_client_global_menu_item();
-            dispatch_client_global_menu_action(model, action)
-        }
-        _ => ClientInputDispatch::Consumed,
-    }
 }
 
 /// item 1: keyboard navigation for the composited new-workspace destination picker. ↑/k and ↓/j
@@ -1097,44 +1062,6 @@ fn accept_new_workspace_picker_dispatch(
         .unwrap_or(ClientInputDispatch::Consumed)
 }
 
-fn dispatch_client_global_menu_action(
-    model: &mut supervisor::ClientSupervisorModel,
-    action: Option<supervisor::ClientGlobalMenuAction>,
-) -> ClientInputDispatch {
-    match action {
-        Some(supervisor::ClientGlobalMenuAction::Settings) => {
-            model.activate_main_server();
-            ClientInputDispatch::ServerControl {
-                server_id: supervisor::ServerId::main(),
-                message: ClientMessage::OpenSettings,
-            }
-        }
-        Some(supervisor::ClientGlobalMenuAction::Keybinds) => {
-            model.activate_main_server();
-            ClientInputDispatch::ServerControl {
-                server_id: supervisor::ServerId::main(),
-                message: ClientMessage::OpenKeybindHelp,
-            }
-        }
-        Some(supervisor::ClientGlobalMenuAction::ReloadConfig) => ClientInputDispatch::ApiRequest {
-            server_id: supervisor::ServerId::main(),
-            refresh: ClientApiRefreshPolicy::Immediate,
-            request: Box::new(crate::api::schema::Request {
-                id: "client:reload-config".into(),
-                method: crate::api::schema::Method::ServerReloadConfig(
-                    crate::api::schema::EmptyParams::default(),
-                ),
-            }),
-        },
-        Some(supervisor::ClientGlobalMenuAction::Detach) => ClientInputDispatch::DetachAll,
-        Some(supervisor::ClientGlobalMenuAction::AddRemote) => ClientInputDispatch::Redraw,
-        // item 3 (Area 5): the overlay was already opened by `select_client_global_menu_item`;
-        // just repaint.
-        Some(supervisor::ClientGlobalMenuAction::ManageRemotes) => ClientInputDispatch::Redraw,
-        None => ClientInputDispatch::Consumed,
-    }
-}
-
 fn dispatch_composited_mouse_input(
     data: Vec<u8>,
     compositor: &mut compositor::ClientCompositor,
@@ -1142,14 +1069,14 @@ fn dispatch_composited_mouse_input(
     host_size: (u16, u16),
     mouse: &MouseEvent,
 ) -> ClientInputDispatch {
-    // #46 (items 5/6/7): a right-click context menu is MODAL — it renders topmost, so it must be
-    // topmost in the EVENT pipeline too. Route every mouse event to it FIRST, ahead of the sidebar
-    // motion/resize/scroll/reorder handlers below (which otherwise highlight rows UNDER the menu on
-    // hover, wheel-scroll the sidebar beneath it, and let a divider-column click start a resize
-    // instead of selecting). This is the fix the user's "events in render order" intuition asks for:
-    // the render was already topmost; only the event ordering was wrong.
-    if model.context_menu_open() {
-        return dispatch_open_context_menu_mouse(compositor, model, host_size, mouse);
+    // #46/#47: an open client menu (launcher / workspace / host) is MODAL — it renders topmost, so it
+    // must be topmost in the EVENT pipeline too. Route every mouse event to it FIRST, ahead of the
+    // sidebar motion/resize/scroll/reorder handlers below (which otherwise highlight rows UNDER the
+    // menu on hover, wheel-scroll the sidebar beneath it, and let a divider-column click start a
+    // resize instead of selecting). Now covers ALL three menus — the launcher used to have its own
+    // ad-hoc hover arm and a non-modal click path, the gap #46 left.
+    if model.client_menu_open() {
+        return dispatch_open_client_menu_mouse(compositor, model, host_size, mouse);
     }
 
     // item 7 (Area 4): handle motion BEFORE resize/scroll/hit_test. The `hit_test` dispatch below
@@ -1159,23 +1086,6 @@ fn dispatch_composited_mouse_input(
     // through so a content `Moved` still forwards its bytes via `translate_content_mouse_input`.
     // The `Redraw` arm recomposes locally (commit 3d47acd: no supervisor request, no server I/O).
     if matches!(mouse.kind, MouseEventKind::Moved) {
-        // item 7: while the global menu is open, motion moves its highlight to the hovered row
-        // (mirrors the monolithic host's `global_menu.hover`); the same shared launcher-menu surface
-        // then renders it. The overlay mouse arm routes the `Moved` here regardless of column.
-        if model.client_global_menu_highlighted().is_some() {
-            let hovered = compositor.client_global_menu_item_at(
-                model,
-                mouse.column,
-                mouse.row,
-                host_size.0,
-                host_size.1,
-            );
-            return if model.hover_client_global_menu_item(hovered) {
-                ClientInputDispatch::Redraw
-            } else {
-                ClientInputDispatch::Consumed
-            };
-        }
         let sidebar_width = compositor.sidebar_width().min(host_size.0);
         if mouse.column < sidebar_width || compositor.hover().is_some() {
             let next =
@@ -1400,14 +1310,15 @@ fn dispatch_composited_mouse_input(
     translate_content_mouse_input(data, mouse, sidebar_width)
 }
 
-/// #46 (items 5/6/7): mouse handling for an OPEN context menu (workspace or host). Called from the
-/// top of `dispatch_composited_mouse_input` before any sidebar handler, so the modal menu owns the
-/// whole host rect. Motion highlights the hovered row (the sidebar hover path never knew about the
-/// menu, so hover used to highlight NOTHING on the menu); a left-press on a row selects it; any
-/// other press dismisses the menu and is CONSUMED (it must NOT leak to the pane underneath).
-/// Geometry comes from the SAME `hit_test` the open render uses, so hover/select line up with the
-/// painted rows.
-fn dispatch_open_context_menu_mouse(
+/// #46/#47: mouse handling for the one OPEN client menu (launcher / workspace / host). Called from
+/// the top of `dispatch_composited_mouse_input` before any sidebar handler, so the modal menu owns
+/// the whole host rect. Motion highlights the hovered row (the sidebar hover path never knew about
+/// the menu, so hover used to highlight NOTHING on it); a left-press on a row selects it; any other
+/// press dismisses the menu and is CONSUMED (it must NOT leak to the pane underneath). Geometry comes
+/// from the SAME `hit_test` the open render uses, so hover/select line up with the painted rows. This
+/// is ONE handler for all three menus — the launcher gets the same modal treatment as the two
+/// context menus (its old ad-hoc hover/click paths are gone).
+fn dispatch_open_client_menu_mouse(
     compositor: &compositor::ClientCompositor,
     model: &mut supervisor::ClientSupervisorModel,
     host_size: (u16, u16),
@@ -1416,19 +1327,11 @@ fn dispatch_open_context_menu_mouse(
     let target = compositor.hit_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
     match mouse.kind {
         MouseEventKind::Moved => match target {
-            Some(compositor::SidebarHitTarget::HostContextMenuRow { index }) => {
-                if model.host_context_menu().map(|m| m.selected) == Some(index) {
+            Some(compositor::SidebarHitTarget::ClientMenuRow { index }) => {
+                if model.client_menu().map(|m| m.selected) == Some(index) {
                     ClientInputDispatch::Consumed
                 } else {
-                    model.set_host_context_menu_selected(index);
-                    ClientInputDispatch::Redraw
-                }
-            }
-            Some(compositor::SidebarHitTarget::WorkspaceContextMenuRow { index }) => {
-                if model.workspace_context_menu().map(|m| m.selected) == Some(index) {
-                    ClientInputDispatch::Consumed
-                } else {
-                    model.set_workspace_context_menu_selected(index);
+                    model.set_client_menu_selected(index);
                     ClientInputDispatch::Redraw
                 }
             }
@@ -1437,10 +1340,9 @@ fn dispatch_open_context_menu_mouse(
             _ => ClientInputDispatch::Consumed,
         },
         MouseEventKind::Down(MouseButton::Left) => match target {
-            Some(
-                row_target @ (compositor::SidebarHitTarget::HostContextMenuRow { .. }
-                | compositor::SidebarHitTarget::WorkspaceContextMenuRow { .. }),
-            ) => dispatch_sidebar_hit_target(row_target, model, mouse),
+            Some(row_target @ compositor::SidebarHitTarget::ClientMenuRow { .. }) => {
+                dispatch_sidebar_hit_target(row_target, model, mouse)
+            }
             // A left-press that misses every row is an outside-click → dismiss + consume (never
             // forward to the pane beneath, which the old `None` fall-through did for content clicks).
             _ => {
@@ -1544,12 +1446,18 @@ fn dispatch_sidebar_hit_target(
                 request: Box::new(request),
             })
             .unwrap_or(ClientInputDispatch::Consumed),
-        compositor::SidebarHitTarget::ClientGlobalMenuItem { index } => {
-            let action = model.select_client_global_menu_item(index);
-            dispatch_client_global_menu_action(model, action)
+        // #47: a click on a row of the open client menu selects AND activates it, through the SAME
+        // `select_client_menu_item` + outcome dispatch the keyboard Enter path uses. Reached from the
+        // modal mouse handler (`dispatch_open_client_menu_mouse`).
+        compositor::SidebarHitTarget::ClientMenuRow { index } => {
+            model.set_client_menu_selected(index);
+            let outcome = model.select_client_menu_item(index);
+            dispatch_for_client_menu_outcome(model, outcome)
         }
+        // #47: the sidebar "menu" button opens the global launcher menu, anchored at the clicked cell
+        // so the popup floats from the button (clamped to screen). It is modal once open.
         compositor::SidebarHitTarget::Menu => {
-            model.open_client_global_menu();
+            model.open_client_global_menu(mouse.column, mouse.row);
             ClientInputDispatch::Redraw
         }
         // #20: handled earlier in `dispatch_composited_mouse_input` (needs `&mut compositor`); this
@@ -1606,19 +1514,8 @@ fn dispatch_sidebar_hit_target(
             model.cancel_remote_manage_delete();
             ClientInputDispatch::Redraw
         }
-        // #23: workspace context-menu mouse targets. Clicking a menu row selects AND activates it
-        // (opening the rename / confirm-close follow-on overlay); the rename submit/cancel and
-        // confirm close/cancel buttons replay the SAME paths the keys use.
-        compositor::SidebarHitTarget::WorkspaceContextMenuRow { index } => {
-            model.set_workspace_context_menu_selected(index);
-            match model.select_workspace_context_menu_item(index) {
-                supervisor::WorkspaceContextOutcome::Redraw
-                | supervisor::WorkspaceContextOutcome::OpenRename
-                | supervisor::WorkspaceContextOutcome::OpenConfirmClose => {
-                    ClientInputDispatch::Redraw
-                }
-            }
-        }
+        // #23: the rename submit/cancel and confirm close/cancel buttons replay the SAME paths the
+        // keys use. (The workspace menu ROW itself is now `ClientMenuRow`, handled above.)
         compositor::SidebarHitTarget::RenameWorkspaceSubmit => {
             // replay an Enter through the rename key handler so the BUTTON re-runs the exact same
             // empty-label validation / submit path as the Enter KEY (mirrors AddRemoteSubmit).
@@ -1634,14 +1531,6 @@ fn dispatch_sidebar_hit_target(
         compositor::SidebarHitTarget::ConfirmCloseWorkspaceCancel => {
             model.close_client_overlay();
             ClientInputDispatch::Redraw
-        }
-        // #43: clicking a host context-menu row selects AND activates it; the outcome is mapped
-        // through the shared helper (add-space ApiRequest / SetRemoteEnabled / Disconnect-Reconnect),
-        // closing the overlay for every action.
-        compositor::SidebarHitTarget::HostContextMenuRow { index } => {
-            model.set_host_context_menu_selected(index);
-            let outcome = model.select_host_context_menu_item(index);
-            dispatch_for_host_context_outcome(model, outcome)
         }
     }
 }
@@ -7091,11 +6980,17 @@ mod tests {
         );
         assert!(matches!(dispatch, ClientInputDispatch::Redraw));
         let menu = model
-            .workspace_context_menu()
+            .client_menu()
             .expect("right-click opened the context menu");
-        assert_eq!(menu.server_id, remote_id);
-        assert_eq!(menu.workspace_id, "remote-api");
-        assert_eq!(menu.label, "api", "captured the current label");
+        assert_eq!(
+            menu.kind,
+            supervisor::ClientMenuKind::Workspace {
+                server_id: remote_id.clone(),
+                workspace_id: "remote-api".into(),
+                label: "api".into(),
+            },
+            "captured the target + current label"
+        );
     }
 
     #[test]
@@ -7122,7 +7017,7 @@ mod tests {
             host,
             &down(MouseButton::Right, row),
         );
-        assert!(model.workspace_context_menu().is_some(), "right-click opened the menu");
+        assert!(model.client_menu().is_some(), "right-click opened the menu");
 
         // The far-right column is outside the 34-wide cursor-anchored popup, so `hit_test` is `None`
         // there while the menu is open — a genuine outside-click.
@@ -7148,7 +7043,7 @@ mod tests {
         );
         assert!(matches!(dispatch, ClientInputDispatch::Redraw));
         assert!(
-            model.workspace_context_menu().is_none(),
+            model.client_menu().is_none(),
             "an outside press dismissed the menu"
         );
     }
@@ -7177,7 +7072,7 @@ mod tests {
             &down(MouseButton::Right, row),
         );
         assert_eq!(
-            model.workspace_context_menu().unwrap().selected,
+            model.client_menu().unwrap().selected,
             0,
             "menu opens on the first row"
         );
@@ -7188,7 +7083,7 @@ mod tests {
             .find(|&(c, r)| {
                 matches!(
                     compositor.hit_test(&model, c, r, host.0, host.1),
-                    Some(compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 })
+                    Some(compositor::SidebarHitTarget::ClientMenuRow { index: 1 })
                 )
             })
             .expect("menu row 1 position");
@@ -7202,7 +7097,7 @@ mod tests {
             dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &moved);
         assert!(matches!(dispatch, ClientInputDispatch::Redraw));
         assert_eq!(
-            model.workspace_context_menu().unwrap().selected,
+            model.client_menu().unwrap().selected,
             1,
             "hover moved the highlight to row 1"
         );
@@ -7232,7 +7127,7 @@ mod tests {
 
         // click the "rename" row (index 0) -> rename overlay opens prefilled.
         let rename_hit = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 0 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 0 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7289,7 +7184,7 @@ mod tests {
 
         // click the "close" row (index 1) -> confirm overlay opens.
         dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 1 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7342,7 +7237,7 @@ mod tests {
             &down(MouseButton::Right, row),
         );
         dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::WorkspaceContextMenuRow { index: 1 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 1 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7391,12 +7286,12 @@ mod tests {
             &down(MouseButton::Right, row),
         );
         assert!(matches!(opened, ClientInputDispatch::Redraw));
-        assert!(model.host_context_menu().is_some());
+        assert!(model.client_menu().is_some());
 
         // #44: click "add new space" (row 1, after the version readout) -> WorkspaceCreate
         // ApiRequest on that host; overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 1 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 1 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7415,7 +7310,7 @@ mod tests {
             }
             other => panic!("expected WorkspaceCreate ApiRequest, got {other:?}"),
         }
-        assert!(model.host_context_menu().is_none(), "overlay closed");
+        assert!(model.client_menu().is_none(), "overlay closed");
     }
 
     #[test]
@@ -7434,7 +7329,7 @@ mod tests {
 
         // #44: click "disable" (row 2) -> SetRemoteEnabled{ registry_id, enabled:false }; overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 2 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 2 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7445,7 +7340,7 @@ mod tests {
             }
             other => panic!("expected SetRemoteEnabled, got {other:?}"),
         }
-        assert!(model.host_context_menu().is_none(), "overlay closed");
+        assert!(model.client_menu().is_none(), "overlay closed");
     }
 
     #[test]
@@ -7465,7 +7360,7 @@ mod tests {
         // #44: click "disconnect" (row 3) -> DisconnectRemote{server_id}, NOT SetRemoteEnabled (so it
         // drops the live stream WITHOUT disabling the registry entry); overlay closes.
         let dispatch = dispatch_sidebar_hit_target(
-            compositor::SidebarHitTarget::HostContextMenuRow { index: 3 },
+            compositor::SidebarHitTarget::ClientMenuRow { index: 3 },
             &mut model,
             &down(MouseButton::Left, 1),
         );
@@ -7479,7 +7374,7 @@ mod tests {
             }
             other => panic!("expected DisconnectRemote, got {other:?}"),
         }
-        assert!(model.host_context_menu().is_none(), "overlay closed");
+        assert!(model.client_menu().is_none(), "overlay closed");
     }
 
     #[test]
@@ -8749,7 +8644,7 @@ mod tests {
         );
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
-        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
     }
 
     #[test]
@@ -8758,44 +8653,47 @@ mod tests {
         // the monolithic host) and repaints; identical motion coalesces; motion off the menu leaves
         // the highlight put. The menu stays open throughout (motion never activates or closes it).
         let (mut model, _) = mixed_remote_model();
-        model.open_client_global_menu();
-        assert_eq!(model.client_global_menu_highlighted(), Some(0));
+        model.open_client_global_menu(0, 0);
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
         let mut compositor = compositor::ClientCompositor::new(26);
         let host = (60u16, 16u16);
 
-        // motion onto menu row index 1 moves the highlight 0 → 1 and repaints.
-        assert_eq!(
-            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
-            ClientInputDispatch::Redraw
-        );
-        assert_eq!(model.client_global_menu_highlighted(), Some(1));
-        // a second identical motion is coalesced (no change) → Consumed.
-        assert_eq!(
-            dispatch_composited_input(moved_bytes(21, 2), &mut compositor, &mut model, host),
-            ClientInputDispatch::Consumed
-        );
-        // motion onto row index 2 moves the highlight 1 → 2.
+        // #47: the launcher anchors at (0,0) with a "menu" title header, so row index i sits at
+        // y = 2 + i. motion onto menu row index 1 (y=3) moves the highlight 0 → 1 and repaints.
         assert_eq!(
             dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
             ClientInputDispatch::Redraw
         );
-        assert_eq!(model.client_global_menu_highlighted(), Some(2));
-        // motion off the right-anchored menu (far-left column) leaves the highlight put → Consumed.
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(1));
+        // a second identical motion is coalesced (no change) → Consumed.
         assert_eq!(
-            dispatch_composited_input(moved_bytes(1, 2), &mut compositor, &mut model, host),
+            dispatch_composited_input(moved_bytes(21, 3), &mut compositor, &mut model, host),
             ClientInputDispatch::Consumed
         );
-        assert_eq!(model.client_global_menu_highlighted(), Some(2));
+        // motion onto row index 2 (y=4) moves the highlight 1 → 2.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(21, 4), &mut compositor, &mut model, host),
+            ClientInputDispatch::Redraw
+        );
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
+        // motion off the menu (a column right of the popup) leaves the highlight put → Consumed.
+        assert_eq!(
+            dispatch_composited_input(moved_bytes(40, 2), &mut compositor, &mut model, host),
+            ClientInputDispatch::Consumed
+        );
+        assert_eq!(model.client_menu().map(|m| m.selected), Some(2));
     }
 
     #[test]
     fn composited_input_clicking_client_global_menu_dispatches_server_actions() {
         let (mut model, _) = mixed_remote_model();
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         let mut compositor = compositor::ClientCompositor::new(26);
 
+        // #47: the launcher anchors at (0,0) with a "menu" title header, so row i sits at y = 2 + i
+        // (SGR row = y + 1): settings idx0 → SGR row 3, keybinds idx1 → 4, reload idx2 → 5, …
         let settings = dispatch_composited_input(
-            b"\x1b[<0;22;2M".to_vec(),
+            b"\x1b[<0;22;3M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8809,9 +8707,9 @@ mod tests {
             }
         );
 
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         let keybinds = dispatch_composited_input(
-            b"\x1b[<0;22;3M".to_vec(),
+            b"\x1b[<0;22;4M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8825,9 +8723,9 @@ mod tests {
             }
         );
 
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         let reload = dispatch_composited_input(
-            b"\x1b[<0;22;4M".to_vec(),
+            b"\x1b[<0;22;5M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8847,9 +8745,9 @@ mod tests {
             }
         );
 
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         let detach = dispatch_composited_input(
-            b"\x1b[<0;22;5M".to_vec(),
+            b"\x1b[<0;22;6M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),
@@ -8867,10 +8765,11 @@ mod tests {
             .unwrap();
         assert_eq!(model.active_server_id(), &remote_id);
 
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         let mut compositor = compositor::ClientCompositor::new(26);
+        // #47: settings (idx0) sits at y=2 under the launcher's "menu" header → SGR row 3.
         let dispatch = dispatch_composited_input(
-            b"\x1b[<0;22;2M".to_vec(),
+            b"\x1b[<0;22;3M".to_vec(),
             &mut compositor,
             &mut model,
             (60, 16),

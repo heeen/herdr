@@ -9,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::state::{MenuListState, ViewLayout};
+use crate::app::state::ViewLayout;
 use crate::app::Mode;
 use crate::client::supervisor::{AgentSidebarRow, ServerId};
 use crate::detect::AgentState;
@@ -27,12 +27,6 @@ const DIVIDER_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::fr
 /// always flushed on release. ~100ms ≈ 10 resizes/sec, well under the ~60/sec a raw drag produced
 /// that collapsed multi-server rendering to <5 fps.
 const SIDEBAR_RESIZE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// #23: the two fixed workspace context-menu rows, in render order. Kept here (ui-side strings) so
-/// the renderer and the geometry/hit-test that derive their row count from `.len()` cannot drift.
-/// Mirrors `ClientSupervisorModel::workspace_context_menu_items` (the supervisor side that maps a
-/// row index to a `Rename`/`Close` action); the two MUST stay in lockstep.
-const WORKSPACE_CONTEXT_MENU_ITEMS: [&str; 2] = ["rename", "close"];
 
 /// #9: the narrow width of the collapsed (mini) sidebar — a status-only glance strip showing each
 /// space's marker + agent status dot. Matches the SHARED renderer's `COLLAPSED_WIDTH` (num + space +
@@ -293,7 +287,10 @@ pub(crate) enum SidebarHitTarget {
     HostBanner {
         server_id: crate::client::supervisor::ServerId,
     },
-    ClientGlobalMenuItem {
+    /// #47: a row of the one open client menu (global launcher / workspace context / host context).
+    /// Resolved by `hit_test_client_menu` from the SAME geometry the renderer uses. Replaces the old
+    /// per-menu `ClientGlobalMenuItem` / `WorkspaceContextMenuRow` / `HostContextMenuRow` targets.
+    ClientMenuRow {
         index: usize,
     },
     New,
@@ -324,18 +321,11 @@ pub(crate) enum SidebarHitTarget {
     RemoteManageAdd,
     RemoteManageConfirmDelete,
     RemoteManageCancelDelete,
-    // #23: workspace context-menu + rename + confirm-close overlay targets.
-    WorkspaceContextMenuRow {
-        index: usize,
-    },
+    // #23: workspace rename + confirm-close overlay targets (the menu row itself is `ClientMenuRow`).
     RenameWorkspaceSubmit,
     RenameWorkspaceCancel,
     ConfirmCloseWorkspaceConfirm,
     ConfirmCloseWorkspaceCancel,
-    // #43: host context-menu overlay target (a click on a menu row resolves to its index).
-    HostContextMenuRow {
-        index: usize,
-    },
 }
 
 #[derive(Clone)]
@@ -374,17 +364,13 @@ struct ClientSidebarSnapshot {
         crate::client::supervisor::RemoteManageOverlay,
         Vec<crate::client::supervisor::RemoteManageRow>,
     )>,
-    // #23: the workspace context menu / rename / confirm-close overlay state, cloned out of the
-    // model. The render closure maps these into ui-owned views before drawing (layering rule).
-    workspace_context_menu: Option<crate::client::supervisor::WorkspaceContextMenu>,
+    // #47: the one client menu (launcher / workspace context / host context), cloned out of the
+    // model. The render closure maps it into a ui-owned `ClientMenuView` before drawing (layering
+    // rule); hit-test reads its anchor + baked item labels/flags from the same clone.
+    client_menu: Option<crate::client::supervisor::ClientMenu>,
+    // #23: the rename / confirm-close follow-on overlays a workspace menu row promotes into.
     rename_workspace: Option<crate::client::supervisor::RenameWorkspaceForm>,
     confirm_close_workspace: Option<crate::client::supervisor::ConfirmCloseWorkspace>,
-    // #43: the host context menu cloned out of the model. The render closure maps it into a ui-owned
-    // view (with the state-dependent row labels) before drawing, per the layering rule.
-    host_context_menu: Option<crate::client::supervisor::HostContextMenu>,
-    // #43: the host menu's row labels, snapshotted alongside the menu so render AND hit-test resolve
-    // their (state-dependent) count from one cloned source, never from a fixed const.
-    host_context_menu_items: Vec<String>,
 }
 
 impl ClientCompositor {
@@ -660,7 +646,7 @@ impl ClientCompositor {
 
         // #46: a context menu is modal — never wheel-scroll the sidebar beneath it, even if a stray
         // event reaches here past the dispatch-level guard (belt-and-suspenders).
-        if model.context_menu_open() {
+        if model.client_menu_open() {
             return None;
         }
 
@@ -803,7 +789,7 @@ impl ClientCompositor {
         // #46: a context menu is modal — never let the sidebar scrollbar (track click / thumb drag)
         // act while one is open, even if a stray event reaches here past the dispatch-level guard.
         // A release still clears any leaked in-progress drag so it can't resume after the menu closes.
-        if model.context_menu_open() {
+        if model.client_menu_open() {
             if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
                 self.scrollbar_drag = None;
             }
@@ -1240,23 +1226,16 @@ impl ClientCompositor {
             if overlay.confirm_delete.is_some() {
                 excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
             }
-        } else if let Some(menu) = snapshot.workspace_context_menu.as_ref() {
-            // #23/#33: protect the cursor-anchored context-menu popup rect (the SAME geometry the
-            // renderer uses), so the menu floats over the content cell-for-cell.
-            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect_at(
+        } else if let Some(menu) = snapshot.client_menu.as_ref() {
+            // #47: protect the anchor-anchored client-menu popup rect (the SAME geometry the renderer
+            // uses), so the menu floats over the content cell-for-cell. One branch now covers all
+            // three menus (launcher / workspace / host) — the launcher is modal too, so this also
+            // protects it (the old per-menu `global_menu_rect()` else-branch is gone).
+            excluded_rects.extend(crate::ui::client_menu_popup_rect_at(
                 menu.anchor_col,
                 menu.anchor_row,
-                WORKSPACE_CONTEXT_MENU_ITEMS.len(),
-                host_width,
-                host_height,
-            ));
-        } else if let Some(menu) = snapshot.host_context_menu.as_ref() {
-            // #43: protect the cursor-anchored host context-menu popup rect (SAME geometry as the
-            // renderer; row count from the cloned state-dependent labels, never a const).
-            excluded_rects.extend(crate::ui::workspace_context_menu_popup_rect_at(
-                menu.anchor_col,
-                menu.anchor_row,
-                snapshot.host_context_menu_items.len(),
+                menu.items.len(),
+                client_menu_header_rows(menu),
                 host_width,
                 host_height,
             ));
@@ -1264,8 +1243,6 @@ impl ClientCompositor {
             excluded_rects.extend(crate::ui::rename_workspace_popup_rect(anchor_area));
         } else if snapshot.confirm_close_workspace.is_some() {
             excluded_rects.extend(crate::ui::confirm_close_workspace_popup_rect(anchor_area));
-        } else {
-            excluded_rects.extend(snapshot.global_menu_rect());
         }
         let frame = render_client_shell(&snapshot, host_width, host_height);
 
@@ -1278,8 +1255,9 @@ impl ClientCompositor {
         let modal_open = model.add_remote_form().is_some()
             || model.new_workspace_picker().is_some()
             || model.remote_manage_overlay().is_some()
-            || model.workspace_context_menu().is_some()
-            || model.host_context_menu().is_some()
+            // #47: the one client menu — now includes the launcher, which is modal too (the cursor
+            // is hidden behind it, matching the two context menus).
+            || model.client_menu().is_some()
             || model.rename_workspace_form().is_some()
             || model.confirm_close_workspace().is_some();
 
@@ -1382,10 +1360,6 @@ impl ClientCompositor {
             Instant::now(),
         );
 
-        if let Some(target) = hit_test_global_menu(&snapshot.app, x, y) {
-            return Some(target);
-        }
-
         // item 1: the composited overlays are footer-anchored popups that float over the live
         // content, so their hit-test runs before the sidebar-width guard. Geometry is derived from
         // the SAME shared helpers the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`/
@@ -1403,18 +1377,13 @@ impl ClientCompositor {
         if snapshot.remote_manage.is_some() {
             return hit_test_remote_manage(&snapshot, anchor_area, x, y);
         }
-        // #23: the workspace context menu / rename / confirm-close overlays are modal too — when
-        // open they own the whole host rect (their own targets or none), so a click on a sidebar
-        // row beneath never resolves to a `Workspace` hit. Geometry comes from the SAME shared `ui`
-        // helpers the renderer uses, so render == hit_test.
-        if snapshot.workspace_context_menu.is_some() {
-            return hit_test_workspace_context_menu(&snapshot, host_width, host_height, x, y);
-        }
-        // #43: the host context menu is modal too — when open it owns the whole host rect (its own
-        // row targets or none). Geometry comes from the SAME cursor-anchored helpers the renderer
-        // uses, so render == hit_test.
-        if snapshot.host_context_menu.is_some() {
-            return hit_test_host_context_menu(&snapshot, host_width, host_height, x, y);
+        // #47: the one client menu (launcher / workspace / host) is modal — when open it owns the
+        // whole host rect (its own row targets or none), so a click on a sidebar row beneath never
+        // resolves to a `Workspace` hit, and the launcher now gets the same modal treatment as the
+        // two context menus (the #46 gap). Geometry comes from the SAME `client_menu_*` helpers the
+        // renderer uses, so render == hit_test.
+        if snapshot.client_menu.is_some() {
+            return hit_test_client_menu(&snapshot, host_width, host_height, x, y);
         }
         if snapshot.rename_workspace.is_some() {
             return hit_test_rename_workspace(&snapshot, anchor_area, x, y);
@@ -1517,9 +1486,9 @@ impl ClientCompositor {
     /// SAME `ClientSidebarSnapshot` + rect checks as `hit_test` so render geometry and hover
     /// geometry cannot drift. Returns `None` (no highlight) for:
     /// - a collapsed/zero-width sidebar (`effective_sidebar_width == 0`),
-    /// - an open add-remote form / global menu / manage overlay — those own their own hover (the
-    ///   global menu moves its highlight on motion via `client_global_menu_item_at`, handled in the
-    ///   client `Moved` arm before this fn), so the sidebar must not fight them,
+    /// - an open client menu / add-remote form / manage overlay — those own their own input (an open
+    ///   client menu is modal and intercepts motion in `dispatch_open_client_menu_mouse` before this
+    ///   fn), so the sidebar must not fight them,
     /// - positions outside the sidebar content,
     /// - disabled remote rows and `None`-`workspace_id` placeholders (matches `hit_test`),
     /// - non-selectable layout rows (divider/banner-skip + headers/separator — they produce no
@@ -1543,10 +1512,10 @@ impl ClientCompositor {
             return None;
         }
 
-        // An open add-remote form / global menu / manage overlay owns input; the sidebar hover
-        // must yield so the existing overlay hover is authoritative. The global menu moves its
-        // highlight on motion (`client_global_menu_item_at`), handled in the client `Moved` arm.
-        if model.client_global_menu_highlighted().is_some()
+        // #47: an open client menu / add-remote form / manage overlay owns input; the sidebar hover
+        // must yield so the overlay hover is authoritative. An open client menu is modal and already
+        // intercepts motion in `dispatch_open_client_menu_mouse` before this fn, but guard here too.
+        if model.client_menu().is_some()
             || model.add_remote_form().is_some()
             || model.remote_manage_overlay().is_some()
         {
@@ -1635,37 +1604,6 @@ impl ClientCompositor {
 
         hover_test_agent_panel(&snapshot, x, y)
     }
-
-    /// item 7: resolve a mouse-motion position to a 0-based item index in the open client global
-    /// menu, or `None` when the menu is closed / the position misses it. Shares the SAME snapshot +
-    /// `global_menu_item_index_at` geometry as `hit_test`, so motion-driven highlight and click
-    /// resolve identical rows. The client `Moved` arm feeds the result to
-    /// `model.hover_client_global_menu_item`, mirroring the monolithic host's `global_menu.hover`.
-    pub(crate) fn client_global_menu_item_at(
-        &self,
-        model: &crate::client::supervisor::ClientSupervisorModel,
-        x: u16,
-        y: u16,
-        host_width: u16,
-        host_height: u16,
-    ) -> Option<usize> {
-        let sidebar_width = self.effective_sidebar_width(host_width);
-        if sidebar_width == 0
-            || host_height == 0
-            || model.client_global_menu_highlighted().is_none()
-        {
-            return None;
-        }
-        let snapshot = ClientSidebarSnapshot::from_model(
-            model,
-            self,
-            sidebar_width,
-            host_width,
-            host_height,
-            Instant::now(),
-        );
-        global_menu_item_index_at(&snapshot.app, x, y)
-    }
 }
 
 fn scrolled_offset(current: usize, delta: i16, metrics: crate::pane::ScrollMetrics) -> usize {
@@ -1730,15 +1668,11 @@ impl ClientSidebarSnapshot {
             host_width.saturating_sub(sidebar_width),
             host_height,
         );
-        app.mode = match model.client_global_menu_highlighted() {
-            Some(highlighted) => {
-                app.global_menu = MenuListState::new(
-                    highlighted.min(app.global_menu_labels().len().saturating_sub(1)),
-                );
-                Mode::GlobalMenu
-            }
-            None => Mode::Navigate,
-        };
+        // #47: the client renders the global launcher through the unified `client_menu` overlay (not
+        // the server's `Mode::GlobalMenu` + `app.global_menu` path), so the client AppState stays in
+        // `Navigate`. The launcher's open state lives in `model.client_menu()`, cloned into the
+        // snapshot above.
+        app.mode = Mode::Navigate;
 
         let mut agents_by_workspace = HashMap::<(ServerId, String), Vec<AgentSidebarRow>>::new();
         for group in model.agent_groups() {
@@ -2056,24 +1990,25 @@ impl ClientSidebarSnapshot {
             remote_manage: model
                 .remote_manage_overlay()
                 .map(|overlay| (overlay.clone(), model.remote_manage_rows())),
-            // #23: clone the workspace context-menu / rename / confirm-close overlay state out of
-            // the model into ui-owned carriers (pure read). The render closure maps these into ui
-            // view structs before drawing.
-            workspace_context_menu: model.workspace_context_menu().cloned(),
+            // #47: clone the one client menu out of the model into a ui-owned carrier (pure read).
+            // The render closure maps it into a ui view before drawing; hit-test reads its anchor +
+            // baked item labels/flags from the same clone. The rename / confirm-close follow-on
+            // overlays are still carried separately.
+            client_menu: model.client_menu().cloned(),
             rename_workspace: model.rename_workspace_form().cloned(),
             confirm_close_workspace: model.confirm_close_workspace().cloned(),
-            // #43: clone the host context menu + its state-dependent row labels out of the model.
-            host_context_menu: model.host_context_menu().cloned(),
-            host_context_menu_items: if model.host_context_menu().is_some() {
-                model.host_context_menu_items()
-            } else {
-                Vec::new()
-            },
         }
     }
+}
 
-    fn global_menu_rect(&self) -> Option<Rect> {
-        matches!(self.app.mode, Mode::GlobalMenu).then(|| self.app.global_menu_rect())
+/// #47: the header-line count for a client menu's geometry — 2 when it carries a target sub-header
+/// (workspace label / host name), 1 for the launcher (title only). Render, hit-test, and the
+/// content-exclusion rect all derive the row offset + popup height from this, so they stay in lockstep.
+fn client_menu_header_rows(menu: &crate::client::supervisor::ClientMenu) -> u16 {
+    if menu.subheader.is_some() {
+        2
+    } else {
+        1
     }
 }
 
@@ -2114,9 +2049,6 @@ fn render_client_shell(
                 // The right-aligned filter label belongs to the expanded layout only; the 4-col
                 // mini strip has no room for it.
                 render_filter_label(snapshot, frame);
-            }
-            if matches!(snapshot.app.mode, Mode::GlobalMenu) {
-                crate::ui::render_global_launcher_menu(&snapshot.app, frame);
             }
             // item 1: render the composited client overlays as footer-anchored popups that float
             // over the live content — the proven `render_global_launcher_menu` compositing path.
@@ -2186,53 +2118,40 @@ fn render_client_shell(
                     anchor_area,
                 );
             }
-            // #23: render the workspace context menu / rename / confirm-close overlays. The
-            // compositor maps the supervisor state into ui-owned views here (no supervisor types
-            // reach `ui`). At most one is ever open (single `client_overlay` slot).
-            if let Some(menu) = &snapshot.workspace_context_menu {
-                let rows: Vec<&str> = WORKSPACE_CONTEXT_MENU_ITEMS.to_vec();
-                // #33: anchor the popup at the stored right-click cursor (clamped to screen), and
-                // render only when it fits. Hit-test derives the same rect from the same anchor.
-                if let Some(popup) = crate::ui::workspace_context_menu_popup_rect_at(
+            // #47: render the one client menu (launcher / workspace / host). At most one client
+            // overlay is ever open. The compositor maps the supervisor menu into a ui-owned view here
+            // (no supervisor types reach `ui`); geometry comes from the SAME anchor + `client_menu_*`
+            // helpers hit-test uses, so render == hit-test.
+            if let Some(menu) = &snapshot.client_menu {
+                let header_rows = client_menu_header_rows(menu);
+                if let Some(popup) = crate::ui::client_menu_popup_rect_at(
                     menu.anchor_col,
                     menu.anchor_row,
-                    rows.len(),
+                    menu.items.len(),
+                    header_rows,
                     host_width,
                     host_height,
                 ) {
-                    let view = crate::ui::WorkspaceContextMenuView {
-                        label: &menu.label,
+                    let rows: Vec<crate::ui::ClientMenuRowView> = menu
+                        .items
+                        .iter()
+                        .map(|item| crate::ui::ClientMenuRowView {
+                            label: &item.label,
+                            selectable: item.selectable,
+                        })
+                        .collect();
+                    let view = crate::ui::ClientMenuView {
+                        title: menu.title,
+                        subheader: menu.subheader.as_deref(),
                         rows: &rows,
+                        selected: menu.selected,
                     };
-                    crate::ui::render_workspace_context_menu_overlay(
+                    crate::ui::render_client_menu_overlay(
                         &snapshot.app.palette,
                         &view,
-                        menu.selected,
                         frame,
                         popup,
-                    );
-                }
-            }
-            // #43: render the host context menu. The compositor maps the supervisor state + its
-            // state-dependent row labels into a ui-owned view here (no supervisor types reach `ui`).
-            if let Some(menu) = &snapshot.host_context_menu {
-                if let Some(popup) = crate::ui::workspace_context_menu_popup_rect_at(
-                    menu.anchor_col,
-                    menu.anchor_row,
-                    snapshot.host_context_menu_items.len(),
-                    host_width,
-                    host_height,
-                ) {
-                    let view = crate::ui::HostContextMenuView {
-                        display_name: &menu.display_name,
-                        rows: &snapshot.host_context_menu_items,
-                    };
-                    crate::ui::render_host_context_menu_overlay(
-                        &snapshot.app.palette,
-                        &view,
-                        menu.selected,
-                        frame,
-                        popup,
+                        header_rows,
                     );
                 }
             }
@@ -2499,72 +2418,39 @@ fn hit_test_remote_manage(
     None
 }
 
-/// #23: hit-test the workspace context menu. Resolves a click on a menu row to its index, derived
-/// from the SAME shared `ui` geometry the renderer uses (`workspace_context_menu_inner_rect` /
-/// `_row_rect`), guaranteeing render == hit_test. The overlay is modal: a click that misses every
-/// row returns `None` (the dimmed sidebar beneath never hit-tests).
-fn hit_test_workspace_context_menu(
+/// #47: hit-test the one client menu (launcher / workspace / host). Resolves a click on a menu row
+/// to its index, derived from the SAME `client_menu_*` geometry the renderer uses (anchor + row
+/// count + `header_rows`), guaranteeing render == hit_test. The overlay is modal: a click that
+/// misses every row returns `None` (the dimmed sidebar beneath never hit-tests). The row count comes
+/// from the cloned menu's baked items (state-dependent for the host menu).
+fn hit_test_client_menu(
     snapshot: &ClientSidebarSnapshot,
     host_width: u16,
     host_height: u16,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
-    let menu = snapshot.workspace_context_menu.as_ref()?;
-    let count = WORKSPACE_CONTEXT_MENU_ITEMS.len();
-    // #33: derive the menu geometry from the stored right-click anchor + host dims so the hit
-    // regions match exactly where the popup was rendered (cursor-anchored, clamped to screen).
-    let inner = crate::ui::workspace_context_menu_inner_rect_at(
+    let menu = snapshot.client_menu.as_ref()?;
+    let count = menu.items.len();
+    let header_rows = client_menu_header_rows(menu);
+    let inner = crate::ui::client_menu_inner_rect_at(
         menu.anchor_col,
         menu.anchor_row,
         count,
+        header_rows,
         host_width,
         host_height,
     )?;
-    // #33: mirror the renderer's `inner.height < 4` bail (render_workspace_context_menu_overlay) so
-    // a host too short to actually draw the rows also hit-tests to nothing — otherwise a tiny
-    // terminal would map clicks to invisible rows that were never painted.
+    // Mirror the renderer's `inner.height < 4` bail (render_client_menu_overlay) so a host too short
+    // to actually draw the rows also hit-tests to nothing — otherwise a tiny terminal would map
+    // clicks to invisible rows that were never painted.
     if inner.height < 4 {
         return None;
     }
     for index in 0..count {
-        let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
+        let rect = crate::ui::client_menu_row_rect(inner, header_rows, index);
         if rect_contains(rect, x, y) {
-            return Some(SidebarHitTarget::WorkspaceContextMenuRow { index });
-        }
-    }
-    None
-}
-
-/// #43: hit-test the host context menu. Resolves a click on a menu row to its index, derived from
-/// the SAME cursor-anchored `ui` geometry the renderer uses. The row `count` comes from the cloned
-/// menu's snapshotted labels (NOT a fixed const — the labels flip with host state). The overlay is
-/// modal: a click that misses every row returns `None`. Mirrors `hit_test_workspace_context_menu`.
-fn hit_test_host_context_menu(
-    snapshot: &ClientSidebarSnapshot,
-    host_width: u16,
-    host_height: u16,
-    x: u16,
-    y: u16,
-) -> Option<SidebarHitTarget> {
-    let menu = snapshot.host_context_menu.as_ref()?;
-    let count = snapshot.host_context_menu_items.len();
-    let inner = crate::ui::workspace_context_menu_inner_rect_at(
-        menu.anchor_col,
-        menu.anchor_row,
-        count,
-        host_width,
-        host_height,
-    )?;
-    // #43: mirror the renderer's `inner.height < 4` bail so a host too short to actually draw the
-    // rows also hit-tests to nothing (otherwise a tiny terminal maps clicks to unpainted rows).
-    if inner.height < 4 {
-        return None;
-    }
-    for index in 0..count {
-        let rect = crate::ui::workspace_context_menu_row_rect(inner, index);
-        if rect_contains(rect, x, y) {
-            return Some(SidebarHitTarget::HostContextMenuRow { index });
+            return Some(SidebarHitTarget::ClientMenuRow { index });
         }
     }
     None
@@ -2614,31 +2500,6 @@ fn hit_test_confirm_close_workspace(
         return Some(SidebarHitTarget::ConfirmCloseWorkspaceCancel);
     }
     None
-}
-
-/// Shared geometry for the open global launcher menu: resolve a position to a 0-based item index,
-/// or `None` when the menu is closed or the position misses the menu's inner item rows. Both
-/// `hit_test_global_menu` (click) and `client_global_menu_item_at` (motion) resolve through this so
-/// click and hover geometry cannot drift from the `render_global_launcher_menu` row layout.
-fn global_menu_item_index_at(app: &crate::app::AppState, x: u16, y: u16) -> Option<usize> {
-    if !matches!(app.mode, Mode::GlobalMenu) {
-        return None;
-    }
-    let rect = app.global_menu_rect();
-    let inner_x = rect.x.saturating_add(1);
-    let inner_y = rect.y.saturating_add(1);
-    let inner_right = rect.x.saturating_add(rect.width).saturating_sub(1);
-    let inner_bottom = rect.y.saturating_add(rect.height).saturating_sub(1);
-    if x < inner_x || x >= inner_right || y < inner_y || y >= inner_bottom {
-        return None;
-    }
-    let index = (y - inner_y) as usize;
-    (index < app.global_menu_labels().len()).then_some(index)
-}
-
-fn hit_test_global_menu(app: &crate::app::AppState, x: u16, y: u16) -> Option<SidebarHitTarget> {
-    global_menu_item_index_at(app, x, y)
-        .map(|index| SidebarHitTarget::ClientGlobalMenuItem { index })
 }
 
 /// #20: the rect of the agents-panel "all"/"current" toggle in the rendered snapshot, derived from
@@ -4786,14 +4647,15 @@ mod tests {
         model.open_host_context_menu(remote_id.clone(), "x".into(), 1, banner_y);
 
         // The menu's inner rect / row geometry comes from the SAME shared helpers the renderer uses.
-        let count = model.host_context_menu_items().len();
-        let inner = crate::ui::workspace_context_menu_inner_rect_at(1, banner_y, count, host.0, host.1)
+        // The host menu carries a sub-header, so `header_rows == 2`.
+        let count = model.client_menu().expect("host menu open").items.len();
+        let inner = crate::ui::client_menu_inner_rect_at(1, banner_y, count, 2, host.0, host.1)
             .expect("host menu fits");
         for index in 0..count {
-            let row = crate::ui::workspace_context_menu_row_rect(inner, index);
+            let row = crate::ui::client_menu_row_rect(inner, 2, index);
             assert_eq!(
                 compositor.hit_test(&model, row.x, row.y, host.0, host.1),
-                Some(SidebarHitTarget::HostContextMenuRow { index }),
+                Some(SidebarHitTarget::ClientMenuRow { index }),
                 "menu row {index} at y={} should hit-test to its index",
                 row.y
             );
@@ -5022,7 +4884,7 @@ mod tests {
     #[test]
     fn client_global_menu_uses_server_launcher_menu_surface() {
         let mut model = ClientSupervisorModel::new("local");
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
 
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
@@ -5038,43 +4900,40 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("reload config")));
         assert!(rows.iter().any(|row| row.contains("detach")));
         assert!(rows.iter().any(|row| row.contains("add remote")));
+        // #47: the launcher anchors at (0,0) with a "menu" title header (header_rows == 1), so row i
+        // sits at y = 2 + i: index 0 ("settings") at y=2, index 4 ("add remote") at y=6.
         assert_eq!(
-            compositor.hit_test(&model, 21, 1, 60, 16),
-            Some(SidebarHitTarget::ClientGlobalMenuItem { index: 0 })
+            compositor.hit_test(&model, 21, 2, 60, 16),
+            Some(SidebarHitTarget::ClientMenuRow { index: 0 })
         );
         assert_eq!(
-            compositor.hit_test(&model, 21, 5, 60, 16),
-            Some(SidebarHitTarget::ClientGlobalMenuItem { index: 4 })
+            compositor.hit_test(&model, 21, 6, 60, 16),
+            Some(SidebarHitTarget::ClientMenuRow { index: 4 })
         );
     }
 
     #[test]
     fn client_global_menu_hover_moves_highlight_render() {
-        // item 7: moving the highlight (as a hover `Moved` does via `hover_client_global_menu_item`)
-        // repaints the accent bg onto the newly highlighted row and clears it from the old one — the
-        // shared launcher-menu surface renders `highlighted` identically to the monolithic host.
+        // #47: moving the highlight (as a hover `Moved` does via `set_client_menu_selected`) repaints
+        // the highlight bg onto the newly selected row and clears it from the old one — the unified
+        // client-menu overlay renders `selected` the same for all three menus.
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
 
         let mut model = ClientSupervisorModel::new("local");
-        model.open_client_global_menu(); // highlighted defaults to index 0.
+        model.open_client_global_menu(0, 0); // anchored top-left; selected defaults to index 0.
         let before = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
 
-        assert!(model.hover_client_global_menu_item(Some(2)));
+        model.set_client_menu_selected(2);
         let after = compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
 
-        let snapshot = ClientSidebarSnapshot::from_model(
-            &model,
-            &compositor,
-            26,
-            60,
-            16,
-            std::time::Instant::now(),
-        );
-        let rect = snapshot.app.global_menu_rect();
-        let row0 = rect.y + 1; // item index 0 ("settings").
-        let row1 = rect.y + 2; // item index 1 ("keybinds"): never highlighted in this test.
-        let row2 = rect.y + 3; // item index 2 ("reload config").
+        // The launcher anchors at (0,0) with no sub-header (header_rows == 1), so rows start one line
+        // below the title. Derive the row y-positions from the SAME shared geometry the renderer uses.
+        let count = model.client_global_menu_items().len();
+        let inner = crate::ui::client_menu_inner_rect_at(0, 0, count, 1, 60, 16).expect("menu fits");
+        let row0 = crate::ui::client_menu_row_rect(inner, 1, 0).y; // item index 0 ("settings").
+        let row1 = crate::ui::client_menu_row_rect(inner, 1, 1).y; // item index 1 ("keybinds").
+        let row2 = crate::ui::client_menu_row_rect(inner, 1, 2).y; // item index 2 ("reload config").
 
         let bgs = |frame: &FrameData, row: u16| -> Vec<u32> {
             (0..frame.width)
@@ -5935,49 +5794,42 @@ mod tests {
         model.close_client_overlay();
 
         let (mut model, _remote_id) = mixed_supervisor_model();
-        model.open_client_global_menu();
+        model.open_client_global_menu(0, 0);
         for y in 0..16u16 {
             assert_eq!(model_hover_anywhere(&model, y), None);
         }
     }
 
     #[test]
-    fn client_global_menu_item_at_resolves_hovered_row() {
-        // item 7: motion over the open menu resolves to the row index under the cursor (same
-        // geometry `hit_test` uses); a far-left column off the right-anchored menu resolves to None;
-        // a closed menu resolves to None.
+    fn client_menu_hit_test_resolves_hovered_row() {
+        // #47: motion/click over the open launcher resolves to the row index under the cursor via the
+        // SAME `hit_test` geometry the renderer uses; a position off the popup resolves to None (the
+        // menu is modal and owns the whole host rect).
         let (mut model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let host = (60u16, 16u16);
-        // closed menu → None.
-        assert_eq!(
-            compositor.client_global_menu_item_at(&model, 21, 1, host.0, host.1),
-            None
-        );
 
-        model.open_client_global_menu();
-        let snapshot = ClientSidebarSnapshot::from_model(
-            &model,
-            &compositor,
-            26,
-            host.0,
-            host.1,
-            Instant::now(),
-        );
-        let rect = snapshot.app.global_menu_rect();
-        // the first item row sits one cell inside the menu's top-left border.
+        model.open_client_global_menu(0, 0);
+        let count = model.client_global_menu_items().len();
+        // launcher: anchored top-left, no sub-header (header_rows == 1).
+        let inner =
+            crate::ui::client_menu_inner_rect_at(0, 0, count, 1, host.0, host.1).expect("menu fits");
+        let x = inner.x + 1;
+        // the first item row sits one line below the title.
+        let row0 = crate::ui::client_menu_row_rect(inner, 1, 0);
         assert_eq!(
-            compositor.client_global_menu_item_at(&model, rect.x + 1, rect.y + 1, host.0, host.1),
-            Some(0)
+            compositor.hit_test(&model, x, row0.y, host.0, host.1),
+            Some(SidebarHitTarget::ClientMenuRow { index: 0 })
         );
         // a deeper row resolves to its index.
+        let row2 = crate::ui::client_menu_row_rect(inner, 1, 2);
         assert_eq!(
-            compositor.client_global_menu_item_at(&model, rect.x + 1, rect.y + 3, host.0, host.1),
-            Some(2)
+            compositor.hit_test(&model, x, row2.y, host.0, host.1),
+            Some(SidebarHitTarget::ClientMenuRow { index: 2 })
         );
-        // the far-left sidebar column misses the right-anchored menu → None.
+        // a click off every menu row (the modal owns the whole rect) resolves to None.
         assert_eq!(
-            compositor.client_global_menu_item_at(&model, 0, rect.y + 1, host.0, host.1),
+            compositor.hit_test(&model, host.0 - 1, host.1 - 1, host.0, host.1),
             None
         );
     }
