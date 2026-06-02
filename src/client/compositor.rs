@@ -658,6 +658,12 @@ impl ClientCompositor {
     ) -> Option<bool> {
         use crossterm::event::MouseEventKind;
 
+        // #46: a context menu is modal — never wheel-scroll the sidebar beneath it, even if a stray
+        // event reaches here past the dispatch-level guard (belt-and-suspenders).
+        if model.context_menu_open() {
+            return None;
+        }
+
         let delta = match mouse.kind {
             MouseEventKind::ScrollUp => -1,
             MouseEventKind::ScrollDown => 1,
@@ -793,6 +799,16 @@ impl ClientCompositor {
         host_height: u16,
     ) -> Option<bool> {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        // #46: a context menu is modal — never let the sidebar scrollbar (track click / thumb drag)
+        // act while one is open, even if a stray event reaches here past the dispatch-level guard.
+        // A release still clears any leaked in-progress drag so it can't resume after the menu closes.
+        if model.context_menu_open() {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.scrollbar_drag = None;
+            }
+            return None;
+        }
 
         // A release always ends an active drag, regardless of geometry.
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
