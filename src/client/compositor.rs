@@ -1318,7 +1318,7 @@ impl ClientCompositor {
         );
         // #56: compute the hover highlight geometry from the (hover-less) snapshot BEFORE clearing
         // the baked hover, so it captures the same card/row/menu rects the renderer lays out.
-        let hover = compute_hover_geometry(&snapshot, host_width, host_height);
+        let hover = compute_hover_geometry(&snapshot);
         // #56: render the shell with NO hover/selection highlight — `from_model` mirrored the live
         // hover (`compositor.set_hover`) and the menu selection into the snapshot; strip them so the
         // cached shell carries no highlight and the per-frame overlay paints whichever row is hovered.
@@ -3053,11 +3053,7 @@ fn blank_cell() -> CellData {
 /// mirrors the renderer's layout — workspace cards, agent-panel rows, affordances, picker rows, open
 /// menu rows — so [`apply_hover_overlay`] paints cell-identical to the old hover-baked render. The
 /// Seam-1 equivalence tests pin that identity, so the two geometries cannot silently drift.
-fn compute_hover_geometry(
-    snapshot: &ClientSidebarSnapshot,
-    host_width: u16,
-    host_height: u16,
-) -> HoverGeometry {
+fn compute_hover_geometry(snapshot: &ClientSidebarSnapshot) -> HoverGeometry {
     use crate::protocol::color_to_u32;
     let app = &snapshot.app;
     let p = &app.palette;
@@ -3071,16 +3067,15 @@ fn compute_hover_geometry(
     // The open client menu owns the highlight (the sidebar is inert beneath it). Its rows are
     // overlay popups, so they paint regardless of the collapsed/expanded sidebar state below.
     if let Some(menu) = snapshot.client_menu.as_ref() {
-        geom.menu = compute_menu_hover_geometry(snapshot, menu, host_width, host_height);
+        geom.menu = compute_menu_hover_geometry(snapshot, menu);
     }
 
     // The new-workspace picker (a footer popup) hovers before the sidebar too — capture its
     // destination rows here so they paint in either sidebar layout. Selected row excluded (its bg
     // wins; hover never overrides it — see `render_new_workspace_picker_overlay`).
     if let Some((dests, selected)) = snapshot.new_workspace_picker.as_ref() {
-        if let Some(inner) =
-            open_overlay_popup_rect(snapshot, host_width, host_height).and_then(panel_inner_rect)
-        {
+        // #53: the picker's footer popup is the open overlay, so read the cached rect.
+        if let Some(inner) = snapshot.overlay_popup.and_then(panel_inner_rect) {
             if inner.height >= 4 {
                 let selected = (*selected).min(dests.len().saturating_sub(1));
                 let max_rows = inner.height.saturating_sub(3) as usize;
@@ -3188,8 +3183,6 @@ fn compute_hover_geometry(
 fn compute_menu_hover_geometry(
     snapshot: &ClientSidebarSnapshot,
     menu: &crate::client::supervisor::ClientMenu,
-    host_width: u16,
-    host_height: u16,
 ) -> Option<MenuHoverGeometry> {
     use crate::protocol::color_to_u32;
     let app = &snapshot.app;
@@ -3198,7 +3191,8 @@ fn compute_menu_hover_geometry(
         menu.kind,
         crate::client::supervisor::ClientMenuKind::GlobalLauncher
     ) {
-        let inner = panel_inner_rect(launcher_menu_rect(snapshot, host_width, host_height)?)?;
+        // #53: a GlobalLauncher `client_menu` means `overlay_popup` IS the launcher rect.
+        let inner = panel_inner_rect(snapshot.overlay_popup?)?;
         let inner_bottom = inner.y.saturating_add(inner.height);
         let mut rows = Vec::new();
         for (idx, item) in app.global_menu_labels().iter().enumerate() {
@@ -3220,8 +3214,8 @@ fn compute_menu_hover_geometry(
             bg: color_to_u32(p.accent),
         })
     } else {
-        let popup =
-            context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height)?;
+        // #53: a non-launcher `client_menu` means `overlay_popup` IS this context menu's popup.
+        let popup = snapshot.overlay_popup?;
         let inner = panel_inner_rect(popup)?;
         if inner.height < 4 {
             return None;
