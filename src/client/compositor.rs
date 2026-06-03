@@ -1478,8 +1478,9 @@ impl ClientCompositor {
         // guaranteeing render == hit_test.
         let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
         // #47: every overlay hit-tests against its (drag-shifted) popup — the SAME rect the renderer
-        // draws — so a dragged overlay's targets follow it and render == hit-test.
-        let overlay_popup = open_overlay_popup_rect(&snapshot, host_width, host_height);
+        // draws — so a dragged overlay's targets follow it and render == hit-test. #53: read the one
+        // rect the view computed; render and hit-test now consume the SAME field, not two recomputes.
+        let overlay_popup = snapshot.overlay_popup;
         if let Some(popup) = overlay_popup {
             if let Some(target) = hit_test_new_workspace_picker(&snapshot, popup, x, y) {
                 return Some(target);
@@ -1504,11 +1505,12 @@ impl ClientCompositor {
                 menu.kind,
                 crate::client::supervisor::ClientMenuKind::GlobalLauncher
             ) {
-                return launcher_menu_rect(&snapshot, host_width, host_height)
+                // #53: a GlobalLauncher `client_menu` means `overlay_popup` IS the launcher rect.
+                return overlay_popup
                     .and_then(|rect| global_menu_item_index_at(&snapshot.app, rect, x, y))
                     .map(|index| SidebarHitTarget::ClientMenuRow { index });
             }
-            return hit_test_client_menu(&snapshot, host_width, host_height, x, y);
+            return hit_test_client_menu(&snapshot, x, y);
         }
         if let Some(popup) = overlay_popup {
             if snapshot.rename_workspace.is_some() {
@@ -2680,16 +2682,15 @@ fn hit_test_remote_manage(
 /// from the cloned menu's baked items (state-dependent for the host menu).
 fn hit_test_client_menu(
     snapshot: &ClientSidebarSnapshot,
-    host_width: u16,
-    host_height: u16,
     x: u16,
     y: u16,
 ) -> Option<SidebarHitTarget> {
     let menu = snapshot.client_menu.as_ref()?;
     let count = menu.items.len();
     let header_rows = client_menu_header_rows(menu);
-    // Derive the inner rect from the (drag-shifted) popup so render == hit-test even after a drag.
-    let popup = context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height)?;
+    // #53: only reached for a non-launcher `client_menu`, so the cached `overlay_popup` IS this
+    // menu's (drag-shifted) popup — derive the inner from it so render == hit-test even after a drag.
+    let popup = snapshot.overlay_popup?;
     let inner = popup_inner(popup);
     // Mirror the renderer's `inner.height < 4` bail (render_client_menu_overlay) so a host too short
     // to actually draw the rows also hit-tests to nothing — otherwise a tiny terminal would map
