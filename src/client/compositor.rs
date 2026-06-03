@@ -2671,12 +2671,7 @@ fn hit_test_client_menu(
     let header_rows = client_menu_header_rows(menu);
     // Derive the inner rect from the (drag-shifted) popup so render == hit-test even after a drag.
     let popup = context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height)?;
-    let inner = Rect::new(
-        popup.x + 1,
-        popup.y + 1,
-        popup.width.saturating_sub(2),
-        popup.height.saturating_sub(2),
-    );
+    let inner = popup_inner(popup);
     // Mirror the renderer's `inner.height < 4` bail (render_client_menu_overlay) so a host too short
     // to actually draw the rows also hit-tests to nothing — otherwise a tiny terminal would map
     // clicks to invisible rows that were never painted.
@@ -3151,7 +3146,10 @@ fn compute_hover_geometry(
     if filter_rect != Rect::default() {
         geom.filter = Some(filter_rect);
     }
-    if app.mouse_capture {
+    // `render_workspace_list` draws the ` new`/`menu` affordances only on `mouse_capture &&
+    // list_bottom > area.y`; mirror BOTH clauses (not `mouse_capture` alone) so the overlay never
+    // recolors an undrawn affordance on a degenerate (≤1-row) workspace list.
+    if app.mouse_capture && list_bottom > ws_area.y {
         geom.new_button = Some(app.sidebar_new_button_rect());
         geom.menu_button = Some(app.global_launcher_rect());
     }
@@ -3324,31 +3322,33 @@ fn frame_cell_mut(frame: &mut FrameData, x: u16, y: u16) -> Option<&mut CellData
         .get_mut(y as usize * frame.width as usize + x as usize)
 }
 
-/// Patch only the bg of every cell in `rect` (fg/symbol/modifier untouched) — the
-/// `set_style(Style::default().bg(..))` the workspace-card / agent-row / picker-row hovers apply.
-fn fill_rect_bg(frame: &mut FrameData, rect: Rect, bg: u32) {
+/// Apply `f` to every in-bounds cell of `rect` — the shared (saturating, clipped) cell walk behind
+/// every hover/selection paint below, so the bounds + `frame_cell_mut` logic lives in ONE place.
+fn for_each_cell_in_rect(frame: &mut FrameData, rect: Rect, mut f: impl FnMut(&mut CellData)) {
     for y in rect.y..rect.y.saturating_add(rect.height) {
         for x in rect.x..rect.x.saturating_add(rect.width) {
             if let Some(cell) = frame_cell_mut(frame, x, y) {
-                cell.bg = bg;
+                f(cell);
             }
         }
     }
+}
+
+/// Patch only the bg of every cell in `rect` (fg/symbol/modifier untouched) — the
+/// `set_style(Style::default().bg(..))` the workspace-card / agent-row / picker-row hovers apply.
+fn fill_rect_bg(frame: &mut FrameData, rect: Rect, bg: u32) {
+    for_each_cell_in_rect(frame, rect, |cell| cell.bg = bg);
 }
 
 /// Recolor only the cells in `rect` whose fg equals `from`, to `to` — the affordance fg-lift
 /// (overlay0 → subtext0). The conditional keeps the result cell-identical: only the affordance glyph
 /// cells (drawn `overlay0`) lift, never the surrounding cells.
 fn recolor_rect_fg(frame: &mut FrameData, rect: Rect, from: u32, to: u32) {
-    for y in rect.y..rect.y.saturating_add(rect.height) {
-        for x in rect.x..rect.x.saturating_add(rect.width) {
-            if let Some(cell) = frame_cell_mut(frame, x, y) {
-                if cell.fg == from {
-                    cell.fg = to;
-                }
-            }
+    for_each_cell_in_rect(frame, rect, |cell| {
+        if cell.fg == from {
+            cell.fg = to;
         }
-    }
+    });
 }
 
 fn paint_menu_selection(frame: &mut FrameData, menu: &MenuHoverGeometry, selected: usize) {
@@ -3373,25 +3373,22 @@ fn paint_menu_selection(frame: &mut FrameData, menu: &MenuHoverGeometry, selecte
     }
 }
 
+/// #56: the painted highlight rect for the model's selected row. `rows` holds only the VISIBLE rows
+/// (clipped to what fits the popup), so a selection scrolled past the last visible row yields `None`
+/// — matching the renderer, which highlights `row_index == selected` and therefore paints nothing
+/// once the selection is off-screen (rather than lighting up the wrong, last-visible row).
 fn row_for_selection(rows: &[Rect], selected: usize) -> Option<Rect> {
-    if rows.is_empty() {
-        return None;
-    }
-    rows.get(selected.min(rows.len() - 1)).copied()
+    rows.get(selected).copied()
 }
 
 /// Patch fg+bg and OR in BOLD over the row's cells — exactly the menu selection `Style` patched onto
 /// the row by the renderer's `Paragraph::style(..)` (fg/bg replaced, BOLD added).
 fn paint_menu_row_style(frame: &mut FrameData, rect: Rect, fg: u32, bg: u32, bold: u16) {
-    for y in rect.y..rect.y.saturating_add(rect.height) {
-        for x in rect.x..rect.x.saturating_add(rect.width) {
-            if let Some(cell) = frame_cell_mut(frame, x, y) {
-                cell.fg = fg;
-                cell.bg = bg;
-                cell.modifier |= bold;
-            }
-        }
-    }
+    for_each_cell_in_rect(frame, rect, |cell| {
+        cell.fg = fg;
+        cell.bg = bg;
+        cell.modifier |= bold;
+    });
 }
 
 /// #45: lay the live `active_frame` content into a cached sidebar [`ComposedShell`], producing the
@@ -3483,6 +3480,21 @@ mod tests {
     };
     use crate::protocol::CursorState;
     use std::time::Duration;
+
+    /// #56: `row_for_selection` must paint NO row once the model's selection has scrolled past the
+    /// last VISIBLE row (a tall menu on a short host) — matching the renderer's `row_index == selected`
+    /// gate — instead of lighting up the wrong, last-visible row.
+    #[test]
+    fn row_for_selection_skips_offscreen_selection() {
+        let rows = [Rect::new(0, 0, 4, 1), Rect::new(0, 1, 4, 1)];
+        assert_eq!(row_for_selection(&rows, 0), Some(rows[0]));
+        assert_eq!(row_for_selection(&rows, 1), Some(rows[1]));
+        // selection beyond the visible rows -> no highlight (NOT clamped to the last row).
+        assert_eq!(row_for_selection(&rows, 2), None);
+        assert_eq!(row_for_selection(&rows, 99), None);
+        // empty visible set -> nothing to paint.
+        assert_eq!(row_for_selection(&[], 0), None);
+    }
 
     fn cell(symbol: &str) -> CellData {
         CellData {

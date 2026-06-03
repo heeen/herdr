@@ -1979,6 +1979,9 @@ impl ClientSupervisorModel {
             },
         ];
         self.new_workspace_picker = None;
+        // #47: a freshly opened overlay starts unshifted (mirrors every other open_* path), so a
+        // stale drag offset from a previous overlay can never displace the host menu from its anchor.
+        self.overlay_drag_offset = (0, 0);
         // #46 (item 5): start on the first ACTIONABLE row — `first_selectable_index` skips the
         // non-selectable version readout (row 0), so the menu never opens looking dead.
         let selected = Self::first_selectable_index(&items);
