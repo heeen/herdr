@@ -450,6 +450,11 @@ struct ClientSidebarSnapshot {
     // #47: the one drag offset (cols, rows) shared by EVERY overlay, cloned from the model. Render,
     // hit-test, and the content-exclusion rect shift the open overlay's default popup by this.
     overlay_drag_offset: (i16, i16),
+    // #53: the open overlay's drag-shifted, on-screen-clamped popup rect — computed ONCE here so
+    // render, hit-test, hover-test, exclusion, the top-border drag, and the #56 hover overlay all
+    // read one rect (mirrors how `ViewState` caches `workspace_card_areas`). `None` when no overlay
+    // is open or it does not fit. Selection-independent, so it stays valid across #56 HoverRedraws.
+    overlay_popup: Option<Rect>,
 }
 
 impl ClientCompositor {
@@ -2189,7 +2194,7 @@ impl ClientSidebarSnapshot {
             }
         }
 
-        Self {
+        let mut snapshot = Self {
             app,
             filter_label: model.filter_label(),
             workspace_routes,
@@ -2213,9 +2218,16 @@ impl ClientSidebarSnapshot {
             // overlays are still carried separately.
             client_menu: model.client_menu().cloned(),
             overlay_drag_offset: model.overlay_drag_offset(),
+            // #53: filled once below, after the struct (and its overlay carriers + drag offset) exist.
+            overlay_popup: None,
             rename_workspace: model.rename_workspace_form().cloned(),
             confirm_close_workspace: model.confirm_close_workspace().cloned(),
-        }
+        };
+        // #53: ONE computation of the open overlay's geometry, from the just-built view. Every read
+        // site (render / hit-test / hover-test / exclusion / drag / #56 hover overlay) reads this
+        // field instead of recomputing, so the rects can never drift.
+        snapshot.overlay_popup = open_overlay_popup_rect(&snapshot, host_width, host_height);
+        snapshot
     }
 
 }
@@ -6703,6 +6715,32 @@ mod tests {
         assert_eq!(
             compositor.hit_test(&model, cancel.x, cancel.y, host.0, host.1),
             Some(SidebarHitTarget::AddRemoteCancel)
+        );
+    }
+
+    #[test]
+    fn snapshot_caches_open_overlay_popup_and_is_selection_independent() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_host_context_menu(ServerId::main(), "local".into(), 10, 4);
+        let compositor = ClientCompositor::new(26);
+        let now = std::time::Instant::now();
+
+        let snap0 = ClientSidebarSnapshot::from_model(&model, &compositor, 26, 80, 24, now);
+        // the cached rect equals the (old) on-demand computation.
+        assert_eq!(
+            snap0.overlay_popup,
+            open_overlay_popup_rect(&snap0, 80, 24),
+            "#53: cached overlay_popup must equal the on-demand popup rect"
+        );
+        assert!(snap0.overlay_popup.is_some(), "an open menu must cache a popup");
+
+        // a menu-SELECTION change must NOT move the popup (it is selection-independent, so caching it
+        // on the hover-less #56 snapshot is safe across HoverRedraws).
+        model.set_client_menu_selected(2);
+        let snap1 = ClientSidebarSnapshot::from_model(&model, &compositor, 26, 80, 24, now);
+        assert_eq!(
+            snap0.overlay_popup, snap1.overlay_popup,
+            "selection must not move the popup"
         );
     }
 
