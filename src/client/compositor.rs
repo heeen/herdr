@@ -1661,8 +1661,9 @@ impl ClientCompositor {
         );
 
         // The new-workspace picker is a footer-anchored popup (item 1), so it hovers before the
-        // sidebar-width guard — the SAME (drag-shifted) popup geometry `hit_test` uses for it.
-        if let Some(popup) = open_overlay_popup_rect(&snapshot, host_width, host_height) {
+        // sidebar-width guard — the SAME (drag-shifted) popup geometry `hit_test` uses for it. #53:
+        // read the one cached rect, so hover-test and hit-test consume the same field, not recomputes.
+        if let Some(popup) = snapshot.overlay_popup {
             if let Some(target) = hover_test_new_workspace_picker(&snapshot, popup, x, y) {
                 return Some(target);
             }
