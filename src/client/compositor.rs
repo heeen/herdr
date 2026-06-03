@@ -2288,9 +2288,10 @@ fn render_client_shell(
             // compositor maps the ui-owned snapshot carriers into ui view structs here (no
             // supervisor types reach `ui`).
             let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
-            // #47: the (drag-shifted) popup rect of whichever overlay is open — render every overlay
-            // at THIS rect so a dragged overlay moves and render == hit-test == drag geometry.
-            let overlay_popup = open_overlay_popup_rect(snapshot, host_width, host_height);
+            // #47/#53: the (drag-shifted) popup rect of whichever overlay is open — render every
+            // overlay at THIS rect so a dragged overlay moves and render == hit-test == drag geometry.
+            // Read from the view (#53): computed once in `from_model`, never recomputed here.
+            let overlay_popup = snapshot.overlay_popup;
             if let Some((dests, selected)) = &snapshot.new_workspace_picker {
                 let views: Vec<crate::ui::DestinationView> = dests
                     .iter()
@@ -2362,9 +2363,13 @@ fn render_client_shell(
             // #47: the global launcher keeps its ORIGINAL look — render it through the unchanged
             // `render_global_launcher_menu` dropdown surface (driven by the AppState `Mode::GlobalMenu`
             // mapping above), so the "menu" button looks exactly as it always did (button-anchored, no
-            // modal header, badge dots). `launcher_menu_rect` applies any drag offset (clamped).
-            if let Some(rect) = launcher_menu_rect(snapshot, host_width, host_height) {
-                crate::ui::render_global_launcher_menu(&snapshot.app, frame, rect);
+            // modal header, badge dots). #53: read the cached popup; `Mode::GlobalMenu` holds iff the
+            // open menu is the launcher (see `from_model`), and there `overlay_popup` IS the launcher
+            // rect (drag offset already applied), so this stays identical to `launcher_menu_rect`.
+            if matches!(snapshot.app.mode, Mode::GlobalMenu) {
+                if let Some(rect) = snapshot.overlay_popup {
+                    crate::ui::render_global_launcher_menu(&snapshot.app, frame, rect);
+                }
             }
             // #47: render the two right-click CONTEXT menus (workspace / host) through the unified
             // overlay. The launcher is excluded (it renders above via its original surface). At most
@@ -2377,7 +2382,9 @@ fn render_client_shell(
                     crate::client::supervisor::ClientMenuKind::GlobalLauncher
                 ) {
                     let header_rows = client_menu_header_rows(menu);
-                    if let Some(popup) = context_menu_popup_rect(menu, snapshot.overlay_drag_offset, host_width, host_height) {
+                    // #53: this branch is gated on a non-launcher `client_menu`, so the cached
+                    // `overlay_popup` IS this context menu's popup — read it instead of recomputing.
+                    if let Some(popup) = snapshot.overlay_popup {
                         let rows: Vec<crate::ui::ClientMenuRowView> = menu
                             .items
                             .iter()
