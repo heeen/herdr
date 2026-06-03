@@ -1344,10 +1344,10 @@ impl ClientCompositor {
         // have). This is exactly what `overlay_anchor_area` returns.
         let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
         let mut excluded_rects: Vec<Rect> = Vec::new();
-        // #47: protect the open overlay's (drag-shifted) popup so it floats over the content
-        // cell-for-cell — ONE source of truth (`open_overlay_popup_rect`) for every overlay's current
-        // rect (the three menus + the five footer forms), keeping render == hit-test == exclusion.
-        excluded_rects.extend(open_overlay_popup_rect(&snapshot, host_width, host_height));
+        // #47/#53: protect the open overlay's (drag-shifted) popup so it floats over the content
+        // cell-for-cell — read the ONE rect the view cached for every overlay's current position (the
+        // three menus + the five footer forms), keeping render == hit-test == exclusion by construction.
+        excluded_rects.extend(snapshot.overlay_popup);
         // the manage delete-confirm sub-popup stays centered on top of the (possibly dragged) list.
         if let Some((overlay, _)) = snapshot.remote_manage.as_ref() {
             if overlay.confirm_delete.is_some() {
@@ -1758,7 +1758,9 @@ impl ClientCompositor {
             host_height,
             Instant::now(),
         );
-        open_overlay_popup_rect(&snapshot, host_width, host_height)
+        // #53: the snapshot already computed the popup once in `from_model` — read it, don't recompute.
+        // (Building a fresh snapshot per drag-Down is a separate cost tracked by #51, out of scope.)
+        snapshot.overlay_popup
     }
 
     /// #47: feed a mouse event to the open overlay's TOP-BORDER drag-to-move. A left-press on the
