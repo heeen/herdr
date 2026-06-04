@@ -42,7 +42,7 @@ rustPlatform.buildRustPackage {
     );
   };
 
-  cargoHash = "sha256-yRT31RnfjSQy5bxFXVvM9zRM59WAPrBozu3S2tag6s8=";
+  cargoHash = "sha256-aUGE8Kt8Kjq9IfgxmLIVravB5jT/Byzc0Cuy4hXuBog=";
   cargoDepsName = "herdr";
 
   nativeBuildInputs = [
