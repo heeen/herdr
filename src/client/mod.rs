@@ -153,6 +153,13 @@ struct ClientState {
     /// so a fast motion sweep that floods one `Moved` per crossed row renders at most once per
     /// frame instead of once per event. Cleared by every composited frame (`flush_composited_frame`).
     pending_hover_render: bool,
+    /// many-remotes: a fleet-scale model update (a connect storm or the 400ms/2s summary-refresh
+    /// cadence firing across N connected remotes) coalesces its full rebuild to ONE per frame instead
+    /// of one per event. Each summary/connection event still APPLIES its model mutation immediately
+    /// (cheap), but the expensive `build_shell`/`from_model` (O(hosts×agents)) is deferred and run at
+    /// most once per frame budget (latest-wins) — so the UI stays responsive no matter the fleet size
+    /// instead of dropping to ~1fps while N events each forced a serial rebuild. Flushed by the Timer.
+    pending_full_render: bool,
     /// #48: when the last composited frame was flushed. Anchors the hover-render frame-budget clamp
     /// in `next_select_deadline` so deferred hover repaints are capped at ~60fps.
     last_composited_render_at: Instant,
@@ -3942,6 +3949,23 @@ fn render_cached_composited_frame(state: &mut ClientState) {
     recompose_composited_frame(state, true);
 }
 
+/// many-remotes: request a full (model-change) render, COALESCED to at most one per frame budget.
+/// A fleet-scale event storm — a connect storm of N remotes, or the 400ms/2s summary-refresh cadence
+/// firing across every connected remote — used to run one full `build_shell`/`from_model`
+/// (O(hosts×agents)) rebuild PER event, serially, so the UI dropped to ~1fps while the storm drained.
+/// The model mutation has already been applied by the caller (cheap); here we only gate the expensive
+/// RENDER: if a full frame budget has elapsed since the last flushed frame, render now; otherwise mark
+/// it pending and let the Timer flush ONE rebuild at the next frame boundary (latest-wins, applying
+/// every mutation that landed in between). So render cost is bounded to one rebuild per frame
+/// regardless of how many remotes flood updates — the UI stays responsive at any fleet size.
+fn request_composited_render(state: &mut ClientState) {
+    if state.last_composited_render_at.elapsed() >= CLIENT_60FPS_FRAME_BUDGET {
+        render_cached_composited_frame(state);
+    } else {
+        state.pending_full_render = true;
+    }
+}
+
 /// #56: compose the cached shell + live content + the per-frame hover overlay, then flush.
 ///
 /// `rebuild = true` forces a fresh hover-less shell (a genuine model/view/size change). A
@@ -4115,6 +4139,9 @@ fn flush_composited_frame(
     // deferred hover repaint is no longer outstanding. Stamp the time so the hover-render clamp in
     // `next_select_deadline` paces the NEXT deferred repaint off this frame (capping it at ~60fps).
     state.pending_hover_render = false;
+    // many-remotes: this frame also reflects every model mutation applied so far, so a deferred
+    // fleet-update full render is satisfied too — clear it so the Timer won't redundantly re-render.
+    state.pending_full_render = false;
     state.last_composited_render_at = Instant::now();
     record_client_frame_sample_split(
         state,
@@ -4270,6 +4297,7 @@ async fn run_client_loop(
         pending_update_remote: HashSet::new(),
         last_animation_tick: Instant::now(),
         pending_hover_render: false,
+        pending_full_render: false,
         last_composited_render_at: Instant::now(),
         last_summary_refresh: HashMap::new(),
     };
@@ -4396,7 +4424,9 @@ async fn run_client_loop(
             Instant::now(),
             state.last_animation_tick,
             wants_animation,
-            state.pending_hover_render,
+            // many-remotes: a deferred FULL render (coalesced fleet-update storm) wakes within one
+            // frame budget too, exactly like a deferred hover repaint — so the storm flushes at ~60fps.
+            state.pending_hover_render || state.pending_full_render,
             state.last_composited_render_at,
         );
         let event = tokio::select! {
@@ -4943,7 +4973,7 @@ async fn run_client_loop(
                         &should_quit,
                     );
                 }
-                render_cached_composited_frame(&mut state);
+                request_composited_render(&mut state);
             }
             ClientLoopEvent::SupervisorSummaryFetched {
                 server_id,
@@ -4983,7 +5013,7 @@ async fn run_client_loop(
                         &should_quit,
                     );
                 }
-                render_cached_composited_frame(&mut state);
+                request_composited_render(&mut state);
             }
             ClientLoopEvent::SupervisorSummarySubscriptionEnded(server_id) => {
                 state.summary_subscription_server_ids.remove(&server_id);
@@ -5071,7 +5101,7 @@ async fn run_client_loop(
                     }
                 }
                 state.request_full_redraw();
-                render_cached_composited_frame(&mut state);
+                request_composited_render(&mut state);
             }
             ClientLoopEvent::SecondaryConnectionAttemptFinished {
                 server_id,
@@ -5126,7 +5156,7 @@ async fn run_client_loop(
                                 "failed to attach retried secondary client stream"
                             );
                             state.request_full_redraw();
-                            render_cached_composited_frame(&mut state);
+                            request_composited_render(&mut state);
                             continue;
                         }
 
@@ -5196,7 +5226,7 @@ async fn run_client_loop(
                     }
                 }
                 state.request_full_redraw();
-                render_cached_composited_frame(&mut state);
+                request_composited_render(&mut state);
             }
             ClientLoopEvent::AddRemoteProgress { message } => {
                 // Update the dialog's live provisioning line (ignored once the form has closed or
@@ -5467,7 +5497,16 @@ async fn run_client_loop(
                 // overlay — NO `build_shell` rebuild — so hover stays smooth no matter the fleet size.
                 // The render reads the compositor's current hover, so intermediate positions are
                 // simply skipped. `flush_composited_frame` clears the flag.
-                if state.pending_hover_render {
+                if state.pending_full_render {
+                    // many-remotes: flush the deferred (coalesced) full rebuild for a fleet-scale
+                    // model-update storm — ONE `build_shell`/`from_model` here applies every summary/
+                    // connection mutation that landed since the last frame, instead of one rebuild per
+                    // event. A full render supersedes a deferred hover repaint. Clear BEFORE rendering
+                    // so an early-return can't leave the flag set and busy-spin the deadline.
+                    state.pending_full_render = false;
+                    state.pending_hover_render = false;
+                    render_cached_composited_frame(&mut state);
+                } else if state.pending_hover_render {
                     // Clear BEFORE rendering: `flush_composited_frame` clears it on the normal path,
                     // but clearing here too keeps a `recompose_composited_frame` early-return
                     // (model/compositor absent) from leaving the flag set — which would busy-spin the
@@ -6251,9 +6290,31 @@ mod tests {
             pending_update_remote: HashSet::new(),
             last_animation_tick: Instant::now(),
             pending_hover_render: false,
+            pending_full_render: false,
             last_composited_render_at: Instant::now(),
             last_summary_refresh: HashMap::new(),
         }
+    }
+
+    /// many-remotes: a burst of fleet-scale model updates (a connect storm, or the 400ms/2s summary-
+    /// refresh cadence firing across N connected remotes) within ONE frame budget must NOT run a full
+    /// `build_shell`/`from_model` (O(hosts×agents)) rebuild per event — that serial rebuild flood is
+    /// the ~1fps lag. They coalesce to a SINGLE deferred render the Timer flushes (latest-wins), so
+    /// render cost is bounded to one rebuild per frame regardless of remote count.
+    #[test]
+    fn request_composited_render_coalesces_a_fleet_update_storm_within_a_frame() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+        let mut state = test_client_state_with_model(model);
+        // a frame was just flushed; 50 remotes then flood model updates in the same frame budget.
+        state.last_composited_render_at = Instant::now();
+        state.pending_full_render = false;
+        for _ in 0..50 {
+            request_composited_render(&mut state);
+        }
+        assert!(
+            state.pending_full_render,
+            "50 fleet updates inside one frame budget coalesce to ONE deferred render, not 50 rebuilds"
+        );
     }
 
     /// #45: any model/view change funnels through `request_full_redraw`, which must drop the cached
