@@ -407,7 +407,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
 
         assert!(saved, "first write (NotFound) must succeed");
-        assert!(diagnostic.is_none(), "first write must not raise a diagnostic");
+        assert!(
+            diagnostic.is_none(),
+            "first write must not raise a diagnostic"
+        );
         assert!(
             on_disk.as_deref().unwrap_or_default().contains("nord"),
             "first write must create the file with the new content"
@@ -433,12 +436,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
 
         assert!(saved, "a normal read-before-write must succeed");
-        assert!(diagnostic.is_none(), "a successful save must not raise a diagnostic");
+        assert!(
+            diagnostic.is_none(),
+            "a successful save must not raise a diagnostic"
+        );
         // Unrelated keys from the original config survive the in-place update.
         assert!(
             on_disk.contains("onboarding = false"),
             "the existing config body must be preserved, not overwritten"
         );
-        assert!(on_disk.contains("nord"), "the updated value must be written");
+        assert!(
+            on_disk.contains("nord"),
+            "the updated value must be written"
+        );
     }
 }

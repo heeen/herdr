@@ -1643,9 +1643,9 @@ fn render_workspace_list(
     // #19 (host half): the dragged host's banner index (== its position in the ordered host list),
     // so its banner row dims while dragging — mirroring the dragged-workspace lift.
     let dragged_host_idx = match app.drag.as_ref().map(|drag| &drag.target) {
-        Some(crate::app::state::DragTarget::HostReorder { source_host_idx, .. }) => {
-            Some(*source_host_idx)
-        }
+        Some(crate::app::state::DragTarget::HostReorder {
+            source_host_idx, ..
+        }) => Some(*source_host_idx),
         _ => None,
     };
 
@@ -4215,12 +4215,24 @@ lines = [
         assert!(toggle.width > 1, "toggle is a full-width row");
 
         let (ws, detail) = expanded_sidebar_sections(area, 0.5);
-        assert!(ws.bottom() <= toggle.y, "expanded ws section must clear the toggle row");
-        assert!(detail.bottom() <= toggle.y, "expanded detail section must clear the toggle row");
+        assert!(
+            ws.bottom() <= toggle.y,
+            "expanded ws section must clear the toggle row"
+        );
+        assert!(
+            detail.bottom() <= toggle.y,
+            "expanded detail section must clear the toggle row"
+        );
 
         let (cws, _, cdetail) = collapsed_sidebar_sections(area);
-        assert!(cws.bottom() <= toggle.y, "collapsed ws section must clear the toggle row");
-        assert!(cdetail.bottom() <= toggle.y, "collapsed detail section must clear the toggle row");
+        assert!(
+            cws.bottom() <= toggle.y,
+            "collapsed ws section must clear the toggle row"
+        );
+        assert!(
+            cdetail.bottom() <= toggle.y,
+            "collapsed detail section must clear the toggle row"
+        );
     }
 
     // #9 item 2: the toggle affordance is drawn in BOTH modes (it used to early-return when

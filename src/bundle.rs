@@ -196,14 +196,13 @@ pub(crate) fn extract_entry(path: &Path, entry: &BundleEntry) -> io::Result<Vec<
     // Bound the inflate too: cap at the claimed (but untrusted) uncompressed length, clamped to a
     // sane ceiling, so a bogus `uncompressed_len` can't drive an unbounded allocation either.
     let limit = (entry.uncompressed_len as usize).min(MAX_BUNDLE_PAYLOAD);
-    let bytes = miniz_oxide::inflate::decompress_to_vec_with_limit(&compressed, limit).map_err(
-        |err| {
+    let bytes =
+        miniz_oxide::inflate::decompress_to_vec_with_limit(&compressed, limit).map_err(|err| {
             io::Error::other(format!(
                 "failed to decompress {} payload: {err:?}",
                 entry.asset_key()
             ))
-        },
-    )?;
+        })?;
     if bytes.len() as u64 != entry.uncompressed_len {
         return Err(io::Error::other(format!(
             "{} payload length mismatch: expected {}, got {}",

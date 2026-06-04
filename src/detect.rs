@@ -2149,10 +2149,7 @@ mod tests {
             detect_cline("Cline is working...\nesc to cancel"),
             AgentState::Working
         );
-        assert_eq!(
-            detect_cline("API Request in progress"),
-            AgentState::Working
-        );
+        assert_eq!(detect_cline("API Request in progress"), AgentState::Working);
     }
 
     // ---- OpenCode ----

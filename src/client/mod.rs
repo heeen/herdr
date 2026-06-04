@@ -1104,9 +1104,7 @@ fn dispatch_composited_mouse_input(
     // other handler (menu select, form buttons, sidebar) — for ALL overlays (the three menus + the
     // add-remote / picker / manage / rename / confirm forms), one mechanism. A press anywhere but the
     // top border returns `None` and falls through to the normal handling below.
-    if let Some(changed) =
-        compositor.handle_overlay_drag(model, mouse, host_size.0, host_size.1)
-    {
+    if let Some(changed) = compositor.handle_overlay_drag(model, mouse, host_size.0, host_size.1) {
         return if changed {
             ClientInputDispatch::Redraw
         } else {
@@ -3020,15 +3018,14 @@ fn run_client_update_remote(
     };
     // Same provisioning the add-remote path uses; `restart_incompatible = true` so an incompatible
     // server is restarted onto the freshly-installed binary instead of blocking on a y/N prompt.
-    let bridge = run_remote_op_with_progress(
-        ADD_REMOTE_BRIDGE_IDLE_TIMEOUT,
-        &on_progress,
-        move |sink| crate::remote::start_ssh_remote_bridge(ssh_target, true, None, sink),
-    )
-    .map_err(|err| match classify_add_remote_bridge_error(err) {
-        AddRemoteFailure::Message(message) => message,
-        AddRemoteFailure::NeedsRestartConfirm { detail, .. } => detail,
-    })?;
+    let bridge =
+        run_remote_op_with_progress(ADD_REMOTE_BRIDGE_IDLE_TIMEOUT, &on_progress, move |sink| {
+            crate::remote::start_ssh_remote_bridge(ssh_target, true, None, sink)
+        })
+        .map_err(|err| match classify_add_remote_bridge_error(err) {
+            AddRemoteFailure::Message(message) => message,
+            AddRemoteFailure::NeedsRestartConfirm { detail, .. } => detail,
+        })?;
     // The reinstall is done; drop the throwaway bridge. The loop schedules a fresh reconnect so the
     // live stream comes back up on the now-matching protocol (and re-fetches runtime status).
     drop(bridge);
@@ -3687,10 +3684,8 @@ fn apply_update_remote_finished(
         Ok(()) => {
             if let Some(model) = &mut state.supervisor_model {
                 model.set_update_progress(server_id, None);
-                let _ = model.set_connection_state(
-                    server_id,
-                    supervisor::ConnectionState::Connecting,
-                );
+                let _ =
+                    model.set_connection_state(server_id, supervisor::ConnectionState::Connecting);
             }
             // Drop the stale-protocol stream and dial it back up on the new binary at the shortest
             // (attempt-0) backoff — same as #43's "reconnect" path.
@@ -4007,7 +4002,14 @@ fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
     let shell_rebuilt = if let (Some(comp), Some(model)) =
         (state.compositor.as_ref(), state.supervisor_model.as_ref())
     {
-        ensure_shell_cache(comp, model, &mut state.shell_cache, state.host_size, rebuild, now)
+        ensure_shell_cache(
+            comp,
+            model,
+            &mut state.shell_cache,
+            state.host_size,
+            rebuild,
+            now,
+        )
     } else {
         return;
     };
@@ -4604,12 +4606,7 @@ async fn run_client_loop(
                                         supervisor::ConnectionState::Connecting,
                                     );
                                 }
-                                schedule_secondary_retry(
-                                    &mut state,
-                                    server_id,
-                                    0,
-                                    Instant::now(),
-                                );
+                                schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -4619,13 +4616,14 @@ async fn run_client_loop(
                             // target from the model, show an initial progress line, and spawn the
                             // worker off the UI loop (the pending guard collapses double-clicks).
                             ClientInputDispatch::UpdateRemote { server_id } => {
-                                let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
-                                    model.server_ssh_target(&server_id).map(
-                                        |(destination, options)| {
-                                            crate::remote::SshTarget::new(destination, options)
-                                        },
-                                    )
-                                });
+                                let ssh_target =
+                                    state.supervisor_model.as_ref().and_then(|model| {
+                                        model.server_ssh_target(&server_id).map(
+                                            |(destination, options)| {
+                                                crate::remote::SshTarget::new(destination, options)
+                                            },
+                                        )
+                                    });
                                 if let Some(ssh_target) = ssh_target {
                                     if let Some(model) = &mut state.supervisor_model {
                                         model.set_update_progress(
@@ -4643,7 +4641,9 @@ async fn run_client_loop(
                                     // A non-ssh (local) host has nothing to reinstall over ssh.
                                     model.set_update_progress(
                                         &server_id,
-                                        Some("update is only available for ssh remotes".to_string()),
+                                        Some(
+                                            "update is only available for ssh remotes".to_string(),
+                                        ),
                                     );
                                 }
                                 state.request_full_redraw();
@@ -5126,8 +5126,7 @@ async fn run_client_loop(
                             state.ssh_bridges.insert(server_id.clone(), bridge);
                         }
                         let rx_bytes = state.rx_counters.counter(&server_id);
-                        let max_frame_size =
-                            server_frame_size_cap(state.kitty_graphics_enabled);
+                        let max_frame_size = server_frame_size_cap(state.kitty_graphics_enabled);
                         if let Err(err) = attach_secondary_client_stream(
                             server_id.clone(),
                             connection.stream,
@@ -6120,11 +6119,10 @@ mod tests {
 
     #[test]
     fn run_remote_op_with_progress_surfaces_inner_error() {
-        let result: Result<(), RemoteOpError> = run_remote_op_with_progress(
-            Duration::from_secs(5),
-            &|_| {},
-            |_sink| Err(io::Error::other("boom")),
-        );
+        let result: Result<(), RemoteOpError> =
+            run_remote_op_with_progress(Duration::from_secs(5), &|_| {}, |_sink| {
+                Err(io::Error::other("boom"))
+            });
         match result {
             Err(RemoteOpError::Failed(err)) => assert_eq!(err.to_string(), "boom"),
             other => panic!("expected Failed(boom), got {other:?}"),
@@ -6135,14 +6133,11 @@ mod tests {
     fn run_remote_op_with_progress_fails_when_op_stalls_without_progress() {
         // The core anti-hang guarantee: an op that makes no progress for a whole idle window yields
         // a timeout error, not a wedge.
-        let result: Result<(), RemoteOpError> = run_remote_op_with_progress(
-            Duration::from_millis(50),
-            &|_| {},
-            |_sink| {
+        let result: Result<(), RemoteOpError> =
+            run_remote_op_with_progress(Duration::from_millis(50), &|_| {}, |_sink| {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(())
-            },
-        );
+            });
         assert!(
             matches!(result, Err(RemoteOpError::TimedOut { .. })),
             "stalled op must time out, got {result:?}"
@@ -7668,13 +7663,7 @@ mod tests {
         state.pending_update_remote.insert(remote_id.clone());
 
         // Ok: clears progress, drops the manual-disconnect mark, schedules an immediate reconnect.
-        apply_update_remote_finished(
-            &mut state,
-            &mut server_writes,
-            &remote_id,
-            Ok(()),
-            now,
-        );
+        apply_update_remote_finished(&mut state, &mut server_writes, &remote_id, Ok(()), now);
         assert_eq!(
             state
                 .supervisor_model
@@ -7712,9 +7701,11 @@ mod tests {
             &mut state2,
             &mut server_writes2,
             &remote2,
-            Err("this herdr build has no binary for linux-aarch64; build/seed it instead of \
+            Err(
+                "this herdr build has no binary for linux-aarch64; build/seed it instead of \
                  downloading"
-                .to_string()),
+                    .to_string(),
+            ),
             now,
         );
         let message = state2
@@ -8060,16 +8051,17 @@ mod tests {
     // distinguishes active-anchoring (→ next server) from first-anchoring or last-anchoring.
     #[test]
     fn step_workspace_focus_anchors_on_active_server() {
-        let secondary = |id: &str, session: &str| crate::remote_registry::RemoteDefinitionSnapshot {
-            id: id.into(),
-            name: id.into(),
-            target: crate::remote_registry::RemoteTargetSnapshot::Local {
-                session: Some(session.into()),
-            },
-            session: None,
-            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-            disabled: false,
-        };
+        let secondary =
+            |id: &str, session: &str| crate::remote_registry::RemoteDefinitionSnapshot {
+                id: id.into(),
+                name: id.into(),
+                target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                    session: Some(session.into()),
+                },
+                session: None,
+                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+                disabled: false,
+            };
         let focused_ws = |id: &str| supervisor::WorkspaceSummary {
             workspace_id: id.into(),
             label: id.into(),
@@ -8086,7 +8078,9 @@ mod tests {
         let mid = model.add_secondary(secondary("remote-b", "b"));
         let last = model.add_secondary(secondary("remote-c", "c"));
         // visible order is [main, remote-b, remote-c]; every server has one focused workspace.
-        model.set_summary(&supervisor::ServerId::main(), summary("main-ws")).unwrap();
+        model
+            .set_summary(&supervisor::ServerId::main(), summary("main-ws"))
+            .unwrap();
         model.set_summary(&mid, summary("mid-ws")).unwrap();
         model.set_summary(&last, summary("last-ws")).unwrap();
 
@@ -8678,7 +8672,10 @@ mod tests {
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
             ClientInputDispatch::HoverRedraw
         );
-        assert!(compositor.has_pending_hover(), "motion records a pending hover");
+        assert!(
+            compositor.has_pending_hover(),
+            "motion records a pending hover"
+        );
         assert_eq!(
             compositor.hover(),
             None,
@@ -9629,10 +9626,8 @@ mod tests {
 
         // Three stages spaced under the idle window; total runtime (~120ms) exceeds it, so this only
         // succeeds because each progress event resets the deadline.
-        let result: Result<u32, RemoteOpError> = run_remote_op_with_progress(
-            Duration::from_millis(80),
-            &on_progress,
-            |sink| {
+        let result: Result<u32, RemoteOpError> =
+            run_remote_op_with_progress(Duration::from_millis(80), &on_progress, |sink| {
                 for stage in [
                     RemoteProvisionStage::Connecting,
                     RemoteProvisionStage::Installing,
@@ -9642,26 +9637,26 @@ mod tests {
                     sink(stage);
                 }
                 Ok(42)
-            },
-        );
+            });
 
         assert_eq!(result.unwrap(), 42);
-        assert_eq!(seen.lock().unwrap().len(), 3, "all stages forwarded to the UI");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "all stages forwarded to the UI"
+        );
     }
 
     #[test]
     fn progress_runner_times_out_naming_the_last_stage() {
         use crate::remote::RemoteProvisionStage;
 
-        let result: Result<u32, RemoteOpError> = run_remote_op_with_progress(
-            Duration::from_millis(60),
-            &|_| {},
-            |sink| {
+        let result: Result<u32, RemoteOpError> =
+            run_remote_op_with_progress(Duration::from_millis(60), &|_| {}, |sink| {
                 sink(RemoteProvisionStage::Installing);
                 std::thread::sleep(Duration::from_millis(400)); // stall past the idle window
                 Ok(0)
-            },
-        );
+            });
 
         match result {
             Err(RemoteOpError::TimedOut { stage, .. }) => assert_eq!(
@@ -10196,7 +10191,10 @@ mod tests {
         // the 100ms housekeeping deadline.
         let stale = now - CLIENT_60FPS_FRAME_BUDGET;
         let due = next_select_deadline(now, last_anim, false, true, stale);
-        assert_eq!(due, now, "an overdue pending hover must flush immediately (clamped to now)");
+        assert_eq!(
+            due, now,
+            "an overdue pending hover must flush immediately (clamped to now)"
+        );
 
         // Mid-budget: deadline rides last_render + one frame budget, well under 100ms housekeeping.
         let recent = now - Duration::from_millis(5);

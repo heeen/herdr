@@ -375,7 +375,9 @@ impl RemoteProvisionStage {
             RemoteProvisionStage::AlreadyInstalled => {
                 "herdr already installed — attaching…".to_string()
             }
-            RemoteProvisionStage::Seeding { source } => format!("provisioning herdr from {source}…"),
+            RemoteProvisionStage::Seeding { source } => {
+                format!("provisioning herdr from {source}…")
+            }
             RemoteProvisionStage::Installing => "installing herdr on the remote…".to_string(),
             RemoteProvisionStage::Verifying => "verifying the installed binary…".to_string(),
             RemoteProvisionStage::StartingServer => "starting the remote server…".to_string(),
@@ -2031,9 +2033,7 @@ impl SshStdioBridge {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         if let Err(err) = stream.set_nonblocking(false) {
-                            tracing::warn!(
-                                "remote bridge failed to prepare client socket: {err}"
-                            );
+                            tracing::warn!("remote bridge failed to prepare client socket: {err}");
                             continue;
                         }
                         let worker_target = target.clone();
@@ -3306,7 +3306,10 @@ mod tests {
                 "x86_64"
             },
         };
-        assert_eq!(classify_seed_source(&unbuildable), NonOverrideSeed::Download);
+        assert_eq!(
+            classify_seed_source(&unbuildable),
+            NonOverrideSeed::Download
+        );
         assert!(
             !can_seed_remote_without_download(&unbuildable),
             "an unbuildable (Download-only) platform refuses a download-free seed"

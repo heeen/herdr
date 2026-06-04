@@ -1332,15 +1332,22 @@ pub(crate) fn client_menu_inner_rect_at(
     host_width: u16,
     host_height: u16,
 ) -> Option<Rect> {
-    client_menu_popup_rect_at(anchor_col, anchor_row, count, header_rows, host_width, host_height)
-        .map(|popup| {
-            Rect::new(
-                popup.x + 1,
-                popup.y + 1,
-                popup.width.saturating_sub(2),
-                popup.height.saturating_sub(2),
-            )
-        })
+    client_menu_popup_rect_at(
+        anchor_col,
+        anchor_row,
+        count,
+        header_rows,
+        host_width,
+        host_height,
+    )
+    .map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
 }
 
 /// #47: the rect for menu row `row_index` inside the client menu's inner rect. Rows start
@@ -1355,7 +1362,6 @@ pub(crate) fn client_menu_row_rect(inner: Rect, header_rows: u16, row_index: usi
 pub(crate) fn rename_workspace_popup_rect(area: Rect) -> Option<Rect> {
     bottom_left_popup_rect(area, 48, 7)
 }
-
 
 /// The (save, cancel) button rects inside the rename overlay's inner rect. Mirrors
 /// `add_remote_button_rects`.
@@ -1443,8 +1449,11 @@ pub(crate) fn render_client_menu_overlay(
     );
     if let Some(subheader) = view.subheader {
         frame.render_widget(
-            Paragraph::new(format!(" {}", truncate_text(subheader, inner.width as usize)))
-                .style(Style::default().fg(palette.overlay0)),
+            Paragraph::new(format!(
+                " {}",
+                truncate_text(subheader, inner.width as usize)
+            ))
+            .style(Style::default().fg(palette.overlay0)),
             Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
         );
     }
@@ -1599,9 +1608,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        add_remote_button_rects, add_remote_inner_rect, confirm_close_overlay_text,
-        new_workspace_picker_button_rects, new_workspace_picker_inner_rect,
-        client_menu_inner_rect_at, client_menu_popup_rect_at, new_workspace_picker_row_rect,
+        add_remote_button_rects, add_remote_inner_rect, client_menu_inner_rect_at,
+        client_menu_popup_rect_at, confirm_close_overlay_text, new_workspace_picker_button_rects,
+        new_workspace_picker_inner_rect, new_workspace_picker_row_rect,
     };
 
     fn rects_are_disjoint(a: Rect, b: Rect) -> bool {
@@ -1611,8 +1620,8 @@ mod tests {
     #[test]
     fn workspace_context_menu_anchors_at_cursor() {
         // #33: the popup's top-left sits at the right-click cursor when it fits on screen.
-        let popup = client_menu_popup_rect_at(10, 4, 2, 2, 80, 24)
-            .expect("popup fits on an 80x24 host");
+        let popup =
+            client_menu_popup_rect_at(10, 4, 2, 2, 80, 24).expect("popup fits on an 80x24 host");
         assert_eq!((popup.x, popup.y), (10, 4), "anchored at the cursor");
     }
 
@@ -1620,8 +1629,8 @@ mod tests {
     fn workspace_context_menu_clamps_to_screen_near_edges() {
         // #33: a cursor near the right/bottom edge shifts the popup left/up so it stays fully
         // on-screen (matching the server-rendered menu's clamp-to-screen behaviour).
-        let popup = client_menu_popup_rect_at(79, 23, 2, 2, 80, 24)
-            .expect("popup fits on an 80x24 host");
+        let popup =
+            client_menu_popup_rect_at(79, 23, 2, 2, 80, 24).expect("popup fits on an 80x24 host");
         assert!(
             popup.x + popup.width <= 80,
             "right edge clamped on-screen: {popup:?}"

@@ -160,7 +160,11 @@ fn block_insert_global_index(cards: &[(usize, Rect)], drop_row: u16) -> Option<u
     match cards.get(above) {
         Some((global, _)) => Some(*global),
         // Dropped past the last rendered card: insert after the block's HIGHEST stored slot.
-        None => cards.iter().map(|(global, _)| *global).max().map(|max| max + 1),
+        None => cards
+            .iter()
+            .map(|(global, _)| *global)
+            .max()
+            .map(|max| max + 1),
     }
 }
 
@@ -737,9 +741,9 @@ impl ClientCompositor {
                 // per SIDEBAR_RESIZE_THROTTLE. Intermediate ticks return Redraw so the divider still
                 // tracks the cursor without flooding every server with un-coalesced resizes (which
                 // each force a full-frame baseline reset + PTY reflow). The final size is flushed on Up.
-                let due = self
-                    .last_resize_emitted
-                    .map_or(true, |prev| now.duration_since(prev) >= SIDEBAR_RESIZE_THROTTLE);
+                let due = self.last_resize_emitted.map_or(true, |prev| {
+                    now.duration_since(prev) >= SIDEBAR_RESIZE_THROTTLE
+                });
                 if due {
                     self.last_resize_emitted = Some(now);
                     Some(SidebarResizeOutcome::Resized(cols, rows))
@@ -1260,10 +1264,7 @@ impl ClientCompositor {
         // `reorder_server` indexes. Under a single-server filter only one banner is visible, so a
         // banner-space drop index would be mis-applied to the full server list (moving the wrong
         // host). Refuse the reorder rather than commit a bogus slot.
-        if !matches!(
-            model.filter(),
-            crate::client::supervisor::ServerFilter::All
-        ) {
+        if !matches!(model.filter(), crate::client::supervisor::ServerFilter::All) {
             return None;
         }
         let sidebar_width = self.effective_sidebar_width(host_width);
@@ -1320,7 +1321,13 @@ impl ClientCompositor {
         host_height: u16,
         now: Instant,
     ) -> ComposedShell {
-        self.build_shell_inner(model, host_width, host_height, now, ShellHoverMode::Hoverless)
+        self.build_shell_inner(
+            model,
+            host_width,
+            host_height,
+            now,
+            ShellHoverMode::Hoverless,
+        )
     }
 
     /// #56: the old, hover-BAKED shell build — kept only as the equivalence golden for the Seam-1
@@ -1844,8 +1851,10 @@ impl ClientCompositor {
                 let dx = mouse.column as i32 - drag.start_col as i32;
                 let dy = mouse.row as i32 - drag.start_row as i32;
                 let next = (
-                    (drag.start_offset.0 as i32 + dx).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    (drag.start_offset.1 as i32 + dy).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    (drag.start_offset.0 as i32 + dx).clamp(i16::MIN as i32, i16::MAX as i32)
+                        as i16,
+                    (drag.start_offset.1 as i32 + dy).clamp(i16::MIN as i32, i16::MAX as i32)
+                        as i16,
                 );
                 let changed = model.overlay_drag_offset() != next;
                 model.set_overlay_drag_offset(next);
@@ -2274,7 +2283,6 @@ impl ClientSidebarSnapshot {
         snapshot.overlay_popup = open_overlay_popup_rect(&snapshot, host_width, host_height);
         snapshot
     }
-
 }
 
 /// #47: the header-line count for a client menu's geometry — 2 when it carries a target sub-header
@@ -2835,7 +2843,11 @@ fn shift_menu_rect(base: Rect, offset: (i16, i16), host_width: u16, host_height:
 
 /// #47: the open global launcher's current popup rect — its original `global_menu_rect` dropdown,
 /// shifted by the menu's drag offset (clamped on-screen). `None` when no launcher is open.
-fn launcher_menu_rect(snapshot: &ClientSidebarSnapshot, host_width: u16, host_height: u16) -> Option<Rect> {
+fn launcher_menu_rect(
+    snapshot: &ClientSidebarSnapshot,
+    host_width: u16,
+    host_height: u16,
+) -> Option<Rect> {
     if !matches!(snapshot.app.mode, Mode::GlobalMenu) {
         return None;
     }
@@ -3125,8 +3137,10 @@ fn compute_hover_geometry(snapshot: &ClientSidebarSnapshot) -> HoverGeometry {
                     if row_index == selected {
                         continue;
                     }
-                    geom.picker_rows
-                        .push((row_index, crate::ui::new_workspace_picker_row_rect(inner, row_index)));
+                    geom.picker_rows.push((
+                        row_index,
+                        crate::ui::new_workspace_picker_row_rect(inner, row_index),
+                    ));
                 }
             }
         }
@@ -4378,7 +4392,10 @@ mod tests {
         assert_eq!(block_insert_global_index(&cards, 3), Some(0));
 
         // Host scroll analogue: leading banner (banner_idx 0) scrolled off, visible = [1, 2].
-        let scrolled = vec![(1usize, Rect::new(0, 0, 4, 1)), (2usize, Rect::new(0, 1, 4, 1))];
+        let scrolled = vec![
+            (1usize, Rect::new(0, 0, 4, 1)),
+            (2usize, Rect::new(0, 1, 4, 1)),
+        ];
         // A drop above the first VISIBLE banner resolves to its true banner_idx (1), not 0.
         assert_eq!(block_insert_global_index(&scrolled, 0), Some(1));
         // Past the last → max(1,2)+1 = 3 (the full-list end), not visible-count 2.
@@ -5409,8 +5426,14 @@ mod tests {
         let (mut model, remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let host = (60u16, 24u16);
-        let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         // The remote host's banner row (index 1 in visible_servers order: [local, remote]).
         let banner_y = snapshot.app.view.host_banner_areas[1].rect.y;
         assert_eq!(
@@ -6603,8 +6626,14 @@ mod tests {
         let host = (60u16, 16u16);
 
         model.open_client_global_menu(0, 0);
-        let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, host.0, host.1, Instant::now());
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            26,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
         let rect = snapshot.app.global_menu_rect();
         // the first item row sits one cell inside the menu's top-left border.
         assert_eq!(
@@ -6646,7 +6675,11 @@ mod tests {
         assert_eq!(
             compositor.handle_overlay_drag(
                 &mut model,
-                &ev(MouseEventKind::Down(MouseButton::Left), before.x + 2, before.y),
+                &ev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    before.x + 2,
+                    before.y
+                ),
                 host.0,
                 host.1,
             ),
@@ -6681,7 +6714,11 @@ mod tests {
         assert_eq!(
             compositor.handle_overlay_drag(
                 &mut model,
-                &ev(MouseEventKind::Up(MouseButton::Left), after.x + 5, after.y + 2),
+                &ev(
+                    MouseEventKind::Up(MouseButton::Left),
+                    after.x + 5,
+                    after.y + 2
+                ),
                 host.0,
                 host.1,
             ),
@@ -6726,7 +6763,11 @@ mod tests {
         assert_eq!(
             compositor.handle_overlay_drag(
                 &mut model,
-                &ev(MouseEventKind::Down(MouseButton::Left), before.x + 2, before.y),
+                &ev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    before.x + 2,
+                    before.y
+                ),
                 host.0,
                 host.1,
             ),
@@ -6777,7 +6818,10 @@ mod tests {
             open_overlay_popup_rect(&snap0, 80, 24),
             "#53: cached overlay_popup must equal the on-demand popup rect"
         );
-        assert!(snap0.overlay_popup.is_some(), "an open menu must cache a popup");
+        assert!(
+            snap0.overlay_popup.is_some(),
+            "an open menu must cache a popup"
+        );
 
         // a menu-SELECTION change must NOT move the popup (it is selection-independent, so caching it
         // on the hover-less #56 snapshot is safe across HoverRedraws).
@@ -6937,13 +6981,19 @@ mod tests {
         assert!(!compositor.sidebar_width_animating());
 
         compositor.toggle_sidebar_collapsed();
-        assert!(compositor.sidebar_width_animating(), "collapse starts a slide");
+        assert!(
+            compositor.sidebar_width_animating(),
+            "collapse starts a slide"
+        );
         let mut prev = compositor.effective_sidebar_width(host);
         let mut steps = 0;
         while compositor.sidebar_width_animating() {
             compositor.step_sidebar_width_animation();
             let w = compositor.effective_sidebar_width(host);
-            assert!(w <= prev, "width must shrink monotonically while collapsing");
+            assert!(
+                w <= prev,
+                "width must shrink monotonically while collapsing"
+            );
             prev = w;
             steps += 1;
             assert!(steps < 20, "animation must terminate");
@@ -6951,7 +7001,10 @@ mod tests {
         assert_eq!(compositor.effective_sidebar_width(host), MINI_SIDEBAR_WIDTH);
 
         compositor.toggle_sidebar_collapsed();
-        assert!(compositor.sidebar_width_animating(), "expand starts a slide");
+        assert!(
+            compositor.sidebar_width_animating(),
+            "expand starts a slide"
+        );
         while compositor.sidebar_width_animating() {
             compositor.step_sidebar_width_animation();
         }
@@ -6974,7 +7027,10 @@ mod tests {
             Instant::now(),
         );
         let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
-        assert!(rect.width > 1, "expanded toggle is a full-width row, not a 1×1 cell");
+        assert!(
+            rect.width > 1,
+            "expanded toggle is a full-width row, not a 1×1 cell"
+        );
         // hittable at the LEFT edge, the RIGHT edge, and the middle of the bottom row.
         for x in [rect.x, rect.x + rect.width - 1, rect.x + rect.width / 2] {
             assert_eq!(
@@ -7273,7 +7329,11 @@ mod tests {
                 agents.push(AgentSummary {
                     agent_id: format!("{prefix}-agent-{w}-{a}"),
                     workspace_id: workspace_id.clone(),
-                    label: if a % 2 == 0 { "claude".into() } else { "codex".into() },
+                    label: if a % 2 == 0 {
+                        "claude".into()
+                    } else {
+                        "codex".into()
+                    },
                     status: match a % 3 {
                         0 => "working",
                         1 => "idle",
@@ -7436,8 +7496,14 @@ mod tests {
 
             let mut overlaid = overlay_content_onto_shell(&shell, &content);
             apply_hover_overlay(&mut overlaid, &shell, None, Some(sel));
-            assert_eq!(overlaid, golden, "#56: launcher overlay != baked for row {sel}");
-            assert_ne!(overlaid, bare, "#56: launcher row {sel} must paint a highlight");
+            assert_eq!(
+                overlaid, golden,
+                "#56: launcher overlay != baked for row {sel}"
+            );
+            assert_ne!(
+                overlaid, bare,
+                "#56: launcher row {sel} must paint a highlight"
+            );
         }
     }
 
@@ -7652,7 +7718,11 @@ mod tests {
             .take(2)
             .map(|(i, _)| SidebarHoverTarget::Workspace { ws_idx: *i })
             .collect();
-        assert_eq!(targets.len(), 2, "need two hoverable cards to simulate a sweep");
+        assert_eq!(
+            targets.len(),
+            2,
+            "need two hoverable cards to simulate a sweep"
+        );
 
         // Warm up so neither side pays first-touch allocator cost.
         let _ = std::hint::black_box(compositor.build_shell(&model, w, h, now));

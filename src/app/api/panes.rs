@@ -637,10 +637,16 @@ mod tests {
     #[test]
     fn report_pane_id_failure_reason_classifies_shapes() {
         // Well-formed server-issued id that simply does not resolve any more.
-        assert_eq!(report_pane_id_failure_reason("p_42"), "stale_or_unknown_pane");
+        assert_eq!(
+            report_pane_id_failure_reason("p_42"),
+            "stale_or_unknown_pane"
+        );
         // Wrong-shaped values that should never come from the integration env.
         assert_eq!(report_pane_id_failure_reason("p_abc"), "malformed_p_id");
-        assert_eq!(report_pane_id_failure_reason("issue-1"), "unexpected_id_format");
+        assert_eq!(
+            report_pane_id_failure_reason("issue-1"),
+            "unexpected_id_format"
+        );
         assert_eq!(report_pane_id_failure_reason("   "), "empty_pane_id");
     }
 

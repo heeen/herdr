@@ -1199,10 +1199,7 @@ impl ClientSupervisorModel {
     /// #47: the first selectable row — the initial highlight, so a menu never opens on a
     /// non-actionable row (e.g. the host version readout). Falls back to 0 when none are selectable.
     fn first_selectable_index(items: &[ClientMenuItem]) -> usize {
-        items
-            .iter()
-            .position(|item| item.selectable)
-            .unwrap_or(0)
+        items.iter().position(|item| item.selectable).unwrap_or(0)
     }
 
     /// #47: open the global launcher menu, anchored at the clicked menu-button cell. The launcher has
@@ -1830,7 +1827,11 @@ impl ClientSupervisorModel {
     /// not change what the user sees, producing the "indicator shown but drop does nothing" bug. The
     /// monolithic sidebar blocks the same case via `worktree_space().is_none()`; this mirrors it so
     /// the client arms a drag (and paints the drop indicator) only where a drop will take effect.
-    pub(crate) fn workspace_is_reorderable(&self, server_id: &ServerId, workspace_id: &str) -> bool {
+    pub(crate) fn workspace_is_reorderable(
+        &self,
+        server_id: &ServerId,
+        workspace_id: &str,
+    ) -> bool {
         self.server(server_id)
             .and_then(|server| {
                 server
@@ -3487,9 +3488,11 @@ mod tests {
             "ui-settings applied"
         );
         assert!(
-            model.workspace_rows().iter().any(|row| row.server_id
-                == ServerId::main()
-                && row.workspace_id.as_deref() == Some("ws-1")),
+            model
+                .workspace_rows()
+                .iter()
+                .any(|row| row.server_id == ServerId::main()
+                    && row.workspace_id.as_deref() == Some("ws-1")),
             "main summary applied"
         );
     }
@@ -5257,7 +5260,9 @@ mod tests {
         // when it drops, instead of collapsing to a single "unavailable" placeholder.
         let mut model = ClientSupervisorModel::new("local");
         let id = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
-        model.set_connection_state(&id, ConnectionState::Connected).unwrap();
+        model
+            .set_connection_state(&id, ConnectionState::Connected)
+            .unwrap();
         model
             .set_summary(
                 &id,
@@ -5286,7 +5291,9 @@ mod tests {
             .unwrap();
 
         // Drop the connection — summaries are intentionally retained.
-        model.set_connection_state(&id, ConnectionState::Disconnected).unwrap();
+        model
+            .set_connection_state(&id, ConnectionState::Disconnected)
+            .unwrap();
 
         let rows: Vec<_> = model
             .workspace_rows()
@@ -5294,10 +5301,17 @@ mod tests {
             .filter(|row| row.server_id == id)
             .collect();
         // Both individual spaces still listed (NOT a single placeholder), and greyed (disabled).
-        assert_eq!(rows.len(), 2, "individual spaces persist, no placeholder collapse");
+        assert_eq!(
+            rows.len(),
+            2,
+            "individual spaces persist, no placeholder collapse"
+        );
         assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-a"));
         assert_eq!(rows[1].workspace_id.as_deref(), Some("ws-b"));
-        assert!(rows.iter().all(|row| row.disabled), "rows greyed while disconnected");
+        assert!(
+            rows.iter().all(|row| row.disabled),
+            "rows greyed while disconnected"
+        );
     }
 
     #[test]
@@ -5722,7 +5736,13 @@ mod tests {
         // #44: a non-selectable version-readout row leads; then add/disable/disconnect; then update.
         assert_eq!(
             menu_labels(&model),
-            ["unknown", "add new space", "disable", "disconnect", "update"]
+            [
+                "unknown",
+                "add new space",
+                "disable",
+                "disconnect",
+                "update"
+            ]
         );
 
         // A disabled + disconnected host flips both toggle labels.
@@ -5908,19 +5928,17 @@ mod tests {
 
         // The items list STARTS with the version readout row and CONTAINS "update".
         let items = menu_labels(&model);
-        assert_eq!(items.first().map(String::as_str), Some(
-            format!("v0.6.4 · proto {local}").as_str()
-        ));
+        assert_eq!(
+            items.first().map(String::as_str),
+            Some(format!("v0.6.4 · proto {local}").as_str())
+        );
         assert!(
             items.iter().any(|item| item == "update"),
             "menu contains an update item: {items:?}"
         );
 
         // The version-readout row (index 0) is non-actionable -> Redraw.
-        assert_eq!(
-            model.select_client_menu_item(0),
-            ClientMenuOutcome::Redraw
-        );
+        assert_eq!(model.select_client_menu_item(0), ClientMenuOutcome::Redraw);
 
         // Selecting the update row index returns Update(server_id) for a connected host.
         let update_index = items
@@ -5945,7 +5963,10 @@ mod tests {
         model.set_remote_runtime_info(&remote, Some("0.6.0".into()), Some(local.wrapping_add(1)));
         model.open_host_context_menu(remote, "alpha".into(), 0, 0);
         let first = menu_labels(&model)[0].clone();
-        assert!(first.starts_with("⚠ "), "mismatched proto marks ⚠: {first:?}");
+        assert!(
+            first.starts_with("⚠ "),
+            "mismatched proto marks ⚠: {first:?}"
+        );
     }
 
     #[test]
