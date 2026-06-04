@@ -1234,6 +1234,11 @@ fn mixed_local_remote_client_connects_main_and_secondary_streams() {
     let dev_connected_before = count_log_occurrences(&dev_log_path, "client connected");
 
     let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    // Drain the client's PTY the way a real terminal does (matching the sibling mixed_* tests). An
+    // undrained PTY fills, the client's blocking stdout frame writes never return, and its
+    // single-threaded event loop freezes — so the Timer-driven secondary-stream connection asserted
+    // below never runs. Bind the receiver so the collector thread stays alive for the whole test.
+    let _client_output = spawn_pty_output_collector(client._master.as_ref());
     assert!(
         wait_for_log_occurrence_count(
             &main_log_path,
