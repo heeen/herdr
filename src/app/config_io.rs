@@ -300,17 +300,16 @@ mod tests {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::remove_dir_all(&dir);
 
-        match result {
-            // A non-NotFound read error must propagate so the caller aborts the save and never
-            // overwrites the existing config with empty-derived content.
-            Err(err) => assert_ne!(
+        // A non-NotFound read error must propagate so the caller aborts the save and never
+        // overwrites the existing config with empty-derived content. If the process can read
+        // mode-0 files (e.g. running as root), the `Err` path can't be exercised; don't fail the
+        // suite for an environment we can't control.
+        if let Err(err) = result {
+            assert_ne!(
                 err.kind(),
                 ErrorKind::NotFound,
                 "permission-denied must not be misreported as NotFound"
-            ),
-            // If the process can read mode-0 files (e.g. running as root), this path can't be
-            // exercised; don't fail the suite for an environment we can't control.
-            Ok(_) => {}
+            );
         }
     }
 

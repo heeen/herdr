@@ -802,7 +802,7 @@ mod tests {
         let remap: HashMap<u32, PaneId> = HashMap::from([(2u32, PaneId::from_raw(9))]);
         let prior: HashMap<u32, u32> = HashMap::from([(100u32, 1u32)]);
         let aliases = compose_handoff_aliases(&remap, &prior);
-        assert!(aliases.get(&100).is_none());
+        assert!(!aliases.contains_key(&100));
         assert_eq!(aliases.get(&2), Some(&PaneId::from_raw(9)));
     }
 

@@ -760,6 +760,10 @@ pub(crate) fn add_remote_popup_rect(area: Rect) -> Option<Rect> {
 
 /// Fixed inner rect for the add-remote overlay. Returns `None` when the host is too small to fit
 /// the overlay, in which case render and hit-test both no-op.
+///
+/// Test-only oracle: production render/hit-test reads this rect from the view (#53), so the helper
+/// is only referenced by unit tests asserting the two geometries agree.
+#[cfg(test)]
 pub(crate) fn add_remote_inner_rect(area: Rect) -> Option<Rect> {
     add_remote_popup_rect(area).map(|popup| {
         Rect::new(
@@ -807,6 +811,9 @@ pub(crate) fn new_workspace_picker_popup_rect(area: Rect, count: usize) -> Optio
 /// Shared inner rect for the new-workspace picker overlay. The popup height is derived from the
 /// destination `count` exactly the way `render_new_workspace_picker_overlay` sizes it, mirroring
 /// `open_existing_worktree_inner_rect`.
+///
+/// Test-only oracle (see `add_remote_inner_rect`): production reads this rect from the view (#53).
+#[cfg(test)]
 pub(crate) fn new_workspace_picker_inner_rect(area: Rect, count: usize) -> Option<Rect> {
     new_workspace_picker_popup_rect(area, count).map(|popup| {
         Rect::new(
@@ -1075,6 +1082,9 @@ pub(crate) fn remote_manage_popup_rect(area: Rect, count: usize) -> Option<Rect>
 /// item 3 (Area 3/5): the SHARED inner rect for the management overlay (render + hit-test). The
 /// popup width is 64, height derived from `count` exactly the way `render_remote_manage_overlay`
 /// sizes it. Returns `None` when the host is too small to fit.
+///
+/// Test-only oracle (see `add_remote_inner_rect`): production reads this rect from the view (#53).
+#[cfg(test)]
 pub(crate) fn remote_manage_inner_rect(area: Rect, count: usize) -> Option<Rect> {
     remote_manage_popup_rect(area, count).map(|popup| {
         Rect::new(
@@ -1324,6 +1334,9 @@ pub(crate) fn client_menu_popup_rect_at(
 
 /// #47: shared inner rect for the anchor-anchored client menu. Returns `None` when the host is too
 /// small for the popup.
+///
+/// Test-only oracle (see `add_remote_inner_rect`): production reads this rect from the view (#53).
+#[cfg(test)]
 pub(crate) fn client_menu_inner_rect_at(
     anchor_col: u16,
     anchor_row: u16,

@@ -532,6 +532,7 @@ impl ClientCompositor {
         self.sidebar_collapsed
     }
 
+    #[cfg(test)]
     pub(crate) fn agent_panel_scope(&self) -> crate::app::state::AgentPanelScope {
         self.agent_panel_scope
     }
@@ -741,9 +742,9 @@ impl ClientCompositor {
                 // per SIDEBAR_RESIZE_THROTTLE. Intermediate ticks return Redraw so the divider still
                 // tracks the cursor without flooding every server with un-coalesced resizes (which
                 // each force a full-frame baseline reset + PTY reflow). The final size is flushed on Up.
-                let due = self.last_resize_emitted.map_or(true, |prev| {
-                    now.duration_since(prev) >= SIDEBAR_RESIZE_THROTTLE
-                });
+                let due = self
+                    .last_resize_emitted
+                    .is_none_or(|prev| now.duration_since(prev) >= SIDEBAR_RESIZE_THROTTLE);
                 if due {
                     self.last_resize_emitted = Some(now);
                     Some(SidebarResizeOutcome::Resized(cols, rows))

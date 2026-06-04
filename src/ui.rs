@@ -58,22 +58,20 @@ use self::status::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        add_remote_button_rects, add_remote_inner_rect, add_remote_popup_rect,
-        client_menu_inner_rect_at, client_menu_popup_rect_at, client_menu_row_rect,
-        confirm_close_button_rects, confirm_close_popup_rect, confirm_close_workspace_button_rects,
-        confirm_close_workspace_popup_rect, new_linked_worktree_button_rects,
-        new_linked_worktree_inner_rect, new_workspace_picker_button_rects,
-        new_workspace_picker_inner_rect, new_workspace_picker_popup_rect,
+        add_remote_button_rects, add_remote_popup_rect, client_menu_popup_rect_at,
+        client_menu_row_rect, confirm_close_button_rects, confirm_close_popup_rect,
+        confirm_close_workspace_button_rects, confirm_close_workspace_popup_rect,
+        new_linked_worktree_button_rects, new_linked_worktree_inner_rect,
+        new_workspace_picker_button_rects, new_workspace_picker_popup_rect,
         new_workspace_picker_row_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_visible_start,
         remote_manage_confirm_button_rects, remote_manage_confirm_popup_rect,
-        remote_manage_inner_rect, remote_manage_popup_rect, remote_manage_row_rect,
-        remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
-        rename_workspace_button_rects, rename_workspace_popup_rect, render_add_remote_overlay,
-        render_client_menu_overlay, render_confirm_close_workspace_overlay,
-        render_new_workspace_picker_overlay, render_remote_manage_overlay,
-        render_rename_workspace_overlay, AddRemoteOverlayView, ClientMenuRowView, ClientMenuView,
-        DestinationView, RemoteManageRowView, RemoteStateGlyph,
+        remote_manage_popup_rect, remote_manage_row_rect, remove_worktree_button_rects,
+        remove_worktree_popup_rect, rename_button_rects, rename_workspace_button_rects,
+        rename_workspace_popup_rect, render_add_remote_overlay, render_client_menu_overlay,
+        render_confirm_close_workspace_overlay, render_new_workspace_picker_overlay,
+        render_remote_manage_overlay, render_rename_workspace_overlay, AddRemoteOverlayView,
+        ClientMenuRowView, ClientMenuView, DestinationView, RemoteManageRowView, RemoteStateGlyph,
     },
     settings::{
         settings_button_rects, settings_show_primary_action, SETTINGS_POPUP_HEIGHT,
@@ -83,12 +81,22 @@ pub(crate) use self::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_entry_row_count,
         agent_panel_scroll_metrics, agent_panel_scrollbar_rect, agent_panel_toggle_rect,
         collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
-        compute_workspace_list_areas_full, expanded_sidebar_sections, host_drop_indicator_row,
-        normalized_workspace_scroll, sidebar_section_divider_rect, workspace_drop_indicator_row,
-        workspace_list_entries, workspace_list_rect, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, HostBannerArea,
-        WorkspaceListEntry,
+        compute_workspace_list_areas_full, expanded_sidebar_sections, normalized_workspace_scroll,
+        sidebar_section_divider_rect, workspace_drop_indicator_row, workspace_list_entries,
+        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
+        workspace_parent_group_state, HostBannerArea, WorkspaceListEntry,
     },
+};
+// Test-only geometry oracles: after the #53 view-geometry refactor the production render/hit-test
+// path reads these rects from the view, so the helpers are referenced only by unit tests (in other
+// modules via `crate::ui::*`). Gated so they don't trip `dead_code`/`unused_imports` in the binary.
+#[cfg(test)]
+pub(crate) use self::{
+    dialogs::{
+        add_remote_inner_rect, client_menu_inner_rect_at, new_workspace_picker_inner_rect,
+        remote_manage_inner_rect,
+    },
+    sidebar::host_drop_indicator_row,
 };
 pub(crate) use self::{
     keybind_help::keybind_help_lines,
