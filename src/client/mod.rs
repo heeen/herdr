@@ -9624,16 +9624,21 @@ mod tests {
         let seen_cb = seen.clone();
         let on_progress = move |stage: RemoteProvisionStage| seen_cb.lock().unwrap().push(stage);
 
-        // Three stages spaced under the idle window; total runtime (~120ms) exceeds it, so this only
-        // succeeds because each progress event resets the deadline.
+        // Three stages, each spaced 150ms apart — under the 400ms idle window, but the ~450ms total
+        // exceeds it, so this only succeeds because each progress event resets the deadline.
+        //
+        // The window is deliberately ~2.7x the per-stage gap (not the old 2x of 40ms/80ms): under
+        // load a CI runner's `sleep(gap)` can overrun by well over the gap itself, and a too-tight
+        // window then fires a spurious idle timeout before the next stage lands (a macOS-CI flake).
+        // Keep `gap < window < 3*gap` so the reset is still exercised, with a large absolute margin.
         let result: Result<u32, RemoteOpError> =
-            run_remote_op_with_progress(Duration::from_millis(80), &on_progress, |sink| {
+            run_remote_op_with_progress(Duration::from_millis(400), &on_progress, |sink| {
                 for stage in [
                     RemoteProvisionStage::Connecting,
                     RemoteProvisionStage::Installing,
                     RemoteProvisionStage::Verifying,
                 ] {
-                    std::thread::sleep(Duration::from_millis(40));
+                    std::thread::sleep(Duration::from_millis(150));
                     sink(stage);
                 }
                 Ok(42)
