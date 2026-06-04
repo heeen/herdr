@@ -198,6 +198,12 @@ pub(crate) struct ClientCompositor {
     scrollbar_drag: Option<ScrollbarDrag>,
     animation_tick: u32,                                  // item 5
     hover: Option<crate::app::state::SidebarHoverTarget>, // item 7
+    // #48: the latest sidebar motion position awaiting hover resolution. The `Moved` dispatch records
+    // it here (O(1)) instead of resolving it through `hover_test` per event — resolving per event
+    // rebuilt the O(hosts×agents) `from_model` snapshot on every motion report, dropping a fast
+    // sidebar sweep to <1fps. `resolve_pending_hover` runs `hover_test` ONCE per frame at the
+    // deferred-render flush (latest-wins). `None` when nothing is pending.
+    pending_hover_pos: Option<(u16, u16)>,
     // #20: client-local agents-panel scope ("all" vs "current"). The server never owns this; it is
     // a per-client view preference fed into the render snapshot (`from_model`) and used to scope
     // the flat `agent_routes` so agent-row hit-testing stays aligned with the rendered entries.
@@ -473,6 +479,7 @@ impl ClientCompositor {
             scrollbar_drag: None,
             animation_tick: 0,
             hover: None,
+            pending_hover_pos: None,
             agent_panel_scope: crate::app::state::AgentPanelScope::default(),
             sidebar_collapsed: false,
             collapse_progress: 0.0,
@@ -628,6 +635,39 @@ impl ClientCompositor {
     /// the sidebar still clears a stale highlight, and by render mirroring in `from_model`.
     pub(crate) fn hover(&self) -> Option<crate::app::state::SidebarHoverTarget> {
         self.hover
+    }
+
+    /// #48: record the latest sidebar motion WITHOUT resolving it. Resolving every motion event
+    /// through `hover_test` rebuilds the O(hosts×agents) `from_model` snapshot per event — the
+    /// <1fps hover flood (issue #48). The `Moved` dispatch stores the position here (O(1)) and
+    /// `resolve_pending_hover` runs `hover_test` once per frame at the deferred-render flush.
+    pub(crate) fn set_pending_hover_pos(&mut self, pos: (u16, u16)) {
+        self.pending_hover_pos = Some(pos);
+    }
+
+    /// #48: whether a sidebar motion is waiting to be resolved. The `Moved` dispatch keeps
+    /// intercepting motion while this is set (even off the sidebar) so a sweep that leaves the
+    /// sidebar still resolves to `None` and clears the highlight — the role `hover().is_some()`
+    /// plays once the hover has been resolved.
+    pub(crate) fn has_pending_hover(&self) -> bool {
+        self.pending_hover_pos.is_some()
+    }
+
+    /// #48: resolve the latest pending sidebar motion into the hover target, ONCE. This runs the
+    /// expensive `hover_test`/`from_model` a single time at the per-frame deferred-render flush, not
+    /// once per motion event. Returns whether the hover target changed (so a same-position sweep
+    /// coalesces to no visible change). A no-op (returns `false`) when nothing is pending.
+    pub(crate) fn resolve_pending_hover(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+    ) -> bool {
+        let Some((col, row)) = self.pending_hover_pos.take() else {
+            return false;
+        };
+        let next = self.hover_test(model, col, row, host_width, host_height);
+        self.set_hover(next)
     }
 
     #[cfg(test)]
@@ -7650,6 +7690,54 @@ mod tests {
             new < old / 2,
             "#56: a hover repaint (cached shell + overlay) must be far cheaper than a shell rebuild \
              (new={new:?}, old={old:?})"
+        );
+    }
+
+    /// #48 regression + measurement (the INPUT side the #56 redraw fix left behind). A sidebar hover
+    /// used to run `hover_test` (→ the O(hosts×agents) `from_model` snapshot, a `TerminalState` per
+    /// agent) on EVERY mouse-motion event, so a fast sweep flooding one `Moved` per crossed cell ran
+    /// `from_model` dozens of times per frame → <1fps. The fix records the motion position per event
+    /// (O(1)) and resolves `hover_test` ONCE per frame at the deferred flush. This measures both costs
+    /// under a heavy 64-agent fleet and asserts the per-EVENT cost is now a tiny fraction of a
+    /// `from_model`, i.e. the O(hosts×agents) cost is OFF the per-motion-event path.
+    #[test]
+    fn hover_input_coalescing_keeps_from_model_off_the_per_event_path() {
+        let model = model_with_agents(8, 8); // 64 agents — the multi-remote load #48 calls out
+        let mut compositor = ClientCompositor::new(30);
+        let (w, h) = (200u16, 50u16);
+        const ITERS: u32 = 200;
+
+        // warm up the allocator so neither side pays first-touch cost.
+        let _ = std::hint::black_box(compositor.hover_test(&model, 1, 5, w, h));
+
+        // OLD per-EVENT cost: resolve the hover inline — every motion event rebuilt `from_model`.
+        let old_start = std::time::Instant::now();
+        for i in 0..ITERS {
+            std::hint::black_box(compositor.hover_test(&model, 1, (i % h as u32) as u16, w, h));
+        }
+        let old = old_start.elapsed();
+
+        // NEW per-EVENT cost (#48): just record the latest motion position (O(1)); the expensive
+        // `hover_test`/`from_model` is deferred to one `resolve_pending_hover` per frame.
+        let new_start = std::time::Instant::now();
+        for i in 0..ITERS {
+            compositor.set_pending_hover_pos((1, (i % h as u32) as u16));
+            std::hint::black_box(compositor.has_pending_hover());
+        }
+        let new = new_start.elapsed();
+
+        let old_us = old.as_secs_f64() * 1e6 / ITERS as f64;
+        let new_us = new.as_secs_f64() * 1e6 / ITERS as f64;
+        eprintln!(
+            "#48 per-EVENT hover cost @ 64 agents: inline hover_test(old)={old_us:.2}us, \
+             record-only(new)={new_us:.4}us, speedup={:.0}x  (from_model now runs 1x/frame, not 1x/event)",
+            old_us / new_us.max(f64::MIN_POSITIVE),
+        );
+
+        assert!(
+            new * 10 < old,
+            "#48: recording a motion position must be far cheaper than an inline hover_test/from_model \
+             (record={new:?}, hover_test={old:?})"
         );
     }
 }

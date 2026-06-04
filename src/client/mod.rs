@@ -1125,18 +1125,19 @@ fn dispatch_composited_mouse_input(
     // The `Redraw` arm recomposes locally (commit 3d47acd: no supervisor request, no server I/O).
     if matches!(mouse.kind, MouseEventKind::Moved) {
         let sidebar_width = compositor.sidebar_width().min(host_size.0);
-        if mouse.column < sidebar_width || compositor.hover().is_some() {
-            let next =
-                compositor.hover_test(model, mouse.column, mouse.row, host_size.0, host_size.1);
-            return if compositor.set_hover(next) {
-                // #48: a hover change is presentation-only — a couple of highlighted cells, not a
-                // model/view mutation. Route it to the lightweight `HoverRedraw` path (rebuild the
-                // shell so the new highlight paints, but keep the blit diff baseline so only the
-                // changed rows hit the terminal) instead of the full-redraw `Redraw` sledgehammer.
-                ClientInputDispatch::HoverRedraw
-            } else {
-                ClientInputDispatch::Consumed
-            };
+        if mouse.column < sidebar_width
+            || compositor.hover().is_some()
+            || compositor.has_pending_hover()
+        {
+            // #48: a hover change is presentation-only — a couple of highlighted cells, not a
+            // model/view mutation. RECORD the latest motion position and defer the resolve to the
+            // per-frame flush (latest-wins) instead of running `hover_test` here: resolving per
+            // motion event rebuilt the O(hosts×agents) `from_model` snapshot every event, dropping a
+            // fast sidebar sweep to <1fps (issue #48). `recompose_composited_frame` calls
+            // `resolve_pending_hover` ONCE per frame. Still intercept while a hover is set OR pending
+            // so a sweep that leaves the sidebar still resolves to `None` and clears the highlight.
+            compositor.set_pending_hover_pos((mouse.column, mouse.row));
+            return ClientInputDispatch::HoverRedraw;
         }
     }
 
@@ -3952,9 +3953,14 @@ fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
     // the immutable compose borrow — keeps the live duration timer fresh on every compose, not
     // just animation ticks (render itself stays pure; the map upkeep performs no I/O).
     let now = Instant::now();
+    let host = state.host_size;
     if let (Some(compositor), Some(model)) =
         (state.compositor.as_mut(), state.supervisor_model.as_ref())
     {
+        // #48: resolve the latest deferred sidebar motion into the hover target ONCE per composed
+        // frame — runs the expensive `hover_test`/`from_model` a single time per frame, not once per
+        // motion event (the <1fps hover flood). A no-op when no motion is pending.
+        compositor.resolve_pending_hover(model, host.0, host.1);
         prune_and_seed_working_since(compositor, model, now);
     }
 
@@ -8598,26 +8604,49 @@ mod tests {
     }
 
     #[test]
-    fn composited_moved_sets_hover_and_redraws_then_coalesces() {
+    fn composited_moved_records_pending_hover_and_resolves_once_per_frame() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
         let host = (60u16, 24u16);
         let row = remote_workspace_row(&compositor, &model, &remote_id, host);
 
-        // #48: first motion over the row → HoverRedraw (hover changed from None) — the lightweight,
-        // diff-only path, NOT a full Redraw.
+        // #48: a motion over the row RECORDS a pending hover and asks for a (deferred) HoverRedraw —
+        // it does NOT resolve `hover_test` inline (resolving per motion event rebuilt the
+        // O(hosts×agents) `from_model` snapshot every event, the <1fps hover flood).
         assert_eq!(
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
             ClientInputDispatch::HoverRedraw
+        );
+        assert!(compositor.has_pending_hover(), "motion records a pending hover");
+        assert_eq!(
+            compositor.hover(),
+            None,
+            "hover is resolved at the per-frame flush, not inline"
+        );
+
+        // the per-frame flush resolves it ONCE; the hover lands on the workspace row.
+        assert!(
+            compositor.resolve_pending_hover(&model, host.0, host.1),
+            "first resolve changes the hover from None"
         );
         assert!(matches!(
             compositor.hover(),
             Some(crate::app::state::SidebarHoverTarget::Workspace { .. })
         ));
-        // a second identical motion → Consumed (change-detection coalescing, zero redraw).
+        assert!(
+            !compositor.has_pending_hover(),
+            "resolve consumes the pending position"
+        );
+
+        // a second identical motion records the same position again; resolving it is a no-op
+        // (latest-wins coalescing — a same-row sweep produces no visible change).
         assert_eq!(
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
-            ClientInputDispatch::Consumed
+            ClientInputDispatch::HoverRedraw
+        );
+        assert!(
+            !compositor.resolve_pending_hover(&model, host.0, host.1),
+            "an unchanged hover resolves to no change"
         );
     }
 
@@ -8628,16 +8657,23 @@ mod tests {
         let host = (60u16, 24u16);
         let row = remote_workspace_row(&compositor, &model, &remote_id, host);
 
-        // establish a sidebar hover.
+        // establish a sidebar hover (record on motion, resolve at the per-frame flush).
         assert_eq!(
             dispatch_composited_input(moved_bytes(1, row), &mut compositor, &mut model, host),
             ClientInputDispatch::HoverRedraw
         );
-        // motion into the content area clears the hover → exactly one HoverRedraw (#48: clearing the
-        // highlight is still a presentation-only change).
+        assert!(compositor.resolve_pending_hover(&model, host.0, host.1));
+        assert!(compositor.hover().is_some());
+        // motion into the content area is still intercepted (a hover is set) → records a pending
+        // hover; resolving it clears the highlight (a content position hover-tests to None). #48:
+        // clearing the highlight is still a presentation-only change.
         assert_eq!(
             dispatch_composited_input(moved_bytes(40, 3), &mut compositor, &mut model, host),
             ClientInputDispatch::HoverRedraw
+        );
+        assert!(
+            compositor.resolve_pending_hover(&model, host.0, host.1),
+            "leaving the sidebar resolves the hover to None — a change"
         );
         assert_eq!(compositor.hover(), None);
         // #31: a second content motion (no prior hover) falls through to
