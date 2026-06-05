@@ -602,6 +602,22 @@ fn pane_shell(configured_shell: &str) -> String {
     pane_shell_from(configured_shell, std::env::var("SHELL").ok())
 }
 
+/// #59: build the base command for an interactive *login* pane shell. argv is `[shell, "-l"]` with
+/// the working directory set; the caller layers env + agent-integration vars on top. Login so the
+/// per-login startup files load (zsh `~/.zprofile`, bash `~/.bash_profile`) — a PTY-backed shell with
+/// no script is already interactive, so `-l` makes it an interactive *login* shell, the same kind
+/// macOS Terminal.app, iTerm2, and tmux spawn by default, where a user's `PATH`/aliases in
+/// `~/.zprofile` "just work" in every pane. `-l` is honored by zsh/bash/fish/nu/dash. Agent panes and
+/// `-c` command panes use other spawn paths (`spawn_argv_command`/`spawn_agent_restore`/
+/// `spawn_shell_command`) and are intentionally NOT login shells.
+fn pane_login_shell_command(default_shell: &str, cwd: std::path::PathBuf) -> CommandBuilder {
+    let shell = pane_shell(default_shell);
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.arg("-l");
+    cmd.cwd(cwd);
+    cmd
+}
+
 fn pane_shell_from(configured_shell: &str, env_shell: Option<String>) -> String {
     let configured_shell = configured_shell.trim();
     if !configured_shell.is_empty() {
@@ -919,9 +935,7 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
-        let shell = pane_shell(default_shell);
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.cwd(cwd);
+        let mut cmd = pane_login_shell_command(default_shell, cwd);
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
         apply_pane_terminal_env(&mut cmd);
         crate::integration::apply_pane_env(&mut cmd, pane_id);
@@ -2242,6 +2256,23 @@ mod tests {
     fn pane_shell_ignores_empty_values() {
         assert_eq!(pane_shell_from("   ", Some("  ".to_string())), "/bin/sh");
         assert_eq!(pane_shell_from("", None), "/bin/sh");
+    }
+
+    #[test]
+    fn pane_login_shell_command_is_a_login_shell() {
+        // #59: the interactive pane shell must be spawned as a login shell (`-l`) so per-login startup
+        // files load (zsh `~/.zprofile`, bash `~/.bash_profile`), matching macOS Terminal.app / tmux.
+        let cmd = pane_login_shell_command("/bin/zsh", std::path::PathBuf::from("/tmp"));
+        let argv = cmd.get_argv();
+        assert_eq!(
+            argv.first().map(|s| s.as_os_str()),
+            Some(std::ffi::OsStr::new("/bin/zsh")),
+            "argv[0] is the shell program"
+        );
+        assert!(
+            argv.iter().any(|a| a == std::ffi::OsStr::new("-l")),
+            "interactive pane shell must be a login shell (argv contains -l), got {argv:?}"
+        );
     }
 
     #[test]
