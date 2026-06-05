@@ -2720,8 +2720,8 @@ fn render_sidebar_toggle(
     p: &Palette,
 ) {
     // #9: draw the affordance in BOTH modes (it used to early-return when expanded, leaving an
-    // invisible 1×1 hit cell). Expanded shows a labeled `‹‹ collapse`; collapsed shows `»` (the mini
-    // strip is too narrow for a word). ratatui clips the label to the rect.
+    // invisible 1×1 hit cell). #58: a single matching guillemet pair, no word — expanded shows `«`
+    // (will collapse), collapsed shows `»` (will expand). ratatui clips the label to the rect.
     let toggle_area = collapsed_sidebar_toggle_rect(area);
     if toggle_area == Rect::default() {
         return;
@@ -2731,7 +2731,7 @@ fn render_sidebar_toggle(
     } else {
         Style::default().fg(p.overlay0)
     };
-    let label = if collapsed { "»" } else { "‹‹ collapse" };
+    let label = if collapsed { "»" } else { "«" };
     frame.render_widget(Paragraph::new(Span::styled(label, icon_style)), toggle_area);
 }
 

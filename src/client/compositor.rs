@@ -7079,6 +7079,50 @@ mod tests {
         assert!(!snap.app.sidebar_collapsed);
     }
 
+    // #58.3: harden the collapse/expand toggle against the REAL collapsed geometry. The sibling test
+    // above forces width 26 (collapse_progress still 0), so it never exercises the mini strip the user
+    // actually clicks. Here we let the slide settle to `MINI_SIDEBAR_WIDTH` and assert the bottom-row
+    // expand affordance is hittable across its FULL width — i.e. "click the collapsed » (or anywhere on
+    // the bottom row)" resolves to the toggle. The bug was triaged against the pre-#25 server-side code;
+    // on this branch the client-side toggle (`collapsed_sidebar_toggle_rect` checked before the
+    // collapsed sections, render == hit-test) makes it reliably expandable.
+    #[test]
+    fn collapsed_mini_toggle_row_is_hittable_full_width() {
+        let (model, _local, _agent) = collapsed_model();
+        let mut compositor = ClientCompositor::new(26);
+        let host = (60u16, 28u16);
+
+        compositor.toggle_sidebar_collapsed();
+        while compositor.sidebar_width_animating() {
+            compositor.step_sidebar_width_animation();
+        }
+        let width = compositor.effective_sidebar_width(host.0);
+        assert_eq!(width, MINI_SIDEBAR_WIDTH, "collapse settles to the mini width");
+
+        let snap = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            width,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        assert!(snap.app.sidebar_collapsed);
+
+        let rect = crate::ui::collapsed_sidebar_toggle_rect(snap.app.view.sidebar_rect);
+        assert!(
+            rect.width > 0 && rect.y == host.1 - 1,
+            "toggle is the bottom row of the mini strip"
+        );
+        for x in [rect.x, rect.x + rect.width / 2, rect.x + rect.width - 1] {
+            assert_eq!(
+                compositor.hit_test(&model, x, rect.y, host.0, host.1),
+                Some(SidebarHitTarget::CollapsedSidebarToggle),
+                "collapsed mini toggle must be hittable at column {x}"
+            );
+        }
+    }
+
     // In COLLAPSED mode a workspace-glance row resolves to Workspace for the owning server, and that
     // target focuses the right workspace via `focus_workspace_route` (mirrors the expanded path).
     #[test]
