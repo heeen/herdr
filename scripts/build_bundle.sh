@@ -53,7 +53,7 @@ require() {
 require cargo "Install Rust: https://rustup.rs"
 require rustc "Install Rust: https://rustup.rs"
 require rustup "Install Rust: https://rustup.rs"
-if ! cargo zigbuild --version >/dev/null 2>&1; then
+if ! cargo-zigbuild --version >/dev/null 2>&1; then
   echo "error: cargo-zigbuild not found. Install with: cargo install cargo-zigbuild" >&2
   exit 1
 fi
