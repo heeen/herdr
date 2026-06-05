@@ -54,7 +54,7 @@ use crate::server::notifications::{
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
 };
-use crate::server::terminal_attach::paste_payload_for_runtime;
+use crate::server::terminal_attach::clipboard_image_paste_payload;
 
 #[cfg(test)]
 use crate::protocol::RenderEncoding;
@@ -1071,7 +1071,10 @@ impl HeadlessServer {
         }) = self.clients.get(&client_id)
         {
             if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                let payload = paste_payload_for_runtime(runtime, &path);
+                // #59: send the staged image path UN-bracketed so the agent's path→image auto-attach
+                // fires. Bracketing it (as a normal text paste would) made Claude Code treat it as
+                // literal text and print the path instead of attaching the image.
+                let payload = clipboard_image_paste_payload(&path);
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
                     warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
                 }
