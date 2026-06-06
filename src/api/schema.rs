@@ -896,6 +896,12 @@ pub struct AgentInfo {
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// #58: the pane's MANUAL rename (`terminal.manual_label`) — the "pane name" the sidebar shows,
+    /// distinct from `name` (the agent name). Carried so the client-rendered multi-remote sidebar can
+    /// show it; the refactor that moved sidebar rendering client-side dropped it. Additive + optional,
+    /// so older peers that omit it simply render no pane name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

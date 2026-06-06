@@ -7206,6 +7206,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -10135,6 +10136,7 @@ mod tests {
                         label: "claude".into(),
                         status: status.into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )

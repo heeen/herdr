@@ -112,6 +112,9 @@ pub(crate) struct AgentSummary {
     pub(crate) label: String,
     pub(crate) status: String,
     pub(crate) focused: bool,
+    /// #58: the pane's manual rename (wire `AgentInfo.manual_label`) — the sidebar "pane name". `None`
+    /// for an unrenamed pane.
+    pub(crate) pane_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +489,8 @@ pub(crate) struct AgentSidebarRow {
     pub(crate) label: String,
     pub(crate) status: String,
     pub(crate) focused: bool,
+    /// #58: the pane's manual rename ("pane name"); `None` for an unrenamed pane.
+    pub(crate) pane_label: Option<String>,
 }
 
 /// item 3 (Area 5): the overlay-state of a remote in the management overlay, analogous to
@@ -2688,6 +2693,7 @@ fn agent_groups_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Agen
                     label: agent.label.clone(),
                     status: agent.status.clone(),
                     focused: agent.focused,
+                    pane_label: agent.pane_label.clone(),
                 })
                 .collect();
 
@@ -2998,6 +3004,7 @@ impl ServerSummary {
                         label,
                         status,
                         focused: agent.focused,
+                        pane_label: agent.manual_label,
                     }
                 })
                 .collect(),
@@ -3330,6 +3337,7 @@ mod tests {
         crate::api::schema::AgentInfo {
             terminal_id: terminal_id.into(),
             name: Some(label.into()),
+            manual_label: None,
             agent: None,
             title: None,
             display_agent: None,
@@ -3576,6 +3584,7 @@ mod tests {
                     label: "claude".into(),
                     status: "working".into(),
                     focused: true,
+                    pane_label: None,
                 }],
             }]
         );
@@ -4314,6 +4323,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -4335,6 +4345,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: true,
+                        pane_label: None,
                     }],
                 },
             )
@@ -4353,6 +4364,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
                 AgentSidebarGroup {
@@ -4365,6 +4377,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: true,
+                        pane_label: None,
                     }],
                 },
             ]
@@ -4383,6 +4396,7 @@ mod tests {
                     label: "claude".into(),
                     status: "idle".into(),
                     focused: true,
+                    pane_label: None,
                 }],
             }]
         );
@@ -4454,6 +4468,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -4547,6 +4562,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )

@@ -411,6 +411,8 @@ impl App {
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
+            // #58: carry the pane's manual rename so the client-rendered sidebar can show "pane name".
+            manual_label: terminal.manual_label.clone(),
             agent: pane.agent,
             title: pane.title,
             display_agent: pane.display_agent,

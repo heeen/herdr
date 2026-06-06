@@ -2021,6 +2021,12 @@ impl ClientSidebarSnapshot {
                 let (state, seen) = agent_state_from_status(&agent.status);
                 let mut terminal = TerminalState::new(terminal_id.clone(), "/".into());
                 terminal.set_agent_name(agent.label.clone());
+                // #58: the sidebar "pane name" = `terminal.manual_label` (see `pane_details_at`). The
+                // multi-remote summary now carries the pane's manual rename, so set it here or the
+                // client renders no pane name even when the pane was renamed.
+                if let Some(pane_label) = &agent.pane_label {
+                    terminal.set_manual_label(pane_label.clone());
+                }
                 if state == AgentState::Working {
                     // Working agents: seed working_since = the persisted start instant so the
                     // live duration timer survives recompose. The map is upkept in the event
@@ -3674,6 +3680,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -3850,6 +3857,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -4036,6 +4044,7 @@ mod tests {
                             label: "claude".into(),
                             status: "idle".into(),
                             focused: false,
+                            pane_label: None,
                         },
                         AgentSummary {
                             agent_id: "agent-2".into(),
@@ -4043,6 +4052,7 @@ mod tests {
                             label: "codex".into(),
                             status: "idle".into(),
                             focused: false,
+                            pane_label: None,
                         },
                     ],
                 },
@@ -4138,6 +4148,7 @@ mod tests {
                         label: "claude".into(),
                         status: "working".into(),
                         focused: true,
+                        pane_label: None,
                     }],
                 },
             )
@@ -4160,6 +4171,7 @@ mod tests {
                         label: "codex".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -5360,6 +5372,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -5577,6 +5590,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -6013,6 +6027,7 @@ mod tests {
                         label: "claude".into(),
                         status: agent_status.into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -6907,6 +6922,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -6915,6 +6931,50 @@ mod tests {
     }
 
     // ---- #25: collapsed sidebar (client compositor) ----
+
+    // #58: a renamed pane's manual_label must travel summary -> agent_groups -> from_model and surface
+    // as the sidebar "pane name" (`PaneDetail.pane_label`). Before this plumbing the multi-remote
+    // summary dropped it, so the client rendered no pane name even for renamed panes.
+    #[test]
+    fn from_model_carries_pane_manual_label_to_sidebar() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "ws-1".into(),
+                        label: "proj".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "term-1".into(),
+                        workspace_id: "ws-1".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: true,
+                        pane_label: Some("backend".into()),
+                    }],
+                },
+            )
+            .unwrap();
+        let compositor = ClientCompositor::new(26);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        let labels: Vec<_> = snap
+            .app
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.pane_details(&snap.app.terminals))
+            .map(|detail| detail.pane_label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.as_deref() == Some("backend")),
+            "renamed pane's manual_label must surface as the sidebar pane name; got {labels:?}"
+        );
+    }
 
     // A single-server model whose focused workspace owns an agent, so the collapsed detail section
     // (which shows the SELECTED workspace's panes) is non-empty. Returns the agent id for assertions.
@@ -6946,6 +7006,7 @@ mod tests {
                         label: "claude".into(),
                         status: "idle".into(),
                         focused: false,
+                        pane_label: None,
                     }],
                 },
             )
@@ -7386,6 +7447,7 @@ mod tests {
                     }
                     .into(),
                     focused: w == 0 && a == 0,
+                    pane_label: None,
                 });
             }
         }
