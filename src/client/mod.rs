@@ -4749,6 +4749,24 @@ async fn run_client_loop(
                     info!(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
+                    // #59: a screenshot tool like macshot copies a file URL pointing into its OWN
+                    // sandboxed container, which macOS won't let herdr (or the agent) read — so the
+                    // image silently falls back to a dead path. Detect that and warn the user instead
+                    // of letting an inaccessible URL paste into the prompt.
+                    if let Some(path) = crate::platform::clipboard_image_file_if_unreadable() {
+                        warn!(
+                            path = %path,
+                            "clipboard image file is unreadable (sandboxed container?); cannot attach"
+                        );
+                        let _ = crate::platform::show_desktop_notification(
+                            "herdr: image can't be attached",
+                            Some(
+                                "The copied image lives in a sandboxed/unreadable location (e.g. a \
+                                 screenshot-tool container). Copy the image itself (⌘⇧⌃4) or use a \
+                                 tool that puts image data on the clipboard.",
+                            ),
+                        );
+                    }
                 }
                 let msg = ClientMessage::Input { data };
                 let server_id = active_server_id(&state);

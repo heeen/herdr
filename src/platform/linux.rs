@@ -219,6 +219,13 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     None
 }
 
+/// #59: Linux counterpart to the macOS sandboxed-image detector. No-op for now — the macshot-style
+/// sandboxed-container clipboard is a macOS (TCC) phenomenon; Linux clipboards expose image data
+/// directly via `read_clipboard_image`.
+pub fn clipboard_image_file_if_unreadable() -> Option<String> {
+    None
+}
+
 /// Show a native desktop notification through libnotify's command-line helper.
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
     show_desktop_notification_with_command(title, body, |program| Command::new(program))
