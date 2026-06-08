@@ -767,7 +767,11 @@ fn sidebar_action_dispatch(
     // round-trip — the SAME methods the mouse toggles call.
     if matches(&keybinds.toggle_sidebar) {
         compositor.toggle_sidebar_collapsed();
-        return Some(ClientInputDispatch::Redraw);
+        // #58: do NOT redraw at the pre-toggle width here — that wasted a full O(hosts×agents)
+        // build_shell showing the unchanged sidebar before the slide. The collapse now settles in one
+        // gated tick (SIDEBAR_COLLAPSE_ANIM_STEP == 1.0) which renders the FINAL width and emits the
+        // content resize, so a single rebuild does the whole transition.
+        return Some(ClientInputDispatch::Consumed);
     }
 
     None
@@ -1300,7 +1304,10 @@ fn dispatch_composited_mouse_input(
         if matches!(target, compositor::SidebarHitTarget::CollapsedSidebarToggle) {
             return if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 compositor.toggle_sidebar_collapsed();
-                ClientInputDispatch::Redraw
+                // #58: defer the render to the single collapse tick (which renders the FINAL width +
+                // emits the resize) instead of redrawing the pre-toggle width first — that wasted a
+                // full build_shell per collapse on the UI loop.
+                ClientInputDispatch::Consumed
             } else {
                 ClientInputDispatch::Consumed
             };
@@ -8163,7 +8170,9 @@ mod tests {
     }
 
     // A collapse-toggle key flips `from_model`'s `app.sidebar_collapsed`; a scope-toggle key flips
-    // the agent-panel scope. Both are client-local compositor flips (Redraw, no server traffic).
+    // the agent-panel scope. Both are client-local compositor flips with no server traffic. #58: the
+    // collapse toggle now returns `Consumed` (not `Redraw`) — the single collapse tick renders the
+    // final width, so the toggle skips a wasted pre-toggle-width repaint.
     #[test]
     fn collapse_toggle_key_flips_sidebar_collapsed() {
         with_client_keys_config("[keys]\ntoggle_sidebar = \"alt+b\"\n", || {
@@ -8173,7 +8182,7 @@ mod tests {
 
             let dispatch =
                 dispatch_composited_input(b"\x1bb".to_vec(), &mut compositor, &mut model, (60, 16));
-            assert_eq!(dispatch, ClientInputDispatch::Redraw);
+            assert_eq!(dispatch, ClientInputDispatch::Consumed);
             assert!(compositor.sidebar_collapsed_for_test());
         });
     }
@@ -8200,10 +8209,11 @@ mod tests {
                 assert!(compositor.prefix_armed());
 
                 // 'b' resolves the prefix-mode collapse: flips the CLIENT flag, disarms prefix, and
-                // is NOT forwarded to the server (a Redraw, never a Forward).
+                // is NOT forwarded to the server. #58: the collapse toggle returns `Consumed` (never a
+                // Forward) — the single collapse tick repaints the final width, no pre-toggle redraw.
                 assert_eq!(
                     press_char('b', &mut compositor, &mut model),
-                    ClientInputDispatch::Redraw
+                    ClientInputDispatch::Consumed
                 );
                 assert!(!compositor.prefix_armed());
                 assert!(compositor.sidebar_collapsed_for_test());
@@ -8215,7 +8225,7 @@ mod tests {
                 );
                 assert_eq!(
                     press_char('b', &mut compositor, &mut model),
-                    ClientInputDispatch::Redraw
+                    ClientInputDispatch::Consumed
                 );
                 assert!(!compositor.sidebar_collapsed_for_test());
             },

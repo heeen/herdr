@@ -33,9 +33,13 @@ const SIDEBAR_RESIZE_THROTTLE: std::time::Duration = std::time::Duration::from_m
 /// dot + separator) so `render_sidebar_collapsed` lays out cleanly at this width.
 const MINI_SIDEBAR_WIDTH: u16 = 4;
 
-/// #9: fraction of the collapse/expand transition covered per gated 80ms Timer tick (≈4 ticks ≈
-/// 320ms end-to-end).
-const SIDEBAR_COLLAPSE_ANIM_STEP: f32 = 0.25;
+/// #9/#58: fraction of the collapse/expand transition covered per gated 80ms Timer tick. A full
+/// `1.0` makes the transition a SINGLE step: each rendered tick reruns the synchronous, O(hosts×
+/// agents) `build_shell`/`from_model` on the UI loop, so a multi-tick slide multiplied that cost
+/// (≈5 rebuilds) and visibly janked collapse/expand under a many-remote fleet. One step = one
+/// rebuild — the snappy minimum (the remaining cost is a single `from_model`, the known O(visible)
+/// ceiling), with no resize storm (the tick still emits at most one content resize).
+const SIDEBAR_COLLAPSE_ANIM_STEP: f32 = 1.0;
 
 /// #9: round-interpolate a width between `full` (t=0) and `mini` (t=1).
 fn lerp_sidebar_width(full: u16, mini: u16, t: f32) -> u16 {
