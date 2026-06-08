@@ -906,6 +906,11 @@ pub struct AgentInfo {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// #58: the display name of the TAB this pane is in (`Tab::display_name()` — custom name or
+    /// number). Carried so the multi-remote client can group panes into tabs and render tab names;
+    /// additive + optional, older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,

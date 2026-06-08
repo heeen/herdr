@@ -2018,8 +2018,13 @@ impl ClientSidebarSnapshot {
                 active_rank = effective_rank;
             }
 
-            let mut pane_terminals = Vec::new();
-            let mut ws_agent_routes = Vec::new();
+            // #58: group this workspace's agents into TABS (by wire `tab_id`, first-seen order) so the
+            // client sidebar can show tab names. Per-tab buckets keep the agent routes aligned with
+            // the tab-then-pane order `pane_details` renders. A single-tab workspace yields one group.
+            let mut tab_index: HashMap<String, usize> = HashMap::new();
+            let mut tab_specs: Vec<crate::workspace::SidebarPlaceholderTab> = Vec::new();
+            let mut tab_routes: Vec<Vec<AgentRoute>> = Vec::new();
+            let mut active_tab = 0usize;
             for agent in &agents {
                 let terminal_id = TerminalId::alloc();
                 let (state, seen) = agent_state_from_status(&agent.status);
@@ -2056,23 +2061,38 @@ impl ClientSidebarSnapshot {
                     terminal.state = state;
                 }
                 app.terminals.insert(terminal_id.clone(), terminal);
-                pane_terminals.push((terminal_id, seen));
-                ws_agent_routes.push(AgentRoute {
+                let group = *tab_index.entry(agent.tab_id.clone()).or_insert_with(|| {
+                    let group = tab_specs.len();
+                    tab_specs.push(crate::workspace::SidebarPlaceholderTab {
+                        custom_name: agent.tab_label.clone(),
+                        number: group + 1,
+                        pane_terminals: Vec::new(),
+                    });
+                    tab_routes.push(Vec::new());
+                    group
+                });
+                if agent.focused {
+                    active_tab = group;
+                }
+                tab_specs[group].pane_terminals.push((terminal_id, seen));
+                tab_routes[group].push(AgentRoute {
                     server_id: row.server_id.clone(),
                     agent_id: agent.agent_id.clone(),
                 });
             }
+            // Flatten routes in tab order so they line up with `pane_details` (tabs, then panes).
+            let ws_agent_routes: Vec<AgentRoute> = tab_routes.into_iter().flatten().collect();
 
             let workspace_id = row
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| format!("client-sidebar-row-{idx}"));
-            let (mut workspace, _) = crate::workspace::Workspace::sidebar_placeholder(
+            let mut workspace = crate::workspace::Workspace::sidebar_placeholder_with_tabs(
                 workspace_id,
                 row.label.clone(),
                 row.branch.clone(),
-                pane_terminals,
-                focused_agent_idx,
+                tab_specs,
+                active_tab,
             );
             // #22: populate the placeholder's worktree grouping from the wire field so the SHARED
             // `workspace_list_entries` groups worktree parents/children exactly like the server. The
@@ -3685,6 +3705,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -3862,6 +3884,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -4049,6 +4073,8 @@ mod tests {
                             status: "idle".into(),
                             focused: false,
                             pane_label: None,
+                            tab_id: String::new(),
+                            tab_label: None,
                         },
                         AgentSummary {
                             agent_id: "agent-2".into(),
@@ -4057,6 +4083,8 @@ mod tests {
                             status: "idle".into(),
                             focused: false,
                             pane_label: None,
+                            tab_id: String::new(),
+                            tab_label: None,
                         },
                     ],
                 },
@@ -4153,6 +4181,8 @@ mod tests {
                         status: "working".into(),
                         focused: true,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -4176,6 +4206,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -5377,6 +5409,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -5595,6 +5629,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -6032,6 +6068,8 @@ mod tests {
                         status: agent_status.into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -6927,6 +6965,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -6960,6 +7000,8 @@ mod tests {
                         status: "idle".into(),
                         focused: true,
                         pane_label: Some("backend".into()),
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -6977,6 +7019,72 @@ mod tests {
         assert!(
             labels.iter().any(|label| label.as_deref() == Some("backend")),
             "renamed pane's manual_label must surface as the sidebar pane name; got {labels:?}"
+        );
+    }
+
+    // #58: agents in distinct tabs (by wire tab_id) must be grouped into separate client tabs carrying
+    // their names, so the sidebar renders tab names (`pane_details` shows tab_label only when >1 tab).
+    #[test]
+    fn from_model_groups_agents_into_named_tabs() {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "ws-1".into(),
+                        label: "proj".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![
+                        AgentSummary {
+                            agent_id: "a1".into(),
+                            workspace_id: "ws-1".into(),
+                            label: "claude".into(),
+                            status: "idle".into(),
+                            focused: true,
+                            pane_label: None,
+                            tab_id: "t1".into(),
+                            tab_label: Some("edit".into()),
+                        },
+                        AgentSummary {
+                            agent_id: "a2".into(),
+                            workspace_id: "ws-1".into(),
+                            label: "codex".into(),
+                            status: "idle".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: "t2".into(),
+                            tab_label: Some("logs".into()),
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let compositor = ClientCompositor::new(26);
+        let snap =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+        let ws = snap
+            .app
+            .workspaces
+            .iter()
+            .find(|ws| ws.tabs.len() == 2)
+            .expect("two distinct tab_ids must build two tabs");
+        let tab_names: Vec<_> = ws.tabs.iter().map(|tab| tab.display_name()).collect();
+        assert!(
+            tab_names.contains(&"edit".to_string()) && tab_names.contains(&"logs".to_string()),
+            "each tab keeps its display name; got {tab_names:?}"
+        );
+        let tab_labels: Vec<_> = ws
+            .pane_details(&snap.app.terminals)
+            .into_iter()
+            .map(|detail| detail.tab_label)
+            .collect();
+        assert!(
+            tab_labels.contains(&"edit".to_string()) && tab_labels.contains(&"logs".to_string()),
+            "pane_details must surface each pane's tab name; got {tab_labels:?}"
         );
     }
 
@@ -7011,6 +7119,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -7452,6 +7562,8 @@ mod tests {
                     .into(),
                     focused: w == 0 && a == 0,
                     pane_label: None,
+                    tab_id: String::new(),
+                    tab_label: None,
                 });
             }
         }

@@ -23,6 +23,15 @@ pub use self::{
     tab::Tab,
 };
 
+/// #58: one tab's worth of a sidebar placeholder workspace — the panes (agent terminals) in that tab
+/// plus the tab's display name and number. The multi-remote client groups its summary agents by
+/// `tab_id` into these so the client-rendered sidebar can show tab names.
+pub(crate) struct SidebarPlaceholderTab {
+    pub custom_name: Option<String>,
+    pub number: usize,
+    pub pane_terminals: Vec<(TerminalId, bool)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeSpaceMembership {
     pub key: String,
@@ -95,78 +104,88 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
-    pub(crate) fn sidebar_placeholder(
+    /// #58: build a placeholder workspace with one [`Tab`] per spec, so the multi-remote
+    /// client-rendered sidebar can show TAB NAMES — the renderer derives `tab_label` from each tab's
+    /// `display_name()` and gates the tab segment on `tabs.len() > 1` (see `pane_details_at`). A
+    /// single tab is the degenerate case. Panes are numbered globally across tabs; `active_tab`
+    /// selects the focused tab. No PTYs — view-only.
+    pub(crate) fn sidebar_placeholder_with_tabs(
         id: String,
         name: String,
         branch: Option<String>,
-        pane_terminals: Vec<(TerminalId, bool)>,
-        focused_pane_idx: Option<usize>,
-    ) -> (Self, Vec<PaneId>) {
+        tab_specs: Vec<SidebarPlaceholderTab>,
+        active_tab: usize,
+    ) -> Self {
         let (events, _) = mpsc::channel(64);
-        let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(AtomicBool::new(false));
         let identity_cwd = PathBuf::from("/");
-        let mut pane_terminals = pane_terminals;
-        if pane_terminals.is_empty() {
-            pane_terminals.push((TerminalId::alloc(), true));
+        let mut tab_specs = tab_specs;
+        if tab_specs.is_empty() {
+            tab_specs.push(SidebarPlaceholderTab {
+                custom_name: None,
+                number: 1,
+                pane_terminals: vec![(TerminalId::alloc(), true)],
+            });
         }
 
-        let (mut layout, root_id) = TileLayout::new();
-        let mut panes = HashMap::new();
-        let mut pane_ids = vec![root_id];
         let mut public_pane_numbers = HashMap::new();
+        let mut next_public_pane_number = 1usize;
+        let mut tabs = Vec::with_capacity(tab_specs.len());
+        for spec in tab_specs {
+            let mut pane_terminals = spec.pane_terminals;
+            if pane_terminals.is_empty() {
+                pane_terminals.push((TerminalId::alloc(), true));
+            }
 
-        let (root_terminal_id, root_seen) = pane_terminals[0].clone();
-        let mut root_pane = PaneState::new(root_terminal_id);
-        root_pane.seen = root_seen;
-        panes.insert(root_id, root_pane);
-        public_pane_numbers.insert(root_id, 1);
+            let (mut layout, root_id) = TileLayout::new();
+            let mut panes = HashMap::new();
 
-        for (idx, (terminal_id, seen)) in pane_terminals.into_iter().enumerate().skip(1) {
-            let pane_id = layout.split_focused(Direction::Vertical);
-            let mut pane = PaneState::new(terminal_id);
-            pane.seen = seen;
-            panes.insert(pane_id, pane);
-            pane_ids.push(pane_id);
-            public_pane_numbers.insert(pane_id, idx + 1);
-        }
+            let (root_terminal_id, root_seen) = pane_terminals[0].clone();
+            let mut root_pane = PaneState::new(root_terminal_id);
+            root_pane.seen = root_seen;
+            panes.insert(root_id, root_pane);
+            public_pane_numbers.insert(root_id, next_public_pane_number);
+            next_public_pane_number += 1;
 
-        if let Some(focused_idx) = focused_pane_idx.and_then(|idx| pane_ids.get(idx).copied()) {
-            layout.focus_pane(focused_idx);
-        }
+            for (terminal_id, seen) in pane_terminals.into_iter().skip(1) {
+                let pane_id = layout.split_focused(Direction::Vertical);
+                let mut pane = PaneState::new(terminal_id);
+                pane.seen = seen;
+                panes.insert(pane_id, pane);
+                public_pane_numbers.insert(pane_id, next_public_pane_number);
+                next_public_pane_number += 1;
+            }
 
-        let tab = Tab {
-            custom_name: None,
-            number: 1,
-            root_pane: root_id,
-            layout,
-            panes,
-            #[cfg(test)]
-            runtimes: HashMap::new(),
-            zoomed: false,
-            events,
-            render_notify,
-            render_dirty,
-        };
-
-        (
-            Self {
-                id,
-                custom_name: Some(name),
-                identity_cwd,
-                cached_git_branch: branch,
-                cached_git_ahead_behind: None,
-                cached_git_space: None,
-                worktree_space: None,
-                public_pane_numbers,
-                next_public_pane_number: pane_ids.len() + 1,
-                tabs: vec![tab],
-                active_tab: 0,
+            tabs.push(Tab {
+                custom_name: spec.custom_name,
+                number: spec.number,
+                root_pane: root_id,
+                layout,
+                panes,
                 #[cfg(test)]
-                test_runtimes: HashMap::new(),
-            },
-            pane_ids,
-        )
+                runtimes: HashMap::new(),
+                zoomed: false,
+                events: events.clone(),
+                render_notify: Arc::new(Notify::new()),
+                render_dirty: Arc::new(AtomicBool::new(false)),
+            });
+        }
+
+        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
+        Self {
+            id,
+            custom_name: Some(name),
+            identity_cwd,
+            cached_git_branch: branch,
+            cached_git_ahead_behind: None,
+            cached_git_space: None,
+            worktree_space: None,
+            public_pane_numbers,
+            next_public_pane_number,
+            tabs,
+            active_tab,
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
     }
 
     pub fn new(

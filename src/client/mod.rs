@@ -7219,6 +7219,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -10152,6 +10154,8 @@ mod tests {
                         status: status.into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )

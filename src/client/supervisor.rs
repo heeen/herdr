@@ -115,6 +115,10 @@ pub(crate) struct AgentSummary {
     /// #58: the pane's manual rename (wire `AgentInfo.manual_label`) — the sidebar "pane name". `None`
     /// for an unrenamed pane.
     pub(crate) pane_label: Option<String>,
+    /// #58: the id + display name of the tab this pane lives in, so the client can group panes into
+    /// tabs and render the sidebar "tab name". `tab_label` is `None` for an older server.
+    pub(crate) tab_id: String,
+    pub(crate) tab_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,6 +495,9 @@ pub(crate) struct AgentSidebarRow {
     pub(crate) focused: bool,
     /// #58: the pane's manual rename ("pane name"); `None` for an unrenamed pane.
     pub(crate) pane_label: Option<String>,
+    /// #58: id + display name of the tab this pane lives in, so the client groups panes into tabs.
+    pub(crate) tab_id: String,
+    pub(crate) tab_label: Option<String>,
 }
 
 /// item 3 (Area 5): the overlay-state of a remote in the management overlay, analogous to
@@ -2694,6 +2701,8 @@ fn agent_groups_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Agen
                     status: agent.status.clone(),
                     focused: agent.focused,
                     pane_label: agent.pane_label.clone(),
+                    tab_id: agent.tab_id.clone(),
+                    tab_label: agent.tab_label.clone(),
                 })
                 .collect();
 
@@ -3005,6 +3014,8 @@ impl ServerSummary {
                         status,
                         focused: agent.focused,
                         pane_label: agent.manual_label,
+                        tab_id: agent.tab_id,
+                        tab_label: agent.tab_label,
                     }
                 })
                 .collect(),
@@ -3340,6 +3351,7 @@ mod tests {
             manual_label: None,
             agent: None,
             title: None,
+            tab_label: None,
             display_agent: None,
             agent_status: status,
             custom_status: None,
@@ -3585,6 +3597,8 @@ mod tests {
                     status: "working".into(),
                     focused: true,
                     pane_label: None,
+                    tab_id: "tab-1".into(),
+                    tab_label: None,
                 }],
             }]
         );
@@ -4324,6 +4338,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -4346,6 +4362,8 @@ mod tests {
                         status: "idle".into(),
                         focused: true,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -4365,6 +4383,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
                 AgentSidebarGroup {
@@ -4378,6 +4398,8 @@ mod tests {
                         status: "idle".into(),
                         focused: true,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             ]
@@ -4397,6 +4419,8 @@ mod tests {
                     status: "idle".into(),
                     focused: true,
                     pane_label: None,
+                    tab_id: String::new(),
+                    tab_label: None,
                 }],
             }]
         );
@@ -4469,6 +4493,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
@@ -4563,6 +4589,8 @@ mod tests {
                         status: "idle".into(),
                         focused: false,
                         pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
                 },
             )
