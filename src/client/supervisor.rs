@@ -131,6 +131,9 @@ pub(crate) struct ManagedServer {
     pub(crate) connection_state: ConnectionState,
     pub(crate) summaries: ServerSummary,
     pub(crate) disabled: bool, // item 3 (serde-driven via registry; default false)
+    /// #61: per-remote auto-update flag, synced from the registry (like `disabled`). When set, the
+    /// client auto-pushes its own build onto this remote on a detected protocol mismatch.
+    pub(crate) auto_update: bool,
     /// Recent round-trip samples (ms) for the host banner readout; capped at the last
     /// [`HOST_PING_SAMPLE_WINDOW`] (issue #13). The banner shows their average.
     pub(crate) ping_samples: std::collections::VecDeque<u32>,
@@ -256,6 +259,8 @@ pub(crate) enum ClientMenuAction {
     HostDisconnect,
     HostReconnect,
     HostUpdate,
+    // #61: flip this remote's per-remote auto-update flag (baked from its current state at open time).
+    HostToggleAutoUpdate { auto_update: bool },
 }
 
 /// #47: the typed outcome of activating a [`ClientMenu`] row, mapped by the client loop into a
@@ -276,6 +281,8 @@ pub(crate) enum ClientMenuOutcome {
     HostDisconnect(ServerId),
     HostReconnect(ServerId),
     HostUpdate(ServerId),
+    // #61: persist this remote's auto-update flag (routed to a `remote.set_auto_update` request).
+    HostToggleAutoUpdate { remote_id: String, auto_update: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +655,7 @@ impl ClientSupervisorModel {
                 connection_state: ConnectionState::Connected,
                 summaries: ServerSummary::default(),
                 disabled: false,
+                auto_update: false,
                 ping_samples: std::collections::VecDeque::new(),
                 download_bps: None,
                 remote_version: None,
@@ -798,6 +806,9 @@ impl ClientSupervisorModel {
             // re-enabled remote keeps its prior state — the toggle-success handler explicitly
             // sets it to `Connecting` so the now-ungated plans pick it back up.
             server.disabled = definition.disabled;
+            // #61: re-apply the auto-update flag on every sync too (like `disabled`), so toggling it
+            // server-side reflects on the client by the next registry refresh.
+            server.auto_update = definition.auto_update;
             next_secondaries.push(server);
         }
 
@@ -1452,6 +1463,15 @@ impl ClientSupervisorModel {
                     .map(ClientMenuOutcome::HostUpdate)
                     .unwrap_or(ClientMenuOutcome::Redraw)
             }
+            ClientMenuAction::HostToggleAutoUpdate { auto_update } => {
+                self.close_client_overlay();
+                host_server_id
+                    .map(|id| ClientMenuOutcome::HostToggleAutoUpdate {
+                        remote_id: id.registry_id().to_string(),
+                        auto_update,
+                    })
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
         }
     }
 
@@ -1988,7 +2008,7 @@ impl ClientSupervisorModel {
         anchor_col: u16,
         anchor_row: u16,
     ) {
-        let (disabled, connected, remote_version, remote_protocol) = self
+        let (disabled, connected, remote_version, remote_protocol, auto_update) = self
             .server(&server_id)
             .map(|server| {
                 (
@@ -1996,9 +2016,10 @@ impl ClientSupervisorModel {
                     server.connection_state == ConnectionState::Connected,
                     server.remote_version.clone(),
                     server.remote_protocol,
+                    server.auto_update,
                 )
             })
-            .unwrap_or((false, false, None, None));
+            .unwrap_or((false, false, None, None, false));
         let (version_label, is_mismatch) =
             host_version_readout(remote_version.as_deref(), remote_protocol);
         let items = vec![
@@ -2041,6 +2062,20 @@ impl ClientSupervisorModel {
                     ClientMenuAction::HostUpdate
                 } else {
                     ClientMenuAction::Noop
+                },
+            },
+            // #61: per-remote auto-update toggle. Always selectable (it just flips a persisted flag,
+            // independent of the live connection); the label shows the ACTION like enable/disable.
+            ClientMenuItem {
+                label: if auto_update {
+                    "disable auto-update"
+                } else {
+                    "enable auto-update"
+                }
+                .to_string(),
+                selectable: true,
+                action: ClientMenuAction::HostToggleAutoUpdate {
+                    auto_update: !auto_update,
                 },
             },
         ];
@@ -2609,6 +2644,26 @@ impl ClientSupervisorModel {
         }
     }
 
+    /// #61: secondary SSH remotes with per-remote auto-update enabled that are at a KNOWN protocol
+    /// mismatch vs this client. The loop pushes this client's build onto each (same flow as the manual
+    /// `update`). Excludes: disabled remotes (inert), non-SSH remotes (nothing to reinstall over ssh),
+    /// and any host whose protocol is still unknown (not yet probed) — we never auto-update on a guess.
+    /// Connection state is intentionally NOT filtered: a mismatched host is NOT `Connected` (its stream
+    /// handshake is rejected on the protocol gap), so the trigger keys off the captured protocol alone.
+    pub(crate) fn auto_update_candidates(&self) -> Vec<ServerId> {
+        self.servers
+            .iter()
+            .filter(|server| server.role == ServerRole::Secondary)
+            .filter(|server| server.auto_update && !server.disabled)
+            .filter(|server| matches!(server.target, ServerConnectionTarget::Ssh { .. }))
+            .filter(|server| {
+                matches!(server.remote_protocol, Some(protocol)
+                    if protocol != crate::protocol::PROTOCOL_VERSION)
+            })
+            .map(|server| server.id.clone())
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn server_for_test(&self, id: &ServerId) -> Option<&ManagedServer> {
         self.server(id)
@@ -2860,6 +2915,7 @@ fn managed_secondary(
         connection_state,
         summaries: ServerSummary::default(),
         disabled: definition.disabled, // item 3 (Area 5): gate input from the registry.
+        auto_update: definition.auto_update, // #61: per-remote auto-update flag from the registry.
         ping_samples: std::collections::VecDeque::new(),
         download_bps: None,
         remote_version: None,
@@ -3391,6 +3447,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         }
     }
 
@@ -3408,6 +3465,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Server,
             disabled: false,
+            auto_update: false,
         }
     }
 
@@ -5924,7 +5982,8 @@ mod tests {
         assert_eq!(menu.selected, 1);
         assert_eq!(menu.anchor_col, 4);
         assert_eq!(menu.anchor_row, 5);
-        // #44: a non-selectable version-readout row leads; then add/disable/disconnect; then update.
+        // #44/#61: a non-selectable version-readout row leads; then add/disable/disconnect; then
+        // update; then the per-remote auto-update toggle (off -> "enable auto-update").
         assert_eq!(
             menu_labels(&model),
             [
@@ -5932,7 +5991,8 @@ mod tests {
                 "add new space",
                 "disable",
                 "disconnect",
-                "update"
+                "update",
+                "enable auto-update"
             ]
         );
 
@@ -5943,10 +6003,18 @@ mod tests {
             .set_connection_state(&remote, ConnectionState::Disconnected)
             .unwrap();
         model.open_host_context_menu(remote.clone(), "beta".into(), 0, 0);
-        // A disabled + disconnected host flips both toggle labels ("enable" / "reconnect").
+        // A disabled + disconnected host flips both toggle labels ("enable" / "reconnect"); the
+        // auto-update row stays (off -> "enable auto-update").
         assert_eq!(
             menu_labels(&model),
-            ["unknown", "add new space", "enable", "reconnect", "update"]
+            [
+                "unknown",
+                "add new space",
+                "enable",
+                "reconnect",
+                "update",
+                "enable auto-update"
+            ]
         );
     }
 
@@ -6036,9 +6104,9 @@ mod tests {
             .unwrap();
         model.open_host_context_menu(remote, "alpha".into(), 0, 0);
 
-        // #44: Down advances through the 5-row menu (version/add/toggle/disconnect/update), clamped
-        // at the last row (index 4). #46: the menu now OPENS on row 1 (add), skipping the
-        // non-actionable version readout, so the first Down lands on row 2.
+        // #44/#61: Down advances through the 6-row menu (version/add/toggle/disconnect/update/
+        // auto-update), clamped at the last row (index 5). #46: the menu now OPENS on row 1 (add),
+        // skipping the non-actionable version readout, so the first Down lands on row 2.
         assert_eq!(model.client_menu().unwrap().selected, 1);
         assert_eq!(
             model.handle_client_menu_key(press(KeyCode::Down)),
@@ -6049,12 +6117,12 @@ mod tests {
         assert_eq!(model.client_menu().unwrap().selected, 3);
         model.handle_client_menu_key(press(KeyCode::Down));
         model.handle_client_menu_key(press(KeyCode::Down));
-        assert_eq!(model.client_menu().unwrap().selected, 4);
+        assert_eq!(model.client_menu().unwrap().selected, 5);
         model.handle_client_menu_key(press(KeyCode::Down));
-        assert_eq!(model.client_menu().unwrap().selected, 4);
+        assert_eq!(model.client_menu().unwrap().selected, 5);
         // k moves back up.
         model.handle_client_menu_key(press(KeyCode::Char('k')));
-        assert_eq!(model.client_menu().unwrap().selected, 3);
+        assert_eq!(model.client_menu().unwrap().selected, 4);
 
         // Esc dismisses.
         model.handle_client_menu_key(press(KeyCode::Esc));
@@ -6258,5 +6326,97 @@ mod tests {
         // Clearing removes it from the banner.
         model.clear_update_outcome(&remote);
         assert!(model.host_banner_specs()[banner_index].1.update_outcome.is_none());
+    }
+
+    fn ssh_remote_auto_update(
+        id: &str,
+        name: &str,
+        target: &str,
+    ) -> crate::remote_registry::RemoteDefinitionSnapshot {
+        crate::remote_registry::RemoteDefinitionSnapshot {
+            auto_update: true,
+            ..ssh_remote(id, name, target)
+        }
+    }
+
+    #[test]
+    fn auto_update_candidates_selects_only_enabled_mismatched_ssh_remotes() {
+        let local = crate::protocol::PROTOCOL_VERSION;
+        let mut model = ClientSupervisorModel::new("local");
+        // r1: auto-update ON, ssh, mismatched protocol -> the one candidate.
+        let r1 = model.add_secondary(ssh_remote_auto_update("r1", "alpha", "alpha"));
+        // r2: auto-update OFF, ssh, mismatched -> excluded (flag off).
+        let r2 = model.add_secondary(ssh_remote("r2", "bravo", "bravo"));
+        // r3: auto-update ON, ssh, MATCHING protocol -> excluded (no mismatch).
+        let r3 = model.add_secondary(ssh_remote_auto_update("r3", "charlie", "charlie"));
+        // r4: auto-update ON but a LOCAL (non-ssh) target -> excluded (nothing to reinstall over ssh).
+        let r4 = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            auto_update: true,
+            ..local_remote("r4", "delta", Some("delta"))
+        });
+
+        model.set_remote_runtime_info(&r1, Some("0.5.0".into()), Some(local.wrapping_add(1)));
+        model.set_remote_runtime_info(&r2, Some("0.5.0".into()), Some(local.wrapping_add(1)));
+        model.set_remote_runtime_info(&r3, Some("0.6.4".into()), Some(local));
+        model.set_remote_runtime_info(&r4, Some("0.5.0".into()), Some(local.wrapping_add(1)));
+
+        assert_eq!(model.auto_update_candidates(), vec![r1.clone()]);
+
+        // A host with an unknown (not-yet-probed) protocol is NOT a candidate (never on a guess).
+        model.set_remote_runtime_info(&r1, None, None);
+        assert!(model.auto_update_candidates().is_empty());
+
+        // Re-probe a mismatch, then DISABLE r1 -> excluded (a disabled remote is inert).
+        model.set_remote_runtime_info(&r1, Some("0.5.0".into()), Some(local.wrapping_add(1)));
+        assert_eq!(model.auto_update_candidates(), vec![r1.clone()]);
+        model.sync_remote_registry(vec![
+            crate::remote_registry::RemoteDefinitionSnapshot {
+                disabled: true,
+                ..ssh_remote_auto_update("r1", "alpha", "alpha")
+            },
+        ]);
+        assert!(model.auto_update_candidates().is_empty());
+
+        let _ = (r2, r3, r4);
+    }
+
+    #[test]
+    fn host_menu_auto_update_row_toggles_the_flag() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+
+        // Auto-update OFF -> the row reads "enable auto-update" and selecting it turns it ON.
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        let labels = menu_labels(&model);
+        let row = labels
+            .iter()
+            .position(|item| item == "enable auto-update")
+            .expect("an auto-update row is present when off");
+        assert_eq!(
+            model.select_client_menu_item(row),
+            ClientMenuOutcome::HostToggleAutoUpdate {
+                remote_id: remote.registry_id().to_string(),
+                auto_update: true,
+            }
+        );
+
+        // Auto-update ON -> the row reads "disable auto-update" and selecting it turns it OFF.
+        model.sync_remote_registry(vec![ssh_remote_auto_update("r1", "alpha", "alpha")]);
+        model.open_host_context_menu(remote.clone(), "alpha".into(), 0, 0);
+        let labels = menu_labels(&model);
+        let row = labels
+            .iter()
+            .position(|item| item == "disable auto-update")
+            .expect("an auto-update row is present when on");
+        assert_eq!(
+            model.select_client_menu_item(row),
+            ClientMenuOutcome::HostToggleAutoUpdate {
+                remote_id: remote.registry_id().to_string(),
+                auto_update: false,
+            }
+        );
     }
 }

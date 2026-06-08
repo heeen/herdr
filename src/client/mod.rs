@@ -155,6 +155,11 @@ struct ClientState {
     /// The model holds the outcome text (no clock); this loop-side map drives the timed clear in the
     /// Timer housekeeping (`expire_host_update_outcomes`). Keyed by `ServerId`.
     update_outcome_expiry: HashMap<supervisor::ServerId, Instant>,
+    /// #61: hosts whose last update FAILED, excluded from the AUTO-update sweep so a remote the local
+    /// build can't seed (or any other hard failure) is not re-attempted every ~14s forever. Cleared
+    /// on a successful update or a deliberate auto-update re-toggle; the manual menu `update` always
+    /// works regardless (this only gates the automatic path).
+    auto_update_suppressed: HashSet<supervisor::ServerId>,
     /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
     last_animation_tick: Instant,
     /// #48: a sidebar hover changed the highlighted row but its render is DEFERRED (latest-wins
@@ -342,6 +347,11 @@ enum ClientInputDispatch {
         remote_id: String,
         enabled: bool,
     },
+    // #61: persist a remote's per-remote auto-update flag off the UI loop against ServerId::main().
+    SetRemoteAutoUpdate {
+        remote_id: String,
+        auto_update: bool,
+    },
     DeleteRemote {
         remote_id: String,
     },
@@ -443,6 +453,13 @@ fn dispatch_for_client_menu_outcome(
         supervisor::ClientMenuOutcome::HostToggleEnabled { remote_id, enabled } => {
             ClientInputDispatch::SetRemoteEnabled { remote_id, enabled }
         }
+        supervisor::ClientMenuOutcome::HostToggleAutoUpdate {
+            remote_id,
+            auto_update,
+        } => ClientInputDispatch::SetRemoteAutoUpdate {
+            remote_id,
+            auto_update,
+        },
         supervisor::ClientMenuOutcome::HostDisconnect(server_id) => {
             ClientInputDispatch::DisconnectRemote { server_id }
         }
@@ -1031,6 +1048,7 @@ fn dispatch_client_overlay_input(
             next,
             ClientInputDispatch::AddRemote(_)
                 | ClientInputDispatch::SetRemoteEnabled { .. }
+                | ClientInputDispatch::SetRemoteAutoUpdate { .. }
                 | ClientInputDispatch::DeleteRemote { .. }
                 | ClientInputDispatch::DisconnectRemote { .. }
                 | ClientInputDispatch::ReconnectRemote { .. }
@@ -2921,6 +2939,8 @@ fn api_client_error_is_timeout(err: &crate::api::client::ApiClientError) -> bool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteManageAction {
     SetEnabled { enabled: bool },
+    // #61: persist the per-remote auto-update flag (no connection side-effect — unlike SetEnabled).
+    SetAutoUpdate { auto_update: bool },
     Delete,
 }
 
@@ -2936,6 +2956,14 @@ fn remote_manage_request(
                 enabled,
             },
         ),
+        RemoteManageAction::SetAutoUpdate { auto_update } => {
+            crate::api::schema::Method::RemoteSetAutoUpdate(
+                crate::api::schema::RemoteSetAutoUpdateParams {
+                    remote_id: remote_id.to_string(),
+                    auto_update,
+                },
+            )
+        }
         RemoteManageAction::Delete => {
             crate::api::schema::Method::RemoteRemove(crate::api::schema::RemoteRemoveParams {
                 remote_id: remote_id.to_string(),
@@ -2990,6 +3018,74 @@ fn spawn_client_remote_manage_request(
 ///      stage as a server_id-keyed `UpdateRemoteProgress`.
 ///   3. On success, post `UpdateRemoteFinished(Ok)`; the loop then reconnects on the new protocol
 ///      and re-fetches runtime status so the version/mismatch readout clears.
+/// #44/#61: resolve a remote's ssh target, show an initial progress line, and spawn the reinstall
+/// worker off the UI loop (the `pending_update_remote` guard collapses double-fires). Shared by the
+/// manual menu `update` and #61's auto-update sweep, so both honour the same seed pre-flight (no
+/// internet download) and surface progress identically. A non-ssh (local) host has nothing to
+/// reinstall over ssh, so it gets a truthful one-liner instead. Clears any stale terminal outcome so
+/// a fresh run's spinner is not masked by a lingering "✓/✗" from a previous update.
+fn spawn_remote_update_for(
+    state: &mut ClientState,
+    server_id: &supervisor::ServerId,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let ssh_target = state.supervisor_model.as_ref().and_then(|model| {
+        model
+            .server_ssh_target(server_id)
+            .map(|(destination, options)| crate::remote::SshTarget::new(destination, options))
+    });
+    match ssh_target {
+        Some(ssh_target) => {
+            if let Some(model) = &mut state.supervisor_model {
+                model.clear_update_outcome(server_id);
+                model.set_update_progress(server_id, Some("starting update…".to_string()));
+            }
+            state.update_outcome_expiry.remove(server_id);
+            spawn_client_update_remote(
+                server_id.clone(),
+                ssh_target,
+                event_tx,
+                &mut state.pending_update_remote,
+            );
+        }
+        None => {
+            if let Some(model) = &mut state.supervisor_model {
+                model.set_update_progress(
+                    server_id,
+                    Some("update is only available for ssh remotes".to_string()),
+                );
+            }
+        }
+    }
+}
+
+/// #61: with per-remote auto-update enabled, push THIS client's build onto every connected secondary
+/// found at a protocol mismatch — the SAME flow as the manual menu `update` (visible progress, the
+/// Part-2 completion signal, the seed pre-flight with no internet fallback). The candidate set is
+/// re-evaluated whenever a runtime status lands (every summary refresh re-probes the protocol), so a
+/// host updated out-of-band, or a flag toggled on, is picked up within a cadence tick. Guards: skip a
+/// host already updating (`pending_update_remote`) and one still showing a terminal outcome
+/// (`update_outcome_expiry`) — the latter avoids re-firing during the post-update reconnect window
+/// before the new (matching) protocol lands.
+fn auto_update_mismatched_remotes(
+    state: &mut ClientState,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let candidates = match &state.supervisor_model {
+        Some(model) => model.auto_update_candidates(),
+        None => return,
+    };
+    for server_id in candidates {
+        if state.pending_update_remote.contains(&server_id)
+            || state.update_outcome_expiry.contains_key(&server_id)
+            || state.auto_update_suppressed.contains(&server_id)
+        {
+            continue;
+        }
+        spawn_remote_update_for(state, &server_id, event_tx);
+    }
+}
+
 fn spawn_client_update_remote(
     server_id: supervisor::ServerId,
     ssh_target: crate::remote::SshTarget,
@@ -3657,6 +3753,26 @@ fn apply_remote_manage_request_finished(
                 model.clear_remote_manage_pending(remote_id);
             }
         }
+        RemoteManageAction::SetAutoUpdate { .. } => {
+            // #61: a deliberate toggle is fresh intent — lift any post-failure auto-update suppression
+            // so turning it back on (or off→on) re-attempts a previously-failed host.
+            state.auto_update_suppressed.remove(&server_id);
+            // No connection side-effect — just re-sync the registry (so the host-menu toggle label
+            // reflects the persisted flag) and then sweep: if auto-update was just turned ON for an
+            // already-mismatched host, push the update now instead of waiting for the next
+            // runtime-status tick to notice.
+            if let Some(model) = &mut state.supervisor_model {
+                refresh_client_supervisor_summaries(
+                    model,
+                    &mut state.pending_main_refresh,
+                    &state.ssh_bridges,
+                    &mut state.pending_summary_refresh_server_ids,
+                    event_tx,
+                );
+                model.clear_remote_manage_pending(remote_id);
+            }
+            auto_update_mismatched_remotes(state, event_tx);
+        }
         RemoteManageAction::Delete => {
             teardown_secondary_connection(state, server_writes, &server_id);
             if let Some(model) = &mut state.supervisor_model {
@@ -3730,6 +3846,9 @@ fn apply_update_remote_finished(
             state
                 .update_outcome_expiry
                 .insert(server_id.clone(), now + HOST_UPDATE_OUTCOME_TTL);
+            // #61: a success clears any prior auto-update suppression for this host (it is now on the
+            // matching protocol, so it is not a candidate anyway — but keep the set tidy).
+            state.auto_update_suppressed.remove(server_id);
             // Drop the stale-protocol stream and dial it back up on the new binary at the shortest
             // (attempt-0) backoff — same as #43's "reconnect" path.
             teardown_secondary_connection(state, server_writes, server_id);
@@ -3752,6 +3871,11 @@ fn apply_update_remote_finished(
             state
                 .update_outcome_expiry
                 .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
+            // #61: suppress AUTO-update retries for this host — a failed update (e.g. the local build
+            // can't seed its platform) would otherwise re-fire every cadence once the outcome line
+            // expires. The manual menu `update` still works; a deliberate auto-update re-toggle (or a
+            // later success) clears this.
+            state.auto_update_suppressed.insert(server_id.clone());
         }
     }
 }
@@ -4379,6 +4503,7 @@ async fn run_client_loop(
         manually_disconnected: HashSet::new(),
         pending_update_remote: HashSet::new(),
         update_outcome_expiry: HashMap::new(),
+        auto_update_suppressed: HashSet::new(),
         last_animation_tick: Instant::now(),
         pending_hover_render: false,
         pending_full_render: false,
@@ -4644,6 +4769,24 @@ async fn run_client_loop(
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
+                            // #61: persist the per-remote auto-update flag (no teardown/reconnect —
+                            // the apply handler just refreshes the registry and, when newly enabled
+                            // for an already-mismatched host, kicks the auto-update sweep).
+                            ClientInputDispatch::SetRemoteAutoUpdate {
+                                remote_id,
+                                auto_update,
+                            } => {
+                                spawn_client_remote_manage_request(
+                                    model,
+                                    RemoteManageAction::SetAutoUpdate { auto_update },
+                                    remote_id,
+                                    &state.ssh_bridges,
+                                    &event_tx,
+                                );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
                             ClientInputDispatch::DeleteRemote { remote_id } => {
                                 spawn_client_remote_manage_request(
                                     model,
@@ -4698,36 +4841,7 @@ async fn run_client_loop(
                             // target from the model, show an initial progress line, and spawn the
                             // worker off the UI loop (the pending guard collapses double-clicks).
                             ClientInputDispatch::UpdateRemote { server_id } => {
-                                let ssh_target =
-                                    state.supervisor_model.as_ref().and_then(|model| {
-                                        model.server_ssh_target(&server_id).map(
-                                            |(destination, options)| {
-                                                crate::remote::SshTarget::new(destination, options)
-                                            },
-                                        )
-                                    });
-                                if let Some(ssh_target) = ssh_target {
-                                    if let Some(model) = &mut state.supervisor_model {
-                                        model.set_update_progress(
-                                            &server_id,
-                                            Some("starting update…".to_string()),
-                                        );
-                                    }
-                                    spawn_client_update_remote(
-                                        server_id,
-                                        ssh_target,
-                                        &event_tx,
-                                        &mut state.pending_update_remote,
-                                    );
-                                } else if let Some(model) = &mut state.supervisor_model {
-                                    // A non-ssh (local) host has nothing to reinstall over ssh.
-                                    model.set_update_progress(
-                                        &server_id,
-                                        Some(
-                                            "update is only available for ssh remotes".to_string(),
-                                        ),
-                                    );
-                                }
+                                spawn_remote_update_for(&mut state, &server_id, &event_tx);
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
                                 continue;
@@ -5509,6 +5623,9 @@ async fn run_client_loop(
                         .update_outcome_expiry
                         .insert(server_id.clone(), Instant::now() + HOST_UPDATE_OUTCOME_TTL);
                 }
+                // #61: this is the freshest read of the remote's protocol — if it mismatches and the
+                // remote has auto-update enabled, push this client's build onto it now.
+                auto_update_mismatched_remotes(&mut state, &event_tx);
                 // #61: this now fires on EVERY summary refresh (the version readout populate path),
                 // not just once after an update — so the render MUST coalesce like the summary
                 // handler, or a fleet of remotes flooding the 400ms/2s cadence would drop the UI to
@@ -6381,6 +6498,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         }
     }
 
@@ -6419,6 +6537,7 @@ mod tests {
             manually_disconnected: HashSet::new(),
             pending_update_remote: HashSet::new(),
             update_outcome_expiry: HashMap::new(),
+            auto_update_suppressed: HashSet::new(),
             last_animation_tick: Instant::now(),
             pending_hover_render: false,
             pending_full_render: false,
@@ -7001,6 +7120,7 @@ mod tests {
                                 keybindings:
                                     crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                                 disabled: false,
+                                auto_update: false,
                             },
                         },
                     })
@@ -7285,6 +7405,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
 
         let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
@@ -7309,6 +7430,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -7842,6 +7964,10 @@ mod tests {
             state.update_outcome_expiry.contains_key(&remote_id),
             "Ok finish arms the outcome display timer"
         );
+        assert!(
+            !state.auto_update_suppressed.contains(&remote_id),
+            "Ok finish leaves no auto-update suppression"
+        );
 
         // Err: clears the spinner but leaves a truthful message; no reconnect scheduled, no download.
         let (model2, remote2) = mixed_remote_model();
@@ -7887,6 +8013,10 @@ mod tests {
         assert!(
             state2.update_outcome_expiry.contains_key(&remote2),
             "Err finish arms the (longer) failure display timer"
+        );
+        assert!(
+            state2.auto_update_suppressed.contains(&remote2),
+            "Err finish suppresses auto-update retries for this host"
         );
         assert!(
             !state2.secondary_retries.contains_key(&remote2),
@@ -7936,6 +8066,92 @@ mod tests {
         assert!(!expire_host_update_outcomes(&mut state, now));
     }
 
+    #[test]
+    fn remote_manage_request_builds_set_auto_update() {
+        // #61: the auto-update toggle routes through a `remote.set_auto_update` request carrying the
+        // remote id and the desired flag.
+        let request =
+            remote_manage_request(RemoteManageAction::SetAutoUpdate { auto_update: true }, "remote-7");
+        match request.method {
+            crate::api::schema::Method::RemoteSetAutoUpdate(params) => {
+                assert_eq!(params.remote_id, "remote-7");
+                assert!(params.auto_update);
+            }
+            _ => panic!("expected a remote.set_auto_update method"),
+        }
+
+        // The host-menu outcome maps to the off-loop SetRemoteAutoUpdate dispatch verbatim.
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let dispatch = dispatch_for_client_menu_outcome(
+            &mut model,
+            supervisor::ClientMenuOutcome::HostToggleAutoUpdate {
+                remote_id: "remote-7".into(),
+                auto_update: false,
+            },
+        );
+        assert!(matches!(
+            dispatch,
+            ClientInputDispatch::SetRemoteAutoUpdate { remote_id, auto_update: false } if remote_id == "remote-7"
+        ));
+    }
+
+    #[test]
+    fn auto_update_sweep_skips_pending_and_outcome_guarded_hosts() {
+        // An ssh remote with auto-update ON at a protocol mismatch IS a candidate…
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-au".into(),
+            name: "au".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Ssh {
+                target: "au-host".into(),
+                args: Vec::new(),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: true,
+        });
+        model.set_remote_runtime_info(
+            &remote,
+            Some("0.5.0".into()),
+            Some(PROTOCOL_VERSION.wrapping_add(1)),
+        );
+        assert_eq!(model.auto_update_candidates(), vec![remote.clone()]);
+
+        let mut state = test_client_state_with_model(model);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        // …but the sweep does NOT spawn a second update while one is already in flight.
+        state.pending_update_remote.insert(remote.clone());
+        auto_update_mismatched_remotes(&mut state, &event_tx);
+        assert_eq!(
+            state.pending_update_remote.len(),
+            1,
+            "a host already updating is not re-spawned"
+        );
+        state.pending_update_remote.remove(&remote);
+
+        // …nor while a terminal outcome is still on screen (the post-update reconnect window), so it
+        // never re-fires before the freshly-installed (matching) protocol lands.
+        state
+            .update_outcome_expiry
+            .insert(remote.clone(), Instant::now() + Duration::from_secs(5));
+        auto_update_mismatched_remotes(&mut state, &event_tx);
+        assert!(
+            state.pending_update_remote.is_empty(),
+            "an outcome-guarded host is not re-updated"
+        );
+        state.update_outcome_expiry.remove(&remote);
+
+        // …nor after a prior failure suppressed it (no endless ~14s retry on an un-seedable host).
+        state.auto_update_suppressed.insert(remote.clone());
+        auto_update_mismatched_remotes(&mut state, &event_tx);
+        assert!(
+            state.pending_update_remote.is_empty(),
+            "a failure-suppressed host is not auto-retried"
+        );
+    }
+
     fn mixed_remote_model_with_many_workspaces(
         main_count: usize,
         remote_count: usize,
@@ -7950,6 +8166,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
 
         let main_workspaces = (0..main_count)
@@ -8273,6 +8490,7 @@ mod tests {
                 session: None,
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                 disabled: false,
+                auto_update: false,
             };
         let focused_ws = |id: &str| supervisor::WorkspaceSummary {
             workspace_id: id.into(),
@@ -8974,6 +9192,7 @@ mod tests {
                     | ClientInputDispatch::ServerControl { .. }
                     | ClientInputDispatch::AddRemote(_)
                     | ClientInputDispatch::SetRemoteEnabled { .. }
+                    | ClientInputDispatch::SetRemoteAutoUpdate { .. }
                     | ClientInputDispatch::DeleteRemote { .. }
                     | ClientInputDispatch::Forward(_)
             )
@@ -9404,6 +9623,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         let api_socket = std::path::PathBuf::from("/tmp/herdr-prod-api.sock");
         let client_socket = std::path::PathBuf::from("/tmp/herdr-prod-client.sock");
@@ -9463,6 +9683,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -9522,6 +9743,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -9607,6 +9829,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);

@@ -32,6 +32,8 @@ pub enum Method {
     RemoteRename(RemoteRenameParams),
     #[serde(rename = "remote.set_enabled")]
     RemoteSetEnabled(RemoteSetEnabledParams),
+    #[serde(rename = "remote.set_auto_update")]
+    RemoteSetAutoUpdate(RemoteSetAutoUpdateParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
@@ -148,6 +150,12 @@ pub struct RemoteRenameParams {
 pub struct RemoteSetEnabledParams {
     pub remote_id: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSetAutoUpdateParams {
+    pub remote_id: String,
+    pub auto_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

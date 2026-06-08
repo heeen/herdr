@@ -623,6 +623,7 @@ mod tests {
                     session: None,
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                     disabled: false,
+                    auto_update: false,
                 }],
             },
         };

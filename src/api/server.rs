@@ -277,6 +277,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::RemoteRemove(_) => "remote.remove",
         Method::RemoteRename(_) => "remote.rename",
         Method::RemoteSetEnabled(_) => "remote.set_enabled",
+        Method::RemoteSetAutoUpdate(_) => "remote.set_auto_update",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",

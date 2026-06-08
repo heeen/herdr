@@ -3671,6 +3671,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -3769,6 +3770,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -3850,6 +3852,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -4000,6 +4003,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -4161,6 +4165,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         // Local server (row 0): workspace focused AND its agent is the focused one.
         model
@@ -4632,6 +4637,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -4816,6 +4822,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         let remote_y = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "remote-y".into(),
@@ -4826,6 +4833,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         for (id, ws, label, focused) in [
             (ServerId::main(), "main-herdr", "herdr", true),
@@ -5229,6 +5237,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -5375,6 +5384,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -5595,6 +5605,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -6034,6 +6045,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -6224,6 +6236,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_connection_state(
@@ -6251,6 +6264,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "r2".into(),
@@ -6262,6 +6276,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model.open_remote_manage_overlay();
         model
@@ -6525,6 +6540,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(
@@ -6931,6 +6947,7 @@ mod tests {
             session: None,
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
+            auto_update: false,
         });
         model
             .set_summary(

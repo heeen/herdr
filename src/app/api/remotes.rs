@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    RemoteAddParams, RemoteRemoveParams, RemoteRenameParams, RemoteSetEnabledParams, ResponseResult,
+    RemoteAddParams, RemoteRemoveParams, RemoteRenameParams, RemoteSetAutoUpdateParams,
+    RemoteSetEnabledParams, ResponseResult,
 };
 use crate::app::App;
 
@@ -71,6 +72,27 @@ impl App {
             .state
             .remote_registry
             .set_enabled(&params.remote_id, params.enabled)
+        {
+            Ok(remote) => {
+                self.state.mark_session_dirty();
+                encode_success(id, ResponseResult::RemoteEnabledChanged { remote })
+            }
+            Err(err) => encode_error(id, err.code(), err.message()),
+        }
+    }
+
+    /// #61: persist a remote's per-remote auto-update flag. Mirrors `handle_remote_set_enabled`;
+    /// reuses the `RemoteEnabledChanged` success body (it just carries the updated definition — the
+    /// client re-syncs the flag off the periodic `remote.list`, not this response).
+    pub(super) fn handle_remote_set_auto_update(
+        &mut self,
+        id: String,
+        params: RemoteSetAutoUpdateParams,
+    ) -> String {
+        match self
+            .state
+            .remote_registry
+            .set_auto_update(&params.remote_id, params.auto_update)
         {
             Ok(remote) => {
                 self.state.mark_session_dirty();
@@ -315,6 +337,49 @@ mod tests {
             error_code(
                 &mut app,
                 r#"{"id":"set","method":"remote.set_enabled","params":{"remote_id":"missing","enabled":false}}"#,
+            ),
+            "remote_not_found"
+        );
+    }
+
+    #[test]
+    fn remote_set_auto_update_persists_marks_dirty_and_lists() {
+        // #61: toggling auto-update flips the persisted flag, marks the session dirty, and the flag
+        // round-trips through `remote.list`.
+        let mut app = test_app();
+        let add = call(
+            &mut app,
+            r#"{"id":"add","method":"remote.add","params":{"name":"x","target":"user@x"}}"#,
+        );
+        let remote_id = add["result"]["remote"]["id"].as_str().unwrap().to_string();
+        app.state.session_dirty = false;
+
+        let enable = format!(
+            r#"{{"id":"au","method":"remote.set_auto_update","params":{{"remote_id":"{remote_id}","auto_update":true}}}}"#
+        );
+        let response = call(&mut app, &enable);
+        assert_eq!(response["result"]["type"], "remote_enabled_changed");
+        assert_eq!(response["result"]["remote"]["id"], remote_id);
+        assert_eq!(response["result"]["remote"]["auto_update"], true);
+        assert!(app.state.session_dirty);
+
+        let snapshot = capture_snapshot(&app);
+        assert!(snapshot.remote_registry.remotes[0].auto_update);
+
+        let list = call(
+            &mut app,
+            r#"{"id":"list","method":"remote.list","params":{}}"#,
+        );
+        assert_eq!(list["result"]["remotes"][0]["auto_update"], true);
+    }
+
+    #[test]
+    fn remote_set_auto_update_unknown_id_returns_not_found() {
+        let mut app = test_app();
+        assert_eq!(
+            error_code(
+                &mut app,
+                r#"{"id":"set","method":"remote.set_auto_update","params":{"remote_id":"missing","auto_update":true}}"#,
             ),
             "remote_not_found"
         );

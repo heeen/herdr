@@ -21,6 +21,12 @@ pub struct RemoteDefinitionSnapshot {
     // keeps enabled remotes serializing byte-identical to today (no golden-file / on-disk churn).
     #[serde(default, skip_serializing_if = "is_false")]
     pub disabled: bool,
+    // #61: when true, the multi-remote client auto-updates this remote to the client's OWN build on a
+    // detected protocol mismatch (the same reinstall the manual `update` runs, no internet download).
+    // Defaults false; `#[serde(default)]` makes old snapshots / old API JSON deserialize to off, and
+    // `skip_serializing_if` keeps an off remote serializing byte-identical to today (no on-disk churn).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_update: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -134,6 +140,7 @@ impl RemoteRegistrySnapshot {
             session: None,
             keybindings,
             disabled: false,
+            auto_update: false,
         };
         self.remotes.push(remote.clone());
         Ok(remote)
@@ -185,6 +192,23 @@ impl RemoteRegistrySnapshot {
             .find(|remote| remote.id == remote_id)
             .ok_or(RemoteRegistryError::NotFound)?;
         remote.disabled = !enabled;
+        Ok(remote.clone())
+    }
+
+    /// #61: flip a remote's per-remote auto-update flag (push this client's build on a protocol
+    /// mismatch). Persisted alongside `disabled`; the client gates its auto-update sweep on it.
+    /// Returns the updated definition clone, or `NotFound` if the id is unknown.
+    pub fn set_auto_update(
+        &mut self,
+        remote_id: &str,
+        auto_update: bool,
+    ) -> Result<RemoteDefinitionSnapshot, RemoteRegistryError> {
+        let remote = self
+            .remotes
+            .iter_mut()
+            .find(|remote| remote.id == remote_id)
+            .ok_or(RemoteRegistryError::NotFound)?;
+        remote.auto_update = auto_update;
         Ok(remote.clone())
     }
 
@@ -657,6 +681,51 @@ mod tests {
         let mut registry = RemoteRegistrySnapshot::default();
         assert_eq!(
             registry.set_enabled("missing", false).unwrap_err(),
+            RemoteRegistryError::NotFound
+        );
+    }
+
+    #[test]
+    fn auto_update_defaults_off_and_round_trips() {
+        // #61: new remotes default to auto-update OFF, an off remote serializes byte-identical to
+        // today (no `auto_update` key), an on remote serializes the key, and a missing key reads off.
+        let mut registry = RemoteRegistrySnapshot::default();
+        let remote = registry
+            .add(
+                Some("dev".into()),
+                "user@dev".into(),
+                RemoteKeybindingsSnapshot::Local,
+            )
+            .unwrap();
+        assert!(!remote.auto_update);
+
+        let off_json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            !off_json.contains("auto_update"),
+            "an auto-update-off remote must not serialize the key: {off_json}"
+        );
+
+        let on = registry.set_auto_update(&remote.id, true).unwrap();
+        assert!(on.auto_update);
+        assert!(registry.remotes[0].auto_update);
+        let on_json = serde_json::to_string(&registry).unwrap();
+        assert!(
+            on_json.contains("\"auto_update\":true"),
+            "an auto-update-on remote must serialize the key: {on_json}"
+        );
+
+        // Toggling back off, and a legacy snapshot with no key, both read false.
+        assert!(!registry.set_auto_update(&remote.id, false).unwrap().auto_update);
+        let legacy = r#"{"remotes":[{"id":"remote-1","name":"dev","target":{"type":"ssh","target":"user@dev"}}]}"#;
+        let parsed: RemoteRegistrySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.remotes[0].auto_update);
+    }
+
+    #[test]
+    fn set_auto_update_missing_id_returns_not_found() {
+        let mut registry = RemoteRegistrySnapshot::default();
+        assert_eq!(
+            registry.set_auto_update("missing", true).unwrap_err(),
             RemoteRegistryError::NotFound
         );
     }
