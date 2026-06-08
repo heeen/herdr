@@ -1351,7 +1351,7 @@ pub(crate) fn compute_workspace_list_areas_full(
                 let updating = app
                     .host_banners
                     .get(*banner_idx)
-                    .map(|spec| spec.update_progress.is_some())
+                    .map(|spec| spec.has_sub_line())
                     .unwrap_or(false);
                 let advance = if updating { 2 } else { 1 };
                 if row_y.saturating_add(advance) > body_bottom {
@@ -1917,22 +1917,32 @@ fn render_workspace_list(
             );
         }
 
-        // #44: render-only "update" progress sub-line one row beneath the banner. The layout pass
-        // (`compute_workspace_list_areas_full`) already advanced row_y by 2 for this banner, so the
-        // sub-row is reserved but is NOT a hit target (the banner area stays height 1 — render ==
-        // hit-test). Dim spinner + message, styled `overlay0` like the agent braille spinner. Guard
-        // the bottom of the list so a half-visible sub-row is never drawn.
-        if let Some(message) = &spec.update_progress {
+        // #44/#61: render-only sub-line one row beneath the banner. The layout pass
+        // (`compute_workspace_list_areas_full`) already advanced row_y by 2 for any banner whose
+        // `has_sub_line()` is true, so the sub-row is reserved but is NOT a hit target (the banner
+        // area stays height 1 — render == hit-test). It shows EITHER an in-flight `update_progress`
+        // line (dim spinner + message, `overlay0` like the agent braille spinner) OR, once the update
+        // finishes, a terminal `update_outcome` (✓ green / ✗ red, no spinner) so completion/failure
+        // is observable rather than inferred from the spinner vanishing. Outcome wins when both are
+        // set. Guard the bottom of the list so a half-visible sub-row is never drawn.
+        let sub_line = spec
+            .update_outcome
+            .as_ref()
+            .map(|outcome| {
+                let color = if outcome.success { p.green } else { p.red };
+                (outcome.message.clone(), color)
+            })
+            .or_else(|| {
+                spec.update_progress.as_ref().map(|message| {
+                    let spinner = super::spinner_frame(app.spinner_tick);
+                    (format!("{spinner} {message}"), p.overlay0)
+                })
+            });
+        if let Some((text, color)) = sub_line {
             let sub_y = row_y + 1;
             if sub_y < list_bottom {
-                let spinner = super::spinner_frame(app.spinner_tick);
-                let sub_spans = vec![
-                    Span::styled(spinner.to_string(), Style::default().fg(p.overlay0)),
-                    Span::raw(" "),
-                    Span::styled(message.clone(), Style::default().fg(p.overlay0)),
-                ];
                 frame.render_widget(
-                    Paragraph::new(Line::from(sub_spans)),
+                    Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
                     Rect::new(banner_area.rect.x, sub_y, banner_area.rect.width, 1),
                 );
             }
@@ -2776,6 +2786,7 @@ mod tests {
             latency_ms: Some(50),
             download_bps: Some(312_000),
             update_progress: None,
+            update_outcome: None,
         };
         let (spans, width) = host_banner_metric_spans(&spec, &p);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4955,6 +4966,7 @@ lines = [
                 latency_ms: None,
                 download_bps: None,
                 update_progress: None,
+                update_outcome: None,
             })
             .collect();
         app.host_banner_active = !banner_rows.is_empty();

@@ -614,6 +614,29 @@ pub struct HostBannerSpec {
     /// When `Some`, the sidebar reserves a render-only sub-line row under the banner and draws a dim
     /// spinner + this message; the banner row itself stays the only hit target (height 1).
     pub update_progress: Option<String>,
+    /// #61: a TERMINAL update outcome shown in the sub-line in place of the in-flight progress once
+    /// an update finishes — a positive "✓ updated …" on success or "✗ update failed …" on failure,
+    /// so completion is observable and not merely inferred from the spinner disappearing. Short-lived
+    /// (the client expires it on a timer). Reserves the same sub-line row as `update_progress`.
+    pub update_outcome: Option<HostUpdateOutcome>,
+}
+
+impl HostBannerSpec {
+    /// #44/#61: whether this banner reserves a render-only sub-line row beneath it — true while an
+    /// update is in flight (`update_progress`) OR while a terminal outcome is being shown
+    /// (`update_outcome`). The layout pass and the renderer agree on this single predicate so the
+    /// reserved row and the drawn row never drift.
+    pub fn has_sub_line(&self) -> bool {
+        self.update_progress.is_some() || self.update_outcome.is_some()
+    }
+}
+
+/// #61: a terminal one-click-update result surfaced on the host banner sub-line. `success` selects
+/// the glyph/colour (✓ green / ✗ red); `message` is the full line text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostUpdateOutcome {
+    pub message: String,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2230,6 +2253,7 @@ mod tests {
             latency_ms: None,
             download_bps: None,
             update_progress: None,
+            update_outcome: None,
         };
         assert_eq!(spec.display_name, "prod");
         assert_eq!(spec.space_count, 2);
@@ -2249,6 +2273,7 @@ mod tests {
                     latency_ms: None,
                     download_bps: None,
                     update_progress: None,
+                    update_outcome: None,
                 }
                 .connection_state,
                 state

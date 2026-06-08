@@ -51,6 +51,11 @@ const CLIENT_60FPS_FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 // the SAME cadence (the recompose is local; link speed only affects the encoded diff).
 const CLIENT_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 const CLIENT_ANIMATION_TICK_STEP: u32 = 8;
+// #61: how long a host's terminal update outcome banner line stays up before the Timer housekeeping
+// clears it. Success auto-dismisses fairly quickly (the new version is already in the menu readout);
+// failure lingers longer so the user can actually read what went wrong before it fades.
+const HOST_UPDATE_OUTCOME_TTL: Duration = Duration::from_secs(6);
+const HOST_UPDATE_FAILURE_TTL: Duration = Duration::from_secs(12);
 const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 // Idle ceiling for bringing up an ssh remote bridge: the maximum time a SINGLE provisioning stage
@@ -146,6 +151,10 @@ struct ClientState {
     /// provisioning flow) running off the UI loop. Guards against double-spawn from a repeated
     /// menu click while the worker is in flight; cleared when `UpdateRemoteFinished` arrives.
     pending_update_remote: HashSet<supervisor::ServerId>,
+    /// #61: when each host's TERMINAL update outcome banner line (✓ updated / ✗ failed) expires.
+    /// The model holds the outcome text (no clock); this loop-side map drives the timed clear in the
+    /// Timer housekeeping (`expire_host_update_outcomes`). Keyed by `ServerId`.
+    update_outcome_expiry: HashMap<supervisor::ServerId, Instant>,
     /// item 5: last time the client advanced the sidebar animation tick (80ms cadence).
     last_animation_tick: Instant,
     /// #48: a sidebar hover changed the highlighted row but its render is DEFERRED (latest-wins
@@ -3406,14 +3415,7 @@ fn start_secondary_supervisor_summary_refreshes(
         pending_summary_refresh_server_ids.insert(server_id.clone());
         let event_tx = event_tx.clone();
         std::thread::spawn(move || {
-            let started_at = Instant::now();
-            let result = supervisor::fetch_server_summary_from_api_target(target);
-            let elapsed = started_at.elapsed();
-            let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
-                server_id,
-                result,
-                elapsed,
-            });
+            fetch_and_post_secondary_summary(target, server_id, &event_tx);
         });
     }
     immediate_results
@@ -3456,14 +3458,35 @@ fn start_single_secondary_summary_refresh(
     let server_id = server_id.clone();
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
-        let started_at = Instant::now();
-        let result = supervisor::fetch_server_summary_from_api_target(api_target);
-        let elapsed = started_at.elapsed();
-        let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
-            server_id,
-            result,
-            elapsed,
+        fetch_and_post_secondary_summary(api_target, server_id, &event_tx);
+    });
+}
+
+/// #61: fetch a secondary's summary AND its runtime version/protocol over one api connection, then
+/// post BOTH back to the loop — the runtime status (so the host context-menu version readout
+/// reflects this LIVE host; the summary fetch's Ping used to capture it then throw it away) and the
+/// summary itself. Shared by the whole-fleet refresh and the single-server refresh so the populate
+/// wiring lives in exactly one place. The runtime status is posted FIRST so the version is recorded
+/// before any mismatch-driven `ConnectionState::ProtocolMismatch` lands from the summary result.
+fn fetch_and_post_secondary_summary(
+    target: crate::api::client::ConnectionTarget,
+    server_id: supervisor::ServerId,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let started_at = Instant::now();
+    let (runtime, result) = supervisor::fetch_server_summary_with_runtime_status(target);
+    let elapsed = started_at.elapsed();
+    if let Some(runtime) = runtime {
+        let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorRuntimeStatusFetched {
+            server_id: server_id.clone(),
+            version: runtime.version,
+            protocol: runtime.protocol,
         });
+    }
+    let _ = event_tx.blocking_send(ClientLoopEvent::SupervisorSummaryFetched {
+        server_id,
+        result,
+        elapsed,
     });
 }
 
@@ -3691,9 +3714,22 @@ fn apply_update_remote_finished(
         Ok(()) => {
             if let Some(model) = &mut state.supervisor_model {
                 model.set_update_progress(server_id, None);
+                // #61: positive, observable "done" signal in place of the vanished spinner. Starts
+                // version-less; the post-update reconnect's runtime-status fetch enriches it to
+                // "✓ updated to vX.Y.Z" via `enrich_update_success_with_version`.
+                model.set_update_outcome(
+                    server_id,
+                    crate::app::state::HostUpdateOutcome {
+                        message: "✓ update complete".to_string(),
+                        success: true,
+                    },
+                );
                 let _ =
                     model.set_connection_state(server_id, supervisor::ConnectionState::Connecting);
             }
+            state
+                .update_outcome_expiry
+                .insert(server_id.clone(), now + HOST_UPDATE_OUTCOME_TTL);
             // Drop the stale-protocol stream and dial it back up on the new binary at the shortest
             // (attempt-0) backoff — same as #43's "reconnect" path.
             teardown_secondary_connection(state, server_writes, server_id);
@@ -3702,10 +3738,48 @@ fn apply_update_remote_finished(
         }
         Err(message) => {
             if let Some(model) = &mut state.supervisor_model {
-                model.set_update_progress(server_id, Some(message));
+                // #61: clear the spinner and surface a clear, lingering failure instead of leaving a
+                // stale "installing…"-looking progress line frozen on the banner (the old behaviour).
+                model.set_update_progress(server_id, None);
+                model.set_update_outcome(
+                    server_id,
+                    crate::app::state::HostUpdateOutcome {
+                        message: format!("✗ update failed: {message}"),
+                        success: false,
+                    },
+                );
             }
+            state
+                .update_outcome_expiry
+                .insert(server_id.clone(), now + HOST_UPDATE_FAILURE_TTL);
         }
     }
+}
+
+/// #61: clear any host update-outcome banner line whose display window has elapsed at `now`. The
+/// model holds the outcome text (no clock); this loop-side sweep removes it after the per-outcome TTL
+/// recorded in `update_outcome_expiry` (success vs failure). Returns whether anything was cleared, so
+/// the Timer can trigger exactly one repaint when a line actually leaves.
+fn expire_host_update_outcomes(state: &mut ClientState, now: Instant) -> bool {
+    if state.update_outcome_expiry.is_empty() {
+        return false;
+    }
+    let expired: Vec<supervisor::ServerId> = state
+        .update_outcome_expiry
+        .iter()
+        .filter(|(_, deadline)| now >= **deadline)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if expired.is_empty() {
+        return false;
+    }
+    for id in &expired {
+        state.update_outcome_expiry.remove(id);
+        if let Some(model) = &mut state.supervisor_model {
+            model.clear_update_outcome(id);
+        }
+    }
+    true
 }
 
 /// #44: re-fetch a remote's runtime version/protocol off the UI loop and post it back via
@@ -4304,6 +4378,7 @@ async fn run_client_loop(
         secondary_retries: HashMap::new(),
         manually_disconnected: HashSet::new(),
         pending_update_remote: HashSet::new(),
+        update_outcome_expiry: HashMap::new(),
         last_animation_tick: Instant::now(),
         pending_hover_render: false,
         pending_full_render: false,
@@ -5369,8 +5444,13 @@ async fn run_client_loop(
             // sub-line (ignored once the model is gone). Server_id-keyed so the right banner updates.
             ClientLoopEvent::UpdateRemoteProgress { server_id, message } => {
                 if let Some(model) = &mut state.supervisor_model {
+                    // #61: fresh progress means a NEW update is underway — drop any prior terminal
+                    // outcome so a lingering "✗ update failed"/"✓ updated" line (which the renderer
+                    // draws in preference to the spinner) can't mask this run's live progress.
+                    model.clear_update_outcome(&server_id);
                     model.set_update_progress(&server_id, Some(message));
                 }
+                state.update_outcome_expiry.remove(&server_id);
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);
             }
@@ -5411,11 +5491,30 @@ async fn run_client_loop(
                 version,
                 protocol,
             } => {
+                let mut enriched = false;
                 if let Some(model) = &mut state.supervisor_model {
+                    // #61: if this host is showing a "✓ update complete" outcome, fold in the
+                    // freshly-installed version now that we know it. Gated on a live success outcome,
+                    // so routine version fetches for un-updated hosts never pop a toast.
+                    if let Some(version) = version.as_deref() {
+                        enriched = model.enrich_update_success_with_version(&server_id, version);
+                    }
                     model.set_remote_runtime_info(&server_id, version, protocol);
                     state.request_full_redraw();
                 }
-                render_cached_composited_frame(&mut state);
+                if enriched {
+                    // Re-arm the display timer so the enriched "updated to vX.Y.Z" line shows for its
+                    // full window rather than expiring on the original (version-less) deadline.
+                    state
+                        .update_outcome_expiry
+                        .insert(server_id.clone(), Instant::now() + HOST_UPDATE_OUTCOME_TTL);
+                }
+                // #61: this now fires on EVERY summary refresh (the version readout populate path),
+                // not just once after an update — so the render MUST coalesce like the summary
+                // handler, or a fleet of remotes flooding the 400ms/2s cadence would drop the UI to
+                // ~1fps with one full rebuild per event. The runtime status is posted right before
+                // its paired summary event, so a coalesced (latest-wins) render flushes both.
+                request_composited_render(&mut state);
             }
             ClientLoopEvent::RemoteManageRequestFinished {
                 action,
@@ -5517,6 +5616,12 @@ async fn run_client_loop(
             ClientLoopEvent::Timer => {
                 // Check if we should quit.
                 let now = Instant::now();
+                // #61: drop any host update-outcome banner line whose display window has elapsed, then
+                // force a rebuild this tick so the cleared sub-line actually leaves the screen.
+                if expire_host_update_outcomes(&mut state, now) {
+                    state.request_full_redraw();
+                    state.pending_full_render = true;
+                }
                 // #48/#56: flush a deferred (coalesced) hover / menu-selection repaint. The
                 // HoverRedraw dispatch only marks this pending (it preserves the cached shell AND the
                 // blit baseline); the actual recompose + diff-write happens here, gated by the
@@ -6313,6 +6418,7 @@ mod tests {
             secondary_retries: HashMap::new(),
             manually_disconnected: HashSet::new(),
             pending_update_remote: HashSet::new(),
+            update_outcome_expiry: HashMap::new(),
             last_animation_tick: Instant::now(),
             pending_hover_render: false,
             pending_full_render: false,
@@ -7722,6 +7828,20 @@ mod tests {
             retry.next_retry_at <= now + secondary_retry_delay(0),
             "reconnect is scheduled at the attempt-0 (shortest) backoff"
         );
+        // #61: Ok finish posts a positive, observable "done" outcome and arms its display timer (so
+        // completion is no longer inferred from the spinner merely vanishing).
+        let outcome = state
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .update_outcome_for(&remote_id)
+            .expect("Ok finish shows a success outcome");
+        assert!(outcome.success);
+        assert_eq!(outcome.message, "✓ update complete");
+        assert!(
+            state.update_outcome_expiry.contains_key(&remote_id),
+            "Ok finish arms the outcome display timer"
+        );
 
         // Err: clears the spinner but leaves a truthful message; no reconnect scheduled, no download.
         let (model2, remote2) = mixed_remote_model();
@@ -7741,20 +7861,79 @@ mod tests {
             ),
             now,
         );
-        let message = state2
+        // #61: the failure now surfaces as a terminal OUTCOME (✗), not a frozen progress spinner —
+        // the spinner/progress line is cleared and the truthful message is carried by the outcome.
+        let outcome = state2
             .supervisor_model
             .as_ref()
             .unwrap()
-            .update_progress_for(&remote2)
-            .expect("Err finish leaves a message on the progress line");
+            .update_outcome_for(&remote2)
+            .expect("Err finish shows a failure outcome");
+        assert!(!outcome.success);
         assert!(
-            message.contains("no binary"),
-            "Err finish surfaces a truthful (no-download) message: {message}"
+            outcome.message.contains("no binary"),
+            "Err finish surfaces a truthful (no-download) failure message: {}",
+            outcome.message
+        );
+        assert_eq!(
+            state2
+                .supervisor_model
+                .as_ref()
+                .unwrap()
+                .update_progress_for(&remote2),
+            None,
+            "Err finish clears the in-flight spinner (no stale 'installing…' line left frozen)"
+        );
+        assert!(
+            state2.update_outcome_expiry.contains_key(&remote2),
+            "Err finish arms the (longer) failure display timer"
         );
         assert!(
             !state2.secondary_retries.contains_key(&remote2),
             "Err finish does not schedule a reconnect"
         );
+    }
+
+    #[test]
+    fn expire_host_update_outcomes_clears_only_elapsed_lines() {
+        let (model, remote_id) = mixed_remote_model();
+        let mut state = test_client_state_with_model(model);
+        if let Some(model) = &mut state.supervisor_model {
+            model.set_update_outcome(
+                &remote_id,
+                crate::app::state::HostUpdateOutcome {
+                    message: "✓ update complete".into(),
+                    success: true,
+                },
+            );
+        }
+        let now = Instant::now();
+        // Not yet due → nothing cleared.
+        state
+            .update_outcome_expiry
+            .insert(remote_id.clone(), now + Duration::from_secs(5));
+        assert!(!expire_host_update_outcomes(&mut state, now));
+        assert!(state
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .update_outcome_for(&remote_id)
+            .is_some());
+
+        // Past its deadline → cleared from BOTH the loop-side timer map and the model.
+        state
+            .update_outcome_expiry
+            .insert(remote_id.clone(), now - Duration::from_secs(1));
+        assert!(expire_host_update_outcomes(&mut state, now));
+        assert!(!state.update_outcome_expiry.contains_key(&remote_id));
+        assert!(state
+            .supervisor_model
+            .as_ref()
+            .unwrap()
+            .update_outcome_for(&remote_id)
+            .is_none());
+        // Idempotent once empty.
+        assert!(!expire_host_update_outcomes(&mut state, now));
     }
 
     fn mixed_remote_model_with_many_workspaces(
@@ -9362,12 +9541,27 @@ mod tests {
         assert!(pending.contains(&remote_id));
         assert!(event_rx.try_recv().is_err());
 
-        let event = event_rx.blocking_recv().unwrap();
-        match event {
+        // #61: the worker now surfaces the runtime version/protocol captured from the same Ping the
+        // summary fetch already issues (previously discarded) — posted FIRST, then the summary result.
+        let first = event_rx.blocking_recv().unwrap();
+        match first {
+            ClientLoopEvent::SupervisorRuntimeStatusFetched {
+                server_id,
+                version,
+                protocol,
+            } => {
+                assert_eq!(server_id, remote_id);
+                assert_eq!(version.as_deref(), Some("0.6.4"));
+                assert_eq!(protocol, Some(PROTOCOL_VERSION));
+            }
+            _ => panic!("expected the runtime-status result first"),
+        }
+        let second = event_rx.blocking_recv().unwrap();
+        match second {
             ClientLoopEvent::SupervisorSummaryFetched { server_id, .. } => {
                 assert_eq!(server_id, remote_id);
             }
-            _ => panic!("expected async summary result"),
+            _ => panic!("expected the async summary result"),
         }
 
         api_thread.join().unwrap();

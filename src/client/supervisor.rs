@@ -575,6 +575,11 @@ pub(crate) struct ClientSupervisorModel {
     /// sub-line targets the right host. Populated by `set_update_progress` from the update worker's
     /// stage events; cleared when the update finishes. Threaded into `host_banner_specs`.
     update_progress: std::collections::HashMap<ServerId, String>,
+    /// #61: per-host TERMINAL update outcome (✓ success / ✗ failure) shown on the banner sub-line
+    /// once an update finishes, so completion is observable rather than inferred from the spinner
+    /// vanishing. Set by `set_update_outcome`; the client loop expires it on a timer (the model holds
+    /// no clock). Threaded into `host_banner_specs` and takes precedence over `update_progress`.
+    update_outcomes: std::collections::HashMap<ServerId, crate::app::state::HostUpdateOutcome>,
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -656,6 +661,7 @@ impl ClientSupervisorModel {
             overlay_drag_offset: (0, 0),
             optimistic_focus: None,
             update_progress: std::collections::HashMap::new(),
+            update_outcomes: std::collections::HashMap::new(),
         }
     }
 
@@ -677,6 +683,53 @@ impl ClientSupervisorModel {
     /// #44: the current live "update" progress line for `id`, if an update is in flight.
     pub(crate) fn update_progress_for(&self, id: &ServerId) -> Option<&str> {
         self.update_progress.get(id).map(String::as_str)
+    }
+
+    /// #61: set the TERMINAL update outcome banner sub-line for `id` (a positive "✓ updated …" on
+    /// success, or "✗ update failed …" on failure). Shown in place of the in-flight progress; the
+    /// client loop expires it on a timer via [`Self::clear_update_outcome`].
+    pub(crate) fn set_update_outcome(
+        &mut self,
+        id: &ServerId,
+        outcome: crate::app::state::HostUpdateOutcome,
+    ) {
+        self.update_outcomes.insert(id.clone(), outcome);
+    }
+
+    /// #61: clear `id`'s terminal update outcome (the loop's timer-driven expiry, or a teardown).
+    pub(crate) fn clear_update_outcome(&mut self, id: &ServerId) {
+        self.update_outcomes.remove(id);
+    }
+
+    /// #61: the current terminal update outcome for `id`, if one is being shown.
+    pub(crate) fn update_outcome_for(
+        &self,
+        id: &ServerId,
+    ) -> Option<&crate::app::state::HostUpdateOutcome> {
+        self.update_outcomes.get(id)
+    }
+
+    /// #61: if `id` is currently showing a SUCCESS outcome, fold the freshly-installed `version` into
+    /// its message ("✓ updated to vX.Y.Z"). Called when the post-update reconnect/refetch delivers
+    /// the new version; gated on a live success outcome so a routine runtime-status fetch for a host
+    /// that was never updated can never pop a toast. Returns whether it changed anything (so the loop
+    /// can re-arm the display timer to show the enriched line for its full window).
+    pub(crate) fn enrich_update_success_with_version(
+        &mut self,
+        id: &ServerId,
+        version: &str,
+    ) -> bool {
+        match self.update_outcomes.get_mut(id) {
+            Some(outcome) if outcome.success => {
+                let enriched = format!("✓ updated to v{version}");
+                if outcome.message == enriched {
+                    return false;
+                }
+                outcome.message = enriched;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn ui_settings(&self) -> &crate::api::schema::UiSettingsInfo {
@@ -2410,6 +2463,7 @@ impl ClientSupervisorModel {
                         latency_ms: server.avg_ping_ms(),
                         download_bps: server.download_bps,
                         update_progress: self.update_progress.get(&server.id).cloned(),
+                        update_outcome: self.update_outcomes.get(&server.id).cloned(),
                     },
                 ));
             }
@@ -2873,19 +2927,57 @@ fn request_server_summary(api: &mut impl SupervisorApi) -> Result<ServerSummary,
     Ok(ServerSummary::from_api(workspaces, agents))
 }
 
-pub(crate) fn fetch_server_summary_from_api_target(
+/// #61: the remote's runtime herdr version + wire protocol, captured from the Ping the summary fetch
+/// already issues. Recorded into the model so the host context-menu version readout reflects a LIVE
+/// host. Previously this Ping's `version` was fetched only to gate the protocol check and then thrown
+/// away, so an already-connected host's readout stayed stuck on "unknown" — only an in-flight
+/// `update` (via the post-update refetch) ever populated it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteRuntimeInfo {
+    pub(crate) version: Option<String>,
+    pub(crate) protocol: Option<u32>,
+}
+
+/// #61: fetch a secondary's summary AND its runtime version/protocol over the SAME api connection —
+/// the summary fetch already Pings for the protocol gate, so this captures the `version` it used to
+/// discard at zero extra round-trips. The runtime info is returned whenever the Ping SUCCEEDS,
+/// INCLUDING on a protocol mismatch (when the summary itself errors): that is exactly the case the
+/// host-menu ⚠ readout exists for (and #61's auto-update trigger keys off). `None` runtime only when
+/// the Ping itself failed (host unreachable), where there is nothing truthful to record.
+pub(crate) fn fetch_server_summary_with_runtime_status(
     target: crate::api::client::ConnectionTarget,
-) -> Result<ServerSummary, ConnectionState> {
+) -> (Option<RemoteRuntimeInfo>, Result<ServerSummary, ConnectionState>) {
     let mut api = crate::api::client::ApiClient::for_target(target);
-    let status = request_runtime_status(&mut api).map_err(|_| ConnectionState::Disconnected)?;
+    summary_with_runtime_status_via_api(&mut api)
+}
+
+/// Testable core of [`fetch_server_summary_with_runtime_status`] over a mockable [`SupervisorApi`].
+fn summary_with_runtime_status_via_api(
+    api: &mut impl SupervisorApi,
+) -> (Option<RemoteRuntimeInfo>, Result<ServerSummary, ConnectionState>) {
+    let status = match request_runtime_status(api) {
+        Ok(status) => status,
+        // The Ping itself failed → the host is unreachable; record nothing (no truthful version).
+        Err(_) => return (None, Err(ConnectionState::Disconnected)),
+    };
+    let runtime = RemoteRuntimeInfo {
+        version: status.version.clone(),
+        protocol: status.protocol,
+    };
     if status.protocol != Some(crate::protocol::PROTOCOL_VERSION) {
-        return Err(ConnectionState::ProtocolMismatch {
-            server_protocol: status.protocol,
-            client_protocol: crate::protocol::PROTOCOL_VERSION,
-        });
+        // Surface the version anyway — the readout's ⚠ is precisely for this mismatch, and the
+        // summary cannot be trusted across a protocol gap.
+        return (
+            Some(runtime),
+            Err(ConnectionState::ProtocolMismatch {
+                server_protocol: status.protocol,
+                client_protocol: crate::protocol::PROTOCOL_VERSION,
+            }),
+        );
     }
 
-    request_server_summary(&mut api).map_err(|_| ConnectionState::Disconnected)
+    let summary = request_server_summary(api).map_err(|_| ConnectionState::Disconnected);
+    (Some(runtime), summary)
 }
 
 pub(crate) fn request_runtime_status(
@@ -3375,6 +3467,9 @@ mod tests {
         ui_settings: crate::api::schema::UiSettingsInfo,
         fail_ui_settings: bool,
         fail_remote_list: bool,
+        // #61: the version/protocol this fake answers a Ping with (drives the runtime-status path).
+        pong_version: String,
+        pong_protocol: u32,
     }
 
     impl SupervisorApi for FakeSupervisorApi {
@@ -3383,6 +3478,14 @@ mod tests {
             request: crate::api::schema::Request,
         ) -> Result<crate::api::schema::SuccessResponse, String> {
             let result = match request.method {
+                crate::api::schema::Method::Ping(_) => {
+                    self.requests.push("ping");
+                    crate::api::schema::ResponseResult::Pong {
+                        version: self.pong_version.clone(),
+                        protocol: self.pong_protocol,
+                        capabilities: None,
+                    }
+                }
                 crate::api::schema::Method::RemoteList(_) => {
                     self.requests.push("remote.list");
                     if self.fail_remote_list {
@@ -3422,6 +3525,50 @@ mod tests {
                 result,
             })
         }
+    }
+
+    #[test]
+    fn summary_with_runtime_status_captures_version_for_a_matched_live_host() {
+        // #61 regression: the summary fetch Pings for the protocol gate; that Pong's `version` used
+        // to be discarded, leaving a live host's readout on "unknown". It must now come back so the
+        // host-menu version row reflects the connected host.
+        let mut api = FakeSupervisorApi {
+            pong_version: "0.6.4".into(),
+            pong_protocol: crate::protocol::PROTOCOL_VERSION,
+            workspaces: vec![workspace_info("main-workspace", "herdr", true)],
+            ..FakeSupervisorApi::default()
+        };
+
+        let (runtime, result) = summary_with_runtime_status_via_api(&mut api);
+
+        let runtime = runtime.expect("a successful Ping must surface the runtime version/protocol");
+        assert_eq!(runtime.version.as_deref(), Some("0.6.4"));
+        assert_eq!(runtime.protocol, Some(crate::protocol::PROTOCOL_VERSION));
+        assert!(result.is_ok(), "a matched host still returns its summary");
+    }
+
+    #[test]
+    fn summary_with_runtime_status_records_version_even_on_protocol_mismatch() {
+        // #61: a mismatch is exactly when the ⚠ readout (and the auto-update trigger) must show the
+        // version — so the runtime info comes back even though the summary errors with the mismatch.
+        let mut api = FakeSupervisorApi {
+            pong_version: "0.5.0".into(),
+            pong_protocol: crate::protocol::PROTOCOL_VERSION.wrapping_add(1),
+            ..FakeSupervisorApi::default()
+        };
+
+        let (runtime, result) = summary_with_runtime_status_via_api(&mut api);
+
+        let runtime = runtime.expect("a mismatched-but-reachable host still reports its version");
+        assert_eq!(runtime.version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            runtime.protocol,
+            Some(crate::protocol::PROTOCOL_VERSION.wrapping_add(1))
+        );
+        assert!(matches!(
+            result,
+            Err(ConnectionState::ProtocolMismatch { .. })
+        ));
     }
 
     #[test]
@@ -6047,5 +6194,69 @@ mod tests {
             model.host_banner_specs()[banner_index].1.update_progress,
             None
         );
+    }
+
+    #[test]
+    fn update_outcome_threads_into_banner_and_enriches_with_new_version() {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote = model.add_secondary(ssh_remote("r1", "alpha", "alpha"));
+        model
+            .set_connection_state(&remote, ConnectionState::Connected)
+            .unwrap();
+        let banner_index = model
+            .host_banner_specs()
+            .iter()
+            .position(|(_, spec)| spec.display_name == "alpha")
+            .expect("remote banner present");
+
+        // No outcome yet → nothing on the banner, and enrich is a no-op (no live success outcome).
+        assert!(model.host_banner_specs()[banner_index].1.update_outcome.is_none());
+        assert!(!model.enrich_update_success_with_version(&remote, "0.6.5"));
+
+        // A success outcome threads onto the banner sub-line.
+        model.set_update_outcome(
+            &remote,
+            crate::app::state::HostUpdateOutcome {
+                message: "✓ update complete".into(),
+                success: true,
+            },
+        );
+        assert_eq!(
+            model.host_banner_specs()[banner_index]
+                .1
+                .update_outcome
+                .as_ref()
+                .map(|o| (o.message.as_str(), o.success)),
+            Some(("✓ update complete", true))
+        );
+
+        // The post-update status fetch folds in the freshly-installed version (and re-fires once).
+        assert!(model.enrich_update_success_with_version(&remote, "0.6.5"));
+        assert_eq!(
+            model.update_outcome_for(&remote).map(|o| o.message.as_str()),
+            Some("✓ updated to v0.6.5")
+        );
+        assert!(
+            !model.enrich_update_success_with_version(&remote, "0.6.5"),
+            "the same version must not re-fire the display-timer re-arm"
+        );
+
+        // A FAILURE outcome is never version-enriched.
+        model.set_update_outcome(
+            &remote,
+            crate::app::state::HostUpdateOutcome {
+                message: "✗ update failed: boom".into(),
+                success: false,
+            },
+        );
+        assert!(!model.enrich_update_success_with_version(&remote, "0.7.0"));
+        assert_eq!(
+            model.update_outcome_for(&remote).map(|o| o.message.as_str()),
+            Some("✗ update failed: boom")
+        );
+
+        // Clearing removes it from the banner.
+        model.clear_update_outcome(&remote);
+        assert!(model.host_banner_specs()[banner_index].1.update_outcome.is_none());
     }
 }
