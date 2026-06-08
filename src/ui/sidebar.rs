@@ -4235,8 +4235,8 @@ lines = [
         );
     }
 
-    // #9 item 2: the toggle affordance is drawn in BOTH modes (it used to early-return when
-    // expanded, leaving an invisible cell): `collapse` label when expanded, `»` glyph when collapsed.
+    // #9/#58 item 2: the toggle affordance is drawn in BOTH modes as a single matching guillemet —
+    // `«` when expanded (will collapse), `»` when collapsed (will expand).
     #[test]
     fn sidebar_toggle_renders_label_in_both_modes() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -4255,12 +4255,12 @@ lines = [
         };
 
         assert!(
-            row_text(false).contains("collapse"),
-            "expanded toggle must show a labeled collapse affordance"
+            row_text(false).contains('«'),
+            "expanded toggle must show the « collapse glyph"
         );
         assert!(
             row_text(true).contains('»'),
-            "collapsed toggle must show an expand glyph"
+            "collapsed toggle must show the » expand glyph"
         );
     }
 
