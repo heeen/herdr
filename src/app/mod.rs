@@ -1134,6 +1134,16 @@ impl App {
                 self.state.agent_panel_scope =
                     agent_panel_scope_from_config(config.ui.agent_panel_scope);
                 self.state.agent_panel_scroll = 0;
+                // #58: the multi-remote client renders the sidebar from the server-pushed UiSettings,
+                // so a sidebar-config change must signal clients to re-fetch immediately — otherwise
+                // the change only lands on the next ~2s supervisor poll (the visible settings lag).
+                // Reuses the existing `request_client_config_reload` → `ReloadSoundConfig` push.
+                if self.state.sidebar_space != config.ui.sidebar.spaces
+                    || self.state.sidebar_agent != config.ui.sidebar.agents
+                    || self.state.sidebar_host != config.ui.sidebar.host
+                {
+                    self.state.request_client_config_reload = true;
+                }
                 self.state.sidebar_space = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_agent = config.ui.sidebar.agents.clone();
                 self.state.sidebar_host = config.ui.sidebar.host.clone();
@@ -1770,6 +1780,35 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #58: the multi-remote client renders the sidebar from server-pushed UiSettings, so a sidebar
+    // layout change on disk must flag clients to re-fetch immediately — otherwise it only lands on the
+    // next ~2s supervisor poll (the visible settings lag).
+    #[test]
+    fn reload_config_sidebar_change_requests_client_ui_settings_refresh() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-sidebar-agents");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[ui.sidebar.agents]\nlines = [[{ field = \"space_name\", show = true }]]\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.request_client_config_reload = false;
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(
+            app.state.request_client_config_reload,
+            "a sidebar-layout change must signal clients to re-fetch UiSettings"
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

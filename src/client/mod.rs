@@ -4922,6 +4922,11 @@ async fn run_client_loop(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
                         );
+                        // #58: a config reload may have changed the server-side sidebar settings
+                        // (pane/tab/space rows), which the client renders from the server-pushed
+                        // UiSettings. Re-fetch them off the UI loop NOW instead of waiting up to ~2s
+                        // for the next supervisor poll, so settings changes apply (near-)instantly.
+                        spawn_main_supervisor_refresh(&mut state.pending_main_refresh, &event_tx);
                     }
                     ServerMessage::MouseCapture { enabled } => {
                         if server_id != active_server_id(&state) {
