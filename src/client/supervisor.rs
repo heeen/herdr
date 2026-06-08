@@ -3512,6 +3512,7 @@ mod tests {
             pane_id: "pane-1".into(),
             focused,
             cwd: None,
+            foreground_cwd: None,
             revision: 1,
         }
     }

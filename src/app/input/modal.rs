@@ -152,7 +152,11 @@ pub(crate) fn handle_global_menu_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(crate) fn handle_navigator_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_navigator_key(
+    state: &mut AppState,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    key: KeyEvent,
+) {
     if state.navigator.search_focused {
         match key.code {
             KeyCode::Esc => {
@@ -163,36 +167,36 @@ pub(crate) fn handle_navigator_key(state: &mut AppState, key: KeyEvent) {
                     state.navigator.query.clear();
                     state.navigator.state_filter = None;
                     state.navigator.search_focused = false;
-                    state.clamp_navigator_selection();
+                    state.clamp_navigator_selection_from(terminal_runtimes);
                 }
             }
             KeyCode::Enter => {
-                state.accept_navigator_selection();
+                state.accept_navigator_selection_from(terminal_runtimes);
             }
             KeyCode::Backspace => {
                 state.navigator.state_filter = None;
                 state.navigator.query.pop();
-                state.clamp_navigator_selection();
+                state.clamp_navigator_selection_from(terminal_runtimes);
             }
-            KeyCode::Up => state.move_navigator_selection(-1),
-            KeyCode::Down => state.move_navigator_selection(1),
+            KeyCode::Up => state.move_navigator_selection_from(terminal_runtimes, -1),
+            KeyCode::Down => state.move_navigator_selection_from(terminal_runtimes, 1),
             KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
-                state.move_navigator_selection(1)
+                state.move_navigator_selection_from(terminal_runtimes, 1)
             }
             KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                state.move_navigator_selection(-1)
+                state.move_navigator_selection_from(terminal_runtimes, -1)
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 state.navigator.query.clear();
                 state.navigator.state_filter = None;
-                state.clamp_navigator_selection();
+                state.clamp_navigator_selection_from(terminal_runtimes);
             }
             KeyCode::Char(c)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 state.navigator.state_filter = None;
                 state.navigator.query.push(c);
-                state.clamp_navigator_selection();
+                state.clamp_navigator_selection_from(terminal_runtimes);
             }
             _ => {}
         }
@@ -206,62 +210,74 @@ pub(crate) fn handle_navigator_key(state: &mut AppState, key: KeyEvent) {
             } else {
                 state.navigator.query.clear();
                 state.navigator.state_filter = None;
-                state.clamp_navigator_selection();
+                state.clamp_navigator_selection_from(terminal_runtimes);
             }
         }
         KeyCode::Enter => {
-            state.accept_navigator_selection();
+            state.accept_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('/') => {
             state.navigator.query.clear();
             state.navigator.state_filter = None;
             state.navigator.search_focused = true;
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Backspace if state.navigator.state_filter.is_some() => {
             state.navigator.state_filter = None;
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('a') if key.modifiers.is_empty() => {
             state.navigator.query.clear();
             state.navigator.state_filter = None;
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('b') if key.modifiers.is_empty() => {
             state.navigator.query.clear();
             state.navigator.state_filter = Some(NavigatorStateFilter::Blocked);
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('w') if key.modifiers.is_empty() => {
             state.navigator.query.clear();
             state.navigator.state_filter = Some(NavigatorStateFilter::Working);
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('i') if key.modifiers.is_empty() => {
             state.navigator.query.clear();
             state.navigator.state_filter = Some(NavigatorStateFilter::Idle);
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
         KeyCode::Char('d') if key.modifiers.is_empty() => {
             state.navigator.query.clear();
             state.navigator.state_filter = Some(NavigatorStateFilter::Done);
-            state.clamp_navigator_selection();
+            state.clamp_navigator_selection_from(terminal_runtimes);
         }
-        KeyCode::Char('j') | KeyCode::Down => state.move_navigator_selection(1),
-        KeyCode::Char('k') | KeyCode::Up => state.move_navigator_selection(-1),
-        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-            state.move_navigator_selection((state.navigator_body_rect().height / 2).max(1) as isize)
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.move_navigator_selection_from(terminal_runtimes, 1)
         }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.move_navigator_selection_from(terminal_runtimes, -1)
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => state
+            .move_navigator_selection_from(
+                terminal_runtimes,
+                (state.navigator_body_rect().height / 2).max(1) as isize,
+            ),
         KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => state
-            .move_navigator_selection(-((state.navigator_body_rect().height / 2).max(1) as isize)),
-        KeyCode::Char(' ') => state.toggle_selected_navigator_workspace(),
+            .move_navigator_selection_from(
+                terminal_runtimes,
+                -((state.navigator_body_rect().height / 2).max(1) as isize),
+            ),
+        KeyCode::Char(' ') => state.toggle_selected_navigator_workspace_from(terminal_runtimes),
         KeyCode::Home => {
             state.navigator.selected = 0;
-            state.ensure_navigator_selection_visible();
+            state.ensure_navigator_selection_visible_from(terminal_runtimes);
         }
         KeyCode::End | KeyCode::Char('G') => {
-            state.navigator.selected = state.navigator_rows().len().saturating_sub(1);
-            state.ensure_navigator_selection_visible();
+            state.navigator.selected = state
+                .navigator_rows_from(terminal_runtimes)
+                .len()
+                .saturating_sub(1);
+            state.ensure_navigator_selection_visible_from(terminal_runtimes);
         }
         _ => {}
     }
@@ -695,49 +711,129 @@ pub(super) fn apply_context_menu_action(
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
-            state.close_tab();
-            state.mode = if state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
+            if !state.close_tab() {
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            }
         }
         (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
             open_rename_pane(state, pane_id);
         }
-        (ContextMenuKind::Pane { pane_id, .. }, Some("Clear pane name")) => {
-            if let Some(ws_idx) = state.active {
-                if let Some(ws) = state.workspaces.get(ws_idx) {
-                    if let Some(pane) = ws.pane_state(pane_id) {
-                        let terminal_id = pane.attached_terminal_id.clone();
-                        if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
-                            terminal.clear_manual_label();
-                            state.mark_session_dirty();
-                        }
+        (
+            ContextMenuKind::Pane {
+                ws_idx, pane_id, ..
+            },
+            Some("Clear pane name"),
+        ) => {
+            if let Some(ws) = state.workspaces.get(ws_idx) {
+                if let Some(pane) = ws.pane_state(pane_id) {
+                    let terminal_id = pane.attached_terminal_id.clone();
+                    if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
+                        terminal.clear_manual_label();
+                        state.mark_session_dirty();
                     }
                 }
             }
             state.mode = Mode::Terminal;
         }
-        (ContextMenuKind::Pane { .. }, Some("Split vertical")) => {
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                source_pane_id,
+                ..
+            },
+            Some("Swap with focused pane"),
+        ) => {
+            if let Some(source_pane_id) = source_pane_id {
+                state.selected = ws_idx;
+                state.active = Some(ws_idx);
+                state.switch_tab(tab_idx);
+                if let Some(tab) = state
+                    .workspaces
+                    .get_mut(ws_idx)
+                    .and_then(|ws| ws.tabs.get_mut(tab_idx))
+                {
+                    if tab.layout.swap_panes(source_pane_id, pane_id) {
+                        tab.layout.focus_pane(source_pane_id);
+                        state.mark_session_dirty();
+                    }
+                }
+            }
+            state.mode = Mode::Terminal;
+        }
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
+            Some("Split right"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
             state.split_pane(terminal_runtimes, Direction::Horizontal);
             state.mode = Mode::Terminal;
         }
-        (ContextMenuKind::Pane { .. }, Some("Split horizontal")) => {
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
+            Some("Split down"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
             state.split_pane(terminal_runtimes, Direction::Vertical);
             state.mode = Mode::Terminal;
         }
-        (ContextMenuKind::Pane { .. }, Some("Zoom")) => {
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
+            Some("Zoom"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
             state.toggle_zoom();
             state.mode = Mode::Terminal;
         }
-        (ContextMenuKind::Pane { .. }, Some("Close pane")) => {
-            state.close_pane();
-            state.mode = if state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
+            Some("Close pane"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
+            if !state.close_pane() {
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            }
         }
         _ => leave_modal(state),
     }
@@ -1259,5 +1355,51 @@ mod tests {
 
         assert!(state.workspaces.is_empty());
         assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        state.active = Some(0);
+        state.selected = 1;
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close pane")
+            .expect("close pane item");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.mode, Mode::ConfirmClose);
+        assert_eq!(state.workspaces.len(), 2);
     }
 }

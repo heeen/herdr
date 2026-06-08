@@ -197,9 +197,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
-    use super::super::{
-        app_for_mouse_test, mouse, numbered_lines_bytes, unique_temp_path, wait_for_file,
-    };
+    use super::super::{app_for_mouse_test, mouse, numbered_lines_bytes};
+    #[cfg(unix)]
+    use super::super::{unique_temp_path, wait_for_file};
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
 
@@ -519,7 +519,7 @@ mod tests {
         let deadline = app
             .selection_highlight_clear_deadline
             .expect("highlight clear deadline");
-        assert!(app.handle_scheduled_tasks(deadline + std::time::Duration::from_millis(1)));
+        assert!(app.handle_scheduled_tasks(deadline + std::time::Duration::from_millis(1), false));
         assert!(app.state.selection.is_none());
     }
 
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_unfocused_pane_with_mouse_reporting_focuses_it_via_right_button() {
+    async fn right_clicking_unfocused_mouse_reporting_pane_keeps_focus_for_context_menu() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let first_pane = ws.tabs[0].root_pane;
@@ -702,12 +702,10 @@ mod tests {
             second_info.inner_rect.y + 2,
         ));
 
-        assert_eq!(
-            app.state.workspaces[0].tabs[0].layout.focused(),
-            second_pane
-        );
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), first_pane);
         assert_eq!(app.state.mode, Mode::ContextMenu);
-        assert!(app.state.context_menu.is_some());
+        let menu = app.state.context_menu.as_ref().expect("pane context menu");
+        assert!(menu.items().contains(&"Swap with focused pane"));
     }
 
     #[tokio::test]
@@ -740,6 +738,7 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_direct_edit_scrollback_opens_editor_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -793,6 +792,7 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_custom_command_runs_before_forwarding_to_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -815,6 +815,7 @@ mod tests {
             label: "ctrl+alt+g".into(),
             command,
             action: crate::config::CustomCommandAction::Shell,
+            description: None,
         }];
 
         app.handle_terminal_key(TerminalKey::new(
@@ -828,6 +829,7 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_custom_pane_command_opens_overlay_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -845,7 +847,7 @@ mod tests {
             80,
             app.state.pane_scrollback_limit_bytes,
             app.state.host_terminal_theme,
-            &app.state.default_shell,
+            crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
             app.event_tx.clone(),
             app.render_notify.clone(),
             app.render_dirty.clone(),
@@ -863,6 +865,7 @@ mod tests {
             label: "ctrl+alt+g".into(),
             command: "printf direct-pane".into(),
             action: crate::config::CustomCommandAction::Pane,
+            description: None,
         }];
 
         app.handle_terminal_key(TerminalKey::new(

@@ -23,6 +23,27 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
+#[cfg(target_os = "macos")]
+fn modified_url_click_modifier() -> KeyModifiers {
+    KeyModifiers::SUPER
+}
+
+#[cfg(not(target_os = "macos"))]
+fn modified_url_click_modifier() -> KeyModifiers {
+    KeyModifiers::CONTROL
+}
+
+#[cfg(test)]
+#[test]
+fn modified_url_click_modifier_matches_platform_primary_modifier() {
+    #[cfg(target_os = "macos")]
+    assert_eq!(modified_url_click_modifier(), KeyModifiers::SUPER);
+
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
+}
+
+mod copy_mode;
 mod modal;
 mod mouse;
 mod navigate;
@@ -60,13 +81,14 @@ impl App {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
+            Mode::Copy => self.handle_copy_mode_key(key),
             _ => {
                 let key_event = key.as_key_event();
                 match self.state.mode {
                     Mode::Onboarding => self.handle_onboarding_key(key_event),
                     Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
                     Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                    Mode::Prefix | Mode::Navigate => unreachable!(),
+                    Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                         handle_rename_key(&mut self.state, key_event)
                     }
@@ -85,7 +107,9 @@ impl App {
                     Mode::Settings => self.handle_settings_key(key_event),
                     Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
                     Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
-                    Mode::Navigator => handle_navigator_key(&mut self.state, key_event),
+                    Mode::Navigator => {
+                        handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
+                    }
                     Mode::Terminal => unreachable!(),
                 }
             }
@@ -218,6 +242,9 @@ impl App {
                     SettingsAction::SavePaneHistory(enabled) => {
                         self.save_pane_history_persistence(enabled)
                     }
+                    SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
+                        self.save_switch_ascii_input_source_in_prefix(enabled)
+                    }
                     SettingsAction::SaveSidebarSpace {
                         previous,
                         preferences,
@@ -280,7 +307,7 @@ impl App {
     fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            || !mouse.modifiers.contains(KeyModifiers::CONTROL)
+            || !mouse.modifiers.contains(modified_url_click_modifier())
         {
             return false;
         }
@@ -440,7 +467,7 @@ impl AppState {
                 cwd,
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
-                &self.default_shell,
+                crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
             ) {
                 let new_id = new_pane.pane_id;
                 terminal_runtimes.insert(new_pane.terminal.id.clone(), new_pane.runtime);
@@ -546,6 +573,7 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {

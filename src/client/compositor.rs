@@ -2738,10 +2738,7 @@ fn hit_test_remote_manage(
         .scroll
         .min(rows.len().saturating_sub(max_rows.max(1)))
         .min(selected)
-        .max(crate::ui::open_existing_worktree_visible_start(
-            selected,
-            max_rows.max(1),
-        ));
+        .max(selected.saturating_sub(max_rows.max(1).saturating_sub(1)));
     for (visible_idx, (row_index, _)) in rows
         .iter()
         .enumerate()

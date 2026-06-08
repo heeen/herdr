@@ -137,14 +137,14 @@
                     </div>
                     <div class="install-panel" aria-label="Install options">
                         <div class="install-methods" role="group" aria-label="Install method">
+                            <span class="install-label">Stable install</span>
                             <button
                                 class="install-method is-active"
                                 type="button"
                                 data-command="curl -fsSL https://herdr.dev/install.sh | sh"
                                 data-size="compact"
                                 aria-pressed="true"
-                            >Direct</button>
-                            <span aria-hidden="true">·</span>
+                            >Script</button>
                             <button
                                 class="install-method"
                                 type="button"
@@ -152,7 +152,6 @@
                                 data-size="normal"
                                 aria-pressed="false"
                             >Homebrew</button>
-                            <span aria-hidden="true">·</span>
                             <button
                                 class="install-method"
                                 type="button"
@@ -166,13 +165,23 @@
                             <code id="install-cmd" class="is-compact"
                                 >curl -fsSL https://herdr.dev/install.sh | sh</code
                             >
-                            <button id="copy-btn" type="button">Copy</button>
+                            <button id="copy-btn" type="button" data-copy-target="install-cmd">Copy</button>
+                        </div>
+                        <div class="windows-install" aria-label="Windows beta preview install">
+                            <div class="windows-install-heading">
+                                <span>Windows beta · preview only</span>
+                                <a href="/docs/preview/windows-beta/">Preview docs</a>
+                            </div>
+                            <div class="install-card install-card-secondary" aria-label="Windows beta install command">
+                                <span class="prompt">PS&gt;</span>
+                                <code id="windows-install-cmd" class="is-compact"
+                                    >irm https://herdr.dev/install.ps1 | iex</code
+                                >
+                                <button type="button" data-copy-target="windows-install-cmd">Copy</button>
+                            </div>
                         </div>
                     </div>
-                    <p class="hero-note">
-                        Install script · Homebrew core · Nix flake · single Rust
-                        binary · no Electron
-                    </p>
+                    <p class="hero-note">Stable Linux/macOS · Windows preview beta · no Electron</p>
                 </div>
                 </div>
 
@@ -714,7 +723,7 @@ $ herdr</code></pre>
                     <div class="agent-card"><span class="agent-icon" style="--agent-icon: url('/assets/agent-icons/kimi.svg')"></span><span>Kimi</span></div>
                     <div class="agent-card"><span class="agent-icon" style="--agent-icon: url('/assets/agent-icons/kiro-mask.svg')"></span><span>Kiro</span></div>
                     <div class="agent-card"><span class="agent-icon" style="--agent-icon: url('/assets/agent-icons/github-copilot.svg')"></span><span>Copilot</span></div>
-                    <div class="agent-card"><span class="agent-icon" style="--agent-icon: url('/assets/agent-icons/qoder-mask.svg')"></span><span>Qoder</span></div>
+                    <div class="agent-card"><span class="agent-icon" style="--agent-icon: url('/assets/agent-icons/qoder-mask.svg')"></span><span>Qoder CLI</span></div>
                 </div>
                 <p class="integration-note">
                     Any terminal agent works in Herdr. Use the Herdr API to add
@@ -1052,18 +1061,23 @@ $ herdr</code></pre>
                     });
                 });
 
-                copyButton.addEventListener("click", async function () {
-                    try {
-                        await navigator.clipboard.writeText(
-                            command.textContent.trim(),
-                        );
-                        copyButton.textContent = "Copied";
-                        setTimeout(function () {
-                            copyButton.textContent = "Copy";
-                        }, 1500);
-                    } catch (error) {
-                        copyButton.textContent = "Select";
-                    }
+                document.querySelectorAll("[data-copy-target]").forEach(function (button) {
+                    button.addEventListener("click", async function () {
+                        var target = document.getElementById(button.dataset.copyTarget);
+                        if (!target) return;
+
+                        try {
+                            await navigator.clipboard.writeText(
+                                target.textContent.trim(),
+                            );
+                            button.textContent = "Copied";
+                            setTimeout(function () {
+                                button.textContent = "Copy";
+                            }, 1500);
+                        } catch (error) {
+                            button.textContent = "Select";
+                        }
+                    });
                 });
             })();
 

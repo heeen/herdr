@@ -2722,6 +2722,18 @@ pub(crate) fn collapsed_sidebar_toggle_rect(area: Rect) -> Rect {
     Rect::new(area.x, bottom_y, content_w, 1)
 }
 
+pub(crate) fn expanded_sidebar_toggle_rect(area: Rect) -> Rect {
+    if area.width <= 1 || area.height == 0 {
+        return Rect::default();
+    }
+    Rect::new(
+        area.x + area.width.saturating_sub(2),
+        area.y + area.height.saturating_sub(1),
+        1,
+        1,
+    )
+}
+
 fn render_sidebar_toggle(
     app: &AppState,
     frame: &mut Frame,
@@ -2732,73 +2744,56 @@ fn render_sidebar_toggle(
     // #9: draw the affordance in BOTH modes (it used to early-return when expanded, leaving an
     // invisible 1×1 hit cell). #58: a single matching guillemet pair, no word — expanded shows `«`
     // (will collapse), collapsed shows `»` (will expand). ratatui clips the label to the rect.
+    // The collapse glyph occupies the full-width bottom row in both modes; right-aligning the
+    // single guillemet keeps it pinned to the legacy `expanded_sidebar_toggle_rect` cell so the
+    // upstream sidebar-settings hit geometry/tests stay valid.
     let toggle_area = collapsed_sidebar_toggle_rect(area);
     if toggle_area == Rect::default() {
         return;
     }
-    let icon_style = if app.global_menu_attention_badge_visible() {
+    let icon = if collapsed { "»" } else { "«" };
+    let icon_style = if collapsed && app.global_menu_attention_badge_visible() {
         Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(p.overlay0)
     };
-    let label = if collapsed { "»" } else { "«" };
-    frame.render_widget(Paragraph::new(Span::styled(label, icon_style)), toggle_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(icon, icon_style)).alignment(Alignment::Right),
+        toggle_area,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
-    fn format_download_rate_scales_units() {
-        assert_eq!(format_download_rate(512), "512b/s");
-        assert_eq!(format_download_rate(312_000), "312kb/s");
-        assert_eq!(format_download_rate(1_500_000), "1.5mb/s");
-    }
+    fn render_sidebar_toggle_draws_expanded_collapse_icon() {
+        let app = crate::app::state::AppState::test_new();
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal =
+            Terminal::new(TestBackend::new(26, 20)).expect("test terminal should initialize");
 
-    #[test]
-    fn host_health_color_grades_by_latency() {
-        let p = Palette::catppuccin();
-        use crate::app::state::HostBannerState::Connected;
-        assert_eq!(host_health_color(None, Connected, &p), p.overlay0);
-        assert_eq!(host_health_color(Some(40), Connected, &p), p.green);
-        assert_eq!(host_health_color(Some(120), Connected, &p), p.yellow);
-        assert_eq!(host_health_color(Some(400), Connected, &p), p.peach);
-        // A down host is always red regardless of any stale latency sample.
+        terminal
+            .draw(|frame| render_sidebar_toggle(&app, frame, area, false, &app.palette))
+            .expect("sidebar toggle should render");
+
+        let toggle = expanded_sidebar_toggle_rect(area);
         assert_eq!(
-            host_health_color(
-                Some(5),
-                crate::app::state::HostBannerState::Disconnected,
-                &p
-            ),
-            p.red
+            terminal.backend().buffer()[(toggle.x, toggle.y)].symbol(),
+            "«"
         );
     }
 
     #[test]
-    fn host_banner_metric_spans_combine_rate_and_ping() {
-        let p = Palette::catppuccin();
-        let spec = crate::app::state::HostBannerSpec {
-            display_name: "macmini".into(),
-            connection_state: crate::app::state::HostBannerState::Connected,
-            space_count: 1,
-            latency_ms: Some(50),
-            download_bps: Some(312_000),
-            update_progress: None,
-            update_outcome: None,
-        };
-        let (spans, width) = host_banner_metric_spans(&spec, &p);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "↓312kb/s 50ms");
-        assert!(width > 0);
-        // Nothing measured → no metric.
-        let empty = crate::app::state::HostBannerSpec {
-            latency_ms: None,
-            download_bps: None,
-            ..spec
-        };
-        assert_eq!(host_banner_metric_spans(&empty, &p).1, 0);
+    fn expanded_sidebar_toggle_sits_inside_sidebar_content() {
+        let area = Rect::new(0, 0, 26, 20);
+        let toggle = expanded_sidebar_toggle_rect(area);
+
+        assert_eq!(toggle.x, area.x + area.width - 2);
+        assert_eq!(toggle.y, area.y + area.height - 1);
     }
 
     fn agent_entry_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
@@ -2904,6 +2899,57 @@ mod tests {
     }
 
     #[test]
+    fn format_download_rate_scales_units() {
+        assert_eq!(format_download_rate(512), "512b/s");
+        assert_eq!(format_download_rate(312_000), "312kb/s");
+        assert_eq!(format_download_rate(1_500_000), "1.5mb/s");
+    }
+
+    #[test]
+    fn host_health_color_grades_by_latency() {
+        let p = Palette::catppuccin();
+        use crate::app::state::HostBannerState::Connected;
+        assert_eq!(host_health_color(None, Connected, &p), p.overlay0);
+        assert_eq!(host_health_color(Some(40), Connected, &p), p.green);
+        assert_eq!(host_health_color(Some(120), Connected, &p), p.yellow);
+        assert_eq!(host_health_color(Some(400), Connected, &p), p.peach);
+        // A down host is always red regardless of any stale latency sample.
+        assert_eq!(
+            host_health_color(
+                Some(5),
+                crate::app::state::HostBannerState::Disconnected,
+                &p
+            ),
+            p.red
+        );
+    }
+
+    #[test]
+    fn host_banner_metric_spans_combine_rate_and_ping() {
+        let p = Palette::catppuccin();
+        let spec = crate::app::state::HostBannerSpec {
+            display_name: "macmini".into(),
+            connection_state: crate::app::state::HostBannerState::Connected,
+            space_count: 1,
+            latency_ms: Some(50),
+            download_bps: Some(312_000),
+            update_progress: None,
+            update_outcome: None,
+        };
+        let (spans, width) = host_banner_metric_spans(&spec, &p);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "↓312kb/s 50ms");
+        assert!(width > 0);
+        // Nothing measured → no metric.
+        let empty = crate::app::state::HostBannerSpec {
+            latency_ms: None,
+            download_bps: None,
+            ..spec
+        };
+        assert_eq!(host_banner_metric_spans(&empty, &p).1, 0);
+    }
+
+    #[test]
     fn all_workspaces_agent_panel_entries_use_workspace_and_optional_tab_labels() {
         let mut app = crate::app::state::AppState::test_new();
         let first = Workspace::test_new("one");
@@ -2941,6 +2987,7 @@ mod tests {
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn all_workspaces_agent_panel_entries_use_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(
@@ -2983,7 +3030,7 @@ mod tests {
             live_cwd.clone(),
             0,
             crate::terminal_theme::TerminalTheme::default(),
-            "/bin/sh",
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

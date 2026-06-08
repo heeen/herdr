@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
     state::{WorktreeCreateState, WorktreeOpenEntry, WorktreeOpenState, WorktreeRemoveState},
@@ -225,6 +225,8 @@ impl App {
             repo_name: space.label,
             entries,
             selected: 0,
+            query: String::new(),
+            search_focused: false,
             error: None,
         });
         self.state.mode = Mode::OpenExistingWorktree;
@@ -277,15 +279,49 @@ impl App {
             }
             KeyCode::Up => {
                 if let Some(open) = &mut self.state.worktree_open {
-                    open.selected = open.selected.saturating_sub(1);
+                    open.select_previous_filtered();
                 }
             }
             KeyCode::Down => {
                 if let Some(open) = &mut self.state.worktree_open {
-                    open.selected = open
-                        .selected
-                        .saturating_add(1)
-                        .min(open.entries.len().saturating_sub(1));
+                    open.select_next_filtered();
+                }
+            }
+            KeyCode::Char('/') => {
+                if let Some(open) = &mut self.state.worktree_open {
+                    if open.search_focused {
+                        open.query.push('/');
+                        open.normalize_selection();
+                    } else {
+                        open.search_focused = true;
+                    }
+                }
+            }
+            KeyCode::Char(ch)
+                if self
+                    .state
+                    .worktree_open
+                    .as_ref()
+                    .is_some_and(|open| open.search_focused)
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+            {
+                if let Some(open) = &mut self.state.worktree_open {
+                    if !ch.is_control() {
+                        open.query.push(ch);
+                        open.normalize_selection();
+                    }
+                }
+            }
+            KeyCode::Backspace
+                if self
+                    .state
+                    .worktree_open
+                    .as_ref()
+                    .is_some_and(|open| open.search_focused) =>
+            {
+                if let Some(open) = &mut self.state.worktree_open {
+                    open.query.pop();
+                    open.normalize_selection();
                 }
             }
             KeyCode::Enter => self.open_selected_existing_worktree(),
@@ -297,7 +333,10 @@ impl App {
         let Some(open) = self.state.worktree_open.as_ref() else {
             return;
         };
-        let Some(entry) = open.entries.get(open.selected).cloned() else {
+        let Some(entry_idx) = open.selected_entry_index() else {
+            return;
+        };
+        let Some(entry) = open.entries.get(entry_idx).cloned() else {
             return;
         };
         let source_workspace_id = open.source_workspace_id.clone();
@@ -349,6 +388,8 @@ impl App {
                     repo_name,
                     entries: vec![entry],
                     selected: 0,
+                    query: String::new(),
+                    search_focused: false,
                     error: Some(format!("failed to open worktree: {err}")),
                 });
                 self.state.mode = Mode::OpenExistingWorktree;
@@ -507,21 +548,44 @@ impl App {
     }
 
     pub(crate) fn start_worktree_remove(&mut self) {
-        let Some(remove) = &mut self.state.worktree_remove else {
+        let Some((workspace_id, repo_root, path, force)) =
+            self.state.worktree_remove.as_mut().and_then(|remove| {
+                if remove.removing {
+                    return None;
+                }
+                #[cfg(windows)]
+                if !remove.force_confirmation
+                    && crate::worktree::checkout_has_dirty_files(&remove.path).unwrap_or(false)
+                {
+                    remove.force_confirmation = true;
+                    remove.error = None;
+                    return None;
+                }
+                remove.removing = true;
+                remove.error = None;
+                Some((
+                    remove.workspace_id.clone(),
+                    remove.repo_root.clone(),
+                    remove.path.clone(),
+                    remove.force_confirmation,
+                ))
+            })
+        else {
             return;
         };
-        if remove.removing {
-            return;
-        }
-        remove.removing = true;
-        remove.error = None;
-        let force = remove.force_confirmation;
 
-        let command =
-            crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
-        tracing::info!(workspace_id = %remove.workspace_id, path = %remove.path.display(), force, "starting git worktree remove");
-        let path = remove.path.clone();
-        let workspace_id = remove.workspace_id.clone();
+        #[cfg(windows)]
+        if let Some(ws_idx) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == workspace_id)
+        {
+            self.shutdown_workspace_terminal_runtimes_for_worktree_remove(ws_idx);
+        }
+
+        let command = crate::worktree::build_worktree_remove_command(&repo_root, &path, force);
+        tracing::info!(workspace_id = %workspace_id, path = %path.display(), force, "starting git worktree remove");
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = crate::worktree::run_worktree_command(&command);
@@ -656,6 +720,23 @@ impl App {
             }
         }
     }
+
+    #[cfg(windows)]
+    pub(crate) fn shutdown_workspace_terminal_runtimes_for_worktree_remove(
+        &mut self,
+        ws_idx: usize,
+    ) {
+        for terminal_id in self.state.terminal_ids_for_workspace(ws_idx) {
+            if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+                tracing::debug!(
+                    workspace_index = ws_idx,
+                    terminal_id = %terminal_id,
+                    "shutting down terminal runtime before Windows worktree removal"
+                );
+                runtime.shutdown();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +822,8 @@ mod tests {
                 already_open_ws_idx: Some(1),
             }],
             selected: 0,
+            query: String::new(),
+            search_focused: false,
             error: None,
         });
 
@@ -757,6 +840,73 @@ mod tests {
             std::path::PathBuf::from("/repo/herdr-issue")
         );
         assert!(target_membership.is_linked_worktree);
+    }
+
+    #[test]
+    fn worktree_open_search_filters_entries() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_open = Some(WorktreeOpenState {
+            source_workspace_id: "source".into(),
+            source_existing_membership: None,
+            source_checkout_path: "/repo/herdr".into(),
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            entries: vec![
+                WorktreeOpenEntry {
+                    path: "/repo/herdr".into(),
+                    branch: Some("main".into()),
+                    is_linked_worktree: false,
+                    already_open_ws_idx: Some(0),
+                },
+                WorktreeOpenEntry {
+                    path: "/repo/fd-cleanup".into(),
+                    branch: Some("fd-cleanup".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                },
+                WorktreeOpenEntry {
+                    path: "/repo/bell-forward-macos-bounce".into(),
+                    branch: Some("bell-forward-macos-bounce".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                },
+            ],
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            error: None,
+        });
+
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('-'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let open = app.state.worktree_open.as_ref().unwrap();
+        assert_eq!(open.query, "fd-cl");
+        assert_eq!(open.filtered_indices(), vec![1]);
+        assert_eq!(open.selected_entry_index(), Some(1));
     }
 
     #[test]
@@ -901,6 +1051,55 @@ mod tests {
         let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn open_new_worktree_dialog_supports_standalone_bare_repo_source() {
+        let repo = create_committed_repo("app-worktree-dialog-bare-origin");
+        let bare = unique_temp_path("app-worktree-dialog-bare-repo");
+        run_git(
+            &repo,
+            &["clone", "--quiet", "--bare", ".", bare.to_str().unwrap()],
+        );
+        let worktree_root = unique_temp_path("app-worktree-dialog-bare-root");
+
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("source")];
+        app.state.workspaces[0].identity_cwd = bare.clone();
+
+        app.open_new_linked_worktree_dialog(0);
+
+        assert_eq!(app.state.mode, Mode::NewLinkedWorktree);
+        assert!(app.state.config_diagnostic.is_none());
+        let create = app.state.worktree_create.as_ref().unwrap();
+        assert_eq!(create.source_checkout_path, bare);
+        assert_eq!(create.source_repo_root, create.source_checkout_path);
+        let source_checkout_path = create.source_checkout_path.clone();
+
+        let branch = "worktree/from-bare-source";
+        let repo_name = create.repo_name.clone();
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, &repo_name, branch);
+        app.state.name_input = branch.into();
+
+        app.start_worktree_add();
+
+        let event = wait_for_worktree_event(&mut app);
+        match event {
+            AppEvent::WorktreeAddFinished(result) => {
+                assert_eq!(result.path, checkout);
+                assert_eq!(result.result, Ok(()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(checkout.join("README.md").exists());
+
+        let remove_new =
+            crate::worktree::build_worktree_remove_command(&source_checkout_path, &checkout, false);
+        crate::worktree::run_worktree_command(&remove_new).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(source_checkout_path);
         let _ = std::fs::remove_dir_all(repo);
     }
 
@@ -1053,15 +1252,19 @@ mod tests {
         app.open_remove_linked_worktree_confirmation(0);
 
         app.start_worktree_remove();
-        let safe_event = wait_for_worktree_event(&mut app);
-        match safe_event {
-            AppEvent::WorktreeRemoveFinished(result) => {
-                assert_eq!(result.workspace_id, workspace_id);
-                assert_eq!(result.path, checkout);
-                assert!(result.result.is_err());
-                app.handle_worktree_remove_finished(result);
+
+        #[cfg(not(windows))]
+        {
+            let safe_event = wait_for_worktree_event(&mut app);
+            match safe_event {
+                AppEvent::WorktreeRemoveFinished(result) => {
+                    assert_eq!(result.workspace_id, workspace_id);
+                    assert_eq!(result.path, checkout);
+                    assert!(result.result.is_err());
+                    app.handle_worktree_remove_finished(result);
+                }
+                other => panic!("unexpected event: {other:?}"),
             }
-            other => panic!("unexpected event: {other:?}"),
         }
 
         let remove = app.state.worktree_remove.as_ref().unwrap();

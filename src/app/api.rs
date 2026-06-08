@@ -13,6 +13,8 @@ mod worktrees;
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 
+const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
     RespawnShell,
@@ -22,14 +24,29 @@ enum RuntimeExitAction {
 impl App {
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
         if let AppEvent::ClipboardWrite { content } = ev {
+            #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
+            #[cfg(test)]
+            let _ = content;
             self.show_clipboard_feedback();
             return;
         }
 
-        if let AppEvent::GitStatusRefreshed { results } = ev {
+        if let AppEvent::GitStatusRefreshed {
+            results,
+            cache_updates,
+        } = ev
+        {
             self.git_refresh_in_flight = false;
-            self.last_git_remote_status_refresh = Instant::now();
+            for (key, entry) in cache_updates {
+                self.git_status_cache.insert(key, entry);
+            }
+            if self.git_refresh_due_after_in_flight {
+                self.mark_git_status_refresh_due(Instant::now());
+                self.git_refresh_due_after_in_flight = false;
+            } else {
+                self.last_git_remote_status_refresh = Instant::now();
+            }
             if self
                 .state
                 .apply_workspace_git_statuses(&self.terminal_runtimes, results)
@@ -101,9 +118,14 @@ impl App {
         } else {
             None
         };
+        let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
+        if terminal_cwd_reported {
+            self.mark_git_status_refresh_due(Instant::now());
+        }
         for update in &pane_updates {
+            self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
         }
         self.sync_agent_metadata_deadline();
@@ -137,11 +159,9 @@ impl App {
             };
 
             if let Some((version, install_command)) = update_ready {
-                let _ = notify(
-                    &format!("v{version} available"),
-                    Some(&format!("detach, then run `{install_command}`")),
-                );
-            } else {
+                let instruction = crate::update::update_install_instruction(&install_command);
+                let _ = notify(&format!("v{version} available"), Some(&instruction));
+            } else if self.state.toast_config.delay_seconds == 0 {
                 for update in &pane_updates {
                     let is_active_tab = self
                         .state
@@ -181,10 +201,13 @@ impl App {
                         ToastKind::Finished => "finished",
                         ToastKind::UpdateInstalled => "updated",
                     };
+                    let workspace_label =
+                        ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
                     let _ = notify(
                         &format!("{} {}", agent_label, event_text),
                         Some(&crate::app::actions::notification_context(
                             ws,
+                            &workspace_label,
                             update.ws_idx,
                             update.pane_id,
                         )),
@@ -197,7 +220,55 @@ impl App {
         self.shutdown_detached_terminal_runtimes();
     }
 
+    pub(crate) fn refresh_new_herdr_toast_context_for_update(
+        &mut self,
+        update: &crate::app::actions::PaneStateUpdate,
+        previous_toast: &Option<crate::app::state::ToastNotification>,
+    ) {
+        if !matches!(
+            self.state.toast_config.delivery,
+            crate::config::ToastDelivery::Herdr
+        ) || self.state.toast == *previous_toast
+        {
+            return;
+        }
+
+        let Some(target) = self
+            .state
+            .toast
+            .as_ref()
+            .and_then(|toast| toast.target.as_ref())
+        else {
+            return;
+        };
+        if target.pane_id != update.pane_id {
+            return;
+        }
+        let Some(ws) = self.state.workspaces.get(update.ws_idx) else {
+            return;
+        };
+        if ws.id != target.workspace_id {
+            return;
+        }
+
+        let workspace_label = ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
+        let context = crate::app::actions::notification_context(
+            ws,
+            &workspace_label,
+            update.ws_idx,
+            update.pane_id,
+        );
+        if let Some(toast) = self.state.toast.as_mut() {
+            toast.context = context;
+        }
+    }
+
     pub(crate) fn show_clipboard_feedback(&mut self) {
+        if !self.state.toast_config.clipboard.enabled {
+            self.state.copy_feedback = None;
+            self.copy_feedback_deadline = None;
+            return;
+        }
         self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
             message: "copied to clipboard".to_string(),
         });
@@ -265,7 +336,7 @@ impl App {
             cwd,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
-            &self.state.default_shell,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -284,9 +355,7 @@ impl App {
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.launch_argv = None;
-            terminal.respawn_shell_on_exit = false;
-            terminal.clear_agent_name();
+            terminal.clear_agent_runtime_identity_after_respawn();
         }
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
         self.schedule_session_save();
@@ -339,7 +408,7 @@ impl App {
         }
     }
 
-    pub(super) fn sync_toast_deadline(
+    pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
     ) {
@@ -352,6 +421,72 @@ impl App {
                 };
                 Instant::now() + duration
             });
+        }
+    }
+
+    pub(crate) fn emit_delayed_client_local_agent_notifications(
+        &self,
+        deliveries: &[crate::app::state::AgentNotificationDelivery],
+    ) {
+        if !self.local_terminal_notifications
+            || !matches!(
+                self.state.toast_config.delivery,
+                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
+            )
+        {
+            return;
+        }
+
+        let notify = match self.state.toast_config.delivery {
+            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
+            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
+            _ => unreachable!("toast delivery was checked above"),
+        };
+
+        for delivery in deliveries {
+            let Some(toast) = &delivery.client_notification else {
+                continue;
+            };
+            let _ = notify(&toast.title, Some(&toast.context));
+        }
+    }
+
+    pub(crate) fn refresh_agent_notification_delivery_contexts(
+        &mut self,
+        deliveries: &mut [crate::app::state::AgentNotificationDelivery],
+    ) {
+        for delivery in deliveries {
+            let Some(ws_idx) = self
+                .state
+                .workspaces
+                .iter()
+                .position(|ws| ws.id == delivery.workspace_id)
+            else {
+                continue;
+            };
+            let ws = &self.state.workspaces[ws_idx];
+            let workspace_label =
+                ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
+            let context = crate::app::actions::notification_context(
+                ws,
+                &workspace_label,
+                ws_idx,
+                delivery.pane_id,
+            );
+            if let Some(toast) = delivery.toast.as_mut() {
+                toast.context = context.clone();
+            }
+            if let Some(toast) = delivery.client_notification.as_mut() {
+                toast.context = context.clone();
+            }
+            if let Some(toast) = self.state.toast.as_mut() {
+                if toast.target.as_ref().is_some_and(|target| {
+                    target.workspace_id == delivery.workspace_id
+                        && target.pane_id == delivery.pane_id
+                }) {
+                    toast.context = context;
+                }
+            }
         }
     }
 
@@ -478,6 +613,9 @@ impl App {
             Method::RemoteSetAutoUpdate(params) => {
                 return self.handle_remote_set_auto_update(request.id, params)
             }
+            Method::NotificationShow(params) => {
+                return self.handle_notification_show(request.id, params);
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
@@ -517,12 +655,24 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
+            Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
+            Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
+            Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
+            Method::PaneNeighbor(params) => return self.handle_pane_neighbor(request.id, params),
+            Method::PaneEdges(params) => return self.handle_pane_edges(request.id, params),
+            Method::PaneFocusDirection(params) => {
+                return self.handle_pane_focus_direction(request.id, params);
+            }
+            Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
+            }
+            Method::PaneReportAgentSession(params) => {
+                return self.handle_pane_report_agent_session(request.id, params);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
@@ -571,6 +721,96 @@ impl App {
             sidebar_host: self.state.sidebar_host.clone(),
         }
     }
+
+    fn handle_notification_show(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationShowParams,
+    ) -> String {
+        use crate::api::schema::{NotificationShowReason, ResponseResult};
+
+        let requested_sound = params.sound;
+        let Some(title) = sanitized_notification_text(&params.title, 80) else {
+            return responses::encode_error(id, "invalid_params", "notification title is empty");
+        };
+        let body = params
+            .body
+            .as_deref()
+            .and_then(|body| sanitized_notification_text(body, 240));
+
+        let reason = match self.state.toast_config.delivery {
+            crate::config::ToastDelivery::Off => NotificationShowReason::Disabled,
+            crate::config::ToastDelivery::Herdr => {
+                if self.state.toast.is_some() {
+                    NotificationShowReason::Busy
+                } else if self.api_notification_rate_limited(Instant::now()) {
+                    NotificationShowReason::RateLimited
+                } else {
+                    let previous_toast = self.state.toast.clone();
+                    self.mark_api_notification_shown(Instant::now());
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: ToastKind::UpdateInstalled,
+                        title,
+                        context: body.unwrap_or_default(),
+                        position: params.position,
+                        target: None,
+                    });
+                    self.sync_toast_deadline(previous_toast);
+                    self.emit_api_notification_sound(requested_sound);
+                    NotificationShowReason::Shown
+                }
+            }
+            crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System => {
+                if self.api_notification_rate_limited(Instant::now()) {
+                    NotificationShowReason::RateLimited
+                } else {
+                    let notify = match self.state.toast_config.delivery {
+                        crate::config::ToastDelivery::Terminal => {
+                            crate::terminal_notify::show_notification
+                        }
+                        crate::config::ToastDelivery::System => {
+                            crate::platform::show_desktop_notification
+                        }
+                        _ => unreachable!("notification delivery was checked above"),
+                    };
+                    match notify(&title, body.as_deref()) {
+                        Ok(true) => {
+                            self.mark_api_notification_shown(Instant::now());
+                            self.emit_api_notification_sound(requested_sound);
+                            NotificationShowReason::Shown
+                        }
+                        Ok(false) | Err(_) => NotificationShowReason::NoForegroundClient,
+                    }
+                }
+            }
+        };
+
+        responses::encode_success(
+            id,
+            ResponseResult::NotificationShow {
+                shown: matches!(reason, NotificationShowReason::Shown),
+                reason,
+            },
+        )
+    }
+
+    fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
+        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
+            return;
+        }
+        if let Some(sound) = sound.to_sound() {
+            crate::sound::play(sound, &self.state.sound);
+        }
+    }
+
+    pub(crate) fn api_notification_rate_limited(&self, now: Instant) -> bool {
+        self.last_api_notification_at
+            .is_some_and(|last| now.duration_since(last) < API_NOTIFICATION_RATE_LIMIT)
+    }
+
+    pub(crate) fn mark_api_notification_shown(&mut self, now: Instant) {
+        self.last_api_notification_at = Some(now);
+    }
 }
 
 fn sidebar_split_per_mille(split: f32) -> u16 {
@@ -578,4 +818,356 @@ fn sidebar_split_per_mille(split: f32) -> u16 {
         return 500;
     }
     (split.clamp(0.1, 0.9) * 1000.0).round() as u16
+}
+
+fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
+    let mut sanitized = String::new();
+    let mut previous_space = false;
+    for ch in value.chars() {
+        let replacement = if ch == '\n' || ch == '\r' || ch == '\t' {
+            Some(' ')
+        } else if ch.is_control() {
+            None
+        } else {
+            Some(ch)
+        };
+        let Some(ch) = replacement else {
+            continue;
+        };
+        if ch.is_whitespace() {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+            sanitized.push(' ');
+        } else {
+            previous_space = false;
+            sanitized.push(ch);
+        }
+        if sanitized.chars().count() >= max_chars {
+            break;
+        }
+    }
+    let sanitized = sanitized.trim().to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::{Agent, AgentState};
+
+    #[cfg(unix)]
+    fn init_repo(path: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn herdr_toast_context_uses_live_root_runtime_cwd_label() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut workspace = crate::workspace::Workspace::test_new("stale");
+        workspace.custom_name = None;
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        let temp_root = std::env::temp_dir().join(format!(
+            "herdr-toast-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stale_cwd = temp_root.join("__herdr_original__");
+        let live_cwd = temp_root.join("__herdr_projects__");
+        std::fs::create_dir_all(&stale_cwd).unwrap();
+        std::fs::create_dir_all(&live_cwd).unwrap();
+        init_repo(&stale_cwd);
+        init_repo(&live_cwd);
+
+        workspace.identity_cwd = stale_cwd.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = stale_cwd;
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delay_seconds = 0;
+
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            root,
+            24,
+            80,
+            live_cwd.clone(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("__herdr_projects__ · 1")
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_herdr_toast_context_uses_live_root_runtime_cwd_label() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut workspace = crate::workspace::Workspace::test_new("stale");
+        workspace.custom_name = None;
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        let temp_root = std::env::temp_dir().join(format!(
+            "herdr-delayed-toast-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stale_cwd = temp_root.join("__herdr_original__");
+        let live_cwd = temp_root.join("__herdr_projects__");
+        std::fs::create_dir_all(&stale_cwd).unwrap();
+        std::fs::create_dir_all(&live_cwd).unwrap();
+        init_repo(&stale_cwd);
+        init_repo(&live_cwd);
+
+        workspace.identity_cwd = stale_cwd.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = stale_cwd;
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delay_seconds = 1;
+
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            root,
+            24,
+            80,
+            live_cwd.clone(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let notification_deadline = app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("pending notification deadline");
+        assert!(app.handle_scheduled_tasks(notification_deadline, false));
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("__herdr_projects__ · 1")
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn pane_died_respawns_shell_and_clears_restored_agent_session() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("restored");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.respawn_shell_on_exit = true;
+        terminal.set_agent_name("codex".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session")
+                .expect("test session id should be valid"),
+        });
+
+        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+
+        assert!(
+            app.find_pane(pane_id).is_some(),
+            "respawnable agent pane should stay attached after the agent process exits"
+        );
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal should survive respawn");
+        assert!(!terminal.respawn_shell_on_exit);
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.agent_name.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn terminal_delivery_does_not_refresh_existing_targeted_toast() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.local_terminal_notifications = false;
+
+        let mut workspace = crate::workspace::Workspace::test_new("stale");
+        workspace.custom_name = None;
+        workspace.identity_cwd = "/__herdr_original__".into();
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = "/__herdr_projects__".into();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Terminal;
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: ToastKind::Finished,
+            title: "codex finished".into(),
+            context: "__herdr_original__ · 1".into(),
+            position: None,
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id,
+                pane_id: root,
+            }),
+        });
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("__herdr_original__ · 1")
+        );
+    }
 }

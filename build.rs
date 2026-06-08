@@ -11,6 +11,8 @@ fn zig_target(target: &str) -> &str {
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
         "x86_64-apple-darwin" => "x86_64-macos",
         "aarch64-apple-darwin" => "aarch64-macos",
+        "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
+        "aarch64-pc-windows-msvc" => "aarch64-windows-msvc",
         other => panic!("unsupported target for libghostty-vt build: {other}"),
     }
 }
@@ -84,6 +86,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SIMD");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ZIG_SYSTEM_DIR");
+    println!("cargo:rerun-if-env-changed=HERDR_BUILD_CHANNEL");
+    println!("cargo:rerun-if-env-changed=HERDR_BUILD_ID");
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
 
@@ -137,6 +141,8 @@ fn main() {
     if target.contains("apple-darwin") {
         let static_lib = lib_dir.join("libghostty-vt.a");
         println!("cargo:rustc-link-arg={}", static_lib.display());
+    } else if target.contains("windows-msvc") {
+        println!("cargo:rustc-link-lib=static=ghostty-vt-static");
     } else {
         println!("cargo:rustc-link-lib=static=ghostty-vt");
     }

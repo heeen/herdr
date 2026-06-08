@@ -1,19 +1,5 @@
 pub(crate) const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub(crate) fn display_version() -> String {
-    display_version_with(option_env!("HERDR_BUILD_COMMIT"))
-}
-
-fn display_version_with(build_commit: Option<&str>) -> String {
-    match build_commit
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(commit) => format!("{PACKAGE_VERSION} ({commit})"),
-        None => PACKAGE_VERSION.to_string(),
-    }
-}
-
 pub(crate) fn version_line_matches_current(line: &str) -> bool {
     version_line_matches_package(line, PACKAGE_VERSION)
 }
@@ -30,20 +16,6 @@ fn version_line_matches_package(line: &str, package_version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn display_version_includes_build_commit_when_present() {
-        assert_eq!(
-            display_version_with(Some("abc123")),
-            format!("{PACKAGE_VERSION} (abc123)")
-        );
-    }
-
-    #[test]
-    fn display_version_omits_empty_build_commit() {
-        assert_eq!(display_version_with(Some(" ")), PACKAGE_VERSION);
-        assert_eq!(display_version_with(None), PACKAGE_VERSION);
-    }
 
     #[test]
     fn current_version_line_allows_commit_suffix() {

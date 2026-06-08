@@ -14,6 +14,7 @@ pub(crate) fn resolve_new_terminal_cwd(
 ) -> PathBuf {
     match policy {
         NewTerminalCwdConfig::Follow => follow_cwd
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/")),
         NewTerminalCwdConfig::Home => std::env::var_os("HOME")
@@ -110,7 +111,7 @@ impl App {
             initial_cwd,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
-            &self.state.default_shell,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
         )?;
         let root_pane = ws.tabs[idx].root_pane;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
@@ -142,7 +143,7 @@ impl App {
             cols,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
-            &self.state.default_shell,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -287,6 +288,9 @@ impl App {
             focused,
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+                .map(|cwd| cwd.display().to_string()),
+            foreground_cwd: ws.tabs[tab_idx]
+                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),

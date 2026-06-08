@@ -34,6 +34,12 @@ pub(crate) struct SelectionAutoscroll {
     pub last_mouse_screen_row: u16,
     pub inner_rect: Rect,
 }
+
+#[derive(Clone)]
+pub(crate) struct RightClickPassthroughGesture {
+    pub pane_info: PaneInfo,
+    pub modifiers: KeyModifiers,
+}
 use crate::terminal_theme::TerminalTheme;
 use crate::workspace::Workspace;
 
@@ -709,6 +715,48 @@ pub struct WorktreeOpenEntry {
     pub already_open_ws_idx: Option<usize>,
 }
 
+impl WorktreeOpenEntry {
+    pub(crate) fn display_name(&self) -> String {
+        self.branch.clone().unwrap_or_else(|| {
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.path.display().to_string())
+        })
+    }
+
+    pub(crate) fn status_label(&self) -> &'static str {
+        if self.already_open_ws_idx.is_some() {
+            "open"
+        } else if self.branch.is_some() {
+            ""
+        } else if self.is_linked_worktree {
+            "detached"
+        } else {
+            "root"
+        }
+    }
+
+    fn search_text(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.display_name(),
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+            self.path.display(),
+            self.status_label()
+        )
+        .to_lowercase()
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        text_matches_query(query, &self.search_text())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeOpenState {
     pub source_workspace_id: String,
@@ -719,7 +767,63 @@ pub struct WorktreeOpenState {
     pub repo_name: String,
     pub entries: Vec<WorktreeOpenEntry>,
     pub selected: usize,
+    pub query: String,
+    pub search_focused: bool,
     pub error: Option<String>,
+}
+
+impl WorktreeOpenState {
+    pub(crate) fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.query.trim();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                (query.is_empty() || entry.matches_query(query)).then_some(idx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_entry_index(&self) -> Option<usize> {
+        let indices = self.filtered_indices();
+        if indices.contains(&self.selected) {
+            Some(self.selected)
+        } else {
+            indices.first().copied()
+        }
+    }
+
+    pub(crate) fn normalize_selection(&mut self) {
+        if let Some(selected) = self.selected_entry_index() {
+            self.selected = selected;
+        }
+    }
+
+    pub(crate) fn select_previous_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(1)];
+    }
+
+    pub(crate) fn select_next_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[(pos + 1).min(indices.len().saturating_sub(1))];
+    }
+}
+
+pub(crate) fn text_matches_query(query: &str, text: &str) -> bool {
+    let haystack = text.to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|needle| haystack.contains(needle))
 }
 
 /// Computed view geometry — derived from AppState + terminal size.
@@ -756,6 +860,7 @@ pub enum Mode {
     ProductAnnouncement,
     Navigate,
     Prefix,
+    Copy,
     Terminal,
     RenameWorkspace,
     RenameTab,
@@ -819,6 +924,21 @@ pub(crate) struct NavigatorState {
     pub search_focused: bool,
     pub state_filter: Option<NavigatorStateFilter>,
     pub expanded_workspaces: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyModeState {
+    pub pane_id: PaneId,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub entry_offset_from_bottom: usize,
+    pub selection: Option<CopyModeSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyModeSelection {
+    Character,
+    Linewise { anchor_row: u32 },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1332,6 +1452,34 @@ impl SettingsSection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExperimentSetting {
+    PaneHistory,
+    SwitchAsciiInputSourceInPrefix,
+}
+
+impl ExperimentSetting {
+    pub(crate) const ALL: [Self; 2] = [Self::PaneHistory, Self::SwitchAsciiInputSourceInPrefix];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PaneHistory => "pane screen history",
+            Self::SwitchAsciiInputSourceInPrefix => {
+                "switch to ascii input source in prefix (macOS)"
+            }
+        }
+    }
+
+    pub(crate) fn enabled(self, state: &AppState) -> bool {
+        match self {
+            Self::PaneHistory => state.pane_history_persistence_enabled(),
+            Self::SwitchAsciiInputSourceInPrefix => {
+                state.switch_ascii_input_source_in_prefix_enabled()
+            }
+        }
+    }
+}
+
 /// All built-in theme names in display order.
 pub const THEME_NAMES: &[&str] = &[
     "catppuccin",
@@ -1501,7 +1649,10 @@ pub enum ContextMenuKind {
         tab_idx: usize,
     },
     Pane {
+        ws_idx: usize,
+        tab_idx: usize,
         pane_id: PaneId,
+        source_pane_id: Option<PaneId>,
         has_manual_label: bool,
     },
 }
@@ -1554,22 +1705,49 @@ impl ContextMenuState {
             ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Rename pane",
                 "Clear pane name",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
                 has_manual_label: false,
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Rename pane",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: true,
+                source_pane_id: None,
+                ..
+            } => &[
+                "Rename pane",
+                "Clear pane name",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: false,
+                source_pane_id: None,
+                ..
+            } => &[
+                "Rename pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
@@ -1595,7 +1773,31 @@ pub struct ToastNotification {
     pub kind: ToastKind,
     pub title: String,
     pub context: String,
+    pub position: Option<crate::config::ToastHerdrPosition>,
     pub target: Option<ToastTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentNotification {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub kind: ToastKind,
+    pub state: AgentState,
+    pub deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentNotificationDelivery {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub kind: ToastKind,
+    pub toast: Option<ToastNotification>,
+    pub client_notification: Option<ToastNotification>,
+    pub sound: Option<crate::sound::Sound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1687,6 +1889,7 @@ pub struct AppState {
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
     pub navigator: NavigatorState,
+    pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
     pub tab_scroll: usize,
@@ -1707,6 +1910,7 @@ pub struct AppState {
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
@@ -1728,6 +1932,8 @@ pub struct AppState {
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
+    pub right_click_passthrough_modifiers: Option<KeyModifiers>,
+    pub right_click_passthrough: Option<RightClickPassthroughGesture>,
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
@@ -1745,8 +1951,14 @@ pub struct AppState {
     pub cjk_ime_agents: Vec<crate::detect::Agent>,
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
+    /// While prefix mode is active, switch the macOS host input source to an
+    /// ASCII-capable layout so prefix commands register as ASCII even when a
+    /// CJK IME is active. macOS only; a no-op elsewhere. See
+    /// `[experimental] switch_ascii_input_source_in_prefix`.
+    pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
+    pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
@@ -1825,6 +2037,18 @@ impl AppState {
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
         self.pane_history_persistence
+    }
+
+    pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
+        self.switch_ascii_input_source_in_prefix
+    }
+
+    pub(crate) fn pane_exposes_host_cursor(
+        &self,
+        _ws_idx: usize,
+        _pane_id: crate::layout::PaneId,
+    ) -> bool {
+        true
     }
 
     pub(crate) fn integration_updates_available(&self) -> bool {
@@ -2014,6 +2238,7 @@ impl AppState {
             product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
             navigator: NavigatorState::default(),
+            copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -2049,6 +2274,7 @@ impl AppState {
             update_dismissed: false,
             config_diagnostic: None,
             toast: None,
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),
@@ -2064,6 +2290,8 @@ impl AppState {
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,
+            right_click_passthrough_modifiers: None,
+            right_click_passthrough: None,
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
@@ -2076,8 +2304,10 @@ impl AppState {
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
+            switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             default_shell: String::new(),
+            shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
@@ -2286,6 +2516,28 @@ mod tests {
         let app = AppState::test_new();
         assert!(app.view.divider_rows.is_empty());
         assert!(app.view.host_banner_areas.is_empty());
+    }
+
+    #[test]
+    fn agent_terminal_keeps_final_child_cursor_exposed() {
+        let mut state = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        state.terminals.insert(
+            ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+            crate::terminal::TerminalState::new(
+                ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+                std::path::PathBuf::from("/tmp"),
+            ),
+        );
+        state
+            .terminals
+            .get_mut(&ws.tabs[0].panes[&pane_id].attached_terminal_id)
+            .expect("terminal state")
+            .launch_argv = Some(vec!["codex".to_string()]);
+        state.workspaces = vec![ws];
+
+        assert!(state.pane_exposes_host_cursor(0, pane_id));
     }
 
     #[test]

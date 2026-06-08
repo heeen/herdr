@@ -20,9 +20,10 @@ pub use self::{
     model::{
         validated_sidebar_bounds, AgentPanelScopeConfig, Config, ConfigReloadReport,
         ConfigReloadStatus, HostBannerAnimation, HostBannerGlyph, HostBannerGradient, KeysConfig,
-        NewTerminalCwdConfig, SidebarAgentField, SidebarAgentsConfig, SidebarColorPreset,
-        SidebarHostConfig, SidebarItem, SidebarSpaceField, SidebarSpacesConfig, ToastConfig,
-        ToastDelivery,
+        NewTerminalCwdConfig, ShellModeConfig, SidebarAgentField, SidebarAgentsConfig,
+        SidebarColorPreset, SidebarHostConfig, SidebarItem, SidebarSpaceField, SidebarSpacesConfig,
+        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition, UpdateChannelConfig,
+        MAX_TOAST_DELAY_SECONDS,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

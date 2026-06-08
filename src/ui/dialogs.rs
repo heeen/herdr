@@ -12,7 +12,7 @@ use super::widgets::{
     ActionButtonSpec,
 };
 use crate::app::state::Palette;
-use crate::app::{AppState, Mode};
+use crate::app::{state::WorktreeOpenState, AppState, Mode};
 
 // item 1 (Area 3 / Decision 2): ui-owned view structs for the composited client modals. These
 // hold ONLY ui primitives / borrowed strings — they MUST NOT reference any supervisor-model
@@ -270,8 +270,11 @@ pub(crate) fn remove_worktree_button_rects(inner: Rect, force_confirmation: bool
 }
 
 pub(crate) fn open_existing_worktree_inner_rect(area: Rect, entry_count: usize) -> Option<Rect> {
-    let height = (entry_count as u16).saturating_add(5).clamp(8, 18);
-    centered_popup_rect(area, 78, height).map(|popup| {
+    let height = (entry_count as u16)
+        .saturating_mul(2)
+        .saturating_add(7)
+        .clamp(12, 26);
+    centered_popup_rect(area, 96, height).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -281,8 +284,21 @@ pub(crate) fn open_existing_worktree_inner_rect(area: Rect, entry_count: usize) 
     })
 }
 
-pub(crate) fn open_existing_worktree_visible_start(selected: usize, max_rows: usize) -> usize {
-    selected.saturating_sub(max_rows.saturating_sub(1))
+pub(crate) fn open_existing_worktree_max_visible_rows(inner: Rect) -> usize {
+    usize::from(inner.height.saturating_sub(5) / 2)
+}
+
+pub(crate) fn open_existing_worktree_visible_start(
+    open: &WorktreeOpenState,
+    max_rows: usize,
+) -> usize {
+    let filtered = open.filtered_indices();
+    let selected = open.selected_entry_index().unwrap_or(open.selected);
+    let selected_pos = filtered
+        .iter()
+        .position(|idx| *idx == selected)
+        .unwrap_or(0);
+    selected_pos.saturating_sub(max_rows.saturating_sub(1))
 }
 
 pub(crate) fn open_existing_worktree_button_rects(inner: Rect) -> (Rect, Rect) {
@@ -494,11 +510,14 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
     };
 
     super::dim_background(frame, area);
-    let height = (open.entries.len() as u16).saturating_add(5).clamp(8, 18);
-    let Some(inner) = render_modal_shell(frame, area, 78, height, &app.palette) else {
+    let height = (open.entries.len() as u16)
+        .saturating_mul(2)
+        .saturating_add(7)
+        .clamp(12, 26);
+    let Some(inner) = render_modal_shell(frame, area, 96, height, &app.palette) else {
         return;
     };
-    if inner.height < 6 {
+    if inner.height < 8 {
         return;
     }
 
@@ -508,39 +527,29 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
         "open worktree",
         &app.palette,
     );
+    render_open_worktree_search(
+        app,
+        frame,
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        open,
+    );
     frame.render_widget(
-        Paragraph::new(" existing checkouts").style(Style::default().fg(app.palette.overlay0)),
-        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+        Paragraph::new("─".repeat(inner.width as usize))
+            .style(Style::default().fg(app.palette.surface1)),
+        Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
     );
 
-    let max_rows = inner.height.saturating_sub(4) as usize;
-    let start = open_existing_worktree_visible_start(open.selected, max_rows);
-    for (visible_idx, (entry_idx, entry)) in open
-        .entries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(max_rows)
-        .enumerate()
-    {
-        let selected = entry_idx == open.selected;
-        let y = inner.y.saturating_add(2 + visible_idx as u16);
-        let marker = if selected { "›" } else { " " };
-        let branch = entry
-            .branch
-            .as_deref()
-            .unwrap_or(if entry.is_linked_worktree {
-                "detached"
-            } else {
-                "root"
-            });
-        let open_label = if entry.already_open_ws_idx.is_some() {
-            " open"
-        } else {
-            ""
+    let filtered = open.filtered_indices();
+    let max_rows = open_existing_worktree_max_visible_rows(inner);
+    let start = open_existing_worktree_visible_start(open, max_rows);
+    for (visible_idx, entry_idx) in filtered.iter().skip(start).take(max_rows).enumerate() {
+        let Some(entry) = open.entries.get(*entry_idx) else {
+            continue;
         };
-        let label = format!("{marker} {branch}{open_label}  {}", entry.path.display());
-        let style = if selected {
+        let selected = Some(*entry_idx) == open.selected_entry_index();
+        let y = inner.y.saturating_add(3 + (visible_idx as u16 * 2));
+        let marker = if selected { "›" } else { " " };
+        let row_style = if selected {
             Style::default()
                 .fg(app.palette.text)
                 .bg(app.palette.surface0)
@@ -548,9 +557,50 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
         } else {
             Style::default().fg(app.palette.subtext0)
         };
+        let path_style = if selected {
+            Style::default()
+                .fg(app.palette.subtext0)
+                .bg(app.palette.surface0)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        let status = entry.status_label();
+        let title_width = inner
+            .width
+            .saturating_sub(status.len() as u16)
+            .saturating_sub(4) as usize;
+        let mut title = format!(
+            "{marker} {}",
+            truncate_text(&entry.display_name(), title_width)
+        );
+        if !status.is_empty() {
+            let pad = inner
+                .width
+                .saturating_sub(title.chars().count() as u16)
+                .saturating_sub(status.len() as u16)
+                .max(1);
+            title.push_str(&" ".repeat(pad as usize));
+            title.push_str(status);
+        }
         frame.render_widget(
-            Paragraph::new(truncate_text(&label, inner.width as usize)).style(style),
+            Paragraph::new(truncate_text(&title, inner.width as usize)).style(row_style),
             Rect::new(inner.x, y, inner.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_text(
+                &format!("  {}", entry.path.display()),
+                inner.width as usize,
+            ))
+            .style(path_style),
+            Rect::new(inner.x, y.saturating_add(1), inner.width, 1),
+        );
+    }
+
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no matching worktrees")
+                .style(Style::default().fg(app.palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
         );
     }
 
@@ -587,6 +637,47 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
             .bg(app.palette.surface0)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+fn render_open_worktree_search(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    open: &WorktreeOpenState,
+) {
+    let focus_style = if open.search_focused {
+        Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.palette.overlay0)
+    };
+    let filtered_count = open.filtered_indices().len();
+    let count = if open.query.trim().is_empty() {
+        format!("{} checkouts", open.entries.len())
+    } else {
+        format!("{filtered_count}/{} checkouts", open.entries.len())
+    };
+    let mut spans = vec![Span::styled(" / ", focus_style)];
+    if open.query.trim().is_empty() {
+        spans.push(Span::styled(
+            "filter worktrees",
+            Style::default().fg(app.palette.overlay0),
+        ));
+    } else {
+        spans.push(Span::styled(
+            open.query.clone(),
+            Style::default().fg(app.palette.text),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            "{count:>width$}",
+            width = area.width.saturating_sub(18) as usize
+        ),
+        Style::default().fg(app.palette.overlay0),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn confirm_close_overlay_text(app: &AppState) -> (String, String) {
@@ -694,8 +785,9 @@ pub(super) fn render_confirm_close_overlay(app: &AppState, frame: &mut Frame, ar
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
-        .areas::<3>(inner);
+        .areas::<4>(inner);
 
         frame.render_widget(Paragraph::new(title_line), rows[0]);
         frame.render_widget(Paragraph::new(detail_line), rows[1]);
@@ -725,7 +817,7 @@ pub(super) fn render_confirm_close_overlay(app: &AppState, frame: &mut Frame, ar
 }
 
 pub(crate) fn confirm_close_popup_rect(area: Rect) -> Option<Rect> {
-    centered_popup_rect(area, 44, 5)
+    centered_popup_rect(area, 64, 6)
 }
 
 pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
@@ -742,7 +834,7 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
             },
         ],
         2,
-        2,
+        3,
     );
     (rects[0], rects[1])
 }
@@ -1172,10 +1264,7 @@ pub(crate) fn render_remote_manage_overlay(
     let start = scroll
         .min(rows.len().saturating_sub(max_rows.max(1)))
         .min(selected)
-        .max(open_existing_worktree_visible_start(
-            selected,
-            max_rows.max(1),
-        ));
+        .max(selected.saturating_sub(max_rows.max(1).saturating_sub(1)));
     for (visible_idx, (row_index, row)) in rows
         .iter()
         .enumerate()

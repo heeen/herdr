@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 // Effective state arbitration is intentionally centralized here. Hooks are the
 // default authority for agent-owned internal state, but a narrow set of strong
-// visible screen signals can veto stale non-blocked hook reports. Precedence is:
-// hook blocked > strong visible blocker > Claude visible idle > hook > fallback.
+// visible screen signals can veto stale hook reports. Precedence is:
+// strong visible blocker > visible working/idle recovery > hook > fallback.
 // Process-exit updates clear matching hook authority before recomputing state.
 
 use crate::detect::{Agent, AgentState};
@@ -15,7 +15,7 @@ use crate::terminal::TerminalId;
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 
-const CLAUDE_WORKING_HOLD: Duration = Duration::from_millis(1200);
+const SCREEN_WORKING_HOLD: Duration = Duration::from_millis(1200);
 const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +81,7 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
+    pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
 }
 
 impl TerminalState {
@@ -108,6 +109,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
+            pending_agent_resume_plan: None,
         }
     }
 
@@ -118,6 +120,14 @@ impl TerminalState {
 
     pub fn with_respawn_shell_on_exit(mut self) -> Self {
         self.respawn_shell_on_exit = true;
+        self
+    }
+
+    pub fn with_pending_agent_resume_plan(
+        mut self,
+        plan: crate::agent_resume::AgentResumePlan,
+    ) -> Self {
+        self.pending_agent_resume_plan = Some(plan);
         self
     }
 
@@ -436,6 +446,35 @@ impl TerminalState {
         self.persisted_agent_session = Some(session);
     }
 
+    pub fn set_agent_session_ref(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+    ) -> Option<TerminalStateMutation> {
+        let session_ref = session_ref?;
+        if !self.hook_report_is_new(&source, seq) {
+            return None;
+        }
+        self.record_hook_report(&source, seq);
+        if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
+            return None;
+        }
+
+        let previous_session = self.current_session_identity_for_persistence();
+        self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source,
+            agent: agent_label,
+            session_ref,
+        });
+        let current_session = self.current_session_identity_for_persistence();
+        Some(TerminalStateMutation {
+            effective_state_change: None,
+            session_ref_changed: previous_session != current_session,
+        })
+    }
+
     fn known_agent_label_conflicts_with_detected_agent(&self, agent_label: &str) -> bool {
         let Some(detected_agent) = self.detected_agent else {
             return false;
@@ -631,12 +670,27 @@ impl TerminalState {
 
     fn visible_working_overrides_hook(&self) -> bool {
         self.fallback_visible_working
-            && self.fallback_not_older_than_hook()
+            && self.visible_working_is_fresh_enough_for_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
-                authority.state == AgentState::Idle
+                (authority.state == AgentState::Idle || authority.state == AgentState::Blocked)
                     && crate::detect::parse_agent_label(&authority.agent_label)
                         == self.detected_agent
             })
+    }
+
+    fn visible_working_is_fresh_enough_for_hook(&self) -> bool {
+        self.fallback_not_older_than_hook()
+            || self
+                .fallback_observed_at
+                .zip(
+                    self.hook_authority
+                        .as_ref()
+                        .map(|authority| authority.reported_at),
+                )
+                .is_some_and(|(observed_at, reported_at)| {
+                    reported_at >= observed_at
+                        && reported_at.duration_since(observed_at) < SCREEN_WORKING_HOLD
+                })
     }
 
     fn visible_idle_stales_hook(&self, now: Instant) -> bool {
@@ -648,7 +702,7 @@ impl TerminalState {
         self.fallback_visible_idle
             && self.fallback_not_older_than_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
-                authority.state == AgentState::Working
+                (authority.state == AgentState::Working || authority.state == AgentState::Blocked)
                     && crate::detect::parse_agent_label(&authority.agent_label)
                         == self.detected_agent
             })
@@ -659,7 +713,7 @@ impl TerminalState {
         let visible_idle_stales_hook = self.fallback_visible_idle
             && self.fallback_not_older_than_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
-                authority.state == AgentState::Working
+                (authority.state == AgentState::Working || authority.state == AgentState::Blocked)
                     && crate::detect::parse_agent_label(&authority.agent_label)
                         == self.detected_agent
             });
@@ -687,6 +741,24 @@ impl TerminalState {
 
     pub fn clear_agent_name(&mut self) {
         self.agent_name = None;
+    }
+
+    pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.detected_agent = None;
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_visible_idle = false;
+        self.fallback_visible_working = false;
+        self.fallback_observed_at = None;
+        self.stale_hook_idle_since = None;
+        self.hook_authority = None;
+        self.persisted_agent_session = None;
+        self.agent_metadata.clear();
+        self.state = AgentState::Unknown;
+        self.launch_argv = None;
+        self.respawn_shell_on_exit = false;
+        self.pending_agent_resume_plan = None;
+        self.clear_agent_name();
     }
 
     pub fn is_agent_terminal(&self) -> bool {
@@ -724,12 +796,7 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
-        let state = if self
-            .hook_authority
-            .as_ref()
-            .is_some_and(|authority| authority.state == AgentState::Blocked)
-            || self.visible_blocker_overrides_hook()
-        {
+        let state = if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else if self.visible_working_overrides_hook() {
             AgentState::Working
@@ -812,21 +879,21 @@ pub(crate) fn stabilize_agent_state(
     previous: AgentState,
     raw: AgentState,
     now: std::time::Instant,
-    last_claude_working_at: &mut Option<std::time::Instant>,
+    last_screen_working_at: &mut Option<std::time::Instant>,
 ) -> AgentState {
-    if agent != Some(Agent::Claude) {
+    if !matches!(agent, Some(Agent::Claude | Agent::Droid)) {
         return raw;
     }
 
     match raw {
         AgentState::Working => {
-            *last_claude_working_at = Some(now);
+            *last_screen_working_at = Some(now);
             AgentState::Working
         }
         AgentState::Blocked => AgentState::Blocked,
         AgentState::Idle if previous == AgentState::Working => {
-            if last_claude_working_at
-                .is_some_and(|last_working| now.duration_since(last_working) < CLAUDE_WORKING_HOLD)
+            if last_screen_working_at
+                .is_some_and(|last_working| now.duration_since(last_working) < SCREEN_WORKING_HOLD)
             {
                 AgentState::Working
             } else {
@@ -843,7 +910,7 @@ pub(crate) fn stabilize_agent_detection(
     detection: crate::detect::AgentDetection,
     process_exited: bool,
     now: std::time::Instant,
-    last_claude_working_at: &mut Option<std::time::Instant>,
+    last_screen_working_at: &mut Option<std::time::Instant>,
 ) -> AgentState {
     if process_exited {
         return detection.state;
@@ -854,7 +921,7 @@ pub(crate) fn stabilize_agent_detection(
         previous,
         detection.state,
         now,
-        last_claude_working_at,
+        last_screen_working_at,
     )
 }
 
@@ -865,6 +932,14 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    fn test_session_path(name: &str) -> String {
+        std::env::current_dir()
+            .unwrap()
+            .join(name)
+            .display()
+            .to_string()
     }
 
     #[test]
@@ -900,7 +975,7 @@ mod tests {
             Some(Agent::Claude),
             AgentState::Working,
             AgentState::Idle,
-            now + CLAUDE_WORKING_HOLD + std::time::Duration::from_millis(1),
+            now + SCREEN_WORKING_HOLD + std::time::Duration::from_millis(1),
             &mut last_working,
         );
         assert_eq!(state, AgentState::Idle);
@@ -916,6 +991,7 @@ mod tests {
             AgentState::Working,
             AgentDetection {
                 state: AgentState::Idle,
+                skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
@@ -938,6 +1014,7 @@ mod tests {
             AgentState::Working,
             AgentDetection {
                 state: AgentState::Idle,
+                skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: true,
                 visible_working: false,
@@ -951,7 +1028,84 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_states_are_unchanged() {
+    fn droid_working_is_sticky_for_short_gap() {
+        let now = std::time::Instant::now();
+        let mut last_working = None;
+
+        let working = stabilize_agent_state(
+            Some(Agent::Droid),
+            AgentState::Idle,
+            AgentState::Working,
+            now,
+            &mut last_working,
+        );
+        assert_eq!(working, AgentState::Working);
+
+        let still_working = stabilize_agent_state(
+            Some(Agent::Droid),
+            AgentState::Working,
+            AgentState::Idle,
+            now + std::time::Duration::from_millis(400),
+            &mut last_working,
+        );
+        assert_eq!(still_working, AgentState::Working);
+    }
+
+    #[test]
+    fn droid_transitions_to_idle_after_hold_expires() {
+        let now = std::time::Instant::now();
+        let mut last_working = Some(now);
+
+        let state = stabilize_agent_state(
+            Some(Agent::Droid),
+            AgentState::Working,
+            AgentState::Idle,
+            now + SCREEN_WORKING_HOLD + std::time::Duration::from_millis(1),
+            &mut last_working,
+        );
+        assert_eq!(state, AgentState::Idle);
+    }
+
+    #[test]
+    fn process_exit_idle_bypasses_droid_working_hold() {
+        let now = std::time::Instant::now();
+        let mut last_working = Some(now);
+
+        let state = stabilize_agent_detection(
+            Some(Agent::Droid),
+            AgentState::Working,
+            AgentDetection {
+                state: AgentState::Idle,
+                skip_state_update: false,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+            },
+            true,
+            now + std::time::Duration::from_millis(100),
+            &mut last_working,
+        );
+
+        assert_eq!(state, AgentState::Idle);
+    }
+
+    #[test]
+    fn droid_blocked_bypasses_working_hold() {
+        let now = std::time::Instant::now();
+        let mut last_working = Some(now);
+
+        let state = stabilize_agent_state(
+            Some(Agent::Droid),
+            AgentState::Working,
+            AgentState::Blocked,
+            now + std::time::Duration::from_millis(100),
+            &mut last_working,
+        );
+        assert_eq!(state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn codex_states_are_unchanged_by_screen_working_hold() {
         let now = std::time::Instant::now();
         let mut last_working = None;
 
@@ -1686,28 +1840,164 @@ mod tests {
     }
 
     #[test]
-    fn visible_idle_does_not_override_hook_blocked() {
+    fn recent_visible_working_holds_against_newer_claude_hook_idle() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now,
+        );
+
+        let change = terminal.set_hook_authority_with_custom_status_at(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+            now + Duration::from_millis(100),
+        );
+
+        assert!(change.unwrap().effective_state_change.is_none());
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn old_visible_working_does_not_hold_against_newer_claude_hook_idle() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now,
+        );
+
+        let change = terminal.set_hook_authority_with_custom_status_at(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+            now + SCREEN_WORKING_HOLD + Duration::from_millis(1),
+        );
+
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            change
+                .unwrap()
+                .effective_state_change
+                .unwrap()
+                .previous_state,
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn refreshed_visible_working_overrides_newer_hook_blocked() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now,
+        );
+        terminal.set_hook_authority_with_custom_status_at(
+            "herdr:codex".into(),
+            "codex".into(),
+            AgentState::Blocked,
+            None,
+            Some("permission".into()),
+            None,
+            None,
+            now + SCREEN_WORKING_HOLD + Duration::from_millis(1),
+        );
+
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        let change = terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now + SCREEN_WORKING_HOLD + Duration::from_millis(800),
+        );
+
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.effective_custom_status(), None);
+        assert_eq!(
+            change.effective_state_change.unwrap().previous_state,
+            AgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn visible_idle_waits_before_overriding_claude_hook_blocked() {
+        let now = Instant::now();
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
-        terminal.set_hook_authority(
+        terminal.set_hook_authority_with_custom_status_at(
             "herdr:claude".into(),
             "claude".into(),
             AgentState::Blocked,
             None,
+            Some("permission".into()),
             None,
+            None,
+            now,
         );
 
-        let change = terminal.set_detected_state_with_visible_blocker(
+        let waiting = terminal.set_detected_state_with_screen_signals_at(
             Some(Agent::Claude),
             AgentState::Idle,
             false,
             true,
             false,
+            false,
+            now + Duration::from_millis(500),
         );
 
+        assert!(waiting.effective_state_change.is_none());
         assert_eq!(terminal.fallback_state, AgentState::Idle);
         assert_eq!(terminal.state, AgentState::Blocked);
-        assert!(change.is_none());
+        assert_eq!(
+            terminal.effective_custom_status().as_deref(),
+            Some("permission")
+        );
+
+        let change = terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_millis(500) + STALE_HOOK_IDLE_GRACE + Duration::from_millis(1),
+        );
+
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(terminal.effective_custom_status(), None);
+        assert_eq!(
+            change.effective_state_change.unwrap().previous_state,
+            AgentState::Blocked
+        );
     }
 
     #[test]
@@ -2038,6 +2328,7 @@ mod tests {
     #[test]
     fn accepted_hook_report_stores_session_ref() {
         let mut terminal = test_terminal();
+        let session_path = test_session_path("pi.jsonl");
         let mutation = terminal
             .set_hook_authority_with_session_ref(
                 "herdr:pi".into(),
@@ -2045,7 +2336,7 @@ mod tests {
                 AgentState::Working,
                 None,
                 None,
-                crate::agent_resume::AgentSessionRef::path("/tmp/pi.jsonl"),
+                crate::agent_resume::AgentSessionRef::path(session_path.clone()),
                 Some(20),
             )
             .expect("accepted report");
@@ -2059,7 +2350,7 @@ mod tests {
                 .map(|session_ref| (&session_ref.kind, session_ref.value.as_str())),
             Some((
                 &crate::agent_resume::AgentSessionRefKind::Path,
-                "/tmp/pi.jsonl"
+                session_path.as_str()
             ))
         );
     }
@@ -2067,13 +2358,15 @@ mod tests {
     #[test]
     fn stale_hook_report_cannot_overwrite_session_ref() {
         let mut terminal = test_terminal();
+        let session_path = test_session_path("pi.jsonl");
+        let new_session_path = test_session_path("new.jsonl");
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/pi.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(session_path.clone()),
             Some(20),
         );
 
@@ -2083,7 +2376,7 @@ mod tests {
             AgentState::Working,
             None,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/new.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(new_session_path),
             Some(19),
         );
 
@@ -2094,20 +2387,21 @@ mod tests {
                 .as_ref()
                 .and_then(|authority| authority.session_ref.as_ref())
                 .map(|session_ref| session_ref.value.as_str()),
-            Some("/tmp/pi.jsonl")
+            Some(session_path.as_str())
         );
     }
 
     #[test]
     fn accepted_hook_report_without_session_ref_clears_previous_ref() {
         let mut terminal = test_terminal();
+        let session_path = test_session_path("pi.jsonl");
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/pi.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(session_path),
             Some(20),
         );
 
@@ -2160,13 +2454,14 @@ mod tests {
     #[test]
     fn clearing_hook_authority_clears_session_ref() {
         let mut terminal = test_terminal();
+        let session_path = test_session_path("pi.jsonl");
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/pi.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(session_path),
             Some(20),
         );
 
@@ -2181,13 +2476,14 @@ mod tests {
     #[test]
     fn release_agent_clears_session_ref() {
         let mut terminal = test_terminal();
+        let session_path = test_session_path("pi.jsonl");
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
             None,
-            crate::agent_resume::AgentSessionRef::path("/tmp/pi.jsonl"),
+            crate::agent_resume::AgentSessionRef::path(session_path),
             Some(20),
         );
 
@@ -2215,6 +2511,27 @@ mod tests {
         assert!(mutation.session_ref_changed);
         assert!(mutation.effective_state_change.is_none());
         assert!(terminal.persisted_agent_session.is_none());
+    }
+
+    #[test]
+    fn respawn_cleanup_resets_restored_agent_status() {
+        let mut terminal = test_terminal();
+        terminal.respawn_shell_on_exit = true;
+        terminal.set_agent_name("codex".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+        });
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert!(terminal.detected_agent.is_none());
+        assert!(terminal.agent_name.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(!terminal.respawn_shell_on_exit);
     }
 
     #[test]

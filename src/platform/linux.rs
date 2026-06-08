@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    os::fd::RawFd,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -84,6 +85,11 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
     let tpgid: i32 = fields.get(5)?.parse().ok()?;
     (tpgid > 0).then_some(tpgid as u32)
+}
+
+pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid as u32)
 }
 
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {

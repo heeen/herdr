@@ -86,7 +86,7 @@ impl App {
                     cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
-                    &default_shell,
+                    crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                 )
             });
         match result {

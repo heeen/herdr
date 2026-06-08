@@ -63,6 +63,8 @@ pub struct CommandKeybindConfig {
     /// Command execution mode. Default: "shell".
     #[serde(rename = "type")]
     pub action_type: CommandKeybindType,
+    /// Optional user-defined description for this custom command.
+    pub description: Option<String>,
 }
 
 impl Default for CommandKeybindConfig {
@@ -71,6 +73,7 @@ impl Default for CommandKeybindConfig {
             key: BindingConfig::empty(),
             command: String::new(),
             action_type: CommandKeybindType::Shell,
+            description: None,
         }
     }
 }
@@ -238,6 +241,7 @@ pub struct CustomCommandKeybind {
     pub label: String,
     pub command: String,
     pub action: CustomCommandAction,
+    pub description: Option<String>,
 }
 
 /// Parsed keybinds for Herdr actions.
@@ -282,10 +286,15 @@ pub struct Keybinds {
     pub close_tab: ActionKeybinds,
     pub rename_pane: ActionKeybinds,
     pub edit_scrollback: ActionKeybinds,
+    pub copy_mode: ActionKeybinds,
     pub focus_pane_left: ActionKeybinds,
     pub focus_pane_down: ActionKeybinds,
     pub focus_pane_up: ActionKeybinds,
     pub focus_pane_right: ActionKeybinds,
+    pub swap_pane_left: ActionKeybinds,
+    pub swap_pane_down: ActionKeybinds,
+    pub swap_pane_up: ActionKeybinds,
+    pub swap_pane_right: ActionKeybinds,
     pub cycle_pane_next: ActionKeybinds,
     pub cycle_pane_previous: ActionKeybinds,
     pub last_pane: ActionKeybinds,
@@ -460,10 +469,15 @@ impl Config {
             close_tab: action!("keys.close_tab", &self.keys.close_tab),
             rename_pane: action!("keys.rename_pane", &self.keys.rename_pane),
             edit_scrollback: action!("keys.edit_scrollback", &self.keys.edit_scrollback),
+            copy_mode: action!("keys.copy_mode", &self.keys.copy_mode),
             focus_pane_left: action!("keys.focus_pane_left", &self.keys.focus_pane_left),
             focus_pane_down: action!("keys.focus_pane_down", &self.keys.focus_pane_down),
             focus_pane_up: action!("keys.focus_pane_up", &self.keys.focus_pane_up),
             focus_pane_right: action!("keys.focus_pane_right", &self.keys.focus_pane_right),
+            swap_pane_left: action!("keys.swap_pane_left", &self.keys.swap_pane_left),
+            swap_pane_down: action!("keys.swap_pane_down", &self.keys.swap_pane_down),
+            swap_pane_up: action!("keys.swap_pane_up", &self.keys.swap_pane_up),
+            swap_pane_right: action!("keys.swap_pane_right", &self.keys.swap_pane_right),
             last_pane: action!("keys.last_pane", &self.keys.last_pane),
             cycle_pane_next: action!("keys.cycle_pane_next", &self.keys.cycle_pane_next),
             cycle_pane_previous: action!(
@@ -534,6 +548,7 @@ impl Config {
                 label,
                 command: command.command.clone(),
                 action,
+                description: command.description.clone(),
             });
         }
 
@@ -1068,7 +1083,13 @@ fn key_parts_match_combo(
     let (expected_code, expected_modifiers) = normalize_key_combo(combo);
 
     if actual_modifiers == expected_modifiers
-        && key_codes_match(actual_code, expected_code, shifted_codepoint)
+        && key_codes_match(
+            actual_code,
+            actual_modifiers,
+            expected_code,
+            expected_modifiers,
+            shifted_codepoint,
+        )
     {
         return true;
     }
@@ -1077,14 +1098,29 @@ fn key_parts_match_combo(
     actual_modifiers.contains(KeyModifiers::SHIFT)
         && actual_without_shift == expected_modifiers
         && shifted_char_matches_expected(actual_code, shifted_codepoint, expected_code)
+        || legacy_shifted_ascii_letter_matches(
+            actual_code,
+            actual_modifiers,
+            expected_code,
+            expected_modifiers,
+        )
 }
 
-fn key_codes_match(actual: KeyCode, expected: KeyCode, shifted_codepoint: Option<u32>) -> bool {
+fn key_codes_match(
+    actual: KeyCode,
+    actual_modifiers: KeyModifiers,
+    expected: KeyCode,
+    expected_modifiers: KeyModifiers,
+    shifted_codepoint: Option<u32>,
+) -> bool {
     match (actual, expected) {
         (KeyCode::Char(actual), KeyCode::Char(expected))
             if actual.is_ascii_alphabetic() && expected.is_ascii_alphabetic() =>
         {
-            actual.eq_ignore_ascii_case(&expected)
+            actual == expected
+                || actual_modifiers.contains(KeyModifiers::SHIFT)
+                    && expected_modifiers.contains(KeyModifiers::SHIFT)
+                    && actual.eq_ignore_ascii_case(&expected)
         }
         (KeyCode::Char(actual), KeyCode::Char(expected)) => {
             actual == expected
@@ -1096,6 +1132,24 @@ fn key_codes_match(actual: KeyCode, expected: KeyCode, shifted_codepoint: Option
         }
         (actual, expected) => actual == expected,
     }
+}
+
+fn legacy_shifted_ascii_letter_matches(
+    actual_code: KeyCode,
+    actual_modifiers: KeyModifiers,
+    expected_code: KeyCode,
+    expected_modifiers: KeyModifiers,
+) -> bool {
+    if actual_modifiers.contains(KeyModifiers::SHIFT) {
+        return false;
+    }
+    let (KeyCode::Char(actual), KeyCode::Char(expected)) = (actual_code, expected_code) else {
+        return false;
+    };
+    actual.is_ascii_uppercase()
+        && expected.is_ascii_lowercase()
+        && actual.to_ascii_lowercase() == expected
+        && actual_modifiers | KeyModifiers::SHIFT == expected_modifiers
 }
 
 fn shifted_char_matches_expected(
@@ -1267,6 +1321,18 @@ next_tab = "prefix+n"
     }
 
     #[test]
+    fn copy_mode_uses_tmux_prefix_bracket_by_default() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.copy_mode),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('['),
+                KeyModifiers::empty()
+            ))]
+        );
+    }
+
+    #[test]
     fn back_and_forth_keybinds_are_unset_by_default() {
         let kb = Config::default().keybinds();
         assert!(kb.last_pane.bindings.is_empty());
@@ -1324,6 +1390,47 @@ close_tab = "X"
     fn shifted_letter_binding_matches_uppercase_key_event() {
         let bindings = ActionKeybinds::prefix("shift+n");
         assert!(bindings.matches_prefix(&KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)));
+    }
+
+    #[test]
+    fn shifted_letter_binding_matches_legacy_uppercase_key_event() {
+        let bindings = ActionKeybinds::prefix("shift+n");
+        assert!(bindings
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+    }
+
+    #[test]
+    fn shifted_letter_direct_binding_matches_legacy_uppercase_key_event() {
+        let bindings = ActionKeybinds::direct("shift+n");
+        assert!(bindings
+            .matches_direct_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+    }
+
+    #[test]
+    fn shifted_letter_binding_matches_modern_modified_key_event() {
+        let bindings = ActionKeybinds::direct("cmd+shift+j");
+        assert!(bindings.matches_direct_key(TerminalKey::new(
+            KeyCode::Char('J'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        )));
+    }
+
+    #[test]
+    fn legacy_uppercase_key_event_does_not_match_unshifted_letter_binding() {
+        let bindings = ActionKeybinds::prefix("n");
+        assert!(!bindings
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+    }
+
+    #[test]
+    fn legacy_uppercase_shift_fallback_is_limited_to_ascii_letters() {
+        let shifted_number = ActionKeybinds::prefix("shift+1");
+        assert!(!shifted_number
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::empty(),)));
+
+        let shifted_non_ascii = ActionKeybinds::prefix("shift+ö");
+        assert!(!shifted_non_ascii
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('Ö'), KeyModifiers::empty(),)));
     }
 
     #[test]
@@ -1635,6 +1742,34 @@ switch_workspace = "prefix+shift+1..9"
             .bindings
             .iter()
             .all(|binding| binding.trigger.is_prefix()));
+        assert_eq!(
+            binding_triggers(&kb.swap_pane_left),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('h'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_pane_down),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('j'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_pane_up),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('k'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_pane_right),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('l'),
+                KeyModifiers::SHIFT
+            ))]
+        );
     }
 
     #[test]
@@ -1653,5 +1788,24 @@ new_workspace = "prefix+n"
         assert!(diagnostics.iter().any(|diag| {
             diag.contains("kept keys.new_workspace") && diag.contains("disabled keys.next_tab")
         }));
+    }
+
+    #[test]
+    fn custom_command_with_description_parses() {
+        let config: Config = toml::from_str(
+            r#"
+[[keys.command]]
+key = "prefix+y"
+command = "echo hello"
+description = "say hello"
+"#,
+        )
+        .unwrap();
+        let keybinds = config.keybinds();
+        assert_eq!(keybinds.custom_commands.len(), 1);
+        assert_eq!(
+            keybinds.custom_commands[0].description,
+            Some("say hello".to_string())
+        );
     }
 }

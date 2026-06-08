@@ -148,6 +148,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "custom command failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -229,6 +230,7 @@ impl App {
                     kind: crate::app::state::ToastKind::NeedsAttention,
                     title: "edit scrollback failed".to_string(),
                     context: err.to_string(),
+                    position: None,
                     target: None,
                 });
                 self.sync_toast_deadline(previous_toast);
@@ -271,6 +273,7 @@ impl App {
                 kind: crate::app::state::ToastKind::Finished,
                 title: "opened scrollback".to_string(),
                 context: format!("focused pane {public_pane_id}"),
+                position: None,
                 target: None,
             });
         }
@@ -499,10 +502,15 @@ pub(crate) enum NavigateAction {
     FocusPaneDown,
     FocusPaneUp,
     FocusPaneRight,
+    SwapPaneLeft,
+    SwapPaneDown,
+    SwapPaneUp,
+    SwapPaneRight,
     SplitVertical,
     SplitHorizontal,
     ClosePane,
     EditScrollback,
+    CopyMode,
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
@@ -595,10 +603,15 @@ fn action_for_key(
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
+        (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
         (&kb.focus_pane_up, NavigateAction::FocusPaneUp),
         (&kb.focus_pane_right, NavigateAction::FocusPaneRight),
+        (&kb.swap_pane_left, NavigateAction::SwapPaneLeft),
+        (&kb.swap_pane_down, NavigateAction::SwapPaneDown),
+        (&kb.swap_pane_up, NavigateAction::SwapPaneUp),
+        (&kb.swap_pane_right, NavigateAction::SwapPaneRight),
         (&kb.last_pane, NavigateAction::LastPane),
         (&kb.cycle_pane_next, NavigateAction::CyclePaneNext),
         (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
@@ -759,8 +772,9 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::CloseTab => {
-            state.close_tab();
-            leave_navigate_mode(state);
+            if !state.close_tab() {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::RenamePane => {
             if let Some(pane_id) = state
@@ -775,6 +789,22 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::FocusPaneDown => state.navigate_pane(NavDirection::Down),
         NavigateAction::FocusPaneUp => state.navigate_pane(NavDirection::Up),
         NavigateAction::FocusPaneRight => state.navigate_pane(NavDirection::Right),
+        NavigateAction::SwapPaneLeft => {
+            state.swap_pane(NavDirection::Left);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneDown => {
+            state.swap_pane(NavDirection::Down);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneUp => {
+            state.swap_pane(NavDirection::Up);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPaneRight => {
+            state.swap_pane(NavDirection::Right);
+            leave_navigate_mode(state);
+        }
         NavigateAction::SplitVertical => {
             state.split_pane(terminal_runtimes, Direction::Horizontal);
             leave_navigate_mode(state);
@@ -784,10 +814,12 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::ClosePane => {
-            state.close_pane();
-            leave_navigate_mode(state);
+            if !state.close_pane() {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::EditScrollback => {}
+        NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
             leave_navigate_mode(state);
@@ -825,7 +857,7 @@ pub(super) fn execute_navigate_action_in_context(
             super::modal::request_detach(state);
             leave_navigate_mode(state);
         }
-        NavigateAction::OpenNavigator => state.open_navigator(),
+        NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -956,12 +988,15 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
 
-    use super::super::{state_with_workspaces, unique_temp_path, wait_for_file};
+    #[cfg(unix)]
+    use super::super::wait_for_file;
+    use super::super::{state_with_workspaces, unique_temp_path};
     use super::*;
     use crate::{
         app::App, config::Config, input::TerminalKey, terminal::TerminalState, workspace::Workspace,
@@ -1266,6 +1301,7 @@ mod tests {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".into(),
             context: "two".into(),
+            position: None,
             target: Some(crate::app::state::ToastTarget {
                 workspace_id: target_workspace_id,
                 pane_id: target_pane,
@@ -1496,6 +1532,19 @@ navigate_pane_right = "ctrl+l"
     }
 
     #[test]
+    fn terminal_direct_swap_pane_shortcut_maps_to_navigation_action() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds.swap_pane_right = crate::config::ActionKeybinds::direct("alt+shift+l");
+
+        let action = terminal_direct_navigation_action(
+            &state,
+            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(action, Some(NavigateAction::SwapPaneRight));
+    }
+
+    #[test]
     fn terminal_direct_last_pane_shortcut_maps_to_navigation_action() {
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.last_pane = crate::config::ActionKeybinds::direct("alt+l");
@@ -1562,6 +1611,88 @@ last_pane = "prefix+tab"
 
         assert!(app.state.request_new_workspace);
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn navigate_mode_matches_legacy_uppercase_shifted_letter() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty()));
+
+        assert!(app.state.request_new_workspace);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn legacy_uppercase_prefers_shifted_workspace_binding_over_unshifted() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Char('W'), KeyModifiers::empty()));
+
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+    }
+
+    #[tokio::test]
+    async fn legacy_uppercase_prefers_shifted_reload_binding_over_unshifted() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Char('R'), KeyModifiers::empty()));
+
+        assert!(app.state.request_reload_config);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn legacy_uppercase_prefers_shifted_pane_binding_over_unshifted() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+
+        app.handle_navigate_key(TerminalKey::new(KeyCode::Char('P'), KeyModifiers::empty()));
+
+        assert_eq!(app.state.mode, Mode::RenamePane);
     }
 
     #[tokio::test]
@@ -1701,11 +1832,11 @@ last_pane = "prefix+tab"
     #[test]
     fn modified_navigate_local_key_can_be_bound_as_prefix_rhs() {
         let mut state = state_with_workspaces(&["test"]);
-        state.keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("shift+h");
+        state.keybinds.toggle_sidebar = crate::config::ActionKeybinds::prefix("shift+u");
 
         handle_navigate_key(
             &mut state,
-            KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT),
         );
 
         assert!(state.sidebar_collapsed);
@@ -1753,6 +1884,23 @@ last_pane = "prefix+tab"
         assert_eq!(state.mode, Mode::Terminal);
     }
 
+    #[test]
+    fn prefix_close_pane_last_parent_group_pane_opens_confirmation() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut state, 0, "repo-key");
+        mark_worktree_space_member(&mut state, 1, "repo-key");
+        state.selected = 1;
+        state.active = Some(0);
+        state.mode = Mode::Navigate;
+
+        execute_navigate_action(&mut state, NavigateAction::ClosePane);
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.mode, Mode::ConfirmClose);
+        assert_eq!(state.workspaces.len(), 2);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn custom_command_runs_from_prefix_key_in_navigate_mode() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1778,6 +1926,7 @@ last_pane = "prefix+tab"
             label: "prefix+m".into(),
             command,
             action: crate::config::CustomCommandAction::Shell,
+            description: None,
         }];
 
         app.handle_key(TerminalKey::new(
@@ -1801,6 +1950,7 @@ last_pane = "prefix+tab"
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pane_overlay_command_opens_and_closes_after_exit() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1817,7 +1967,7 @@ last_pane = "prefix+tab"
             80,
             app.state.pane_scrollback_limit_bytes,
             app.state.host_terminal_theme,
-            &app.state.default_shell,
+            crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
             app.event_tx.clone(),
             app.render_notify.clone(),
             app.render_dirty.clone(),
@@ -1838,6 +1988,7 @@ last_pane = "prefix+tab"
             label: "prefix+m".into(),
             command,
             action: crate::config::CustomCommandAction::Pane,
+            description: None,
         }];
 
         app.handle_key(TerminalKey::new(
@@ -1887,6 +2038,7 @@ last_pane = "prefix+tab"
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn edit_scrollback_key_opens_focused_runtime_scrollback_in_editor_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

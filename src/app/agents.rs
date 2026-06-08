@@ -433,6 +433,7 @@ impl App {
             pane_id: pane.pane_id,
             focused: pane.focused,
             cwd: pane.cwd,
+            foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
         })
     }

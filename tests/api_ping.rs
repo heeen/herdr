@@ -72,8 +72,20 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
+#[cfg(target_os = "linux")]
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("path did not appear at {}", path.display());
+}
+
 fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedHerdr {
-    spawn_herdr_with_path(config_home, runtime_dir, socket_path, None)
+    spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, "/bin/sh")
 }
 
 fn spawn_herdr_with_path(
@@ -81,6 +93,32 @@ fn spawn_herdr_with_path(
     runtime_dir: &Path,
     socket_path: &Path,
     path_override: Option<&Path>,
+) -> SpawnedHerdr {
+    spawn_herdr_with_options(
+        config_home,
+        runtime_dir,
+        socket_path,
+        path_override,
+        "/bin/sh",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_herdr_with_shell(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    shell: &str,
+) -> SpawnedHerdr {
+    spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, shell)
+}
+
+fn spawn_herdr_with_options(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    path_override: Option<&Path>,
+    shell: &str,
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -106,7 +144,7 @@ fn spawn_herdr_with_path(
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
-    cmd.env("SHELL", "/bin/sh");
+    cmd.env("SHELL", shell);
     cmd.env_remove("HERDR_ENV");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
@@ -553,6 +591,120 @@ fn tab_methods_round_trip_over_socket() {
         ),
     );
     assert_eq!(closed["result"]["type"], "ok");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let foreground = base.join("foreground-process");
+    let marker = base.join("foreground-ready");
+    let pid_file = base.join("foreground.pid");
+    fs::create_dir_all(&foreground).unwrap();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/bash");
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fg_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let command = format!(
+        "/bin/sh -c 'cd {} && printf %s $$ > {} && touch {} && sleep 30'",
+        foreground.display(),
+        pid_file.display(),
+        marker.display()
+    );
+    let send_text = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fg_send",
+            "method": "pane.send_text",
+            "params": {
+                "pane_id": pane_id,
+                "text": command,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(send_text["result"]["type"], "ok");
+    let send_enter = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fg_enter","method":"pane.send_keys","params":{{"pane_id":"{}","keys":["Enter"]}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(send_enter["result"]["type"], "ok");
+    wait_for_path(&marker, Duration::from_secs(5));
+
+    let foreground_pid: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    assert_eq!(
+        fs::read_link(format!("/proc/{foreground_pid}/cwd")).unwrap(),
+        foreground
+    );
+
+    let pane = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(pane["result"]["pane"]["cwd"], base.display().to_string());
+    assert_eq!(
+        pane["result"]["pane"]["foreground_cwd"],
+        foreground.display().to_string()
+    );
+
+    let panes = send_request(
+        &socket_path,
+        r#"{"id":"fg_panes","method":"pane.list","params":{}}"#,
+    );
+    assert_eq!(
+        panes["result"]["panes"][0]["cwd"],
+        base.display().to_string()
+    );
+    assert_eq!(
+        panes["result"]["panes"][0]["foreground_cwd"],
+        foreground.display().to_string()
+    );
+
+    let reported = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fg_report","method":"pane.report_agent","params":{{"pane_id":"{}","source":"test","agent":"probe","state":"working"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(reported["result"]["type"], "ok");
+
+    let agents = send_request(
+        &socket_path,
+        r#"{"id":"fg_agents","method":"agent.list","params":{}}"#,
+    );
+    assert_eq!(
+        agents["result"]["agents"][0]["cwd"],
+        base.display().to_string()
+    );
+    assert_eq!(
+        agents["result"]["agents"][0]["foreground_cwd"],
+        foreground.display().to_string()
+    );
 
     cleanup_spawned_herdr(child, base);
 }

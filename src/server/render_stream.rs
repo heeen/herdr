@@ -45,8 +45,10 @@ impl ClientRenderState {
         match self {
             Self::Semantic { last_frame } => {
                 if last_frame.as_ref() == Some(frame) {
+                    crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
+                crate::render_prof::event("prepare_frame.semantic.changed");
                 // issue #13: stream only the changed cells when a delta against the client's last
                 // full frame is meaningfully smaller; otherwise (first frame / resize / near-full
                 // repaint) send a full frame to re-baseline. The client reconstructs from its cache.
@@ -65,10 +67,22 @@ impl ClientRenderState {
             }
             Self::TerminalAnsi { blit_encoder, seq } => {
                 if blit_encoder.is_current(frame) {
+                    crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
                 let mut encoded = blit_encoder.encode(frame, false);
+                crate::render_prof::event("prepare_frame.ansi.changed");
+                crate::render_prof::counter("prepare_frame.ansi.bytes", encoded.bytes.len() as u64);
+                if encoded.full {
+                    crate::render_prof::event("prepare_frame.ansi.full");
+                } else {
+                    crate::render_prof::event("prepare_frame.ansi.partial");
+                }
                 insert_graphics_before_sync_end(&mut encoded.bytes, &frame.graphics);
+                crate::render_prof::counter(
+                    "prepare_frame.graphics.bytes",
+                    frame.graphics.len() as u64,
+                );
                 Some(PreparedRender {
                     message: ServerMessage::Terminal(TerminalFrame {
                         seq: *seq + 1,
@@ -80,6 +94,13 @@ impl ClientRenderState {
                     encoded: Some(encoded),
                 })
             }
+        }
+    }
+
+    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
+        match self {
+            Self::Semantic { last_frame } => last_frame.as_ref(),
+            Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
 
@@ -250,11 +271,15 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let pre_compute_suppresses_focused_terminal_cursor =
+        focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
         crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
     } else {
         crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
     }
+    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
+        || focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
 
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
@@ -266,8 +291,15 @@ pub(crate) fn render_virtual_with_runtime_registry(
         .expect("render to TestBackend should never fail");
 
     let buffer = terminal.backend().buffer().clone();
-    let cursor = focused_terminal_cursor(app_state, terminal_runtimes)
-        .or_else(|| terminal.backend().rendered_cursor());
+    let cursor = if suppress_focused_terminal_cursor {
+        None
+    } else {
+        focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
+            (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
+                .then(|| terminal.backend().rendered_cursor())
+                .flatten()
+        })
+    };
 
     (buffer, cursor)
 }
@@ -331,6 +363,7 @@ pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let suppress_cursor = runtime.synchronized_output_active();
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
@@ -341,15 +374,20 @@ pub(crate) fn render_terminal_virtual(
         .expect("render to TestBackend should never fail");
 
     let buffer = terminal.backend().buffer().clone();
-    let cursor = runtime
-        .cursor_state(area, true)
+    let cursor = (!suppress_cursor)
+        .then(|| runtime.cursor_state(area, true))
+        .flatten()
         .map(|cursor| CursorState {
             x: cursor.x,
             y: cursor.y,
             visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
             shape: cursor.shape,
         })
-        .or_else(|| terminal.backend().rendered_cursor());
+        .or_else(|| {
+            (!suppress_cursor)
+                .then(|| terminal.backend().rendered_cursor())
+                .flatten()
+        });
 
     (buffer, cursor)
 }
@@ -381,7 +419,7 @@ pub(crate) fn visible_hyperlinks(
     links
 }
 
-fn focused_terminal_cursor(
+pub(crate) fn focused_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> Option<CursorState> {
@@ -395,9 +433,14 @@ fn focused_terminal_cursor(
         .pane_infos
         .iter()
         .find(|info| info.is_focused)?;
+    if !app_state.pane_exposes_host_cursor(ws_idx, info.id) {
+        return None;
+    }
     let rt = app_state.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)?;
+    if rt.synchronized_output_active() {
+        return None;
+    }
     let scrolled_back = crate::ui::pane_is_scrolled_back(rt);
-
     // Determine whether the IME-anchor reveal applies to this focused pane.
     // The master switch must be on, and either no agent filter is configured
     // (apply to any pane) or the focused pane's detected agent matches the
@@ -446,4 +489,60 @@ fn focused_terminal_cursor(
     } else {
         None
     }
+}
+
+fn focused_terminal_owns_host_cursor(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> bool {
+    if app_state.mode != Mode::Terminal {
+        return false;
+    }
+
+    let Some(ws_idx) = app_state.active else {
+        return false;
+    };
+    let Some(info) = app_state
+        .view
+        .pane_infos
+        .iter()
+        .find(|info| info.is_focused)
+    else {
+        return false;
+    };
+    if !app_state.pane_exposes_host_cursor(ws_idx, info.id) {
+        return false;
+    }
+
+    app_state
+        .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        .is_some()
+}
+
+fn focused_terminal_suppresses_host_cursor(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> bool {
+    if app_state.mode != Mode::Terminal {
+        return false;
+    }
+
+    let Some(ws_idx) = app_state.active else {
+        return false;
+    };
+    let Some(info) = app_state
+        .view
+        .pane_infos
+        .iter()
+        .find(|info| info.is_focused)
+    else {
+        return false;
+    };
+    if !app_state.pane_exposes_host_cursor(ws_idx, info.id) {
+        return false;
+    }
+
+    app_state
+        .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
 }

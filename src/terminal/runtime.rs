@@ -84,7 +84,7 @@ impl TerminalRuntime {
         cwd: std::path::PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        default_shell: &str,
+        shell_config: crate::pane::PaneShellConfig<'_>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
@@ -96,7 +96,7 @@ impl TerminalRuntime {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
-            default_shell,
+            shell_config,
             events,
             render_notify,
             render_dirty,
@@ -111,7 +111,7 @@ impl TerminalRuntime {
         cwd: std::path::PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        default_shell: &str,
+        shell_config: crate::pane::PaneShellConfig<'_>,
         initial_history_ansi: Option<&str>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
@@ -124,7 +124,7 @@ impl TerminalRuntime {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
-            default_shell,
+            shell_config,
             initial_history_ansi,
             events,
             render_notify,
@@ -189,33 +189,6 @@ impl TerminalRuntime {
         .map(Self)
     }
 
-    pub fn spawn_agent_restore(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        launch: crate::agent_resume::AgentResumeLaunch<'_>,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
-    ) -> std::io::Result<Self> {
-        crate::pane::PaneRuntime::spawn_agent_restore(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            launch,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            events,
-            render_notify,
-            render_dirty,
-        )
-        .map(Self)
-    }
-
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
         self.0.apply_host_terminal_theme(theme);
     }
@@ -228,6 +201,7 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
+    #[cfg(unix)]
     pub fn nudge_child_redraw_after_handoff(&self) {
         self.0.nudge_child_redraw_after_handoff();
     }
@@ -264,6 +238,10 @@ impl TerminalRuntime {
         self.0.cursor_state(area, show_cursor)
     }
 
+    pub fn synchronized_output_active(&self) -> bool {
+        self.0.synchronized_output_active()
+    }
+
     pub fn visible_text(&self) -> String {
         self.0.visible_text()
     }
@@ -298,6 +276,14 @@ impl TerminalRuntime {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.0.render(frame, area, show_cursor);
+    }
+
+    pub(crate) fn collect_dirty_patch(
+        &self,
+        area_width: u16,
+        area_height: u16,
+    ) -> crate::pane::TerminalDirtyPatchOutcome {
+        self.0.collect_dirty_patch(area_width, area_height)
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
@@ -352,6 +338,16 @@ impl TerminalRuntime {
         self.0.encode_mouse_button(kind, column, row, modifiers)
     }
 
+    pub fn encode_mouse_motion(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Vec<u8>> {
+        self.0.encode_mouse_motion(kind, column, row, modifiers)
+    }
+
     pub fn encode_mouse_wheel(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -371,6 +367,10 @@ impl TerminalRuntime {
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         self.0.cwd()
+    }
+
+    pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
+        self.0.foreground_cwd()
     }
 
     pub(crate) fn current_size(&self) -> (u16, u16) {
@@ -399,6 +399,10 @@ impl TerminalRuntime {
         Self(crate::pane::PaneRuntime::test_with_screen_bytes(
             cols, rows, bytes,
         ))
+    }
+
+    pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
+        self.0.test_process_pty_bytes(bytes);
     }
 
     pub(crate) fn test_with_scrollback_bytes(

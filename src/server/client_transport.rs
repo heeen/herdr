@@ -5,18 +5,20 @@
 //! `HeadlessServer`.
 
 use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use interprocess::local_socket::traits::Stream as _;
+use interprocess::TryClone as _;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::ipc::LocalStream;
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientMessage,
-    ClientSurfaceMode, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
+    ClientLaunchMode, ClientMessage, ClientSurfaceMode, RenderEncoding, ServerMessage,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -35,6 +37,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
+/// Maximum structured input events accepted in one client message.
+const MAX_INPUT_EVENT_BATCH: usize = 4096;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
@@ -58,10 +62,16 @@ pub(crate) enum ServerEvent {
         surface_mode: ClientSurfaceMode,
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
+        direct_attach_requested: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    /// A client sent structured input events.
+    ClientInputEvents {
+        client_id: u64,
+        events: Vec<crate::protocol::ClientInputEvent>,
+    },
     /// A client sent local clipboard image bytes to paste into a remote pane.
     ClientClipboardImage {
         client_id: u64,
@@ -134,12 +144,57 @@ fn parse_client_keybindings(
     }
 }
 
+fn input_events_within_limits(events: &[ClientInputEvent]) -> bool {
+    if events.len() > MAX_INPUT_EVENT_BATCH {
+        return false;
+    }
+
+    let mut paste_bytes = 0usize;
+    for event in events {
+        if let ClientInputEvent::Paste { text } = event {
+            paste_bytes = paste_bytes.saturating_add(text.len());
+            if paste_bytes > MAX_INPUT_PAYLOAD {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[cfg(windows)]
+fn set_client_recv_timeout(
+    stream: &LocalStream,
+    timeout: Option<Duration>,
+    context: &'static str,
+    client_id: u64,
+) -> io::Result<()> {
+    match stream.set_recv_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            debug!(client_id, err = %err, context, "client socket receive timeout unavailable");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(windows))]
+fn set_client_recv_timeout(
+    stream: &LocalStream,
+    timeout: Option<Duration>,
+    _context: &'static str,
+    _client_id: u64,
+) -> io::Result<()> {
+    stream.set_recv_timeout(timeout)
+}
+
 /// Handles the client handshake on a blocking thread.
 ///
 /// Reads the `Hello` message, validates the version, sends `Welcome`,
 /// and then enters a read loop forwarding messages to the server event channel.
 pub(crate) fn handle_client_handshake(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -148,8 +203,12 @@ pub(crate) fn handle_client_handshake(
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
 
-    // Set a read timeout for the handshake.
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    set_client_recv_timeout(
+        &stream,
+        Some(HANDSHAKE_TIMEOUT),
+        "client handshake read timeout unavailable",
+        client_id,
+    )?;
 
     // Read the Hello message.
     let hello: ClientMessage = match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
@@ -195,6 +254,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         surface_mode,
         keybindings,
+        direct_attach_requested,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -205,6 +265,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             surface_mode,
             keybindings,
+            launch_mode,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -244,6 +305,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 surface_mode,
                 keybindings,
+                launch_mode == ClientLaunchMode::TerminalAttach,
             )
         }
         _ => {
@@ -267,8 +329,12 @@ pub(crate) fn handle_client_handshake(
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
 
-    // Clear read timeout for normal operation.
-    stream.set_read_timeout(None)?;
+    set_client_recv_timeout(
+        &stream,
+        None,
+        "failed to clear client handshake read timeout",
+        client_id,
+    )?;
 
     // Create separate channels for reliable control messages and droppable renders.
     let (control_tx, control_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -288,6 +354,7 @@ pub(crate) fn handle_client_handshake(
         surface_mode,
         render_encoding,
         keybindings,
+        direct_attach_requested,
         writer,
     });
 
@@ -310,7 +377,7 @@ pub(crate) fn handle_client_handshake(
 
 /// The client writer loop — prioritizes control messages over render frames.
 fn client_writer_loop(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     client_id: u64,
     control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -376,7 +443,7 @@ fn client_writer_loop(
     debug!("client writer thread exiting");
 }
 
-fn write_framed_bytes(stream: &mut UnixStream, data: &[u8]) -> bool {
+fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
     if let Err(err) = stream.write_all(data) {
         debug!(err = %err, "client write failed, closing writer");
         return false;
@@ -390,7 +457,7 @@ fn write_framed_bytes(stream: &mut UnixStream, data: &[u8]) -> bool {
 
 /// The client read loop — reads messages from the client and forwards to the server event channel.
 fn client_read_loop(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
@@ -436,6 +503,20 @@ fn client_read_loop(
                     break;
                 } else {
                     ServerEvent::ClientInput { client_id, data }
+                }
+            }
+            ClientMessage::InputEvents { events } => {
+                if !input_events_within_limits(&events) {
+                    warn!(
+                        client_id,
+                        count = events.len(),
+                        "oversized input events from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                } else {
+                    ServerEvent::ClientInputEvents { client_id, events }
                 }
             }
             ClientMessage::ClipboardImage { extension, data } => {
@@ -518,6 +599,42 @@ fn client_read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::path::PathBuf;
+
+    struct TestSocketPath(PathBuf);
+
+    impl Drop for TestSocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn unique_test_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let filename = format!("h{}-{nanos}.sock", std::process::id());
+        #[cfg(unix)]
+        {
+            let _ = name;
+            PathBuf::from("/tmp").join(filename)
+        }
+        #[cfg(windows)]
+        {
+            std::env::temp_dir().join(format!("herdr-{name}-{filename}"))
+        }
+    }
+
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, TestSocketPath) {
+        let path = unique_test_path(name);
+        let _ = std::fs::remove_file(&path);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        (client, server, TestSocketPath(path))
+    }
 
     #[test]
     fn clamp_terminal_size_zero_zero() {
@@ -600,7 +717,7 @@ new_tab = "ctrl+notakey"
 
     #[test]
     fn handshake_negotiates_terminal_ansi_encoding() {
-        let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-handshake-ansi");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let handshake_quit = should_quit.clone();
@@ -619,6 +736,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::App,
             },
         )
         .expect("write hello");
@@ -651,6 +769,7 @@ new_tab = "ctrl+notakey"
                 surface_mode,
                 render_encoding,
                 keybindings,
+                direct_attach_requested,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -659,6 +778,72 @@ new_tab = "ctrl+notakey"
                 assert_eq!(surface_mode, ClientSurfaceMode::FullApp);
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
+                assert!(!direct_attach_requested);
+                drop(writer);
+            }
+            other => panic!("expected ClientConnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn handshake_marks_terminal_attach_launch_mode() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-handshake-terminal-attach");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                surface_mode: ClientSurfaceMode::FullApp,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalAttach,
+            },
+        )
+        .expect("write hello");
+
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        match welcome {
+            ServerMessage::Welcome {
+                version,
+                encoding,
+                error,
+            } => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(encoding, RenderEncoding::TerminalAnsi);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client connected event")
+        {
+            ServerEvent::ClientConnected {
+                direct_attach_requested,
+                writer,
+                ..
+            } => {
+                assert!(direct_attach_requested);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -674,7 +859,7 @@ new_tab = "ctrl+notakey"
 
     #[test]
     fn client_read_loop_rejects_oversized_input() {
-        let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-read-oversized");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
@@ -689,6 +874,126 @@ new_tab = "ctrl+notakey"
             },
         )
         .expect("write oversized input");
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client disconnected event")
+        {
+            ServerEvent::ClientDisconnected { client_id } => assert_eq!(client_id, 7),
+            other => panic!("expected ClientDisconnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn client_read_loop_forwards_input_events() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-read-events");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+        let events = vec![
+            ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Enter,
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+            },
+            ClientInputEvent::FocusGained,
+        ];
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::InputEvents {
+                events: events.clone(),
+            },
+        )
+        .expect("write input events");
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client input events event")
+        {
+            ServerEvent::ClientInputEvents {
+                client_id,
+                events: actual,
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(actual, events);
+            }
+            other => panic!("expected ClientInputEvents, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn client_read_loop_rejects_oversized_input_event_batch() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-oversized-events");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::InputEvents {
+                events: vec![ClientInputEvent::FocusGained; MAX_INPUT_EVENT_BATCH + 1],
+            },
+        )
+        .expect("write oversized input events");
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client disconnected event")
+        {
+            ServerEvent::ClientDisconnected { client_id } => assert_eq!(client_id, 7),
+            other => panic!("expected ClientDisconnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn client_read_loop_rejects_oversized_input_event_paste() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-oversized-paste");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::InputEvents {
+                events: vec![ClientInputEvent::Paste {
+                    text: "x".repeat(MAX_INPUT_PAYLOAD + 1),
+                }],
+            },
+        )
+        .expect("write oversized paste event");
 
         match server_event_rx
             .blocking_recv()

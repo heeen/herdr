@@ -4,10 +4,10 @@ use ratatui::layout::Rect;
 use crate::{
     app::{
         state::{
-            ordered_sidebar_agent_items, ordered_sidebar_space_items, AppState, SettingsSection,
-            SidebarAgentItem, SidebarAgentPreferences, SidebarConfigGroup, SidebarLine,
-            SidebarSpaceItem, SidebarSpacePreferences, SIDEBAR_AGENT_ITEMS, SIDEBAR_SPACE_ITEMS,
-            THEME_NAMES,
+            ordered_sidebar_agent_items, ordered_sidebar_space_items, AppState, ExperimentSetting,
+            SettingsSection, SidebarAgentItem, SidebarAgentPreferences, SidebarConfigGroup,
+            SidebarLine, SidebarSpaceItem, SidebarSpacePreferences, SIDEBAR_AGENT_ITEMS,
+            SIDEBAR_SPACE_ITEMS, THEME_NAMES,
         },
         App, Mode,
     },
@@ -23,6 +23,7 @@ pub(super) enum SettingsAction {
     SaveToastDelivery(ToastDelivery),
     SaveAgentBorderLabels(bool),
     SavePaneHistory(bool),
+    SaveSwitchAsciiInputSourceInPrefix(bool),
     SaveSidebarSpace {
         previous: SidebarSpacePreferences,
         preferences: SidebarSpacePreferences,
@@ -38,6 +39,20 @@ pub(super) enum SettingsAction {
     InstallRecommendedIntegrations,
 }
 
+/// Map an Experiments row index to the toggle action that flips it.
+fn experiment_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
+    match ExperimentSetting::ALL.get(idx).copied()? {
+        ExperimentSetting::PaneHistory => Some(SettingsAction::SavePaneHistory(
+            !ExperimentSetting::PaneHistory.enabled(state),
+        )),
+        ExperimentSetting::SwitchAsciiInputSourceInPrefix => {
+            Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(
+                !ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(state),
+            ))
+        }
+    }
+}
+
 impl App {
     pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
         let previous_section = self.state.settings.section;
@@ -51,6 +66,9 @@ impl App {
                 }
                 SettingsAction::SavePaneHistory(enabled) => {
                     self.save_pane_history_persistence(enabled)
+                }
+                SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
+                    self.save_switch_ascii_input_source_in_prefix(enabled)
                 }
                 SettingsAction::SaveSidebarSpace {
                     previous,
@@ -740,16 +758,12 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
             }
         },
         SettingsSection::Experiments => match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.settings.list.move_prev();
-            }
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
             KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.move_next(1);
+                state.settings.list.move_next(ExperimentSetting::ALL.len())
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                return Some(SettingsAction::SavePaneHistory(
-                    !state.pane_history_persistence_enabled(),
-                ));
+                return experiment_toggle_action(state, state.settings.list.selected);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 state.settings.section = SettingsSection::Integrations;
@@ -914,7 +928,11 @@ impl AppState {
             }
             SettingsSection::Experiments => {
                 let list_y = area.y + 3;
-                (row == list_y).then_some(0)
+                if row >= list_y && row < list_y + ExperimentSetting::ALL.len() as u16 {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
             }
             SettingsSection::Integrations => None,
         }
@@ -965,9 +983,7 @@ impl AppState {
                             self.settings.sidebar_config_editing = false;
                             toggle_sidebar_config_item(self)
                         }
-                        SettingsSection::Experiments => Some(SettingsAction::SavePaneHistory(
-                            !self.pane_history_persistence_enabled(),
-                        )),
+                        SettingsSection::Experiments => experiment_toggle_action(self, idx),
                         SettingsSection::Integrations => None,
                     };
                 }
@@ -1652,6 +1668,50 @@ mod tests {
         );
         assert_eq!(app.state.sidebar_agent, expected);
         assert_eq!(app.state.settings.list.selected, 7);
+    }
+
+    #[test]
+    fn settings_experiments_down_then_toggle_switches_ascii_input_source() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.switch_ascii_input_source_in_prefix = false;
+        open_settings_at(&mut state, SettingsSection::Experiments);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.list.selected, 1);
+
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(true))
+        );
+        assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_mouse_click_toggles_switch_ascii_input_source_row() {
+        let mut app = app_for_mouse_test();
+        app.state.switch_ascii_input_source_in_prefix = false;
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+
+        let area = app.state.settings_content_rect();
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.y + 4,
+        ));
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(true))
+        );
+        assert_eq!(app.state.settings.list.selected, 1);
     }
 
     #[test]

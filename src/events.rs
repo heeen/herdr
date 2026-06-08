@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
-use crate::workspace::WorkspaceGitStatus;
+use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
 pub struct WorktreeAddResult {
@@ -46,6 +46,14 @@ pub enum AppEvent {
         state: AgentState,
         message: Option<String>,
         custom_status: Option<String>,
+        seq: Option<u64>,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    },
+    /// Agent session identity was reported without state authority.
+    AgentSessionReported {
+        pane_id: PaneId,
+        source: String,
+        agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
     },
@@ -88,8 +96,17 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A pane child reported its shell current directory through terminal
+    /// metadata such as OSC 7.
+    TerminalCwdReported {
+        pane_id: PaneId,
+        cwd: std::path::PathBuf,
+    },
     /// Background git status refresh completed for workspaces.
-    GitStatusRefreshed { results: Vec<WorkspaceGitStatus> },
+    GitStatusRefreshed {
+        results: Vec<WorkspaceGitStatus>,
+        cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    },
     /// Background `git worktree add` completed.
     WorktreeAddFinished(WorktreeAddResult),
     /// Background `git worktree remove` completed.

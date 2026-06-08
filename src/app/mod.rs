@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_resume;
 mod agents;
 mod api;
 mod api_helpers;
@@ -34,6 +35,7 @@ pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
@@ -95,14 +97,18 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
+    pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    pub(crate) git_refresh_due_after_in_flight: bool,
+    pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
+    pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
@@ -116,6 +122,7 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -291,6 +298,7 @@ impl App {
                 80,
                 config.advanced.scrollback_limit_bytes,
                 &config.terminal.default_shell,
+                config.terminal.shell_mode,
                 config.session.resume_agents_on_restore,
                 event_tx.clone(),
                 render_notify.clone(),
@@ -444,6 +452,7 @@ impl App {
             }),
             keybind_help: state::KeybindHelpState { scroll: 0 },
             navigator: state::NavigatorState::default(),
+            copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -479,6 +488,7 @@ impl App {
             update_dismissed: false,
             config_diagnostic,
             toast: None,
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code,
@@ -494,6 +504,8 @@ impl App {
             sidebar_section_split,
             agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
+            right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
+            right_click_passthrough: None,
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
@@ -506,8 +518,12 @@ impl App {
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
+            switch_ascii_input_source_in_prefix: config
+                .experimental
+                .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             default_shell: config.terminal.default_shell.clone(),
+            shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
@@ -573,12 +589,15 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
+            last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            git_refresh_due_after_in_flight: false,
+            git_status_cache: HashMap::new(),
             last_sidebar_divider_click: None,
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
@@ -586,6 +605,7 @@ impl App {
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,
+            pending_agent_resume_deadline: None,
             session_save_deadline: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
@@ -604,6 +624,7 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
+            prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }
 
@@ -624,6 +645,7 @@ impl App {
             snapshot,
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
+            config.terminal.shell_mode,
             imports,
             app.event_tx.clone(),
             app.render_notify.clone(),
@@ -681,6 +703,36 @@ impl App {
         self.full_redraw_pending = true;
     }
 
+    pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
+        match (
+            previous_mode == Mode::Prefix,
+            self.state.mode == Mode::Prefix,
+        ) {
+            (false, true) if self.state.switch_ascii_input_source_in_prefix => {
+                self.prefix_input_source.switch_to_ascii();
+            }
+            (true, false) => self.prefix_input_source.restore(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn handle_internal_event_with_prefix_sync(
+        &mut self,
+        event: crate::events::AppEvent,
+    ) {
+        let previous_mode = self.state.mode;
+        self.handle_internal_event(event);
+        self.sync_prefix_input_source(previous_mode);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_prefix_input_source(
+        &mut self,
+        source: Box<dyn crate::platform::PrefixInputSource>,
+    ) {
+        self.prefix_input_source = source;
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
@@ -708,7 +760,7 @@ impl App {
             self.sync_session_save_schedule();
 
             let now = Instant::now();
-            if self.handle_scheduled_tasks(now) {
+            if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
 
@@ -777,6 +829,10 @@ impl App {
                 needs_render = true;
             }
 
+            if self.ensure_default_workspace() {
+                needs_render = true;
+            }
+
             let now = Instant::now();
             self.sync_animation_timer(now);
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
@@ -823,6 +879,11 @@ impl App {
                         cell_size,
                     )?;
                 }
+                self.sync_pending_agent_resume_deadline(now);
+                if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
+                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_notify.notify_one();
+                }
                 self.last_render_at = Some(now);
                 needs_render = false;
                 continue;
@@ -852,7 +913,7 @@ impl App {
             match event {
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
-                    self.handle_internal_event(ev);
+                    self.handle_internal_event_with_prefix_sync(ev);
                     needs_render = true;
                 }
                 LoopEvent::Api(msg) => {
@@ -898,6 +959,33 @@ impl App {
         }
         *active = desired;
         Ok(())
+    }
+
+    pub(crate) fn ensure_default_workspace(&mut self) -> bool {
+        if !self.state.workspaces.is_empty() || self.state.mode == Mode::Onboarding {
+            return false;
+        }
+
+        let previous_mode = self.state.mode;
+        let preserve_mode = matches!(
+            previous_mode,
+            Mode::ReleaseNotes | Mode::ProductAnnouncement | Mode::Settings
+        );
+        let cwd = self.resolve_new_terminal_cwd(None);
+
+        match self.create_workspace_with_options(cwd, true) {
+            Ok(_) => {
+                if preserve_mode {
+                    self.state.mode = previous_mode;
+                }
+                true
+            }
+            Err(err) => {
+                tracing::error!(err = %err, "failed to create default workspace");
+                self.state.mode = Mode::Navigate;
+                false
+            }
+        }
     }
 
     pub(crate) fn dismiss_release_notes(&mut self) {
@@ -1127,6 +1215,8 @@ impl App {
                 }
                 self.state.redraw_on_focus_gained = config.ui.redraw_on_focus_gained;
                 self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
+                self.state.right_click_passthrough_modifiers =
+                    config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
                 self.state.show_agent_labels_on_pane_borders =
@@ -1170,6 +1260,8 @@ impl App {
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
+            self.state.switch_ascii_input_source_in_prefix =
+                config.experimental.switch_ascii_input_source_in_prefix;
             self.persist_pane_history = config.experimental.pane_history;
             self.state.pane_history_persistence = config.experimental.pane_history;
             if !self.persist_pane_history {
@@ -1183,6 +1275,7 @@ impl App {
 
         if !invalid_section("terminal") {
             self.state.default_shell = config.terminal.default_shell.clone();
+            self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
         }
 
@@ -1214,6 +1307,7 @@ impl App {
                     kind: crate::app::state::ToastKind::UpdateInstalled,
                     title: "reloaded config".to_string(),
                     context: "using config.toml".to_string(),
+                    position: None,
                     target: None,
                 });
             }
@@ -1225,6 +1319,7 @@ impl App {
                     kind: crate::app::state::ToastKind::UpdateInstalled,
                     title: "reloaded config".to_string(),
                     context: "with warnings".to_string(),
+                    position: None,
                     target: None,
                 });
             }
@@ -1261,6 +1356,7 @@ impl App {
         apply_host_terminal_theme: bool,
     ) {
         for event in events {
+            let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
                     let key_id = repeat_key_identity(&key);
@@ -1332,6 +1428,7 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
+            self.sync_prefix_input_source(previous_mode);
         }
     }
 
@@ -1347,6 +1444,9 @@ impl App {
             }
             Mode::Navigate => {
                 self.handle_navigate_key(key);
+            }
+            Mode::Copy => {
+                self.handle_copy_mode_key(key);
             }
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 input::handle_rename_key(&mut self.state, key_event);
@@ -1392,7 +1492,7 @@ impl App {
                 self.handle_settings_key(key_event);
             }
             Mode::Navigator => {
-                input::handle_navigator_key(&mut self.state, key_event);
+                input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.
@@ -1418,6 +1518,8 @@ mod tests {
     use crate::terminal::TerminalRuntime;
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Mutex;
 
     fn raw_key(
@@ -1448,6 +1550,154 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[cfg(windows)]
+    fn exiting_test_command() -> &'static str {
+        "C:\\Windows\\System32\\whoami.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn exiting_test_command() -> &'static str {
+        "/usr/bin/true"
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePrefixInputSource {
+        switch_calls: Rc<Cell<usize>>,
+        restore_calls: Rc<Cell<usize>>,
+        switched: Rc<Cell<bool>>,
+        will_switch: bool,
+    }
+
+    impl FakePrefixInputSource {
+        fn switching() -> Self {
+            Self {
+                will_switch: true,
+                ..Self::default()
+            }
+        }
+
+        fn no_op() -> Self {
+            Self {
+                will_switch: false,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl crate::platform::PrefixInputSource for FakePrefixInputSource {
+        fn switch_to_ascii(&mut self) {
+            self.switch_calls.set(self.switch_calls.get() + 1);
+            if self.will_switch {
+                self.switched.set(true);
+            }
+        }
+
+        fn restore(&mut self) {
+            if self.switched.replace(false) {
+                self.restore_calls.set(self.restore_calls.get() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn sync_prefix_input_source_switches_then_restores_when_enabled() {
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = true;
+        let fake = FakePrefixInputSource::switching();
+        let switch_calls = fake.switch_calls.clone();
+        let restore_calls = fake.restore_calls.clone();
+        app.set_prefix_input_source(Box::new(fake));
+
+        // Terminal -> Prefix should switch to ASCII.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        assert_eq!(switch_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 0);
+
+        // Prefix -> Terminal should restore the saved source.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Prefix);
+        assert_eq!(switch_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[test]
+    fn sync_prefix_input_source_is_noop_when_flag_disabled() {
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = false;
+        let fake = FakePrefixInputSource::switching();
+        let switch_calls = fake.switch_calls.clone();
+        let restore_calls = fake.restore_calls.clone();
+        app.set_prefix_input_source(Box::new(fake));
+
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Prefix);
+
+        assert_eq!(switch_calls.get(), 0);
+        assert_eq!(restore_calls.get(), 0);
+    }
+
+    #[test]
+    fn sync_prefix_input_source_restore_is_safe_when_switch_was_noop() {
+        // Simulates the already-ASCII / failed-switch case: switch reports no
+        // change, and the later restore on leave must stay harmless.
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = true;
+        let fake = FakePrefixInputSource::no_op();
+        let switch_calls = fake.switch_calls.clone();
+        let restore_calls = fake.restore_calls.clone();
+        app.set_prefix_input_source(Box::new(fake));
+
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Prefix);
+
+        assert_eq!(switch_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_input_dispatch_restores_input_source_when_leaving_prefix() {
+        // Leaving prefix mode happens inside the raw-input dispatch, not in
+        // `handle_key` itself — the sync must sit at the dispatch layer so any
+        // event that exits prefix (here Esc) still restores the host source.
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = true;
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let fake = FakePrefixInputSource::switching();
+        let switch_calls = fake.switch_calls.clone();
+        let restore_calls = fake.restore_calls.clone();
+        app.set_prefix_input_source(Box::new(fake));
+
+        // ctrl+b (the default prefix key) enters prefix mode → switch edge.
+        app.handle_raw_input_event(raw_key(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        ))
+        .await;
+        assert_eq!(app.state.mode, Mode::Prefix);
+        assert_eq!(switch_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 0);
+
+        // Esc leaves prefix mode → restore edge, even though the exit is decided
+        // below `handle_key`.
+        app.handle_raw_input_event(raw_key(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ))
+        .await;
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(restore_calls.get(), 1);
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
@@ -1492,6 +1742,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
             results: Vec::new(),
+            cache_updates: Vec::new(),
         });
 
         assert!(!app.git_refresh_in_flight);
@@ -1514,6 +1765,7 @@ mod tests {
                 ahead_behind: Some((1, 0)),
                 space: None,
             }],
+            cache_updates: Vec::new(),
         });
 
         assert!(app.render_dirty.load(Ordering::Acquire));
@@ -1534,12 +1786,26 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_feedback_can_be_disabled() {
+        let mut app = test_app();
+        app.state.toast_config.clipboard.enabled = false;
+
+        app.handle_internal_event(AppEvent::ClipboardWrite {
+            content: b"copied".to_vec(),
+        });
+
+        assert!(app.state.copy_feedback.is_none());
+        assert!(app.copy_feedback_deadline.is_none());
+    }
+
+    #[test]
     fn clipboard_feedback_does_not_replace_notification_toast() {
         let mut app = test_app();
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
             context: "background · 2".to_string(),
+            position: None,
             target: None,
         });
         let original_toast = app.state.toast.clone();
@@ -1556,6 +1822,172 @@ mod tests {
                 .map(|feedback| feedback.message.as_str()),
             Some("copied to clipboard")
         );
+    }
+
+    #[test]
+    fn notification_show_api_creates_herdr_toast_with_position() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: Some("api workspace".into()),
+                        position: Some(crate::config::ToastHerdrPosition::TopLeft),
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: true,
+                reason: crate::api::schema::NotificationShowReason::Shown,
+            }
+        );
+        let toast = app.state.toast.as_ref().expect("api toast");
+        assert_eq!(toast.title, "build failed");
+        assert_eq!(toast.context, "api workspace");
+        assert_eq!(
+            toast.position,
+            Some(crate::config::ToastHerdrPosition::TopLeft)
+        );
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[test]
+    fn notification_show_api_herdr_toast_expires() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: true,
+                reason: crate::api::schema::NotificationShowReason::Shown,
+            }
+        );
+        let deadline = app.toast_deadline.expect("api toast deadline");
+        assert!(app.handle_scheduled_tasks(deadline, false));
+        assert!(app.state.toast.is_none());
+        assert!(app.toast_deadline.is_none());
+    }
+
+    #[test]
+    fn notification_show_api_respects_off_delivery() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::Disabled,
+            }
+        );
+        assert!(app.state.toast.is_none());
+    }
+
+    #[test]
+    fn notification_show_api_does_not_replace_existing_toast() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "pi needs attention".to_string(),
+            context: "background · 2".to_string(),
+            position: None,
+            target: None,
+        });
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::Busy,
+            }
+        );
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.title.as_str()),
+            Some("pi needs attention")
+        );
+    }
+
+    #[test]
+    fn notification_show_api_is_rate_limited() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.mark_api_notification_shown(Instant::now());
+
+        let response =
+            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+                id: "notify".into(),
+                method: crate::api::schema::Method::NotificationShow(
+                    crate::api::schema::NotificationShowParams {
+                        title: "build failed".into(),
+                        body: None,
+                        position: None,
+                        sound: crate::api::schema::NotificationShowSound::None,
+                    },
+                ),
+            });
+
+        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed.result,
+            crate::api::schema::ResponseResult::NotificationShow {
+                shown: false,
+                reason: crate::api::schema::NotificationShowReason::RateLimited,
+            }
+        );
+        assert!(app.state.toast.is_none());
     }
 
     #[test]
@@ -1744,7 +2176,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[ui]\nagent_panel_scope = \"current\"\nredraw_on_focus_gained = false\n[ui.toast]\ndelivery = \"herdr\"\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[ui]\nagent_panel_scope = \"current\"\nredraw_on_focus_gained = false\nright_click_passthrough_modifier = \"ctrl\"\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -1769,12 +2201,21 @@ mod tests {
             state::AgentPanelScope::CurrentWorkspace
         );
         assert!(!app.state.redraw_on_focus_gained);
+        assert_eq!(
+            app.state.right_click_passthrough_modifiers,
+            Some(KeyModifiers::CONTROL)
+        );
         assert!(app.state.request_client_config_reload);
         assert_eq!(app.state.default_shell, "nu");
+        assert_eq!(
+            app.state.shell_mode,
+            crate::config::ShellModeConfig::NonLogin
+        );
         assert_eq!(
             app.state.new_terminal_cwd,
             crate::config::NewTerminalCwdConfig::Home
         );
+        assert!(app.state.switch_ascii_input_source_in_prefix);
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -2056,6 +2497,42 @@ mod tests {
             .config_diagnostic
             .as_deref()
             .is_some_and(|message| message.contains("invalid ui config")));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_preserves_invalid_terminal_section_but_applies_valid_ui() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-invalid-terminal-section");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"sideways\"\nnew_cwd = \"home\"\n[ui.toast]\ndelivery = \"terminal\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let original_default_shell = app.state.default_shell.clone();
+        let original_shell_mode = app.state.shell_mode;
+        let original_new_cwd = app.state.new_terminal_cwd.clone();
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(app.state.default_shell, original_default_shell);
+        assert_eq!(app.state.shell_mode, original_shell_mode);
+        assert_eq!(app.state.new_terminal_cwd, original_new_cwd);
+        assert_eq!(
+            app.state.toast_config.delivery,
+            crate::config::ToastDelivery::Terminal
+        );
+        assert!(app
+            .state
+            .config_diagnostic
+            .as_deref()
+            .is_some_and(|message| message.contains("invalid terminal config")));
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2649,12 +3126,40 @@ mod tests {
                 crate::api::schema::WorktreeCreateParams::default(),
             ),
         };
+        let pane_swap = crate::api::schema::Request {
+            id: "req_6".into(),
+            method: crate::api::schema::Method::PaneSwap(crate::api::schema::PaneSwapParams {
+                pane_id: Some("w_1-1".into()),
+                direction: Some(crate::api::schema::PaneDirection::Right),
+                ..crate::api::schema::PaneSwapParams::default()
+            }),
+        };
+        let pane_focus_direction = crate::api::schema::Request {
+            id: "req_7".into(),
+            method: crate::api::schema::Method::PaneFocusDirection(
+                crate::api::schema::PaneFocusDirectionParams {
+                    pane_id: Some("w_1-1".into()),
+                    direction: crate::api::schema::PaneDirection::Right,
+                },
+            ),
+        };
+        let pane_resize = crate::api::schema::Request {
+            id: "req_8".into(),
+            method: crate::api::schema::Method::PaneResize(crate::api::schema::PaneResizeParams {
+                pane_id: Some("w_1-1".into()),
+                direction: crate::api::schema::PaneDirection::Right,
+                amount: Some(0.05),
+            }),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
         assert!(crate::api::request_changes_ui(&mutating));
         assert!(crate::api::request_changes_ui(&pane_rename));
         assert!(crate::api::request_changes_ui(&worktree_create));
+        assert!(crate::api::request_changes_ui(&pane_swap));
+        assert!(crate::api::request_changes_ui(&pane_focus_direction));
+        assert!(crate::api::request_changes_ui(&pane_resize));
     }
 
     #[test]
@@ -2731,6 +3236,18 @@ mod tests {
         );
 
         assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-source"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_follow_without_source_uses_home() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+
+        let cwd =
+            creation::resolve_new_terminal_cwd(&crate::config::NewTerminalCwdConfig::Follow, None);
+
+        assert_eq!(cwd, home);
     }
 
     #[test]
@@ -2946,7 +3463,7 @@ mod tests {
     async fn pane_split_request_targets_pane_in_background_tab() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-pane-split-background-tab");
@@ -2983,8 +3500,9 @@ mod tests {
             id: "req_pane_split_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
-                target_pane_id,
+                target_pane_id: Some(target_pane_id),
                 direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
                 cwd: None,
                 focus: false,
             }),
@@ -2993,9 +3511,11 @@ mod tests {
 
         assert_eq!(response["result"]["type"], "pane_info");
         assert_eq!(response["result"]["pane"]["tab_id"], target_tab_id);
+        let response_cwd =
+            std::path::PathBuf::from(response["result"]["pane"]["cwd"].as_str().unwrap());
         assert_eq!(
-            response["result"]["pane"]["cwd"],
-            split_cwd.display().to_string()
+            crate::worktree::canonical_or_original(&response_cwd),
+            crate::worktree::canonical_or_original(&split_cwd)
         );
         assert_eq!(response["result"]["pane"]["focused"], false);
         assert_eq!(app.state.active, Some(0));
@@ -3040,7 +3560,7 @@ mod tests {
     async fn pane_split_request_focuses_new_pane_when_requested() {
         let _guard = config_env_lock().lock().unwrap();
         let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", "/usr/bin/true");
+        std::env::set_var("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-pane-split-focus-background-tab");
@@ -3059,8 +3579,9 @@ mod tests {
             id: "req_pane_split_focus_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
-                target_pane_id,
+                target_pane_id: Some(target_pane_id),
                 direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
                 cwd: None,
                 focus: true,
             }),
@@ -3072,6 +3593,97 @@ mod tests {
         assert_eq!(response["result"]["pane"]["focused"], true);
         assert_eq!(app.state.active, Some(0));
         assert_eq!(app.state.workspaces[0].active_tab, background_tab);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_split_request_applies_ratio() {
+        let _guard = config_env_lock().lock().unwrap();
+        let original_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/usr/bin/true");
+
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-split-ratio");
+        let target_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_split_ratio".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(target_pane_id),
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: Some(0.333),
+                cwd: None,
+                focus: false,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        let splits = app.state.workspaces[0].tabs[0]
+            .layout
+            .splits(ratatui::layout::Rect::new(0, 0, 100, 20));
+        assert_eq!(splits.len(), 1);
+        assert!((splits[0].ratio - 0.333).abs() < f32::EPSILON);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_split_request_uses_active_focused_pane_when_target_is_omitted() {
+        let _guard = config_env_lock().lock().unwrap();
+        let original_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/usr/bin/true");
+
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-split-current");
+        let target_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.focus_pane_in_workspace(0, target_pane);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_split_current".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: None,
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: false,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.focused(),
+            target_pane
+        );
 
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
@@ -3102,7 +3714,7 @@ mod tests {
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
                 focus: true,
-                argv: vec!["/usr/bin/true".into()],
+                argv: vec![exiting_test_command().into()],
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3174,6 +3786,47 @@ mod tests {
     }
 
     #[test]
+    fn pane_close_request_requires_confirmation_before_closing_parent_worktree_group() {
+        let mut app = test_app();
+        let mut parent = Workspace::test_new("api-pane-close-parent");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        let mut child = Workspace::test_new("api-pane-close-child");
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-child".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![parent, child];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 1;
+
+        let target_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let target_pane_id = app.pane_info(0, target_pane).unwrap().pane_id;
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_close_parent_group".into(),
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: target_pane_id,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "confirmation_required");
+        assert_eq!(app.state.mode, Mode::ConfirmClose);
+        assert_eq!(app.state.selected, 0);
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    #[test]
     fn session_dirty_flag_schedules_debounced_save() {
         let mut app = test_app();
         app.no_session = false;
@@ -3208,7 +3861,7 @@ mod tests {
         app.next_auto_update_check = Some(now + Duration::from_secs(6));
 
         assert_eq!(
-            app.next_headless_loop_deadline(now, false),
+            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             app.session_save_deadline
         );
     }
@@ -3225,7 +3878,10 @@ mod tests {
         app.session_save_deadline = None;
         app.state.workspaces.clear();
 
-        assert_eq!(app.next_headless_loop_deadline(now, false), None);
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
+            None
+        );
     }
 
     #[test]
@@ -3233,7 +3889,7 @@ mod tests {
         let mut app = test_app();
         app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
 
-        app.handle_scheduled_tasks(Instant::now());
+        app.handle_scheduled_tasks(Instant::now(), false);
 
         assert!(app.session_save_deadline.is_none());
     }
@@ -3242,6 +3898,7 @@ mod tests {
     fn next_loop_deadline_includes_selection_autoscroll_deadline() {
         let mut app = test_app();
         let now = Instant::now();
+        app.next_resize_poll = now + Duration::from_millis(300);
         app.selection_autoscroll_deadline = Some(now + Duration::from_millis(5));
         app.next_animation_tick = Some(now + Duration::from_millis(100));
         app.session_save_deadline = Some(now + Duration::from_millis(200));
@@ -3698,6 +4355,23 @@ last_pane = "prefix+tab"
                 b: 0x56,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn route_client_input_does_not_forward_incomplete_osc_introducer_to_pane() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b]".to_vec());
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
