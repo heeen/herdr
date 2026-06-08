@@ -2558,9 +2558,11 @@ fn connect_secondary_client_stream_for_plan_detached(
                 let ssh_target =
                     crate::remote::SshTarget::new(destination.clone(), options.clone());
                 // Reconnect path: can't prompt, so never auto-restart an incompatible server.
-                // No dialog to update on a background reconnect, so progress is dropped.
+                // No dialog to update on a background reconnect, so progress is dropped. A plain
+                // reconnect never force-reinstalls — only the explicit "update" button does.
                 let bridge = crate::remote::start_ssh_remote_bridge(
                     ssh_target,
+                    false,
                     false,
                     None,
                     &crate::remote::ignore_progress,
@@ -3132,7 +3134,10 @@ fn run_client_update_remote(
     // server is restarted onto the freshly-installed binary instead of blocking on a y/N prompt.
     let bridge =
         run_remote_op_with_progress(ADD_REMOTE_BRIDGE_IDLE_TIMEOUT, &on_progress, move |sink| {
-            crate::remote::start_ssh_remote_bridge(ssh_target, true, None, sink)
+            // #61: the "update" button FORCES a reinstall — reseed the current build even when the
+            // remote reports the same version (a dev rebuild at the same version but a newer commit
+            // is otherwise treated as already-installed and skipped), then live-hand-off onto it.
+            crate::remote::start_ssh_remote_bridge(ssh_target, true, true, None, sink)
         })
         .map_err(|err| match classify_add_remote_bridge_error(err) {
             AddRemoteFailure::Message(message) => message,
@@ -3324,6 +3329,7 @@ fn prepare_client_add_remote_submission(
                     crate::remote::start_ssh_remote_bridge(
                         ssh_target,
                         restart_incompatible,
+                        false, // add-remote reuses a version-matching binary; only "update" forces
                         None,
                         sink,
                     )
@@ -3929,6 +3935,7 @@ fn refetch_secondary_runtime_status(
         let bridge = match crate::remote::start_ssh_remote_bridge(
             ssh_target,
             false,
+            false, // status-only refetch: never reinstall
             None,
             &crate::remote::ignore_progress,
         ) {

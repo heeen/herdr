@@ -226,6 +226,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let prepared_remote = prepare_remote_herdr(
         &ssh_target,
         remote.live_handoff,
+        false, // add-remote reuses a version-matching binary; only the "update" button forces
         RemotePrepPolicy::Interactive,
         &progress,
     )?;
@@ -398,6 +399,7 @@ pub(crate) fn ignore_progress(_: RemoteProvisionStage) {}
 pub(crate) fn start_ssh_remote_bridge(
     target: SshTarget,
     restart_incompatible: bool,
+    force_reinstall: bool,
     session_name: Option<&str>,
     progress: &ProgressSink,
 ) -> io::Result<RemoteBridge> {
@@ -407,7 +409,7 @@ pub(crate) fn start_ssh_remote_bridge(
     let policy = RemotePrepPolicy::NonInteractive {
         restart_incompatible,
     };
-    let prepared_remote = prepare_remote_herdr(&target, true, policy, progress)?;
+    let prepared_remote = prepare_remote_herdr(&target, true, force_reinstall, policy, progress)?;
     progress(RemoteProvisionStage::StartingServer);
     ensure_remote_server_ready(
         &target,
@@ -688,6 +690,7 @@ impl InstallSource {
 fn prepare_remote_herdr(
     target: &SshTarget,
     live_handoff_enabled: bool,
+    force_reinstall: bool,
     policy: RemotePrepPolicy,
     progress: &ProgressSink,
 ) -> io::Result<PreparedRemoteHerdr> {
@@ -699,7 +702,12 @@ fn prepare_remote_herdr(
     let path_remote_herdr = remote_binary_on_path_any(target, &remote_herdr)?;
     let exe_name_remote_herdr = remote_herdr_from_current_exe_name(&remote_herdr.platform);
 
-    if override_binary.is_none() {
+    // #61: a FORCED update (the host-menu "update") always reseeds the current build, even when the
+    // remote reports the same version+protocol. A dev rebuild at the SAME version string but a newer
+    // commit is otherwise treated as "already installed" — `version_line_matches_current` compares
+    // only the package version and accepts ANY commit suffix — so the update silently no-ops. Forcing
+    // skips that match-and-skip the same way an explicit `override_binary` already does.
+    if override_binary.is_none() && !force_reinstall {
         if let Some(path_remote_herdr) = path_remote_herdr
             .as_ref()
             .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
