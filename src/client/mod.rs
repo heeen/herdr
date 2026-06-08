@@ -978,6 +978,30 @@ fn open_focused_workspace_overlay(
     ClientInputDispatch::Redraw
 }
 
+/// Whether a dispatch is an actionable COMMAND the event loop must handle, vs. a presentation-only
+/// outcome (`Redraw`/`HoverRedraw`/`Consumed`) that the input batcher can coalesce. EVERY host- and
+/// workspace-menu action and server command MUST be listed here — one that is missing falls through
+/// to the repaint-promotion and is silently dropped before it ever reaches the loop. That is exactly
+/// how the host-menu `update` (`UpdateRemote`) did nothing from #44 until #61: it was produced and had
+/// a loop handler, but was absent from this gate. Extracted as a named predicate so the routing set is
+/// asserted by a unit test and a new menu action can't regress the same way.
+fn dispatch_requires_loop_handling(dispatch: &ClientInputDispatch) -> bool {
+    matches!(
+        dispatch,
+        ClientInputDispatch::AddRemote(_)
+            | ClientInputDispatch::SetRemoteEnabled { .. }
+            | ClientInputDispatch::SetRemoteAutoUpdate { .. }
+            | ClientInputDispatch::DeleteRemote { .. }
+            | ClientInputDispatch::DisconnectRemote { .. }
+            | ClientInputDispatch::ReconnectRemote { .. }
+            | ClientInputDispatch::UpdateRemote { .. }
+            | ClientInputDispatch::ApiRequest { .. }
+            | ClientInputDispatch::ServerControl { .. }
+            | ClientInputDispatch::Resize { .. }
+            | ClientInputDispatch::DetachAll
+    )
+}
+
 fn dispatch_client_overlay_input(
     data: Vec<u8>,
     compositor: &mut compositor::ClientCompositor,
@@ -1044,19 +1068,7 @@ fn dispatch_client_overlay_input(
             _ => ClientInputDispatch::Consumed,
         };
 
-        if matches!(
-            next,
-            ClientInputDispatch::AddRemote(_)
-                | ClientInputDispatch::SetRemoteEnabled { .. }
-                | ClientInputDispatch::SetRemoteAutoUpdate { .. }
-                | ClientInputDispatch::DeleteRemote { .. }
-                | ClientInputDispatch::DisconnectRemote { .. }
-                | ClientInputDispatch::ReconnectRemote { .. }
-                | ClientInputDispatch::ApiRequest { .. }
-                | ClientInputDispatch::ServerControl { .. }
-                | ClientInputDispatch::Resize { .. }
-                | ClientInputDispatch::DetachAll
-        ) {
+        if dispatch_requires_loop_handling(&next) {
             dispatch = next;
             break;
         }
@@ -8157,6 +8169,53 @@ mod tests {
             state.pending_update_remote.is_empty(),
             "a failure-suppressed host is not auto-retried"
         );
+    }
+
+    #[test]
+    fn every_host_menu_command_dispatch_routes_to_the_loop() {
+        // #61 regression: the host-menu "update" (UpdateRemote) was DROPPED before the loop because
+        // it was missing from the input-batcher's actionable gate — produced and handled, but never
+        // routed, so clicking "update" did nothing from #44 onward. Every host-menu action that maps
+        // to a command MUST route; presentation-only outcomes must NOT (they coalesce to a repaint).
+        let sid = supervisor::ServerId::secondary("remote-1");
+        let commands = [
+            ClientInputDispatch::UpdateRemote {
+                server_id: sid.clone(),
+            },
+            ClientInputDispatch::DisconnectRemote {
+                server_id: sid.clone(),
+            },
+            ClientInputDispatch::ReconnectRemote {
+                server_id: sid.clone(),
+            },
+            ClientInputDispatch::SetRemoteEnabled {
+                remote_id: "remote-1".into(),
+                enabled: false,
+            },
+            ClientInputDispatch::SetRemoteAutoUpdate {
+                remote_id: "remote-1".into(),
+                auto_update: true,
+            },
+            ClientInputDispatch::DeleteRemote {
+                remote_id: "remote-1".into(),
+            },
+        ];
+        for dispatch in &commands {
+            assert!(
+                dispatch_requires_loop_handling(dispatch),
+                "a host-menu command must route to the loop, not be coalesced into a repaint"
+            );
+        }
+        // Presentation-only outcomes are coalesced, never broken out as a command.
+        assert!(!dispatch_requires_loop_handling(
+            &ClientInputDispatch::Redraw
+        ));
+        assert!(!dispatch_requires_loop_handling(
+            &ClientInputDispatch::HoverRedraw
+        ));
+        assert!(!dispatch_requires_loop_handling(
+            &ClientInputDispatch::Consumed
+        ));
     }
 
     fn mixed_remote_model_with_many_workspaces(
