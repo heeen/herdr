@@ -41,10 +41,10 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn prepare_frame(&mut self, frame: &FrameData) -> Option<PreparedRender> {
+    pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
             Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(frame) {
+                if last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
@@ -60,17 +60,20 @@ impl ClientRenderState {
                 };
                 // issue #13: deflate the verbose semantic payload on the wire (full frames are
                 // ~hundreds of KB of per-cell data). The client inflates before dispatching.
-                Some(PreparedRender {
+                // #512 (a7cd780) made PreparedRender::Semantic carry the frame; keep the original
+                // so commit_sent_frame can re-baseline last_frame even though `message` is a
+                // compressed/delta payload the frame can't be recovered from.
+                Some(PreparedRender::Semantic {
                     message: crate::protocol::compress_server_message(message),
-                    encoded: None,
+                    frame,
                 })
             }
             Self::TerminalAnsi { blit_encoder, seq } => {
-                if blit_encoder.is_current(frame) {
+                if blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
-                let mut encoded = blit_encoder.encode(frame, false);
+                let mut encoded = blit_encoder.encode(&frame, false);
                 crate::render_prof::event("prepare_frame.ansi.changed");
                 crate::render_prof::counter("prepare_frame.ansi.bytes", encoded.bytes.len() as u64);
                 if encoded.full {
@@ -83,7 +86,7 @@ impl ClientRenderState {
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
                 );
-                Some(PreparedRender {
+                Some(PreparedRender::TerminalAnsi {
                     message: ServerMessage::Terminal(TerminalFrame {
                         seq: *seq + 1,
                         width: frame.width,
@@ -91,6 +94,7 @@ impl ClientRenderState {
                         full: encoded.full,
                         bytes: encoded.bytes.clone(),
                     }),
+                    frame,
                     encoded: Some(encoded),
                 })
             }
@@ -104,10 +108,20 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn commit_sent_frame(&mut self, frame: FrameData, prepared: PreparedRender) {
-        match (self, prepared.encoded) {
-            (Self::Semantic { last_frame }, None) => *last_frame = Some(frame),
-            (Self::TerminalAnsi { blit_encoder, seq }, Some(encoded)) => {
+    pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
+        match (self, prepared) {
+            (
+                Self::Semantic { last_frame },
+                PreparedRender::Semantic { frame, .. },
+            ) => *last_frame = Some(frame),
+            (
+                Self::TerminalAnsi { blit_encoder, seq },
+                PreparedRender::TerminalAnsi {
+                    frame,
+                    encoded: Some(encoded),
+                    ..
+                },
+            ) => {
                 blit_encoder.commit(frame, encoded);
                 *seq += 1;
             }
@@ -149,14 +163,32 @@ fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// A prepared client render message plus any baseline state needed after send.
-pub(crate) struct PreparedRender {
-    message: ServerMessage,
-    encoded: Option<EncodedBlit>,
+pub(crate) enum PreparedRender {
+    Semantic {
+        message: ServerMessage,
+        /// The original frame, kept for re-baselining `last_frame` after send. Under issue #13
+        /// `message` is a compressed/delta payload, so the frame can't be recovered from it.
+        frame: FrameData,
+    },
+    TerminalAnsi {
+        message: ServerMessage,
+        frame: FrameData,
+        encoded: Option<EncodedBlit>,
+    },
 }
 
 impl PreparedRender {
     pub(crate) fn message(&self) -> &ServerMessage {
-        &self.message
+        match self {
+            Self::Semantic { message, .. } | Self::TerminalAnsi { message, .. } => message,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> Option<FrameData> {
+        match self {
+            Self::Semantic { frame, .. } => Some(frame),
+            Self::TerminalAnsi { frame, .. } => Some(frame),
+        }
     }
 }
 

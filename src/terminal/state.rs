@@ -331,6 +331,10 @@ impl TerminalState {
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
         }
+        let session_ref = session_ref.map(|session_ref| {
+            self.conflicting_current_session_ref(&source, &agent_label, &session_ref)
+                .unwrap_or(session_ref)
+        });
         self.record_hook_report(&source, seq);
         self.persisted_agent_session = None;
         self.hook_authority = Some(HookAuthority {
@@ -439,6 +443,27 @@ impl TerminalState {
         })
     }
 
+    fn conflicting_current_session_ref(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> Option<crate::agent_resume::AgentSessionRef> {
+        self.current_session_identity_for_persistence().and_then(
+            |(current_source, current_agent, current_kind, current_value)| {
+                (current_source == source
+                    && current_agent == agent_label
+                    && current_kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && (current_kind != session_ref.kind || current_value != session_ref.value))
+                    .then_some(crate::agent_resume::AgentSessionRef {
+                        kind: current_kind,
+                        value: current_value,
+                    })
+            },
+        )
+    }
+
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
@@ -459,6 +484,12 @@ impl TerminalState {
         }
         self.record_hook_report(&source, seq);
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
+            return None;
+        }
+        if self
+            .conflicting_current_session_ref(&source, &agent_label, &session_ref)
+            .is_some()
+        {
             return None;
         }
 
@@ -2449,6 +2480,137 @@ mod tests {
             .expect("accepted report");
 
         assert!(mutation.session_ref_changed);
+    }
+
+    #[test]
+    fn different_same_agent_session_ref_is_ignored_until_current_session_clears() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+
+        let mutation = terminal.set_agent_session_ref(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("nested-session"),
+            Some(21),
+        );
+
+        assert!(mutation.is_none());
+        assert_eq!(
+            terminal.hook_report_sequences.get("herdr:claude"),
+            Some(&21)
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("claude-session")
+        );
+    }
+
+    #[test]
+    fn repeated_same_agent_session_ref_is_accepted_without_session_change() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+
+        let mutation = terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(21),
+            )
+            .expect("same session should be accepted");
+
+        assert!(!mutation.session_ref_changed);
+    }
+
+    #[test]
+    fn hook_authority_preserves_current_session_ref_when_incoming_ref_differs() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:copilot".into(),
+                "copilot".into(),
+                AgentState::Working,
+                None,
+                None,
+                crate::agent_resume::AgentSessionRef::id("copilot-session"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+
+        let mutation = terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:copilot".into(),
+                "copilot".into(),
+                AgentState::Blocked,
+                Some("needs approval".into()),
+                None,
+                crate::agent_resume::AgentSessionRef::id("nested-session"),
+                Some(21),
+            )
+            .expect("state update should still be accepted");
+
+        assert!(!mutation.session_ref_changed);
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.as_ref())
+                .map(|session_ref| session_ref.value.as_str()),
+            Some("copilot-session")
+        );
+    }
+
+    #[test]
+    fn different_same_agent_session_ref_is_accepted_after_detection_clears_current_session() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+
+        let clear = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);
+        assert!(clear.session_ref_changed);
+
+        let mutation = terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("new-session"),
+                Some(21),
+            )
+            .expect("new session should be accepted after clear");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("new-session")
+        );
     }
 
     #[test]
