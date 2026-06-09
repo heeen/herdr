@@ -277,12 +277,18 @@ pub(crate) enum ClientMenuOutcome {
     ReloadConfig,
     Detach,
     HostAddSpace(ServerId),
-    HostToggleEnabled { remote_id: String, enabled: bool },
+    HostToggleEnabled {
+        remote_id: String,
+        enabled: bool,
+    },
     HostDisconnect(ServerId),
     HostReconnect(ServerId),
     HostUpdate(ServerId),
     // #61: persist this remote's auto-update flag (routed to a `remote.set_auto_update` request).
-    HostToggleAutoUpdate { remote_id: String, auto_update: bool },
+    HostToggleAutoUpdate {
+        remote_id: String,
+        auto_update: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3002,7 +3008,10 @@ pub(crate) struct RemoteRuntimeInfo {
 /// the Ping itself failed (host unreachable), where there is nothing truthful to record.
 pub(crate) fn fetch_server_summary_with_runtime_status(
     target: crate::api::client::ConnectionTarget,
-) -> (Option<RemoteRuntimeInfo>, Result<ServerSummary, ConnectionState>) {
+) -> (
+    Option<RemoteRuntimeInfo>,
+    Result<ServerSummary, ConnectionState>,
+) {
     let mut api = crate::api::client::ApiClient::for_target(target);
     summary_with_runtime_status_via_api(&mut api)
 }
@@ -3010,7 +3019,10 @@ pub(crate) fn fetch_server_summary_with_runtime_status(
 /// Testable core of [`fetch_server_summary_with_runtime_status`] over a mockable [`SupervisorApi`].
 fn summary_with_runtime_status_via_api(
     api: &mut impl SupervisorApi,
-) -> (Option<RemoteRuntimeInfo>, Result<ServerSummary, ConnectionState>) {
+) -> (
+    Option<RemoteRuntimeInfo>,
+    Result<ServerSummary, ConnectionState>,
+) {
     let status = match request_runtime_status(api) {
         Ok(status) => status,
         // The Ping itself failed → the host is unreachable; record nothing (no truthful version).
@@ -6279,7 +6291,10 @@ mod tests {
             .expect("remote banner present");
 
         // No outcome yet → nothing on the banner, and enrich is a no-op (no live success outcome).
-        assert!(model.host_banner_specs()[banner_index].1.update_outcome.is_none());
+        assert!(model.host_banner_specs()[banner_index]
+            .1
+            .update_outcome
+            .is_none());
         assert!(!model.enrich_update_success_with_version(&remote, "0.6.5"));
 
         // A success outcome threads onto the banner sub-line.
@@ -6302,7 +6317,9 @@ mod tests {
         // The post-update status fetch folds in the freshly-installed version (and re-fires once).
         assert!(model.enrich_update_success_with_version(&remote, "0.6.5"));
         assert_eq!(
-            model.update_outcome_for(&remote).map(|o| o.message.as_str()),
+            model
+                .update_outcome_for(&remote)
+                .map(|o| o.message.as_str()),
             Some("✓ updated to v0.6.5")
         );
         assert!(
@@ -6320,13 +6337,18 @@ mod tests {
         );
         assert!(!model.enrich_update_success_with_version(&remote, "0.7.0"));
         assert_eq!(
-            model.update_outcome_for(&remote).map(|o| o.message.as_str()),
+            model
+                .update_outcome_for(&remote)
+                .map(|o| o.message.as_str()),
             Some("✗ update failed: boom")
         );
 
         // Clearing removes it from the banner.
         model.clear_update_outcome(&remote);
-        assert!(model.host_banner_specs()[banner_index].1.update_outcome.is_none());
+        assert!(model.host_banner_specs()[banner_index]
+            .1
+            .update_outcome
+            .is_none());
     }
 
     fn ssh_remote_auto_update(
@@ -6370,12 +6392,10 @@ mod tests {
         // Re-probe a mismatch, then DISABLE r1 -> excluded (a disabled remote is inert).
         model.set_remote_runtime_info(&r1, Some("0.5.0".into()), Some(local.wrapping_add(1)));
         assert_eq!(model.auto_update_candidates(), vec![r1.clone()]);
-        model.sync_remote_registry(vec![
-            crate::remote_registry::RemoteDefinitionSnapshot {
-                disabled: true,
-                ..ssh_remote_auto_update("r1", "alpha", "alpha")
-            },
-        ]);
+        model.sync_remote_registry(vec![crate::remote_registry::RemoteDefinitionSnapshot {
+            disabled: true,
+            ..ssh_remote_auto_update("r1", "alpha", "alpha")
+        }]);
         assert!(model.auto_update_candidates().is_empty());
 
         let _ = (r2, r3, r4);

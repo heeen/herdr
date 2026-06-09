@@ -715,7 +715,12 @@ mod tests {
         );
 
         // Toggling back off, and a legacy snapshot with no key, both read false.
-        assert!(!registry.set_auto_update(&remote.id, false).unwrap().auto_update);
+        assert!(
+            !registry
+                .set_auto_update(&remote.id, false)
+                .unwrap()
+                .auto_update
+        );
         let legacy = r#"{"remotes":[{"id":"remote-1","name":"dev","target":{"type":"ssh","target":"user@dev"}}]}"#;
         let parsed: RemoteRegistrySnapshot = serde_json::from_str(legacy).unwrap();
         assert!(!parsed.remotes[0].auto_update);

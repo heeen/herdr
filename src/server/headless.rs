@@ -6552,7 +6552,9 @@ next_tab = ""
             .render_state
             .prepare_frame(&frame)
             .expect("hyperlink frame differs");
-        client.render_state.commit_sent_frame(frame.clone(), prepared);
+        client
+            .render_state
+            .commit_sent_frame(frame.clone(), prepared);
 
         let runtime = server
             .app

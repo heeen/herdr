@@ -27,7 +27,9 @@ use crossterm::event::{
     EnableFocusChange, EnableMouseCapture,
 };
 #[cfg(unix)]
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 #[cfg(not(windows))]
 use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
@@ -2494,7 +2496,10 @@ fn run_client_with_mode(
     let terminal_guard = if direct_attach {
         setup_direct_attach_terminal()
     } else {
-        setup_terminal(desired_mouse_capture(mouse_capture, client_compositor_enabled))
+        setup_terminal(desired_mouse_capture(
+            mouse_capture,
+            client_compositor_enabled,
+        ))
     }
     .map_err(|err| {
         eprintln!("herdr: failed to set up terminal: {err}");
@@ -3173,6 +3178,7 @@ fn spawn_client_remote_manage_request(
 ///      stage as a server_id-keyed `UpdateRemoteProgress`.
 ///   3. On success, post `UpdateRemoteFinished(Ok)`; the loop then reconnects on the new protocol
 ///      and re-fetches runtime status so the version/mismatch readout clears.
+///
 /// #44/#61: resolve a remote's ssh target, show an initial progress line, and spawn the reinstall
 /// worker off the UI loop (the `pending_update_remote` guard collapses double-fires). Shared by the
 /// manual menu `update` and #61's auto-update sweep, so both honour the same seed pre-flight (no
@@ -8296,8 +8302,10 @@ mod tests {
     fn remote_manage_request_builds_set_auto_update() {
         // #61: the auto-update toggle routes through a `remote.set_auto_update` request carrying the
         // remote id and the desired flag.
-        let request =
-            remote_manage_request(RemoteManageAction::SetAutoUpdate { auto_update: true }, "remote-7");
+        let request = remote_manage_request(
+            RemoteManageAction::SetAutoUpdate { auto_update: true },
+            "remote-7",
+        );
         match request.method {
             crate::api::schema::Method::RemoteSetAutoUpdate(params) => {
                 assert_eq!(params.remote_id, "remote-7");

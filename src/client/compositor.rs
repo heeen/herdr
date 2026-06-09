@@ -7031,7 +7031,9 @@ mod tests {
             .map(|detail| detail.pane_label)
             .collect();
         assert!(
-            labels.iter().any(|label| label.as_deref() == Some("backend")),
+            labels
+                .iter()
+                .any(|label| label.as_deref() == Some("backend")),
             "renamed pane's manual_label must surface as the sidebar pane name; got {labels:?}"
         );
     }
@@ -7286,7 +7288,10 @@ mod tests {
             compositor.step_sidebar_width_animation();
         }
         let width = compositor.effective_sidebar_width(host.0);
-        assert_eq!(width, MINI_SIDEBAR_WIDTH, "collapse settles to the mini width");
+        assert_eq!(
+            width, MINI_SIDEBAR_WIDTH,
+            "collapse settles to the mini width"
+        );
 
         let snap = ClientSidebarSnapshot::from_model(
             &model,
