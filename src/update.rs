@@ -80,6 +80,9 @@ pub struct Version {
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        // Channel-suffixed build versions such as `0.6.10-mx.1` or
+        // `0.6.10-preview.20260611` order by their numeric core.
+        let s = s.split('-').next()?;
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -2373,6 +2376,17 @@ mod tests {
                 patch: 0
             })
         );
+    }
+
+    #[test]
+    fn parse_version_with_channel_suffix() {
+        let expected = Some(Version {
+            major: 0,
+            minor: 6,
+            patch: 10,
+        });
+        assert_eq!(Version::parse("0.6.10-mx.1"), expected);
+        assert_eq!(Version::parse("v0.6.10-preview.20260611"), expected);
     }
 
     #[test]
