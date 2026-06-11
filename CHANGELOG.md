@@ -2,8 +2,25 @@
 
 ## Unreleased
 
+## [0.6.10-mx.1] - 2026-06-11
+
+First release of **herdr-mx** — a friendly downstream distribution of [herdr](https://github.com/ogulcancelik/herdr) that tracks every upstream release and adds a full **multi-remote client**. All credit for herdr itself goes upstream; herdr-mx exists so you can run multi-remote today, and retires the day it lands upstream. This release contains everything in upstream herdr v0.6.10, plus:
+
 ### Added
-- Added an opt-in multi-platform "fat" build (`just bundle`) that appends macOS and Linux binaries (x86_64 and aarch64; Linux as static musl) to the native binary as compressed, indexed data. `herdr --remote <host>` then seeds a different-OS host offline at exact version parity by extracting the matching binary from itself, instead of needing a release download on the remote. Released/Homebrew/Nix artifacts and `herdr update` are unchanged. Adds `herdr bundle list` and `herdr bundle pack`, with a clean fallback to the download path when a build does not carry the remote platform. (#28)
+- Multi-remote client: manage secondary local or SSH-backed Herdr servers from one sidebar — combined workspace and agent summaries across hosts, workspace creation/focus routed to the selected server, per-host context menus (add space / disable / disconnect / rename), and secondary disconnects isolated from the main session.
+- Generic SSH add-remote with non-interactive auto-install and provisioning progress, including offline cross-OS seeding: an opt-in multi-platform "fat" build (`just bundle`) appends macOS and Linux binaries (x86_64 and aarch64; Linux as static musl) to the native binary as compressed, indexed data, so `herdr --remote <host>` seeds a different-OS host at exact version parity without a release download. Adds `herdr bundle list` and `herdr bundle pack`. (#11, #28, #32)
+- Per-remote auto-update-to-this-client toggle, live host version/protocol readout, and a one-click host-menu update that can force a reinstall. (#44, #61)
+- Semantic-frame delta streaming with compression for 30fps remote panes, last-frame-first switching, and accurate host-banner ping/throughput readouts. (#13)
+- Sidebar settings TUI with configurable agent segments, instant apply, and tab names in the multi-remote sidebar. (#58, #62)
+- Client sidebar interactions across hosts: keyboard navigation, drag reorder with preview, worktree parent chevron collapse, collapsed status-only mode, animated collapse, and a unified drag-to-move overlay framework for client menus. (#9, #19-#26, #47)
+
+### Fixed
+- Many-remote client performance: fleet-scale model-update renders coalesced to one per frame, sidebar shell caching, and hover painted as a per-frame overlay — attach and hover no longer drop below 1fps with many remotes. (#45, #46, #48, #53, #56)
+- Paint-first client cold start with no blocking round-trips before the first frame, and supervisor refreshes moved off the UI loop. (#42)
+- Clipboard images: pasted sandboxed/unreadable macOS screenshot locations now warn, staged image paths attach correctly, and interactive panes spawn as login shells so `~/.zprofile` loads. (#59)
+
+### Notes
+- Install via Homebrew with `brew install 2lab-ai/tap/herdr-mx`, or from GitHub releases. `herdr update` is intentionally disabled in mx builds — update with `brew upgrade herdr-mx` or a newer release. Report issues at https://github.com/2lab-ai/herdr-mx/issues, not upstream.
 
 ## [0.6.10] - 2026-06-11
 

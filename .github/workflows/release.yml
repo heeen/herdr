@@ -119,6 +119,14 @@ jobs:
       - name: Remove Zig caches
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
+      # herdr-mx: tags look like v0.6.10-mx.1; stamp the build channel so
+      # `herdr --version` reports the mx identity and self-update stays gated.
+      - name: Set herdr-mx build identity
+        if: contains(github.ref_name, '-mx.')
+        run: |
+          echo "HERDR_BUILD_CHANNEL=mx" >> "$GITHUB_ENV"
+          echo "HERDR_BUILD_ID=${GITHUB_REF_NAME##*-mx.}" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -309,6 +317,9 @@ jobs:
 
   update-latest-json:
     needs: release
+    # herdr-mx releases must not rewrite the upstream website manifest or push
+    # to the master mirror branch.
+    if: ${{ !contains(github.ref_name, '-mx.') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

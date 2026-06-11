@@ -30,6 +30,13 @@ const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
+// herdr-mx downstream builds must never self-update from the upstream
+// herdr.dev manifests: that would silently replace this binary with a stock
+// herdr that lacks the multi-remote client.
+const MX_BUILD_CHANNEL: &str = "mx";
+const MX_HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr-mx";
+const MX_RELEASES_UPDATE_COMMAND: &str =
+    "install a newer herdr-mx from https://github.com/2lab-ai/herdr-mx/releases";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
@@ -1718,6 +1725,12 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
+    if crate::build_info::channel() == MX_BUILD_CHANNEL {
+        if is_homebrew_managed_install() {
+            return MX_HOMEBREW_UPDATE_COMMAND;
+        }
+        return MX_RELEASES_UPDATE_COMMAND;
+    }
     if is_homebrew_managed_install() {
         HOMEBREW_UPDATE_COMMAND
     } else if is_mise_managed_install() {
@@ -1938,6 +1951,11 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if crate::build_info::channel() == MX_BUILD_CHANNEL {
+        return Err(format!(
+            "self-update is disabled for herdr-mx builds; run `{MX_HOMEBREW_UPDATE_COMMAND}` for Homebrew installs, or {MX_RELEASES_UPDATE_COMMAND}"
+        ));
+    }
     let channel = UpdateChannel::configured();
     #[cfg(windows)]
     if channel == UpdateChannel::Stable {
@@ -2092,6 +2110,13 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
                 install_command: update_install_command().to_string(),
             });
         }
+        return;
+    }
+
+    if crate::build_info::channel() == MX_BUILD_CHANNEL {
+        crate::logging::update_check_failed(
+            "update checks against herdr.dev are disabled for herdr-mx builds; update via the herdr-mx tap or GitHub releases",
+        );
         return;
     }
 
