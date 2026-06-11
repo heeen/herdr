@@ -260,9 +260,12 @@ fn live_handoff_params_with_cli_defaults(
     params
         .expected_protocol
         .get_or_insert(crate::protocol::PROTOCOL_VERSION);
+    // Default to the full build version: channel-suffixed builds (preview/mx)
+    // report e.g. 0.6.10-mx.1 from the import side, so a bare
+    // CARGO_PKG_VERSION default would make them reject their own handoff.
     params
         .expected_version
-        .get_or_insert_with(|| env!("CARGO_PKG_VERSION").to_string());
+        .get_or_insert_with(crate::build_info::version);
     Ok(params)
 }
 

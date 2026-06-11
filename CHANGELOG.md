@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.6.10-mx.3] - 2026-06-12
+
+### Fixed
+- `herdr server live-handoff` now works from channel-suffixed builds (mx/preview): the CLI defaulted the handoff version expectation to the bare crate version (`0.6.10`), so the import side — which reports its full build version (`0.6.10-mx.N`) — rejected its own handoff with `handoff stream closed while reading line`. The default now uses the full build version. Older CLIs can work around it with `--expected-version <full version>`.
+
 ## [0.6.10-mx.2] - 2026-06-12
 
 ### Changed
