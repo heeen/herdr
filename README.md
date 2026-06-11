@@ -1,13 +1,23 @@
-# herdr
+# herdr-mx
 
 
 <p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
+  <img src="assets/logo.png" alt="herdr-mx" width="100" />
 </p>
 
 <p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="#quick-start">quick start</a> · <a href="#supported-agents">supported agents</a> · <a href="https://herdr.dev/docs/integrations/">integrations</a> · <a href="https://herdr.dev/docs/configuration/">configuration</a> · <a href="https://herdr.dev/docs/socket-api/">socket api</a>
+  <b>herdr, multiplexed further.</b> one terminal, every machine.
 </p>
+
+<p align="center">
+  <a href="https://github.com/ogulcancelik/herdr">upstream herdr</a> · <a href="#install">install</a> · <a href="DIVERGENCE.md">what's different</a> · <a href="#quick-start">quick start</a> · <a href="#supported-agents">supported agents</a> · <a href="https://herdr.dev/docs/configuration/">configuration</a> · <a href="https://herdr.dev/docs/socket-api/">socket api</a>
+</p>
+
+---
+
+**herdr-mx** is a friendly downstream distribution of [herdr](https://github.com/ogulcancelik/herdr) by [@ogulcancelik](https://github.com/ogulcancelik). it tracks every upstream release and adds one big thing: a full **multi-remote client** — attach to herdr servers on all your machines at once, one sidebar, one keymap, zero ssh tabs. all credit for herdr itself goes upstream; herdr-mx exists so you can run multi-remote *today*, and retires the day it lands upstream.
+
+everything herdr-mx adds is documented in [DIVERGENCE.md](DIVERGENCE.md). report herdr-mx issues [here](https://github.com/2lab-ai/herdr-mx/issues), **not** upstream — if `herdr --version` prints a `-mx.` version, it's this distribution.
 
 ---
 
@@ -15,37 +25,23 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 **agent multiplexer that lives in your terminal.**
 
-workspaces, tabs, panes. mouse-native: click, drag, split. every agent at a glance: blocked, working, done. detach and reattach, agents keep running. no gui app, no electron, no mac-only native wrapper. you see the agent's own terminal, not someone's interpretation of it.
+workspaces, tabs, panes. mouse-native: click, drag, split. every agent at a glance: blocked, working, done. detach and reattach, agents keep running. no gui app, no electron, no mac-only native wrapper. you see the agent's own terminal, not someone's interpretation of it. and with mx: every remote herdr server in the same sidebar.
 
 ---
 
 ## install
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+brew install 2lab-ai/tap/herdr-mx
 ```
 
-on windows preview beta:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
-```
-
-or install with homebrew:
+or install with mise (straight from GitHub releases):
 
 ```bash
-brew install herdr
+mise use -g "ubi:2lab-ai/herdr-mx[exe=herdr]"
 ```
 
-or install with mise:
-
-```bash
-mise use -g herdr
-```
-
-if mise reports `herdr not found in mise tool registry`, update mise and retry. older mise versions predate the herdr registry entry; `mise use -g github:ogulcancelik/herdr` works as a temporary fallback.
-
-or download the stable Linux/macOS binary from [releases](https://github.com/ogulcancelik/herdr/releases). Native Windows binaries are preview-only beta builds.
+or download the Linux/macOS binary from [releases](https://github.com/2lab-ai/herdr-mx/releases). the binary installs as `herdr` — a drop-in replacement for upstream herdr, so don't install both. native Windows builds are not available in herdr-mx yet (tracked in [#63](https://github.com/2lab-ai/herdr-mx/issues/63)).
 
 ## quick start
 
@@ -75,29 +71,14 @@ Press `ctrl+b q` to detach the client. The server and pane processes keep runnin
 
 ## update
 
-Herdr notifies you when a new version is available. Run manually:
+herdr-mx updates ship through your package manager, not the built-in updater:
 
 ```bash
-herdr update
+brew upgrade herdr-mx        # Homebrew
+mise upgrade                 # mise
 ```
 
-`herdr update` is for installs managed by Herdr's own installer. Homebrew, mise, and Nix installs update through `brew upgrade herdr`, `mise upgrade herdr`, or your Nix workflow, then use the same stop-and-run-again flow if a session is still running the old server. Linux and macOS direct installs can opt into development preview builds with `herdr channel set preview` and return to stable with `herdr channel set stable`. Windows beta installs are preview-only for now. See [install docs](https://herdr.dev/docs/install/) and [session state docs](https://herdr.dev/docs/session-state/) for the full update, restart, restore, and handoff matrix.
-
-Linux and macOS direct installs use the stable update channel by default. Windows beta installs default to preview. To test preview builds from `master` before the next stable release:
-
-```bash
-herdr channel set preview
-```
-
-To return Linux and macOS direct installs to stable:
-
-```bash
-herdr channel set stable
-```
-
-For direct installs, changing channels also checks that channel and installs its latest binary. If that update fails, run `herdr update` to retry from the configured channel.
-
-Preview is only for direct installs managed by Herdr's updater. Homebrew, mise, and Nix stay on stable and update through their package managers.
+or install a newer binary from [releases](https://github.com/2lab-ai/herdr-mx/releases). `herdr update` and the herdr.dev update channels are intentionally disabled in mx builds — they would replace this binary with a stock herdr that lacks the multi-remote client. After updating, use the same stop-and-run-again flow as upstream if a session is still running the old server.
 
 ## how it compares
 
