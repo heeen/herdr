@@ -9,9 +9,10 @@ currently tracking: **upstream v0.6.10** (released 2026-06-11). policy: every up
 upstream herdr attaches to one server at a time (`herdr --remote <host>` per terminal). herdr-mx makes the client a **fleet console**:
 
 - **one sidebar, every machine** — register secondary local or SSH-backed herdr servers; their workspaces and agents appear in the same sidebar as your main session, with combined status summaries (blocked / working / done across hosts at a glance).
-- **add-remote that provisions itself** — point it at any ssh host; herdr-mx installs the matching server binary non-interactively, with animated progress and truthful failure diagnosis. parsed ssh options (ports, identities, jump hosts) are honored.
+- **add-remote that provisions itself** — point it at any ssh host; the host row appears in the sidebar immediately and herdr-mx installs the matching server binary in the background, streaming a multiline stage log under the host banner. transient failures keep retrying with backoff; terminal ones (ssh auth, unknown host, impossible seed) pin a readable error on the row, retryable from the host menu or its status glyph. parsed ssh options (ports, identities, jump hosts) are honored.
 - **offline cross-OS seeding** — the opt-in "fat" build (`just bundle`, `herdr bundle list|pack`) embeds macOS + Linux (x86_64/aarch64, static musl) binaries in one file, so a fresh host of a *different* OS is seeded at exact version parity with no release download on the remote.
-- **per-remote lifecycle** — host context menu (add space / disable / disconnect / rename), per-remote auto-update-to-this-client toggle, live host version+protocol readout, one-click force-reinstall update.
+- **per-remote lifecycle** — host context menu (add space / disable / disconnect / rename), per-remote auto-update-to-this-client toggle, live host version+protocol readout, one-click force-reinstall update with a multiline install log.
+- **full workspace menu on every host** — the client sidebar's workspace context menu matches the server-rendered one, including the worktree rows: new worktree, open worktree… (picker), delete worktree checkout…, and group expand/collapse — all executed on the owning server over the API.
 - **fast over distance** — semantic-frame delta streaming with compression for ~30fps remote panes, last-frame-first switching, accurate per-host ping/throughput in the banner.
 - **isolation** — a secondary host going down never touches your main session.
 
