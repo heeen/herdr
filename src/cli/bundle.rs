@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 use crate::bundle::{self, BundleIndex, PackInput};
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+// Default `--version` for `bundle pack`: the FULL build version (channel-suffixed for
+// mx/preview builds), so a locally packed fat bundle passes the seed parity gate that
+// compares the index against what the carried binaries report from `--version`.
+const CURRENT_VERSION: &str = crate::build_info::FULL_VERSION;
 
 pub(crate) fn run_bundle_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {

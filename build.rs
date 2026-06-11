@@ -42,6 +42,28 @@ fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Mirror of `src/build_info.rs::version()`: base version plus the channel/build-id
+/// suffix. Exported as `HERDR_FULL_VERSION` so version comparisons can be compile-time
+/// constants that match what suffixed builds actually report.
+fn full_version() -> String {
+    let base = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let channel = non_empty_env("HERDR_BUILD_CHANNEL").unwrap_or_else(|| "stable".into());
+    if channel == "stable" {
+        return base;
+    }
+    match non_empty_env("HERDR_BUILD_ID") {
+        Some(build_id) => format!("{base}-{channel}.{build_id}"),
+        None => format!("{base}-{channel}"),
+    }
+}
+
 fn build_commit(manifest_dir: &Path) -> String {
     if let Ok(commit) = env::var("HERDR_BUILD_COMMIT") {
         return commit;
@@ -102,6 +124,10 @@ fn main() {
         "cargo:rustc-env=HERDR_BUILD_COMMIT={}",
         build_commit(&manifest_dir)
     );
+    // The full user-facing version (base + channel/build-id suffix), computed once here
+    // so every compile-time consumer (version probes, bundle parity, handoff expectations)
+    // agrees on the exact string a suffixed build reports from `herdr --version`.
+    println!("cargo:rustc-env=HERDR_FULL_VERSION={}", full_version());
 
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());

@@ -19,7 +19,10 @@ const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+// The FULL build version (channel-suffixed for mx/preview builds) — every parity check
+// here must use this, not CARGO_PKG_VERSION: the remote binary reports the suffixed
+// version, so a bare comparison made suffixed builds reject their own installs.
+const CURRENT_VERSION: &str = crate::build_info::FULL_VERSION;
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
@@ -1169,6 +1172,13 @@ fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
         return false;
     }
 
+    // Channel builds (mx/preview) have no downloadable asset at their exact version, so
+    // the running executable is the only same-platform seed source — even when it is
+    // package-manager managed (brew/mise install the very fat binary the release shipped).
+    if crate::build_info::channel() != "stable" {
+        return std::env::current_exe().is_ok();
+    }
+
     std::env::current_exe()
         .map(|path| !crate::update::is_package_manager_managed_exe_path(&path))
         .unwrap_or(false)
@@ -1745,6 +1755,17 @@ fn warn_if_remote_bin_not_on_path(target: &SshTarget) -> io::Result<()> {
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
+    // Channel builds are never published to the herdr.dev manifest, so a download could
+    // only ever fetch a foreign (stable upstream) binary. Fail fast with the real fix
+    // instead of installing a binary that would immediately fail the version probe.
+    let channel = crate::build_info::channel();
+    if channel != "stable" {
+        return Err(io::Error::other(format!(
+            "this {channel}-channel build ({CURRENT_VERSION}) cannot seed remotes from the herdr.dev release manifest; use a fat (multi-platform) build of this version, set {REMOTE_BINARY_ENV_VAR}=<path to a {} binary>, or install the matching herdr on the remote host manually",
+            platform.asset_key()
+        )));
+    }
+
     let manifest_output = Command::new("curl")
         .args([
             "-sfL",

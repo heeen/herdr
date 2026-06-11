@@ -2,6 +2,12 @@
 
 pub const BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The full user-facing version (base + channel/build-id suffix), computed by build.rs
+/// so it is available as a compile-time constant. This is exactly what
+/// `herdr --version` reports; version-parity checks must compare against this, never
+/// against the bare `CARGO_PKG_VERSION` (suffixed builds would reject themselves).
+pub const FULL_VERSION: &str = env!("HERDR_FULL_VERSION");
+
 pub fn channel() -> &'static str {
     non_empty(option_env!("HERDR_BUILD_CHANNEL")).unwrap_or("stable")
 }
@@ -11,13 +17,7 @@ pub fn build_id() -> Option<&'static str> {
 }
 
 pub fn version() -> String {
-    match channel() {
-        "stable" => BASE_VERSION.to_string(),
-        channel => match build_id() {
-            Some(build_id) => format!("{BASE_VERSION}-{channel}.{build_id}"),
-            None => format!("{BASE_VERSION}-{channel}"),
-        },
-    }
+    FULL_VERSION.to_string()
 }
 
 pub fn is_preview() -> bool {
@@ -40,5 +40,11 @@ mod tests {
     #[test]
     fn stable_version_defaults_to_cargo_version() {
         assert!(!super::version().is_empty());
+    }
+
+    #[test]
+    fn full_version_starts_with_base_version() {
+        assert!(super::FULL_VERSION.starts_with(super::BASE_VERSION));
+        assert_eq!(super::version(), super::FULL_VERSION);
     }
 }
