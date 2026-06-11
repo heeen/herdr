@@ -168,6 +168,35 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
+      # herdr-mx: every published asset is a multi-platform "fat" bundle so any
+      # installed binary (brew/mise/direct) can seed a different-OS remote
+      # offline at exact version parity. `bundle pack` is pure file surgery, so
+      # the runner-native linux binary packs all four carriers.
+      - name: Pack fat bundles
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="${GITHUB_SHA::7}"
+          PACKER=herdr-linux-x86_64/herdr-linux-x86_64
+          chmod +x "$PACKER"
+          declare -A OSARCH=(
+            [herdr-macos-aarch64]=macos-aarch64
+            [herdr-macos-x86_64]=macos-x86_64
+            [herdr-linux-aarch64]=linux-aarch64
+            [herdr-linux-x86_64]=linux-x86_64
+          )
+          mkdir -p fat
+          for name in "${!OSARCH[@]}"; do
+            args=()
+            for other in "${!OSARCH[@]}"; do
+              [ "$other" = "$name" ] && continue
+              args+=(--binary "${OSARCH[$other]}=$other/$other")
+            done
+            "$PACKER" bundle pack --carrier "$name/$name" --output "fat/$name" \
+              --version "$VERSION" --commit "$COMMIT" "${args[@]}"
+            "$PACKER" bundle list "fat/$name"
+          done
+
       - name: Extract release notes from changelog
         run: python3 scripts/changelog.py extract --version "${GITHUB_REF_NAME#v}" --output RELEASE_NOTES.md
 
@@ -175,10 +204,10 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: |
-            herdr-linux-x86_64/herdr-linux-x86_64
-            herdr-linux-aarch64/herdr-linux-aarch64
-            herdr-macos-x86_64/herdr-macos-x86_64
-            herdr-macos-aarch64/herdr-macos-aarch64
+            fat/herdr-linux-x86_64
+            fat/herdr-linux-aarch64
+            fat/herdr-macos-x86_64
+            fat/herdr-macos-aarch64
           body_path: RELEASE_NOTES.md
 
   close-released-issues:

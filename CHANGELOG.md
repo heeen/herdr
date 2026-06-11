@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.6.10-mx.2] - 2026-06-12
+
+### Changed
+- Every released binary is now a multi-platform "fat" bundle: each asset carries the other three platforms (macOS/Linux × x86_64/aarch64) as compressed appended data, so a brew-, mise-, or directly-installed herdr-mx can seed a different-OS remote offline at exact version parity with `herdr --remote <host>` — no release download needed on the remote. Inspect with `herdr bundle list`. Assets grow from ~14 MB to ~30 MB.
+
 ## [0.6.10-mx.1] - 2026-06-11
 
 First release of **herdr-mx** — a friendly downstream distribution of [herdr](https://github.com/ogulcancelik/herdr) that tracks every upstream release and adds a full **multi-remote client**. All credit for herdr itself goes upstream; herdr-mx exists so you can run multi-remote today, and retires the day it lands upstream. This release contains everything in upstream herdr v0.6.10, plus:
