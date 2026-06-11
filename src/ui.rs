@@ -76,7 +76,7 @@ pub(crate) use self::{
         DestinationView, RemoteManageRowView, RemoteStateGlyph,
     },
     settings::{
-        settings_button_rects, settings_show_primary_action, SETTINGS_POPUP_HEIGHT,
+        settings_button_rects, settings_popup_height, settings_show_primary_action,
         SETTINGS_POPUP_WIDTH,
     },
     sidebar::{

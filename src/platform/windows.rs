@@ -345,6 +345,10 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
     false
 }
 
+pub fn read_clipboard_text() -> Option<String> {
+    None
+}
+
 pub fn open_url(url: &str) -> std::io::Result<()> {
     let operation = wide_null("open");
     let url = wide_null(url);

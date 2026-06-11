@@ -6,6 +6,10 @@ pub mod panes;
 
 pub use panes::*;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -26,6 +30,10 @@ pub enum Method {
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.ui_settings")]
     ServerUiSettings(EmptyParams),
+    #[serde(rename = "server.agent_manifests")]
+    ServerAgentManifests(EmptyParams),
+    #[serde(rename = "server.reload_agent_manifests")]
+    ServerReloadAgentManifests(EmptyParams),
     #[serde(rename = "remote.list")]
     RemoteList(EmptyParams),
     #[serde(rename = "remote.add")]
@@ -80,6 +88,8 @@ pub enum Method {
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
+    #[serde(rename = "agent.explain")]
+    AgentExplain(AgentTarget),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
     #[serde(rename = "agent.rename")]
@@ -399,6 +409,7 @@ pub enum ReadSource {
     Visible,
     Recent,
     RecentUnwrapped,
+    Detection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -505,6 +516,7 @@ pub enum IntegrationTarget {
     Droid,
     Kimi,
     Opencode,
+    Kilo,
     Hermes,
     Qodercli,
     Cursor,
@@ -771,6 +783,9 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
+    AgentExplain {
+        explain: serde_json::Value,
+    },
     SubscriptionStarted {},
     WaitMatched {
         event: EventEnvelope,
@@ -793,6 +808,16 @@ pub enum ResponseResult {
         target: IntegrationTarget,
         details: IntegrationUninstallResult,
     },
+    AgentManifestReload {
+        manifests: Vec<AgentManifestInfo>,
+    },
+    AgentManifestStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_check_unix: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_result: Option<String>,
+        manifests: Vec<AgentManifestInfo>,
+    },
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
@@ -801,6 +826,26 @@ pub enum ResponseResult {
         settings: UiSettingsInfo,
     },
     Ok {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentManifestInfo {
+    pub agent: String,
+    pub source: String,
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_remote_version: Option<String>,
+    pub local_override_shadowing_remote: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_update_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_update_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_last_checked_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -886,6 +931,8 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1258,6 +1305,47 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    #[test]
+    fn request_round_trips_for_server_reload_agent_manifests() {
+        let request = Request {
+            id: "req_reload_agent_manifests".into(),
+            method: Method::ServerReloadAgentManifests(EmptyParams::default()),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "server.reload_agent_manifests");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+    }
+
+    #[test]
+    fn request_round_trips_for_server_agent_manifests() {
+        let request = Request {
+            id: "req_agent_manifests".into(),
+            method: Method::ServerAgentManifests(EmptyParams::default()),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "server.agent_manifests");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+    }
+
+    #[test]
+    fn request_round_trips_for_agent_explain() {
+        let request = Request {
+            id: "req_agent_explain".into(),
+            method: Method::AgentExplain(AgentTarget {
+                target: "agent-1".into(),
+            }),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "agent.explain");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
     }
 
     #[test]

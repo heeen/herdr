@@ -197,6 +197,21 @@ impl TerminalRuntime {
         self.0.begin_graceful_release(agent);
     }
 
+    pub fn reset_agent_detection(&self) {
+        self.0.reset_agent_detection();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_detection_reset_notify_for_test(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Notify> {
+        self.0.agent_detection_reset_notify_for_test()
+    }
+
+    pub fn set_full_lifecycle_authority_active(&self, active: bool) {
+        self.0.set_full_lifecycle_authority_active(active);
+    }
+
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
@@ -248,6 +263,18 @@ impl TerminalRuntime {
 
     pub fn visible_ansi(&self) -> String {
         self.0.visible_ansi()
+    }
+
+    pub fn detection_text(&self) -> String {
+        self.0.detection_text()
+    }
+
+    pub fn agent_osc_title(&self) -> String {
+        self.0.agent_osc_title()
+    }
+
+    pub fn agent_osc_progress(&self) -> String {
+        self.0.agent_osc_progress()
     }
 
     pub fn recent_text(&self, lines: usize) -> String {

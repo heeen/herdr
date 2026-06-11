@@ -616,11 +616,13 @@ impl App {
                 ReadSource::Visible => pane.visible_text(),
                 ReadSource::Recent => pane.recent_text(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
+                ReadSource::Detection => pane.detection_text(),
             },
             ReadFormat::Ansi => match params.source {
                 ReadSource::Visible => pane.visible_ansi(),
                 ReadSource::Recent => pane.recent_ansi(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
+                ReadSource::Detection => pane.detection_text(),
             },
         };
 

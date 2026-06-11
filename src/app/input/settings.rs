@@ -811,6 +811,7 @@ pub(crate) fn open_settings(state: &mut AppState) {
 }
 
 pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
+    state.integration_install_messages.clear();
     state.settings.original_palette = Some(state.palette.clone());
     state.settings.original_theme = Some(state.theme_name.clone());
     state.settings.section = section;
@@ -835,7 +836,7 @@ impl AppState {
         crate::ui::centered_popup_rect(
             self.screen_rect(),
             crate::ui::SETTINGS_POPUP_WIDTH,
-            crate::ui::SETTINGS_POPUP_HEIGHT,
+            crate::ui::settings_popup_height(self),
         )
         .unwrap_or_default()
     }
@@ -1094,7 +1095,7 @@ mod tests {
         let popup = state.settings_popup_rect();
 
         assert_eq!(popup.width, crate::ui::SETTINGS_POPUP_WIDTH);
-        assert_eq!(popup.height, crate::ui::SETTINGS_POPUP_HEIGHT);
+        assert_eq!(popup.height, crate::ui::settings_popup_height(&state));
     }
 
     #[test]

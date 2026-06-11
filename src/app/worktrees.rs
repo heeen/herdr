@@ -256,15 +256,19 @@ impl App {
                 self.sync_worktree_branch_from_input();
             }
             KeyCode::Char(c) => {
-                if self.state.name_input_replace_on_type {
-                    self.state.name_input.clear();
-                    self.state.name_input_replace_on_type = false;
-                }
-                self.state.name_input.push(c);
-                self.sync_worktree_branch_from_input();
+                self.insert_worktree_create_text(&c.to_string());
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn insert_worktree_create_text(&mut self, text: &str) {
+        if self.state.name_input_replace_on_type {
+            self.state.name_input.clear();
+            self.state.name_input_replace_on_type = false;
+        }
+        self.state.name_input.push_str(text);
+        self.sync_worktree_branch_from_input();
     }
 
     pub(crate) fn handle_worktree_open_key(&mut self, key: KeyEvent) {
@@ -303,14 +307,10 @@ impl App {
                     .worktree_open
                     .as_ref()
                     .is_some_and(|open| open.search_focused)
-                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && !ch.is_control() =>
             {
-                if let Some(open) = &mut self.state.worktree_open {
-                    if !ch.is_control() {
-                        open.query.push(ch);
-                        open.normalize_selection();
-                    }
-                }
+                self.insert_worktree_open_search_text(&ch.to_string());
             }
             KeyCode::Backspace
                 if self
@@ -327,6 +327,17 @@ impl App {
             KeyCode::Enter => self.open_selected_existing_worktree(),
             _ => {}
         }
+    }
+
+    pub(crate) fn insert_worktree_open_search_text(&mut self, text: &str) {
+        let Some(open) = &mut self.state.worktree_open else {
+            return;
+        };
+        if !open.search_focused {
+            return;
+        }
+        open.query.push_str(text);
+        open.normalize_selection();
     }
 
     pub(crate) fn open_selected_existing_worktree(&mut self) {
@@ -797,6 +808,102 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn worktree_create_replaces_prefilled_branch_on_paste_and_syncs_state() {
+        let mut app = app_for_worktree_tests();
+        app.state.name_input = "generated-branch".into();
+        app.state.name_input_replace_on_type = true;
+        app.state.worktree_create = Some(WorktreeCreateState {
+            source_workspace_id: "source".into(),
+            source_checkout_path: "/repo/herdr".into(),
+            source_existing_membership: None,
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            branch: "generated-branch".into(),
+            checkout_path: "/repo/herdr-generated-branch".into(),
+            error: None,
+            creating: false,
+        });
+
+        app.insert_worktree_create_text("feature/linear-302");
+
+        assert_eq!(app.state.name_input, "feature/linear-302");
+        assert!(!app.state.name_input_replace_on_type);
+        assert_eq!(
+            app.state
+                .worktree_create
+                .as_ref()
+                .map(|create| create.branch.as_str()),
+            Some("feature/linear-302")
+        );
+    }
+
+    #[test]
+    fn worktree_open_search_accepts_pasted_text_when_focused() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_open = Some(WorktreeOpenState {
+            source_workspace_id: "source".into(),
+            source_existing_membership: None,
+            source_checkout_path: "/repo/herdr".into(),
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            entries: vec![
+                WorktreeOpenEntry {
+                    path: "/repo/herdr-main".into(),
+                    branch: Some("main".into()),
+                    is_linked_worktree: false,
+                    already_open_ws_idx: None,
+                },
+                WorktreeOpenEntry {
+                    path: "/repo/feature-linear-302".into(),
+                    branch: Some("feature/linear-302".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                },
+            ],
+            selected: 0,
+            query: String::new(),
+            search_focused: true,
+            error: None,
+        });
+
+        app.insert_worktree_open_search_text("linear-302");
+
+        let open = app.state.worktree_open.as_ref().unwrap();
+        assert_eq!(open.query, "linear-302");
+        assert_eq!(open.selected_entry_index(), Some(1));
+    }
+
+    #[test]
+    fn worktree_open_search_ignores_paste_when_search_is_not_focused() {
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_open = Some(WorktreeOpenState {
+            source_workspace_id: "source".into(),
+            source_existing_membership: None,
+            source_checkout_path: "/repo/herdr".into(),
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            entries: Vec::new(),
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            error: None,
+        });
+
+        app.insert_worktree_open_search_text("linear-302");
+
+        assert_eq!(
+            app.state
+                .worktree_open
+                .as_ref()
+                .map(|open| open.query.as_str()),
+            Some("")
+        );
     }
 
     #[test]

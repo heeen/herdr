@@ -253,6 +253,37 @@ where
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn wait_for_events(
+    reader: &mut JsonLineReader,
+    expected: &[&str],
+    timeout: Duration,
+) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + timeout;
+    let mut remaining = expected.to_vec();
+    let mut events = Vec::new();
+    while !remaining.is_empty() {
+        let remaining_timeout = deadline.saturating_duration_since(Instant::now());
+        let value = reader.read_json_line(remaining_timeout.max(Duration::from_millis(1)));
+        let Some(event) = value["event"].as_str() else {
+            continue;
+        };
+        if let Some(index) = remaining.iter().position(|expected| *expected == event) {
+            remaining.remove(index);
+            events.push(value);
+        }
+    }
+    events
+}
+
+#[cfg(not(target_os = "macos"))]
+fn event_by_kind<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_json::Value {
+    events
+        .iter()
+        .find(|event| event["event"] == kind)
+        .unwrap_or_else(|| panic!("missing event {kind}"))
+}
+
 #[test]
 fn ping_over_socket_returns_version() {
     let _lock = test_lock();
@@ -274,6 +305,51 @@ fn ping_over_socket_returns_version() {
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 14);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn server_reload_agent_manifests_reports_runtime_override() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let override_dir = config_home.join("herdr-dev").join("agent-detection");
+    fs::create_dir_all(&override_dir).unwrap();
+    let override_path = override_dir.join("codex.toml");
+    fs::write(
+        &override_path,
+        r#"
+id = "codex"
+
+[[rules]]
+id = "reload_marker"
+state = "blocked"
+contains = ["server-reload-marker"]
+"#,
+    )
+    .unwrap();
+
+    let response = send_request(
+        &socket_path,
+        r#"{"id":"reload_manifests","method":"server.reload_agent_manifests","params":{}}"#,
+    );
+    assert_eq!(response["id"], "reload_manifests");
+    assert_eq!(response["result"]["type"], "agent_manifest_reload");
+    let manifests = response["result"]["manifests"].as_array().unwrap();
+    let codex = manifests
+        .iter()
+        .find(|manifest| manifest["agent"] == "codex")
+        .expect("codex manifest summary");
+    assert_eq!(codex["source_kind"], "local override");
+    assert_eq!(codex["source"], override_path.display().to_string());
+    assert!(codex.get("warning").is_none());
 
     cleanup_spawned_herdr(child, base);
 }
@@ -1043,28 +1119,39 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
         .unwrap()
         .to_string();
 
-    let workspace_created =
-        wait_for_event(&mut reader, "workspace_created", Duration::from_secs(2));
+    let initial_events = wait_for_events(
+        &mut reader,
+        &[
+            "workspace_created",
+            "workspace_focused",
+            "tab_created",
+            "tab_focused",
+            "pane_created",
+            "pane_focused",
+        ],
+        Duration::from_secs(2),
+    );
+
+    let workspace_created = event_by_kind(&initial_events, "workspace_created");
     assert_eq!(
         workspace_created["data"]["workspace"]["workspace_id"],
         workspace_id
     );
-    let workspace_focused =
-        wait_for_event(&mut reader, "workspace_focused", Duration::from_secs(2));
+    let workspace_focused = event_by_kind(&initial_events, "workspace_focused");
     assert_eq!(workspace_focused["data"]["workspace_id"], workspace_id);
 
     let first_tab_id = format!("{workspace_id}:1");
-    let tab_created = wait_for_event(&mut reader, "tab_created", Duration::from_secs(2));
+    let tab_created = event_by_kind(&initial_events, "tab_created");
     assert_eq!(tab_created["data"]["tab"]["tab_id"], first_tab_id);
-    let tab_focused = wait_for_event(&mut reader, "tab_focused", Duration::from_secs(2));
+    let tab_focused = event_by_kind(&initial_events, "tab_focused");
     assert_eq!(tab_focused["data"]["tab_id"], first_tab_id);
 
-    let pane_created = wait_for_event(&mut reader, "pane_created", Duration::from_secs(2));
+    let pane_created = event_by_kind(&initial_events, "pane_created");
     let pane_id = pane_created["data"]["pane"]["pane_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let pane_focused = wait_for_event(&mut reader, "pane_focused", Duration::from_secs(2));
+    let pane_focused = event_by_kind(&initial_events, "pane_focused");
     assert_eq!(pane_focused["data"]["pane_id"], pane_id);
 
     let send_pi = send_request(
@@ -1941,7 +2028,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
             stop_file.display()
         ),
     )
@@ -2014,7 +2101,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     );
     assert_eq!(send_enter["result"]["type"], "ok");
 
-    let status_event = reader.read_json_line(Duration::from_secs(8));
+    let status_event = reader.read_json_line(Duration::from_secs(12));
     assert_eq!(status_event["event"], "pane.agent_status_changed");
     assert_eq!(status_event["data"]["pane_id"], background_pane_id);
     assert_eq!(status_event["data"]["agent_status"], "done");

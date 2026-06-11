@@ -74,9 +74,10 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
         (source, agent),
         ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
-            | ("herdr:cursor", "cursor")
+            | ("herdr:copilot", "copilot")
             | ("herdr:droid", "droid")
-            | ("herdr:opencode", "opencode")
+            | ("herdr:qodercli", "qodercli")
+            | ("herdr:cursor", "cursor")
     )
 }
 
@@ -123,6 +124,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:droid", "droid", AgentSessionRefKind::Id) => {
             vec!["droid".into(), "--resume".into(), session_ref.value.clone()]
         }
+        ("herdr:kimi", "kimi", AgentSessionRefKind::Id) => {
+            vec!["kimi".into(), "--session".into(), session_ref.value.clone()]
+        }
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
@@ -139,6 +143,16 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
                 "--session".into(),
                 session_ref.value.clone(),
             ]
+        }
+        ("herdr:qodercli", "qodercli", AgentSessionRefKind::Id) => {
+            vec![
+                "qodercli".into(),
+                "--resume".into(),
+                session_ref.value.clone(),
+            ]
+        }
+        ("herdr:kilo", "kilo", AgentSessionRefKind::Id) => {
+            vec!["kilo".into(), "--session".into(), session_ref.value.clone()]
         }
         ("herdr:cursor", "cursor", AgentSessionRefKind::Id) => {
             vec![
@@ -171,9 +185,12 @@ fn is_official_agent_source(source: &str, agent: &str) -> bool {
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:droid", "droid")
+            | ("herdr:kimi", "kimi")
             | ("herdr:pi", "pi")
             | ("herdr:hermes", "hermes")
             | ("herdr:opencode", "opencode")
+            | ("herdr:qodercli", "qodercli")
+            | ("herdr:kilo", "kilo")
             | ("herdr:cursor", "cursor")
     )
 }
@@ -199,6 +216,17 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn native_state_reservation_excludes_full_lifecycle_sources() {
+        assert!(is_reserved_native_state_source("herdr:claude", "claude"));
+        assert!(is_reserved_native_state_source("herdr:codex", "codex"));
+        assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
+        assert!(!is_reserved_native_state_source(
+            "herdr:opencode",
+            "opencode"
+        ));
     }
 
     #[test]
@@ -246,6 +274,16 @@ mod tests {
         );
         assert_eq!(
             plan(
+                "herdr:kimi",
+                "kimi",
+                &AgentSessionRef::id("kimi-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["kimi", "--session", "kimi-session"]
+        );
+        assert_eq!(
+            plan(
                 "herdr:pi",
                 "pi",
                 &AgentSessionRef::path(&pi_session).unwrap()
@@ -273,6 +311,26 @@ mod tests {
             .unwrap()
             .argv,
             vec!["opencode", "--session", "opencode-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:qodercli",
+                "qodercli",
+                &AgentSessionRef::id("qoder-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["qodercli", "--resume", "qoder-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:kilo",
+                "kilo",
+                &AgentSessionRef::id("kilo-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["kilo", "--session", "kilo-session"]
         );
         assert_eq!(
             plan(
@@ -349,6 +407,22 @@ mod tests {
             Some("/tmp/droid-session".into())
         )
         .is_none());
+
+        let session_ref =
+            session_ref_from_report("herdr:kimi", "kimi", Some("kimi-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "kimi-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:kilo", "kilo", Some("kilo-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "kilo-id");
+
+        let session_ref =
+            session_ref_from_report("herdr:qodercli", "qodercli", Some("qoder-id".into()), None)
+                .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "qoder-id");
     }
 
     #[test]
@@ -370,6 +444,7 @@ mod tests {
     fn planner_rejects_path_refs_for_id_only_agents() {
         let hermes_session = absolute_test_path("hermes-session");
         let opencode_session = absolute_test_path("opencode-session");
+        let kilo_session = absolute_test_path("kilo-session");
         let copilot_session = absolute_test_path("copilot-session");
         assert!(plan(
             "herdr:hermes",
@@ -381,6 +456,12 @@ mod tests {
             "herdr:opencode",
             "opencode",
             &AgentSessionRef::path(&opencode_session).unwrap()
+        )
+        .is_none());
+        assert!(plan(
+            "herdr:kilo",
+            "kilo",
+            &AgentSessionRef::path(&kilo_session).unwrap()
         )
         .is_none());
         assert!(plan(
@@ -401,6 +482,13 @@ mod tests {
             "opencode",
             AgentSessionRefKind::Id,
             "opencode-session"
+        )
+        .is_some());
+        assert!(session_ref_from_snapshot(
+            "herdr:kilo",
+            "kilo",
+            AgentSessionRefKind::Id,
+            "kilo-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(

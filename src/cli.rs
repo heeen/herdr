@@ -739,6 +739,7 @@ pub(super) fn parse_read_source(value: &str) -> std::io::Result<ReadSource> {
         "visible" => Ok(ReadSource::Visible),
         "recent" => Ok(ReadSource::Recent),
         "recent-unwrapped" | "recent_unwrapped" => Ok(ReadSource::RecentUnwrapped),
+        "detection" => Ok(ReadSource::Detection),
         _ => Err(std::io::Error::other(format!(
             "invalid read source: {value}"
         ))),

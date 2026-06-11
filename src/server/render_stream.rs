@@ -110,10 +110,9 @@ impl ClientRenderState {
 
     pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
         match (self, prepared) {
-            (
-                Self::Semantic { last_frame },
-                PreparedRender::Semantic { frame, .. },
-            ) => *last_frame = Some(frame),
+            (Self::Semantic { last_frame }, PreparedRender::Semantic { frame, .. }) => {
+                *last_frame = Some(frame)
+            }
             (
                 Self::TerminalAnsi { blit_encoder, seq },
                 PreparedRender::TerminalAnsi {

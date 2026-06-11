@@ -51,21 +51,21 @@ const KIMI_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/kimi/herdr-agent-state.sh")
 };
-const KIMI_INTEGRATION_VERSION: u32 = 1;
+const KIMI_INTEGRATION_VERSION: u32 = 3;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> herdr kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< herdr kimi integration";
-const KIMI_MIN_VERSION: &str = "0.8.0";
+const KIMI_MIN_VERSION: &str = "0.14.0";
 const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
-    ("SessionStart", "idle"),
+    ("SessionStart", "session"),
     ("UserPromptSubmit", "working"),
     ("PreToolUse", "working"),
+    ("SubagentStart", "working"),
+    ("PreCompact", "working"),
     ("PermissionRequest", "blocked"),
     ("PermissionResult", "working"),
-    ("PostToolUse", "working"),
-    ("PostToolUseFailure", "working"),
     ("Stop", "idle"),
-    ("StopFailure", "idle"),
+    ("Interrupt", "idle"),
     ("SessionEnd", "release"),
 ];
 const COPILOT_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
@@ -78,8 +78,20 @@ const COPILOT_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/copilot/herdr-agent-state.sh")
 };
-const COPILOT_INTEGRATION_VERSION: u32 = 1;
+const COPILOT_INTEGRATION_VERSION: u32 = 2;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
+const COPILOT_HOOK_EVENTS: [&str; 1] = ["SessionStart"];
+const COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS: [&str; 9] = [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "agentStop",
+    "SessionEnd",
+    "notification",
+    "sessionStart",
+];
 const DROID_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
     "herdr-agent-state.ps1"
 } else {
@@ -90,10 +102,25 @@ const DROID_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/droid/herdr-agent-state.sh")
 };
-const DROID_INTEGRATION_VERSION: u32 = 1;
+const DROID_INTEGRATION_VERSION: u32 = 2;
+const DROID_HOOK_EVENTS: [(&str, &str); 1] = [("SessionStart", "session")];
+const DROID_REMOVED_LIFECYCLE_HOOK_EVENTS: [(&str, &str); 9] = [
+    ("SessionStart", "idle"),
+    ("UserPromptSubmit", "working"),
+    ("PreToolUse", "working"),
+    ("PostToolUse", "working"),
+    ("Notification", "blocked"),
+    ("Stop", "idle"),
+    ("SubagentStop", "working"),
+    ("PreCompact", "working"),
+    ("SessionEnd", "release"),
+];
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/herdr-agent-state.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 4;
+const OPENCODE_INTEGRATION_VERSION: u32 = 5;
+const KILO_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
+const KILO_PLUGIN_ASSET: &str = include_str!("assets/kilo/herdr-agent-state.js");
+const KILO_INTEGRATION_VERSION: u32 = 1;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
@@ -110,8 +137,23 @@ const QODERCLI_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/qodercli/herdr-agent-state.sh")
 };
-const QODERCLI_INTEGRATION_VERSION: u32 = 1;
+const QODERCLI_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
+const QODERCLI_HOOK_EVENTS: [(&str, &str); 1] = [("SessionStart", "session")];
+const QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS: [(&str, &str); 12] = [
+    ("SessionStart", "idle"),
+    ("UserPromptSubmit", "working"),
+    ("PreToolUse", "working"),
+    ("PostToolUse", "working"),
+    ("PostToolUseFailure", "working"),
+    ("SubagentStart", "working"),
+    ("SubagentStop", "working"),
+    ("PreCompact", "working"),
+    ("Notification", "blocked"),
+    ("PermissionRequest", "blocked"),
+    ("Stop", "idle"),
+    ("SessionEnd", "release"),
+];
 const CURSOR_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CURSOR_HOOK_ASSET: &str = include_str!("assets/cursor/herdr-agent-state.sh");
 const CURSOR_INTEGRATION_VERSION: u32 = 1;
@@ -153,6 +195,11 @@ pub(crate) struct DroidInstallPaths {
 
 #[derive(Debug)]
 pub(crate) struct OpenCodeInstallPaths {
+    pub plugin_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct KiloInstallPaths {
     pub plugin_path: PathBuf,
 }
 
@@ -300,6 +347,12 @@ pub(crate) struct OpenCodeUninstallResult {
 }
 
 #[derive(Debug)]
+pub(crate) struct KiloUninstallResult {
+    pub plugin_path: PathBuf,
+    pub removed_plugin: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct HermesUninstallResult {
     pub plugin_dir: PathBuf,
     pub config_path: PathBuf,
@@ -312,9 +365,99 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(HERDR_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
 }
 
+pub(crate) const INSTALL_WARNING_PREFIX: &str = "warning:";
+
+struct AgentVersionRequirement {
+    label: &'static str,
+    binary: &'static str,
+    args: &'static [&'static str],
+    min_version: &'static str,
+}
+
+fn agent_version_requirement(
+    target: crate::api::schema::IntegrationTarget,
+) -> Option<AgentVersionRequirement> {
+    match target {
+        crate::api::schema::IntegrationTarget::Kimi => Some(AgentVersionRequirement {
+            label: "kimi code",
+            binary: "kimi",
+            args: &["--version"],
+            min_version: KIMI_MIN_VERSION,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_version_triple(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|token| {
+        let token = token.trim_start_matches('v');
+        let mut parts = token.splitn(3, '.');
+        let major: u64 = parts.next()?.parse().ok()?;
+        let minor: u64 = parts.next()?.parse().ok()?;
+        let patch: u64 = parts
+            .next()
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(0);
+        Some((major, minor, patch))
+    })
+}
+
+/// Returns `Ok(None)` when the installed agent satisfies the requirement,
+/// `Ok(Some(warning))` when the version cannot be determined (install
+/// proceeds), and `Err` when the installed agent is too old.
+fn enforce_agent_version(requirement: &AgentVersionRequirement) -> io::Result<Option<String>> {
+    let probe = format!("{} {}", requirement.binary, requirement.args.join(" "));
+    let output = match std::process::Command::new(requirement.binary)
+        .args(requirement.args)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            return Ok(Some(format!(
+                "{INSTALL_WARNING_PREFIX} could not run `{probe}` to verify the installed version; hooks require {} {} or newer",
+                requirement.label, requirement.min_version
+            )));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(found) = extract_version_triple(&stdout) else {
+        return Ok(Some(format!(
+            "{INSTALL_WARNING_PREFIX} could not parse the {} version from `{probe}` output; hooks require {} {} or newer",
+            requirement.label, requirement.label, requirement.min_version
+        )));
+    };
+    let required = extract_version_triple(requirement.min_version)
+        .expect("static min version must be a valid version triple");
+
+    if found < required {
+        return Err(io::Error::other(format!(
+            "{label} {}.{}.{} is too old: herdr hooks require {label} {min} or newer. upgrade {label}, then re-run install",
+            found.0,
+            found.1,
+            found.2,
+            label = requirement.label,
+            min = requirement.min_version
+        )));
+    }
+    Ok(None)
+}
+
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
 ) -> io::Result<Vec<String>> {
+    let result = install_target_inner(target);
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    crate::logging::integration_action("install", integration_target_label(target), outcome);
+    result
+}
+
+fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Result<Vec<String>> {
     if !integration_target_supported(target) {
         return Err(io::Error::other(format!(
             "{} integration is not supported on Windows",
@@ -322,7 +465,12 @@ pub(crate) fn install_target(
         )));
     }
 
-    let messages = match target {
+    let version_warning = match agent_version_requirement(target) {
+        Some(requirement) => enforce_agent_version(&requirement)?,
+        None => None,
+    };
+
+    let mut messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
             vec![format!("installed pi integration to {}", path.display())]
@@ -423,6 +571,13 @@ pub(crate) fn install_target(
                 installed.plugin_path.display()
             )]
         }
+        crate::api::schema::IntegrationTarget::Kilo => {
+            let installed = install_kilo()?;
+            vec![format!(
+                "installed kilo integration plugin to {}",
+                installed.plugin_path.display()
+            )]
+        }
         crate::api::schema::IntegrationTarget::Hermes => {
             let installed = install_hermes()?;
             vec![
@@ -461,7 +616,10 @@ pub(crate) fn install_target(
         }
     };
 
-    crate::logging::integration_action("install", integration_target_label(target), "ok");
+    if let Some(warning) = version_warning {
+        messages.push(warning);
+    }
+
     Ok(messages)
 }
 
@@ -661,6 +819,20 @@ pub(crate) fn uninstall_target(
                 )]
             }
         }
+        crate::api::schema::IntegrationTarget::Kilo => {
+            let result = uninstall_kilo()?;
+            if result.removed_plugin {
+                vec![format!(
+                    "removed kilo integration plugin at {}",
+                    result.plugin_path.display()
+                )]
+            } else {
+                vec![format!(
+                    "no kilo integration plugin found at {}",
+                    result.plugin_path.display()
+                )]
+            }
+        }
         crate::api::schema::IntegrationTarget::Hermes => {
             let result = uninstall_hermes()?;
             let mut messages = Vec::new();
@@ -760,6 +932,7 @@ pub(crate) fn integration_target_label(
         crate::api::schema::IntegrationTarget::Droid => "droid",
         crate::api::schema::IntegrationTarget::Kimi => "kimi",
         crate::api::schema::IntegrationTarget::Opencode => "opencode",
+        crate::api::schema::IntegrationTarget::Kilo => "kilo",
         crate::api::schema::IntegrationTarget::Hermes => "hermes",
         crate::api::schema::IntegrationTarget::Qodercli => "qodercli",
         crate::api::schema::IntegrationTarget::Cursor => "cursor",
@@ -782,6 +955,7 @@ fn integration_target_command_names(
         crate::api::schema::IntegrationTarget::Droid => &["droid"],
         crate::api::schema::IntegrationTarget::Kimi => &["kimi"],
         crate::api::schema::IntegrationTarget::Opencode => &["opencode"],
+        crate::api::schema::IntegrationTarget::Kilo => &["kilo", "kilo-code"],
         crate::api::schema::IntegrationTarget::Hermes => &["hermes"],
         crate::api::schema::IntegrationTarget::Qodercli => qodercli_command_names(),
         crate::api::schema::IntegrationTarget::Cursor => cursor_command_names(),
@@ -989,7 +1163,7 @@ fn integration_specs() -> [(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 11] {
+); 12] {
     [
         (
             crate::api::schema::IntegrationTarget::Pi,
@@ -1030,6 +1204,11 @@ fn integration_specs() -> [(
             crate::api::schema::IntegrationTarget::Opencode,
             opencode_dir().map(|dir| dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME)),
             OPENCODE_INTEGRATION_VERSION,
+        ),
+        (
+            crate::api::schema::IntegrationTarget::Kilo,
+            kilo_dir().map(|dir| dir.join("plugin").join(KILO_PLUGIN_INSTALL_NAME)),
+            KILO_INTEGRATION_VERSION,
         ),
         (
             crate::api::schema::IntegrationTarget::Hermes,
@@ -1385,34 +1564,15 @@ pub(crate) fn install_copilot() -> io::Result<CopilotInstallPaths> {
         "copilot settings hooks",
     )?;
     let command = hook_command(&hook_path, None);
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "PostToolUseFailure",
-        "Stop",
-        "agentStop",
-        "SessionEnd",
-        "notification",
-    ] {
+    for event in COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS {
         remove_direct_hook_commands(hooks, event, &hook_path, None)?;
     }
-    ensure_direct_command_hook(hooks, "SessionStart", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "UserPromptSubmit", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "PreToolUse", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "PostToolUse", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "PostToolUseFailure", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "Stop", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "agentStop", command.clone(), 10, None)?;
-    ensure_direct_command_hook(hooks, "SessionEnd", command.clone(), 10, None)?;
-    ensure_direct_command_hook(
-        hooks,
-        "notification",
-        command,
-        10,
-        Some("permission_prompt|elicitation_dialog|agent_idle"),
-    )?;
+    for event in COPILOT_HOOK_EVENTS {
+        remove_direct_hook_commands(hooks, event, &hook_path, None)?;
+    }
+    for event in COPILOT_HOOK_EVENTS {
+        ensure_direct_command_hook(hooks, event, command.clone(), 10, None)?;
+    }
     remove_legacy_bash_hook_file(&hook_path)?;
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -1458,13 +1618,21 @@ pub(crate) fn install_droid() -> io::Result<DroidInstallPaths> {
         "droid settings hooks",
     )?;
     remove_hook_commands(hooks, "SessionStart", &hook_path, None)?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        hook_command(&hook_path, None),
-        10,
-        None,
-    )?;
+    for (event, action) in DROID_REMOVED_LIFECYCLE_HOOK_EVENTS {
+        remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+    }
+    for (event, action) in DROID_HOOK_EVENTS {
+        remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+    }
+    for (event, action) in DROID_HOOK_EVENTS {
+        ensure_command_hook(
+            hooks,
+            event,
+            hook_command(&hook_path, Some(action)),
+            10,
+            None,
+        )?;
+    }
     remove_legacy_bash_hook_file(&hook_path)?;
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -1483,6 +1651,14 @@ pub(crate) fn install_droid() -> io::Result<DroidInstallPaths> {
             "droid hooks file hooks",
         )? {
             updated_legacy_hooks = remove_hook_commands(hooks, "SessionStart", &hook_path, None)?;
+            for (event, action) in DROID_REMOVED_LIFECYCLE_HOOK_EVENTS {
+                updated_legacy_hooks |=
+                    remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
+            for (event, action) in DROID_HOOK_EVENTS {
+                updated_legacy_hooks |=
+                    remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
         }
         if updated_legacy_hooks {
             fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
@@ -1513,6 +1689,24 @@ pub(crate) fn install_opencode() -> io::Result<OpenCodeInstallPaths> {
     fs::write(&plugin_path, OPENCODE_PLUGIN_ASSET)?;
 
     Ok(OpenCodeInstallPaths { plugin_path })
+}
+
+pub(crate) fn install_kilo() -> io::Result<KiloInstallPaths> {
+    let dir = kilo_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "kilo config directory not found at {}. install kilo first",
+            dir.display()
+        )));
+    }
+
+    let plugins_dir = dir.join("plugin");
+    fs::create_dir_all(&plugins_dir)?;
+
+    let plugin_path = plugins_dir.join(KILO_PLUGIN_INSTALL_NAME);
+    fs::write(&plugin_path, KILO_PLUGIN_ASSET)?;
+
+    Ok(KiloInstallPaths { plugin_path })
 }
 
 pub(crate) fn install_hermes() -> io::Result<HermesInstallPaths> {
@@ -1724,20 +1918,12 @@ pub(crate) fn uninstall_copilot() -> io::Result<CopilotUninstallResult> {
             "copilot settings",
             "copilot settings hooks",
         )? {
-            updated_settings |=
-                remove_direct_hook_commands(hooks, "SessionStart", &hook_path, None)?;
-            updated_settings |=
-                remove_direct_hook_commands(hooks, "UserPromptSubmit", &hook_path, None)?;
-            updated_settings |= remove_direct_hook_commands(hooks, "PreToolUse", &hook_path, None)?;
-            updated_settings |=
-                remove_direct_hook_commands(hooks, "PostToolUse", &hook_path, None)?;
-            updated_settings |=
-                remove_direct_hook_commands(hooks, "PostToolUseFailure", &hook_path, None)?;
-            updated_settings |= remove_direct_hook_commands(hooks, "Stop", &hook_path, None)?;
-            updated_settings |= remove_direct_hook_commands(hooks, "agentStop", &hook_path, None)?;
-            updated_settings |= remove_direct_hook_commands(hooks, "SessionEnd", &hook_path, None)?;
-            updated_settings |=
-                remove_direct_hook_commands(hooks, "notification", &hook_path, None)?;
+            for event in COPILOT_HOOK_EVENTS {
+                updated_settings |= remove_direct_hook_commands(hooks, event, &hook_path, None)?;
+            }
+            for event in COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS {
+                updated_settings |= remove_direct_hook_commands(hooks, event, &hook_path, None)?;
+            }
         }
 
         if updated_settings {
@@ -1776,6 +1962,12 @@ pub(crate) fn uninstall_droid() -> io::Result<DroidUninstallResult> {
             "droid hooks file hooks",
         )? {
             updated_hooks |= remove_hook_commands(hooks, "SessionStart", &hook_path, None)?;
+            for (event, action) in DROID_REMOVED_LIFECYCLE_HOOK_EVENTS {
+                updated_hooks |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
+            for (event, action) in DROID_HOOK_EVENTS {
+                updated_hooks |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
         }
 
         if updated_hooks {
@@ -1798,6 +1990,12 @@ pub(crate) fn uninstall_droid() -> io::Result<DroidUninstallResult> {
             "droid settings hooks",
         )? {
             updated_settings = remove_hook_commands(hooks, "SessionStart", &hook_path, None)?;
+            for (event, action) in DROID_REMOVED_LIFECYCLE_HOOK_EVENTS {
+                updated_settings |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
+            for (event, action) in DROID_HOOK_EVENTS {
+                updated_settings |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
         }
 
         if updated_settings {
@@ -1825,6 +2023,16 @@ pub(crate) fn uninstall_opencode() -> io::Result<OpenCodeUninstallResult> {
     let removed_plugin = remove_file_if_exists(&plugin_path)?;
 
     Ok(OpenCodeUninstallResult {
+        plugin_path,
+        removed_plugin,
+    })
+}
+
+pub(crate) fn uninstall_kilo() -> io::Result<KiloUninstallResult> {
+    let plugin_path = kilo_dir()?.join("plugin").join(KILO_PLUGIN_INSTALL_NAME);
+    let removed_plugin = remove_file_if_exists(&plugin_path)?;
+
+    Ok(KiloUninstallResult {
         plugin_path,
         removed_plugin,
     })
@@ -1874,9 +2082,7 @@ pub(crate) fn install_qodercli() -> io::Result<QodercliInstallPaths> {
     // settings.json (per https://docs.qoder.com/zh/cli/hooks): a top-level
     // `hooks` object keyed by event name, each entry holding a matcher + a
     // list of `{type: "command", command, timeout?}` invocations. The hook
-    // script reads the event payload from stdin via `hook_event_name` so the
-    // installation never depends on a `QODER_HOOK_EVENT` environment
-    // variable.
+    // script reads the event payload from stdin via `hook_event_name`.
     let settings_path = dir.join("settings.json");
     let mut settings = if settings_path.is_file() {
         serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?).map_err(|err| {
@@ -1895,57 +2101,21 @@ pub(crate) fn install_qodercli() -> io::Result<QodercliInstallPaths> {
         "qodercli settings",
         "qodercli settings hooks",
     )?;
-    // SubagentStop is intentionally *not* mapped to working: the hook script
-    // returns early on it (mirroring assets/claude/herdr-agent-state.sh) so
-    // that recap/away-summary frames cannot revive an idle pane.
-    remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "UserPromptSubmit", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PreToolUse", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PermissionRequest", &hook_path, Some("blocked"))?;
-    remove_hook_commands(hooks, "Stop", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "SessionEnd", &hook_path, Some("release"))?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        hook_command(&hook_path, Some("idle")),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "UserPromptSubmit",
-        hook_command(&hook_path, Some("working")),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "PreToolUse",
-        hook_command(&hook_path, Some("working")),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "PermissionRequest",
-        hook_command(&hook_path, Some("blocked")),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "Stop",
-        hook_command(&hook_path, Some("idle")),
-        10,
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        "SessionEnd",
-        hook_command(&hook_path, Some("release")),
-        10,
-        Some("*"),
-    )?;
+    for (event, action) in QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS {
+        remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+    }
+    for (event, action) in QODERCLI_HOOK_EVENTS {
+        remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+    }
+    for (event, action) in QODERCLI_HOOK_EVENTS {
+        ensure_command_hook(
+            hooks,
+            event,
+            hook_command(&hook_path, Some(action)),
+            10,
+            Some("*"),
+        )?;
+    }
     remove_legacy_bash_hook_file(&hook_path)?;
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -2035,17 +2205,12 @@ pub(crate) fn uninstall_qodercli() -> io::Result<QodercliUninstallResult> {
             "qodercli settings",
             "qodercli settings hooks",
         )? {
-            updated_settings |=
-                remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "UserPromptSubmit", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PreToolUse", &hook_path, Some("working"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "PermissionRequest", &hook_path, Some("blocked"))?;
-            updated_settings |= remove_hook_commands(hooks, "Stop", &hook_path, Some("idle"))?;
-            updated_settings |=
-                remove_hook_commands(hooks, "SessionEnd", &hook_path, Some("release"))?;
+            for (event, action) in QODERCLI_REMOVED_LIFECYCLE_HOOK_EVENTS {
+                updated_settings |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
+            for (event, action) in QODERCLI_HOOK_EVENTS {
+                updated_settings |= remove_hook_commands(hooks, event, &hook_path, Some(action))?;
+            }
         }
 
         if updated_settings {
@@ -2206,8 +2371,8 @@ fn ensure_command_hook(
 
 // Claude and Codex use nested hook groups:
 //   { "matcher": "...", "hooks": [{ "type": "command", ... }] }
-// Copilot and Qoder CLI use the flatter settings shape:
-//   { "type": "command", "matcher": "...", "command": "...", ... }
+// Copilot uses the flatter settings shape:
+//   { "type": "command", "matcher": "...", "bash": "...", ... }
 // Keep the helpers separate so install/uninstall preserves unrelated hooks in
 // each agent's native format instead of normalizing user configuration.
 fn ensure_direct_command_hook(
@@ -2223,13 +2388,18 @@ fn ensure_direct_command_hook(
         .as_array_mut()
         .ok_or_else(|| io::Error::other(format!("hook entries for {event} must be an array")))?;
 
+    let command_field = direct_command_field();
     if let Some(entry) = entries.iter_mut().find(|entry| {
         entry.get("type").and_then(Value::as_str) == Some("command")
-            && entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+            && is_matching_direct_command_entry(entry, command.as_str())
     }) {
         let Some(entry_object) = entry.as_object_mut() else {
             return Ok(());
         };
+        entry_object.remove("command");
+        entry_object.remove("bash");
+        entry_object.remove("powershell");
+        entry_object.insert(command_field.to_string(), Value::String(command.clone()));
         entry_object.insert("timeoutSec".to_string(), Value::Number(timeout_sec.into()));
         match matcher {
             Some(matcher) => {
@@ -2247,10 +2417,24 @@ fn ensure_direct_command_hook(
     if let Some(matcher) = matcher {
         entry.insert("matcher".to_string(), Value::String(matcher.to_string()));
     }
-    entry.insert("command".to_string(), Value::String(command));
+    entry.insert(command_field.to_string(), Value::String(command));
     entry.insert("timeoutSec".to_string(), Value::Number(timeout_sec.into()));
     entries.push(Value::Object(entry));
     Ok(())
+}
+
+fn direct_command_field() -> &'static str {
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "bash"
+    }
+}
+
+fn is_matching_direct_command_entry(entry: &Value, command: &str) -> bool {
+    entry.get("command").and_then(Value::as_str) == Some(command)
+        || entry.get("bash").and_then(Value::as_str) == Some(command)
+        || entry.get("powershell").and_then(Value::as_str) == Some(command)
 }
 
 fn remove_command_hook(
@@ -2311,7 +2495,7 @@ fn remove_direct_command_hook(
     let before = entries.len();
     entries.retain(|entry| {
         !(entry.get("type").and_then(Value::as_str) == Some("command")
-            && entry.get("command").and_then(Value::as_str) == Some(command))
+            && is_matching_direct_command_entry(entry, command))
     });
     let removed = entries.len() != before;
     if entries.is_empty() {
@@ -3061,6 +3245,10 @@ fn opencode_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".config/opencode"))
 }
 
+fn kilo_dir() -> io::Result<PathBuf> {
+    Ok(home_dir()?.join(".config/kilo"))
+}
+
 fn hermes_dir() -> io::Result<PathBuf> {
     Ok(home_dir()?.join(".hermes"))
 }
@@ -3113,6 +3301,86 @@ pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_version_triple_parses_common_outputs() {
+        assert_eq!(extract_version_triple("0.14.0"), Some((0, 14, 0)));
+        assert_eq!(extract_version_triple("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(
+            extract_version_triple("kimi-code 0.14.0 (linux/x64)"),
+            Some((0, 14, 0))
+        );
+        assert_eq!(extract_version_triple("0.14"), Some((0, 14, 0)));
+        assert_eq!(extract_version_triple("0.14.1-beta.2"), Some((0, 14, 1)));
+        assert_eq!(extract_version_triple("no version here"), None);
+        assert_eq!(extract_version_triple(""), None);
+    }
+
+    #[test]
+    fn extract_version_triple_orders_versions() {
+        let old = extract_version_triple("0.12.1").unwrap();
+        let min = extract_version_triple(KIMI_MIN_VERSION).unwrap();
+        let new = extract_version_triple("0.15.0").unwrap();
+        assert!(old < min);
+        assert!(min <= min);
+        assert!(min < new);
+    }
+
+    #[test]
+    fn agent_version_requirement_only_set_for_kimi() {
+        let requirement = agent_version_requirement(crate::api::schema::IntegrationTarget::Kimi)
+            .expect("kimi must have a version requirement");
+        assert_eq!(requirement.binary, "kimi");
+        assert_eq!(requirement.min_version, KIMI_MIN_VERSION);
+        assert!(agent_version_requirement(crate::api::schema::IntegrationTarget::Claude).is_none());
+        assert!(agent_version_requirement(crate::api::schema::IntegrationTarget::Codex).is_none());
+    }
+
+    #[test]
+    fn enforce_agent_version_warns_when_binary_missing() {
+        let requirement = AgentVersionRequirement {
+            label: "kimi code",
+            binary: "herdr-test-binary-that-does-not-exist",
+            args: &["--version"],
+            min_version: "0.14.0",
+        };
+        let warning = enforce_agent_version(&requirement)
+            .expect("missing binary must not fail the install")
+            .expect("missing binary must produce a warning");
+        assert!(warning.contains("could not run"));
+        assert!(warning.contains("0.14.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enforce_agent_version_rejects_old_version() {
+        let requirement = AgentVersionRequirement {
+            label: "kimi code",
+            binary: "echo",
+            args: &["0.12.1"],
+            min_version: "0.14.0",
+        };
+        let err =
+            enforce_agent_version(&requirement).expect_err("old version must fail the install");
+        let message = err.to_string();
+        assert!(message.contains("0.12.1"));
+        assert!(message.contains("0.14.0"));
+        assert!(message.contains("upgrade"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enforce_agent_version_accepts_current_version() {
+        let requirement = AgentVersionRequirement {
+            label: "kimi code",
+            binary: "echo",
+            args: &["0.14.0"],
+            min_version: "0.14.0",
+        };
+        let result = enforce_agent_version(&requirement)
+            .expect("matching version must not fail the install");
+        assert!(result.is_none(), "matching version must not warn");
+    }
 
     fn clear_integration_path_env() {
         std::env::remove_var(PI_CODING_AGENT_DIR_ENV_VAR);
@@ -3192,6 +3460,7 @@ mod tests {
         assert!(!integration_target_supported(IntegrationTarget::Pi));
         assert!(!integration_target_supported(IntegrationTarget::Omp));
         assert!(!integration_target_supported(IntegrationTarget::Opencode));
+        assert!(!integration_target_supported(IntegrationTarget::Kilo));
         assert!(!integration_target_supported(IntegrationTarget::Hermes));
         assert!(!integration_target_supported(IntegrationTarget::Cursor));
 
@@ -3218,12 +3487,14 @@ mod tests {
         fs::write(bin.join("pi.cmd"), "@echo off\r\n").unwrap();
         fs::write(bin.join("omp.cmd"), "@echo off\r\n").unwrap();
         fs::write(bin.join("opencode.cmd"), "@echo off\r\n").unwrap();
+        fs::write(bin.join("kilo.cmd"), "@echo off\r\n").unwrap();
         fs::write(bin.join("hermes.exe"), "").unwrap();
         fs::write(bin.join("cursor-agent.cmd"), "@echo off\r\n").unwrap();
 
         assert!(!integration_target_available(IntegrationTarget::Pi));
         assert!(!integration_target_available(IntegrationTarget::Omp));
         assert!(!integration_target_available(IntegrationTarget::Opencode));
+        assert!(!integration_target_available(IntegrationTarget::Kilo));
         assert!(!integration_target_available(IntegrationTarget::Hermes));
         assert!(!integration_target_available(IntegrationTarget::Cursor));
 
@@ -4362,7 +4633,7 @@ mod tests {
         );
         assert_eq!(installed.config_path, kimi_dir.join("config.toml"));
         assert_eq!(hook_content, KIMI_HOOK_ASSET);
-        assert_eq!(hooks.len(), 11);
+        assert_eq!(hooks.len(), KIMI_HOOK_EVENTS.len() + 1);
         assert!(config.contains("default_model = \"moonshot\""));
         assert!(config.contains("command = \"echo keep\""));
         assert!(config.contains(KIMI_CONFIG_BLOCK_BEGIN));
@@ -4481,9 +4752,17 @@ mod tests {
         let home = base.join("home");
         let copilot_dir = home.join(".copilot");
         fs::create_dir_all(&copilot_dir).unwrap();
+        let hook_path = copilot_dir.join("hooks").join(COPILOT_HOOK_INSTALL_NAME);
+        let stale_session_start_command = format!(
+            "bash {}",
+            shell_single_quote(&hook_path.display().to_string())
+        );
         fs::write(
             copilot_dir.join("settings.json"),
-            r#"{"theme":"dark","hooks":{"PreToolUse":[{"type":"command","command":"echo keep","timeoutSec":10}]}}"#,
+            format!(
+                r#"{{"theme":"dark","hooks":{{"PreToolUse":[{{"type":"command","command":"echo keep","timeoutSec":10}}],"sessionStart":[{{"type":"command","bash":{},"timeoutSec":10}}]}}}}"#,
+                serde_json::to_string(&stale_session_start_command).unwrap()
+            ),
         )
         .unwrap();
         std::env::set_var("HOME", &home);
@@ -4500,35 +4779,28 @@ mod tests {
         assert_eq!(installed.settings_path, copilot_dir.join("settings.json"));
         assert_eq!(hook_content, COPILOT_HOOK_ASSET);
         assert_eq!(settings["theme"], "dark");
-        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(settings["hooks"]["PreToolUse"][0]["command"], "echo keep");
-        assert!(settings["hooks"]["PreToolUse"][1]["command"]
+        assert!(settings["hooks"]["SessionStart"][0][direct_command_field()]
             .as_str()
             .unwrap()
             .contains(COPILOT_HOOK_INSTALL_NAME));
-        assert!(settings["hooks"]["PostToolUse"][0].get("matcher").is_none());
-        assert!(settings["hooks"]["PostToolUseFailure"][0]
-            .get("matcher")
-            .is_none());
-        assert_eq!(
-            settings["hooks"]["notification"][0]["matcher"],
-            "permission_prompt|elicitation_dialog|agent_idle"
-        );
-        assert!(settings["hooks"]["Stop"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains(COPILOT_HOOK_INSTALL_NAME));
-        assert!(settings["hooks"]["agentStop"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains(COPILOT_HOOK_INSTALL_NAME));
+        for event in COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS {
+            if let Some(entries) = settings["hooks"].get(event) {
+                assert!(
+                    !entries.to_string().contains(COPILOT_HOOK_INSTALL_NAME),
+                    "expected herdr hooks.{event} entries to be removed"
+                );
+            }
+        }
+        assert!(settings["hooks"].get("sessionStart").is_none());
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn copilot_v1_integration_status_is_current() {
+    fn copilot_v1_integration_status_is_outdated() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -4550,8 +4822,8 @@ mod tests {
 
         assert_eq!(copilot.path, hook_path);
         assert_eq!(copilot.installed_version, Some(1));
-        assert_eq!(copilot.expected_version, 1);
-        assert_eq!(copilot.state, IntegrationStatusKind::Current);
+        assert_eq!(copilot.expected_version, COPILOT_INTEGRATION_VERSION);
+        assert_eq!(copilot.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -4580,22 +4852,13 @@ mod tests {
             settings["hooks"]["SessionStart"].as_array().unwrap().len(),
             1
         );
-        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(
-            settings["hooks"]["PostToolUseFailure"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            settings["hooks"]["notification"].as_array().unwrap().len(),
-            1
-        );
+        for event in COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS {
+            assert!(
+                settings["hooks"].get(event).is_none(),
+                "expected hooks.{event} to be absent"
+            );
+        }
+        assert!(settings["hooks"].get("sessionStart").is_none());
 
         clear_integration_path_env();
         let _ = fs::remove_dir_all(base);
@@ -4618,14 +4881,14 @@ mod tests {
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
-                    {"type": "command", "command": command, "timeoutSec": 10},
+                    {"type": "command", direct_command_field(): command, "timeoutSec": 10},
                     {"type": "command", "command": "echo keep", "timeoutSec": 10}
                 ],
-                "PostToolUse": [{"type": "command", "command": command, "timeoutSec": 10}],
+                "PostToolUse": [{"type": "command", direct_command_field(): command, "timeoutSec": 10}],
                 "notification": [{
                     "type": "command",
                     "matcher": "permission_prompt|elicitation_dialog|agent_idle",
-                    "command": command,
+                    direct_command_field(): command,
                     "timeoutSec": 10
                 }]
             }
@@ -4721,6 +4984,15 @@ mod tests {
         assert!(settings["hooks"]["SessionStart"][0]
             .get("matcher")
             .is_none());
+        for (event, action) in DROID_HOOK_EVENTS {
+            let command = settings["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(
+                command.contains(DROID_HOOK_INSTALL_NAME) && command.ends_with(action),
+                "expected droid {event} hook command to end with {action}, got {command}"
+            );
+        }
         assert_eq!(legacy_hooks["hooks"]["PreToolUse"][0]["matcher"], "Read");
         assert!(legacy_hooks["hooks"].get("SessionStart").is_none());
 
@@ -4743,17 +5015,20 @@ mod tests {
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(droid_dir.join("settings.json")).unwrap())
                 .unwrap();
-        assert_eq!(
-            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
-            1
-        );
+        for (event, _) in DROID_HOOK_EVENTS {
+            assert_eq!(
+                settings["hooks"][event].as_array().unwrap().len(),
+                1,
+                "expected hooks.{event} to be idempotent"
+            );
+        }
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn droid_v1_integration_status_is_current() {
+    fn droid_v1_integration_status_is_outdated() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -4775,8 +5050,8 @@ mod tests {
 
         assert_eq!(droid.path, hook_path);
         assert_eq!(droid.installed_version, Some(1));
-        assert_eq!(droid.expected_version, 1);
-        assert_eq!(droid.state, IntegrationStatusKind::Current);
+        assert_eq!(droid.expected_version, DROID_INTEGRATION_VERSION);
+        assert_eq!(droid.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -4919,6 +5194,67 @@ mod tests {
         let err = install_opencode().unwrap_err().to_string();
 
         assert!(err.contains("opencode config directory not found"));
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_kilo_writes_plugin_to_plugin_dir() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let kilo_dir = home.join(".config/kilo");
+        fs::create_dir_all(&kilo_dir).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_kilo().unwrap();
+        let plugin_content = fs::read_to_string(&installed.plugin_path).unwrap();
+
+        assert_eq!(
+            installed.plugin_path,
+            kilo_dir.join("plugin").join(KILO_PLUGIN_INSTALL_NAME)
+        );
+        assert_eq!(plugin_content, KILO_PLUGIN_ASSET);
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn uninstall_kilo_removes_plugin_when_present() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let kilo_plugin_dir = home.join(".config/kilo/plugin");
+        fs::create_dir_all(&kilo_plugin_dir).unwrap();
+        fs::write(
+            kilo_plugin_dir.join(KILO_PLUGIN_INSTALL_NAME),
+            KILO_PLUGIN_ASSET,
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        let result = uninstall_kilo().unwrap();
+
+        assert!(result.removed_plugin);
+        assert!(!result.plugin_path.exists());
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_kilo_errors_when_config_dir_missing() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let err = install_kilo().unwrap_err().to_string();
+
+        assert!(err.contains("kilo config directory not found"));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -5216,34 +5552,37 @@ mod tests {
         assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
         assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
         assert!(KIMI_HOOK_ASSET.contains("source = \"herdr:kimi\""));
-        assert!(KIMI_HOOK_ASSET.contains("pane.report_agent"));
+        assert!(KIMI_HOOK_ASSET.contains("agent_session_id"));
+        assert!(KIMI_HOOK_ASSET.contains("pane.report_agent_session"));
+        assert!(KIMI_HOOK_ASSET.contains("\"state\": action"));
         assert!(KIMI_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(!KIMI_HOOK_ASSET.contains("agent_session_id"));
         assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
-        assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
-        assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
-        assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
-        assert!(DROID_HOOK_ASSET.contains("hook_event_name"));
-        assert!(DROID_HOOK_ASSET.contains("SessionStart"));
+        assert!(COPILOT_HOOK_ASSET.contains("pane.report_agent_session"));
+        assert!(!COPILOT_HOOK_ASSET.contains("\"state\":"));
+        assert!(!COPILOT_HOOK_ASSET.contains("pane.release_agent"));
         assert!(DROID_HOOK_ASSET.contains("agent_session_id"));
         assert!(DROID_HOOK_ASSET.contains("pane.report_agent_session"));
-        assert!(!DROID_HOOK_ASSET.contains("\"state\":"));
+        assert!(!DROID_HOOK_ASSET.contains("\"state\": action"));
         assert!(!DROID_HOOK_ASSET.contains("pane.release_agent"));
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
-        assert!(OPENCODE_PLUGIN_ASSET.contains("agent_session_id: sessionID"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("params.agent_session_id = sessionID"));
         assert!(OPENCODE_PLUGIN_ASSET.contains("pane.report_agent_session"));
-        assert!(!OPENCODE_PLUGIN_ASSET.contains("reportState"));
-        assert!(!OPENCODE_PLUGIN_ASSET.contains("pane.release_agent"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("reportState"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("pane.release_agent"));
+        assert!(KILO_PLUGIN_ASSET.contains("SOURCE = \"herdr:kilo\""));
+        assert!(KILO_PLUGIN_ASSET.contains("AGENT = \"kilo\""));
+        assert!(KILO_PLUGIN_ASSET.contains("pane.report_agent_session"));
+        assert!(KILO_PLUGIN_ASSET.contains("reportState"));
+        assert!(KILO_PLUGIN_ASSET.contains("pane.release_agent"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("session_id = _session_id(kwargs)"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("agent_session_id"));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("pane.report_agent\","));
         assert!(HERMES_PLUGIN_INIT_ASSET.contains("pane.release_agent"));
-        // Qoder hook reads the event from the stdin JSON payload (per
-        // https://docs.qoder.com/zh/cli/hooks). Make sure the bundled script
-        // never reaches for a QODER_HOOK_EVENT environment variable.
         assert!(QODERCLI_HOOK_ASSET.contains("HERDR_HOOK_INPUT_FILE"));
-        assert!(QODERCLI_HOOK_ASSET.contains("hook_event_name"));
         assert!(QODERCLI_HOOK_ASSET.contains("agent_session_id"));
+        assert!(QODERCLI_HOOK_ASSET.contains("pane.report_agent_session"));
+        assert!(!QODERCLI_HOOK_ASSET.contains("\"state\": action"));
+        assert!(!QODERCLI_HOOK_ASSET.contains("pane.release_agent"));
         assert!(!QODERCLI_HOOK_ASSET.contains("QODER_HOOK_EVENT"));
         assert!(CURSOR_HOOK_ASSET.contains("HERDR_INTEGRATION_ID=cursor"));
         assert!(CURSOR_HOOK_ASSET.contains("conversation_id"));
@@ -5285,17 +5624,15 @@ mod tests {
             .get("hooks")
             .and_then(Value::as_object)
             .expect("hooks should be present");
-        for event in [
-            "SessionStart",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PermissionRequest",
-            "Stop",
-            "SessionEnd",
-        ] {
+        for (event, action) in QODERCLI_HOOK_EVENTS {
             assert!(
                 hooks.contains_key(event),
                 "expected hooks.{event} to be registered"
+            );
+            let command = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                command.contains(QODERCLI_HOOK_INSTALL_NAME) && command.ends_with(action),
+                "expected qodercli {event} hook command to end with {action}, got {command}"
             );
         }
         // Pre-existing settings keys must be preserved.
@@ -5320,14 +5657,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(qoder_dir.join("settings.json")).unwrap())
                 .unwrap();
         let hooks = settings.get("hooks").and_then(Value::as_object).unwrap();
-        for event in [
-            "SessionStart",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PermissionRequest",
-            "Stop",
-            "SessionEnd",
-        ] {
+        for (event, _) in QODERCLI_HOOK_EVENTS {
             let entries = hooks.get(event).and_then(Value::as_array).unwrap();
             assert_eq!(
                 entries.len(),
@@ -5353,7 +5683,7 @@ mod tests {
         let mut settings: Value =
             serde_json::from_str(&fs::read_to_string(qoder_dir.join("settings.json")).unwrap())
                 .unwrap();
-        settings["hooks"]["UserPromptSubmit"]
+        settings["hooks"]["SessionStart"]
             .as_array_mut()
             .unwrap()
             .push(json!({
@@ -5374,10 +5704,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(qoder_dir.join("settings.json")).unwrap())
                 .unwrap();
         let hooks = settings.get("hooks").and_then(Value::as_object).unwrap();
-        let remaining = hooks
-            .get("UserPromptSubmit")
-            .and_then(Value::as_array)
-            .unwrap();
+        let remaining = hooks.get("SessionStart").and_then(Value::as_array).unwrap();
         assert_eq!(remaining.len(), 1);
         let cmd = remaining[0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, "echo user-defined");

@@ -23,8 +23,9 @@ use super::{
     osc::{
         contains_scrollback_clear_sequence, current_transient_default_color_owner,
         maybe_filter_primary_screen_scrollback_clear, restore_host_terminal_theme_if_needed,
-        write_host_terminal_theme, CwdOscTracker, DefaultColorEvent, DefaultColorEventTracker,
-        DefaultColorOscTracker, DefaultColorQuery, DefaultColorTrackedEvent, Osc52Forwarder,
+        write_host_terminal_theme, AgentOscStateTracker, CwdOscTracker, DefaultColorEvent,
+        DefaultColorEventTracker, DefaultColorOscTracker, DefaultColorQuery,
+        DefaultColorTrackedEvent, Osc52Forwarder, OscDebugTracker,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -125,6 +126,8 @@ pub(crate) struct GhosttyPaneCore {
     pub child_default_background_changed: bool,
     pub osc52_forwarder: Osc52Forwarder,
     pub cwd_osc_tracker: CwdOscTracker,
+    pub osc_debug_tracker: OscDebugTracker,
+    pub agent_osc_state: AgentOscStateTracker,
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
 }
 
@@ -267,6 +270,21 @@ impl PaneTerminal {
             .maybe_restore_host_terminal_theme(pane_id, shell_pid)
     }
 
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_title(&self) -> String {
+        self.ghostty.agent_osc_title()
+    }
+
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_progress(&self) -> String {
+        self.ghostty.agent_osc_progress()
+    }
+
+    /// Clears retained OSC title/progress evidence on foreground agent change.
+    pub fn clear_agent_osc_state(&self) {
+        self.ghostty.clear_agent_osc_state()
+    }
+
     pub fn keyboard_protocol(
         &self,
         fallback: crate::input::KeyboardProtocol,
@@ -364,6 +382,8 @@ impl GhosttyPaneTerminal {
                 child_default_background_changed: false,
                 osc52_forwarder: Osc52Forwarder::default(),
                 cwd_osc_tracker: CwdOscTracker::default(),
+                osc_debug_tracker: OscDebugTracker::default(),
+                agent_osc_state: AgentOscStateTracker::default(),
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
             }),
             key_encoder: Mutex::new(key_encoder),
@@ -417,6 +437,34 @@ impl GhosttyPaneTerminal {
         )
     }
 
+    /// Returns the latest OSC 0/2 title retained for agent detection, or `""`
+    /// if no title has been seen or the last update was an empty clear.
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_title(&self) -> String {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.latest_title().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Returns the latest OSC 9 progress payload retained for agent detection,
+    /// or `""` if none has been seen.
+    #[allow(dead_code)] // exposed for Stage C (detection loop wiring)
+    pub fn agent_osc_progress(&self) -> String {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.latest_progress().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Clears retained OSC title/progress evidence when the pane's foreground
+    /// agent changes, so a new agent process starts from a blank OSC slate.
+    pub fn clear_agent_osc_state(&self) {
+        if let Ok(mut core) = self.core.lock() {
+            core.agent_osc_state.clear_retained();
+        }
+    }
+
     pub fn process_pty_bytes(
         &self,
         pane_id: PaneId,
@@ -451,6 +499,16 @@ impl GhosttyPaneTerminal {
         let clipboard_writes = core.osc52_forwarder.drain_pending();
         core.cwd_osc_tracker.observe(bytes);
         let reported_cwd = core.cwd_osc_tracker.drain_latest();
+        core.osc_debug_tracker.observe(bytes);
+        for event in core.osc_debug_tracker.drain_pending() {
+            debug!(
+                pane = pane_id.raw(),
+                osc_command = %event.command,
+                osc_payload = ?event.payload,
+                "agent OSC evidence observed"
+            );
+        }
+        core.agent_osc_state.observe(bytes);
 
         let alternate_screen = core
             .terminal

@@ -3516,6 +3516,7 @@ mod tests {
             tab_label: None,
             display_agent: None,
             agent_status: status,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: std::collections::HashMap::new(),
             agent_session: None,

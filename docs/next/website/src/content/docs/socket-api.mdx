@@ -80,13 +80,13 @@ Raw socket method names use dot notation:
 
 | Area | Methods |
 | --- | --- |
-| Server | `ping`, `server.stop`, `server.reload_config` |
+| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
 | Notification | `notification.show` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.zoom`, `pane.layout`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
@@ -330,9 +330,11 @@ Use `pane.read` through the CLI unless you are writing a protocol client.
 herdr pane read 1-1 --source visible --lines 80
 herdr pane read 1-1 --source recent --lines 120
 herdr pane read 1-1 --source recent-unwrapped --lines 120
+herdr pane read 1-1 --source detection
 ```
 
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
+`detection` returns the bottom-buffer snapshot used by agent screen detection.
 
 ## Waiting for state
 
@@ -366,6 +368,46 @@ Successful responses look like this:
   }
 }
 ```
+
+`server.agent_manifests` returns the active agent detection manifest sources and remote update diagnostics without reloading rules:
+
+```json
+{
+  "id": "req_1",
+  "result": {
+    "type": "agent_manifest_status",
+    "last_check_unix": 1781043522,
+    "last_result": "checked",
+    "manifests": [
+      {
+        "agent": "cursor",
+        "source": "/home/me/.config/herdr/agent-detection/cursor.toml",
+        "source_kind": "local override",
+        "active_version": "2026.06.10.1",
+        "cached_remote_version": "2026.06.10.1",
+        "local_override_shadowing_remote": true,
+        "remote_update_result": "current"
+      }
+    ]
+  }
+}
+```
+
+Fields such as `last_check_unix`, `last_result`, `active_version`, `cached_remote_version`, `remote_update_result`, `remote_update_error`, `remote_last_checked_unix`, and `warning` are omitted when not available. `server.reload_agent_manifests` returns `agent_manifest_reload` with the same `manifests` item shape after reloading the in-memory rule cache.
+
+`agent.explain` evaluates the target pane's detection snapshot in the running server using the server's active manifest cache:
+
+```json
+{
+  "id": "req_2",
+  "method": "agent.explain",
+  "params": { "target": "1-1" }
+}
+```
+
+The response contains the same explain object printed by `herdr agent explain --json`, including the final state, manifest source and version, matched rule, evaluated rule evidence, skip-state reason, idle fallback reason, and `screen_detection_skip_reason` when a full lifecycle hook authority makes screen rules non-authoritative.
+
+Clients need a running server that supports `agent.explain`; after upgrading Herdr, restart or live-handoff the server before relying on this method.
 
 Errors look like this:
 
