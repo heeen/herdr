@@ -75,6 +75,8 @@ jobs:
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # herdr-mx tags (v0.6.10-mx.1) build the upstream base version.
+          TAG_VERSION="${TAG_VERSION%%-mx.*}"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "error: tag $GITHUB_REF_NAME doesn't match Cargo.toml version $CARGO_VERSION"
             exit 1
