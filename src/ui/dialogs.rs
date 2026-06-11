@@ -35,9 +35,6 @@ pub(crate) struct AddRemoteOverlayView<'a> {
     pub progress: Option<&'a str>,
     /// Current spinner glyph for the in-progress line (advances with the shared animation tick).
     pub spinner: &'a str,
-    /// When set (the destination), the status row shows a `[y/N]` prompt to restart an
-    /// incompatible no-handoff remote server. Highest precedence (issue #12, macmini).
-    pub restart_confirm_destination: Option<&'a str>,
 }
 
 /// View for one new-workspace destination row.
@@ -990,19 +987,7 @@ pub(crate) fn render_add_remote_overlay(
         palette,
     );
 
-    if let Some(destination) = view.restart_confirm_destination {
-        frame.render_widget(
-            Paragraph::new(format!(
-                " {destination} runs an old herdr — restart it? stops its panes  [y/N]"
-            ))
-            .style(
-                Style::default()
-                    .fg(palette.yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rows[4],
-        );
-    } else if view.in_progress {
+    if view.in_progress {
         let stage = view.progress.unwrap_or("connecting to remote…");
         frame.render_widget(
             Paragraph::new(format!(" {} {stage}", view.spinner))

@@ -64,8 +64,6 @@ const CLIENT_ANIMATION_TICK_STEP: u32 = 8;
 // failure lingers longer so the user can actually read what went wrong before it fades.
 const HOST_UPDATE_OUTCOME_TTL: Duration = Duration::from_secs(6);
 const HOST_UPDATE_FAILURE_TTL: Duration = Duration::from_secs(12);
-const ADD_REMOTE_TARGET_VALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
-const ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 // Idle ceiling for bringing up an ssh remote bridge: the maximum time a SINGLE provisioning stage
 // (connect / detect / seed / install / verify / server-start) may run without emitting progress
 // before we give up. The deadline RESETS on every `RemoteProvisionStage` the worker reports, so a
@@ -158,6 +156,14 @@ struct ClientState {
     /// until an explicit "reconnect" (which removes the entry) — that is what makes Disconnect a
     /// distinct, non-persistent action from Disable.
     manually_disconnected: HashSet<supervisor::ServerId>,
+    /// Hosts whose provisioning failed TERMINALLY (auth, unknown host, impossible seed/version —
+    /// see [`classify_provision_failure`]): the retry sweep stops for them and the failure stays
+    /// on the banner until an explicit retry (context-menu reconnect / status-glyph click).
+    provision_failed: HashSet<supervisor::ServerId>,
+    /// One-shot approvals (issue #12): the next retry for these hosts may RESTART an incompatible
+    /// no-handoff remote server. Set by the explicit retry-after-restart-confirm affordance,
+    /// consumed by the next spawned attempt.
+    retry_restart_incompatible: HashSet<supervisor::ServerId>,
     /// #44: hosts with a one-click "update" (reinstall the local herdr via the add-remote
     /// provisioning flow) running off the UI loop. Guards against double-spawn from a repeated
     /// menu click while the worker is in flight; cleared when `UpdateRemoteFinished` arrives.
@@ -201,12 +207,6 @@ struct SecondaryRetryState {
 }
 
 struct SecondaryConnectionAttempt {
-    stream: LocalStream,
-    bridge: Option<crate::remote::RemoteBridge>,
-}
-
-struct ClientAddRemoteSuccess {
-    remote: crate::remote_registry::RemoteDefinitionSnapshot,
     stream: LocalStream,
     bridge: Option<crate::remote::RemoteBridge>,
 }
@@ -1236,10 +1236,13 @@ fn dispatch_composited_mouse_input(
                 );
                 return ClientInputDispatch::Redraw;
             }
-            // #43: a right-click on a host banner opens the host context menu (add-space /
-            // enable-disable / disconnect-reconnect), anchored at the cursor. The display name is
-            // captured so the menu's sub-header needs no second lookup.
-            Some(compositor::SidebarHitTarget::HostBanner { server_id }) => {
+            // #43: a right-click on a host banner (its status glyph included) opens the host
+            // context menu (add-space / enable-disable / disconnect-reconnect), anchored at the
+            // cursor. The display name is captured so the menu's sub-header needs no second lookup.
+            Some(
+                compositor::SidebarHitTarget::HostBanner { server_id }
+                | compositor::SidebarHitTarget::HostBannerGlyph { server_id },
+            ) => {
                 let display_name = model
                     .server_display_name(&server_id)
                     .unwrap_or_else(|| server_id.registry_id().to_string());
@@ -1599,6 +1602,18 @@ fn dispatch_sidebar_hit_target(
         // `dispatch_composited_mouse_input` (needs `&mut compositor`); the click itself focuses the
         // host's first workspace there too. This arm only keeps the match exhaustive.
         compositor::SidebarHitTarget::HostBanner { .. } => ClientInputDispatch::Consumed,
+        // A left-press on the banner's status glyph RETRIES a down host (the affordance the
+        // provisioning-failure sub-line points at); on a connected host it behaves like the
+        // plain banner (consume).
+        compositor::SidebarHitTarget::HostBannerGlyph { server_id } => {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && model.server_is_reconnectable(&server_id)
+            {
+                ClientInputDispatch::ReconnectRemote { server_id }
+            } else {
+                ClientInputDispatch::Consumed
+            }
+        }
         // item 1: composited-modal action buttons.
         compositor::SidebarHitTarget::AddRemoteSubmit => {
             // re-run the SAME empty-target validation as the Enter key by replaying an Enter
@@ -2257,13 +2272,12 @@ enum ClientLoopEvent {
         result: Result<SecondaryConnectionAttempt, ClientError>,
         elapsed: Duration,
     },
-    /// A provisioning stage of an in-flight add-remote submission (connecting / detecting / seeding
-    /// / installing / …). Updates the dialog's live progress line so a fresh-host install reads as
-    /// forward motion instead of a hung "connecting…" (issue #32).
-    AddRemoteProgress { message: String },
-    /// Add-remote validation and setup completed off the UI loop.
+    /// Add-remote registration (parse + duplicate check + `remote.add` against the local main
+    /// socket) completed off the UI loop. On Ok the host row is added to the sidebar immediately
+    /// (state `Connecting`) and the retry sweep provisions the bridge with live per-host progress
+    /// sub-lines — the form closes right away instead of blocking on the install.
     AddRemoteFinished {
-        result: Result<ClientAddRemoteSuccess, AddRemoteFailure>,
+        result: Result<crate::remote_registry::RemoteDefinitionSnapshot, String>,
         elapsed: Duration,
     },
     /// #44: a provisioning stage of an in-flight one-click "update" (reinstall the local herdr onto
@@ -2702,6 +2716,8 @@ fn connect_secondary_client_stream_for_plan_detached(
     cell_width_px: u32,
     cell_height_px: u32,
     existing_ssh_client_socket: Option<std::path::PathBuf>,
+    restart_incompatible: bool,
+    on_progress: &dyn Fn(crate::remote::RemoteProvisionStage),
 ) -> Result<SecondaryConnectionAttempt, ClientError> {
     let socket_path = match &plan.target {
         supervisor::ServerConnectionTarget::Ssh {
@@ -2713,17 +2729,26 @@ fn connect_secondary_client_stream_for_plan_detached(
             } else {
                 let ssh_target =
                     crate::remote::SshTarget::new(destination.clone(), options.clone());
-                // Reconnect path: can't prompt, so never auto-restart an incompatible server.
-                // No dialog to update on a background reconnect, so progress is dropped. A plain
-                // reconnect never force-reinstalls — only the explicit "update" button does.
-                let bridge = crate::remote::start_ssh_remote_bridge(
-                    ssh_target,
-                    false,
-                    false,
-                    None,
-                    &crate::remote::ignore_progress,
+                // Provisioning rides the retry sweep (the non-modal add-remote flow): stages are
+                // forwarded to the host's banner sub-lines, and the whole bring-up is bounded by
+                // the per-stage idle window so a stuck host fails instead of hanging the retry.
+                // `restart_incompatible` is the one-shot user approval from an explicit
+                // retry-after-restart-confirm (issue #12); plain reconnects never restart an
+                // incompatible server. A reconnect never force-reinstalls — only "update" does.
+                let bridge = run_remote_op_with_progress(
+                    ADD_REMOTE_BRIDGE_IDLE_TIMEOUT,
+                    on_progress,
+                    move |sink| {
+                        crate::remote::start_ssh_remote_bridge(
+                            ssh_target,
+                            restart_incompatible,
+                            false,
+                            None,
+                            sink,
+                        )
+                    },
                 )
-                .map_err(ClientError::ConnectionFailed)?;
+                .map_err(|err| ClientError::ConnectionFailed(remote_op_error_io(err)))?;
                 let socket_path = bridge.client_socket_path().to_path_buf();
                 return connect_secondary_client_stream(
                     &socket_path,
@@ -3298,9 +3323,12 @@ fn run_client_update_remote(
             // is otherwise treated as already-installed and skipped), then live-hand-off onto it.
             crate::remote::start_ssh_remote_bridge(ssh_target, true, true, None, sink)
         })
-        .map_err(|err| match classify_add_remote_bridge_error(err) {
-            AddRemoteFailure::Message(message) => message,
-            AddRemoteFailure::NeedsRestartConfirm { detail, .. } => detail,
+        .map_err(|err| {
+            let io_err = remote_op_error_io(err);
+            match crate::remote::restart_confirm_needed(&io_err) {
+                Some(confirm) => confirm.to_string(),
+                None => map_remote_bridge_error(&io_err.to_string()),
+            }
         })?;
     // The reinstall is done; drop the throwaway bridge. The loop schedules a fresh reconnect so the
     // live stream comes back up on the now-matching protocol (and re-fetches runtime status).
@@ -3310,8 +3338,6 @@ fn run_client_update_remote(
 
 fn spawn_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
-    server_size: (u16, u16),
-    cell_size_px: (u32, u32),
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
     pending_add_remote: &mut bool,
 ) {
@@ -3322,16 +3348,7 @@ fn spawn_client_add_remote_submission(
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
         let started_at = Instant::now();
-        // Forward each provisioning stage to the dialog's live progress line. blocking_send is fine
-        // off the UI loop; a dropped receiver (shutdown) just means the stage is discarded.
-        let progress_tx = event_tx.clone();
-        let on_progress = move |stage: crate::remote::RemoteProvisionStage| {
-            let _ = progress_tx.blocking_send(ClientLoopEvent::AddRemoteProgress {
-                message: stage.label(),
-            });
-        };
-        let result =
-            prepare_client_add_remote_submission(draft, server_size, cell_size_px, &on_progress);
+        let result = prepare_client_add_remote_submission(draft);
         let elapsed = started_at.elapsed();
         let _ = event_tx.blocking_send(ClientLoopEvent::AddRemoteFinished { result, elapsed });
     });
@@ -3351,20 +3368,53 @@ enum RemoteOpError {
     Failed(io::Error),
 }
 
-/// Why an add-remote submission did not succeed.
-#[derive(Debug)]
-enum AddRemoteFailure {
-    /// A plain message for the dialog's status row.
-    Message(String),
-    /// The remote runs an incompatible server that can't live-handoff; ask the user whether to
-    /// restart it (issue #12, macmini). `detail` is the prompt text; `destination` re-targets the
-    /// retry.
-    NeedsRestartConfirm { destination: String, detail: String },
+/// How a failed secondary connection/provisioning attempt should be handled by the retry sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisionFailureDisposition {
+    /// Transient (network blips, timeouts, refused): keep the backoff retry running.
+    Retry,
+    /// Terminal (ssh auth, unknown host, impossible version/seed): stop retrying, surface the
+    /// error on the host banner, and wait for an explicit retry (context-menu reconnect or a
+    /// click on the banner's status glyph).
+    Stop,
+    /// Terminal like [`Self::Stop`], but the remote runs an incompatible server that can't
+    /// live-handoff (issue #12): an explicit retry is allowed to restart that server.
+    StopNeedsRestartConfirm,
 }
 
-impl From<String> for AddRemoteFailure {
-    fn from(message: String) -> Self {
-        AddRemoteFailure::Message(message)
+/// Classify a failed secondary connection attempt. Protocol mismatches are handled by the caller
+/// (they stop the retry and may trigger #61 auto-update); everything else is judged by the error
+/// text: provably-unrecoverable conditions stop the sweep, anything ambiguous keeps retrying with
+/// the conservative backoff (the pre-existing behaviour for plain reconnects).
+fn classify_provision_failure(err: &ClientError) -> ProvisionFailureDisposition {
+    if let ClientError::ConnectionFailed(io_err) = err {
+        if crate::remote::restart_confirm_needed(io_err).is_some() {
+            return ProvisionFailureDisposition::StopNeedsRestartConfirm;
+        }
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    const TERMINAL_MARKERS: &[&str] = &[
+        // ssh says the host itself is wrong or refuses us — retrying can't fix these.
+        "permission denied",
+        "too many authentication failures",
+        "host key verification failed",
+        "could not resolve hostname",
+        "name or service not known",
+        "nodename nor servname",
+        // remote/unix.rs install verdicts: the binary/seed situation can't improve on its own.
+        "not version",
+        "can't be upgraded in place",
+        "cannot seed remotes",
+        "release manifest",
+        "not executable on the remote host",
+        "does not support the remote-bridge subcommands",
+        "did not respond to --version",
+        "installation cancelled",
+    ];
+    if TERMINAL_MARKERS.iter().any(|marker| text.contains(marker)) {
+        ProvisionFailureDisposition::Stop
+    } else {
+        ProvisionFailureDisposition::Retry
     }
 }
 
@@ -3418,111 +3468,41 @@ where
     }
 }
 
-/// Turn a bridge-setup failure into a dialog-facing [`AddRemoteFailure`]. A
-/// [`crate::remote::RestartConfirmNeeded`] signal becomes a y/N confirm; everything else becomes a
-/// mapped error message.
-fn classify_add_remote_bridge_error(err: RemoteOpError) -> AddRemoteFailure {
+/// Collapse a bounded remote op failure into an `io::Error`, preserving a typed
+/// [`crate::remote::RestartConfirmNeeded`] payload (callers downcast it for the retry-with-restart
+/// affordance). Timeout/worker-gone keep the old dialog wording so logs stay greppable.
+fn remote_op_error_io(err: RemoteOpError) -> io::Error {
     match err {
         RemoteOpError::TimedOut { idle, stage } => {
             let doing = stage.unwrap_or_else(|| "connecting to the remote host".to_string());
-            AddRemoteFailure::Message(format!(
-                "failed to start ssh remote bridge: no progress for {}s while {doing}",
-                idle.as_secs()
-            ))
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "failed to start ssh remote bridge: no progress for {}s while {doing}",
+                    idle.as_secs()
+                ),
+            )
         }
-        RemoteOpError::WorkerGone => AddRemoteFailure::Message(
-            "failed to start ssh remote bridge: remote connection worker exited unexpectedly"
-                .to_string(),
+        RemoteOpError::WorkerGone => io::Error::other(
+            "failed to start ssh remote bridge: remote connection worker exited unexpectedly",
         ),
-        RemoteOpError::Failed(err) => match crate::remote::restart_confirm_needed(&err) {
-            Some(confirm) => AddRemoteFailure::NeedsRestartConfirm {
-                destination: confirm.destination.clone(),
-                detail: confirm.to_string(),
-            },
-            None => AddRemoteFailure::Message(format!(
-                "failed to start ssh remote bridge: {}",
-                map_remote_bridge_error(&err.to_string())
-            )),
-        },
+        RemoteOpError::Failed(err) => err,
     }
 }
 
+/// Register the draft with the local main server's registry — parse + duplicate check +
+/// `remote.add`. NO bridge provisioning happens here: on success the host row is inserted into
+/// the sidebar immediately and the retry sweep brings the connection up with live per-host
+/// progress (so the add-remote form never blocks on a slow install).
 fn prepare_client_add_remote_submission(
     draft: supervisor::AddRemoteDraft,
-    server_size: (u16, u16),
-    cell_size_px: (u32, u32),
-    on_progress: &dyn Fn(crate::remote::RemoteProvisionStage),
-) -> Result<ClientAddRemoteSuccess, AddRemoteFailure> {
+) -> Result<crate::remote_registry::RemoteDefinitionSnapshot, String> {
     let target = crate::remote_registry::RemoteTargetSnapshot::parse(&draft.target)
         .map_err(|err| err.message().to_string())?;
     reject_duplicate_main_target(&target)?;
 
-    let keybindings = draft.keybindings;
-    let restart_incompatible = draft.restart_incompatible;
-    let (stream, bridge) = match &target {
-        crate::remote_registry::RemoteTargetSnapshot::Local { session } => {
-            validate_add_remote_target(
-                crate::api::client::ConnectionTarget::LocalSession(session.clone()),
-                |connection_target| {
-                    let mut api = crate::api::client::ApiClient::for_target(connection_target);
-                    supervisor::request_runtime_status(&mut api)
-                },
-            )?;
-            let socket_path = crate::session::client_socket_path_for(session.as_deref());
-            let stream = connect_secondary_client_stream(
-                &socket_path,
-                server_size,
-                cell_size_px.0,
-                cell_size_px.1,
-                keybindings,
-            )
-            .map_err(|err| err.to_string())?;
-            (stream, None)
-        }
-        crate::remote_registry::RemoteTargetSnapshot::Ssh { target, args } => {
-            let ssh_target = crate::remote::SshTarget::new(target.clone(), args.clone());
-            let bridge = run_remote_op_with_progress(
-                ADD_REMOTE_BRIDGE_IDLE_TIMEOUT,
-                on_progress,
-                move |sink| {
-                    crate::remote::start_ssh_remote_bridge(
-                        ssh_target,
-                        restart_incompatible,
-                        false, // add-remote reuses a version-matching binary; only "update" forces
-                        None,
-                        sink,
-                    )
-                },
-            )
-            .map_err(classify_add_remote_bridge_error)?;
-            validate_add_remote_target(
-                crate::api::client::ConnectionTarget::SocketPath(
-                    bridge.api_socket_path().to_path_buf(),
-                ),
-                |connection_target| {
-                    let mut api = crate::api::client::ApiClient::for_target(connection_target);
-                    supervisor::request_runtime_status(&mut api)
-                },
-            )?;
-            let stream = connect_secondary_client_stream(
-                bridge.client_socket_path(),
-                server_size,
-                cell_size_px.0,
-                cell_size_px.1,
-                keybindings,
-            )
-            .map_err(|err| err.to_string())?;
-            (stream, Some(bridge))
-        }
-    };
-
     let mut main_api = crate::api::client::ApiClient::local();
-    let remote = submit_remote_add_to_main_api(&mut main_api, draft)?;
-    Ok(ClientAddRemoteSuccess {
-        remote,
-        stream,
-        bridge,
-    })
+    submit_remote_add_to_main_api(&mut main_api, draft)
 }
 
 fn reject_duplicate_main_target(
@@ -3545,44 +3525,6 @@ fn main_server_target_snapshot() -> Option<crate::remote_registry::RemoteTargetS
     Some(crate::remote_registry::RemoteTargetSnapshot::Local {
         session: crate::session::active_name(),
     })
-}
-
-fn validate_add_remote_target(
-    target: crate::api::client::ConnectionTarget,
-    mut status_for_target: impl FnMut(
-        crate::api::client::ConnectionTarget,
-    ) -> Result<crate::api::RuntimeStatus, String>,
-) -> Result<(), String> {
-    let deadline = Instant::now() + ADD_REMOTE_TARGET_VALIDATE_TIMEOUT;
-    loop {
-        match status_for_target(target.clone()) {
-            Ok(status) => {
-                if status.protocol != Some(PROTOCOL_VERSION) {
-                    return Err(format!(
-                        "protocol mismatch: server protocol {:?}, client protocol {}",
-                        status.protocol, PROTOCOL_VERSION
-                    ));
-                }
-                return Ok(());
-            }
-            Err(err)
-                if add_remote_target_status_error_is_transient(&err)
-                    && Instant::now() < deadline =>
-            {
-                std::thread::sleep(ADD_REMOTE_TARGET_VALIDATE_RETRY_DELAY);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-fn add_remote_target_status_error_is_transient(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("resource temporarily unavailable")
-        || error.contains("operation would block")
-        || error.contains("timed out")
-        || error.contains("connection refused")
-        || error.contains("no such file or directory")
 }
 
 /// #42: spawn the LOCAL main/registry/ui-settings/summary refresh OFF the UI loop. The render/
@@ -4153,8 +4095,12 @@ fn schedule_missing_secondary_stream_retries(
         .chain(model.unconnected_secondary_server_ids());
     for server_id in retry_server_ids {
         // #43: a manually-disconnected host stays down — never re-enqueue its stream retry, or the
-        // next tick would silently reconnect it (collapsing Disconnect into a no-op).
-        if state.manually_disconnected.contains(&server_id) {
+        // next tick would silently reconnect it (collapsing Disconnect into a no-op). A host whose
+        // provisioning failed TERMINALLY likewise stays down until an explicit retry clears the
+        // mark (re-enqueueing it here would undo the stop-on-terminal-failure classification).
+        if state.manually_disconnected.contains(&server_id)
+            || state.provision_failed.contains(&server_id)
+        {
             continue;
         }
         state
@@ -4219,9 +4165,12 @@ fn retry_due_secondary_connections(
         .collect();
 
     for (server_id, attempt) in due {
-        // #43: a manually-disconnected host must not be reconnected by the retry sweep. Drop any
-        // stale retry entry and skip it so it stays down until an explicit "reconnect".
-        if state.manually_disconnected.contains(&server_id) {
+        // #43: a manually-disconnected host must not be reconnected by the retry sweep — nor a
+        // host stopped on a terminal provisioning failure. Drop any stale retry entry and skip it
+        // so it stays down until an explicit "reconnect"/retry.
+        if state.manually_disconnected.contains(&server_id)
+            || state.provision_failed.contains(&server_id)
+        {
             state.secondary_retries.remove(&server_id);
             continue;
         }
@@ -4254,6 +4203,10 @@ fn retry_due_secondary_connections(
         state
             .pending_secondary_connect_server_ids
             .insert(server_id.clone());
+        // One-shot approval from an explicit retry after a restart-confirm failure (issue #12):
+        // this attempt may restart an incompatible no-handoff remote server. Consumed here so a
+        // later background retry can never restart a server without a fresh approval.
+        let restart_incompatible = state.retry_restart_incompatible.remove(&server_id);
         spawn_secondary_connection_retry(
             server_id.clone(),
             attempt,
@@ -4262,11 +4215,17 @@ fn retry_due_secondary_connections(
             state.cell_size_px.0,
             state.cell_size_px.1,
             existing_ssh_client_socket,
+            restart_incompatible,
             event_tx,
         );
         if let Some(model) = &mut state.supervisor_model {
             let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Connecting);
+            // A fresh attempt owns the banner sub-lines: drop the previous attempt's stage log and
+            // any terminal failure outcome so this run's progress is never masked by stale lines.
+            model.set_update_progress(&server_id, None);
+            model.clear_update_outcome(&server_id);
         }
+        state.update_outcome_expiry.remove(&server_id);
         state.request_full_redraw();
     }
 }
@@ -4279,17 +4238,31 @@ fn spawn_secondary_connection_retry(
     cell_width_px: u32,
     cell_height_px: u32,
     existing_ssh_client_socket: Option<std::path::PathBuf>,
+    restart_incompatible: bool,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
         let started_at = Instant::now();
+        // Forward each provisioning stage to the host's banner sub-lines (the same per-host feed
+        // the one-click "update" uses), so a fresh-host install during add-remote/reconnect reads
+        // as forward motion in the sidebar instead of a silent "connecting…" (issue #32).
+        let progress_tx = event_tx.clone();
+        let progress_server_id = server_id.clone();
+        let on_progress = move |stage: crate::remote::RemoteProvisionStage| {
+            let _ = progress_tx.blocking_send(ClientLoopEvent::UpdateRemoteProgress {
+                server_id: progress_server_id.clone(),
+                message: stage.label(),
+            });
+        };
         let result = connect_secondary_client_stream_for_plan_detached(
             plan,
             server_size,
             cell_width_px,
             cell_height_px,
             existing_ssh_client_socket,
+            restart_incompatible,
+            &on_progress,
         );
         let elapsed = started_at.elapsed();
         let _ = event_tx.blocking_send(ClientLoopEvent::SecondaryConnectionAttemptFinished {
@@ -4682,6 +4655,8 @@ async fn run_client_loop(
         ssh_bridges,
         secondary_retries: HashMap::new(),
         manually_disconnected: HashSet::new(),
+        provision_failed: HashSet::new(),
+        retry_restart_incompatible: HashSet::new(),
         pending_update_remote: HashSet::new(),
         update_outcome_expiry: HashMap::new(),
         auto_update_suppressed: HashSet::new(),
@@ -4925,8 +4900,6 @@ async fn run_client_loop(
                                 model.set_add_remote_in_progress();
                                 spawn_client_add_remote_submission(
                                     draft,
-                                    state.reported_size,
-                                    state.cell_size_px,
                                     &event_tx,
                                     &mut state.pending_add_remote,
                                 );
@@ -5005,14 +4978,21 @@ async fn run_client_loop(
                             // #43: restore a manually-disconnected stream — clear the mark and
                             // schedule an immediate (0-backoff) reconnect; the retry sweep then dials
                             // it back up. Mark the model Connecting so the banner reflects the attempt.
+                            // Doubles as the explicit RETRY for a terminal provisioning failure: the
+                            // failed mark and the pinned failure outcome are cleared so the fresh
+                            // attempt's progress owns the banner sub-lines again.
                             ClientInputDispatch::ReconnectRemote { server_id } => {
                                 state.manually_disconnected.remove(&server_id);
+                                state.provision_failed.remove(&server_id);
                                 if let Some(model) = &mut state.supervisor_model {
                                     let _ = model.set_connection_state(
                                         &server_id,
                                         supervisor::ConnectionState::Connecting,
                                     );
+                                    model.set_update_progress(&server_id, None);
+                                    model.clear_update_outcome(&server_id);
                                 }
+                                state.update_outcome_expiry.remove(&server_id);
                                 schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                                 state.request_full_redraw();
                                 render_cached_composited_frame(&mut state);
@@ -5585,12 +5565,19 @@ async fn run_client_loop(
                         }
 
                         state.secondary_retries.remove(&server_id);
+                        state.provision_failed.remove(&server_id);
+                        state.retry_restart_incompatible.remove(&server_id);
+                        state.update_outcome_expiry.remove(&server_id);
                         let now = Instant::now();
                         if let Some(model) = &mut state.supervisor_model {
                             let _ = model.set_connection_state(
                                 &server_id,
                                 supervisor::ConnectionState::Connected,
                             );
+                            // The connection is up: the provisioning stage log and any stale
+                            // failure outcome have served their purpose — drop the sub-lines.
+                            model.set_update_progress(&server_id, None);
+                            model.clear_update_outcome(&server_id);
                             // item 6 (Area 6): prioritize the just-connected server. Neither
                             // `set_connection_state(.., Connected)` nor anything here sets
                             // `active_server_id`, so key off the handler's explicit `server_id`
@@ -5630,13 +5617,65 @@ async fn run_client_loop(
                         ) {
                             state.secondary_retries.remove(&server_id);
                         } else {
-                            let next_attempt = attempt.saturating_add(1);
-                            schedule_secondary_retry(
-                                &mut state,
-                                server_id.clone(),
-                                next_attempt,
-                                Instant::now(),
-                            );
+                            match classify_provision_failure(&err) {
+                                ProvisionFailureDisposition::Retry => {
+                                    let next_attempt = attempt.saturating_add(1);
+                                    let delay = secondary_retry_delay(next_attempt);
+                                    schedule_secondary_retry(
+                                        &mut state,
+                                        server_id.clone(),
+                                        next_attempt,
+                                        Instant::now(),
+                                    );
+                                    // Leave the failure visible between attempts: the stage log
+                                    // keeps the history and this transient line says what failed
+                                    // and that the sweep is still on it.
+                                    if let Some(model) = &mut state.supervisor_model {
+                                        model.set_update_progress(
+                                            &server_id,
+                                            Some(format!(
+                                                "✗ {} — retrying in {}s",
+                                                map_remote_bridge_error(&err.to_string()),
+                                                delay.as_secs()
+                                            )),
+                                        );
+                                    }
+                                }
+                                disposition @ (ProvisionFailureDisposition::Stop
+                                | ProvisionFailureDisposition::StopNeedsRestartConfirm) => {
+                                    // Terminal: retrying cannot fix this (ssh auth, unknown host,
+                                    // impossible seed/version, or a server restart that needs
+                                    // explicit approval). Stop the sweep and pin a persistent,
+                                    // multiline failure on the banner; an explicit retry (context
+                                    // menu / status glyph) clears it and starts fresh.
+                                    state.secondary_retries.remove(&server_id);
+                                    state.provision_failed.insert(server_id.clone());
+                                    let retry_hint = if disposition
+                                        == ProvisionFailureDisposition::StopNeedsRestartConfirm
+                                    {
+                                        state.retry_restart_incompatible.insert(server_id.clone());
+                                        "retry restarts the remote server (live panes interrupted)"
+                                    } else {
+                                        "fix the cause, then retry from the host menu or its status glyph"
+                                    };
+                                    if let Some(model) = &mut state.supervisor_model {
+                                        model.set_update_progress(&server_id, None);
+                                        model.set_update_outcome(
+                                            &server_id,
+                                            crate::app::state::HostUpdateOutcome {
+                                                success: false,
+                                                message: format!(
+                                                    "✗ {}\n  {retry_hint}",
+                                                    map_remote_bridge_error(&err.to_string())
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    // No expiry: a terminal provisioning failure stays visible
+                                    // until an explicit retry clears it.
+                                    state.update_outcome_expiry.remove(&server_id);
+                                }
+                            }
                         }
                         state.ssh_bridges.remove(&server_id);
                         if let Some(model) = &mut state.supervisor_model {
@@ -5652,108 +5691,42 @@ async fn run_client_loop(
                 state.request_full_redraw();
                 request_composited_render(&mut state);
             }
-            ClientLoopEvent::AddRemoteProgress { message } => {
-                // Update the dialog's live provisioning line (ignored once the form has closed or
-                // the worker already reported a terminal error).
-                if let Some(model) = &mut state.supervisor_model {
-                    model.set_add_remote_progress(message);
-                }
-                state.request_full_redraw();
-                render_cached_composited_frame(&mut state);
-            }
             ClientLoopEvent::AddRemoteFinished { result, elapsed } => {
                 state.pending_add_remote = false;
                 if elapsed > CLIENT_60FPS_FRAME_BUDGET {
                     debug!(
                         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
                         frame_budget_fps = fps_for_frame_duration(CLIENT_60FPS_FRAME_BUDGET),
-                        "client add-remote submission completed off UI thread"
+                        "client add-remote registration completed off UI thread"
                     );
                 }
                 match result {
-                    Ok(success) => {
-                        // Clone the (Arc-backed) counters registry up front so we can resolve the
-                        // new server's byte counter without re-borrowing `state` inside the model borrow.
-                        let rx_counters = state.rx_counters.clone();
-                        // Resolve the framing cap before the `&mut state.supervisor_model` borrow
-                        // below (which would otherwise block reading `state.kitty_graphics_enabled`).
-                        let max_frame_size = server_frame_size_cap(state.kitty_graphics_enabled);
-                        if let Some(model) = &mut state.supervisor_model {
-                            let server_id = model.add_secondary(success.remote);
-                            if let Some(bridge) = success.bridge {
-                                state.ssh_bridges.insert(server_id.clone(), bridge);
-                            }
-                            let rx_bytes = rx_counters.counter(&server_id);
-                            match attach_secondary_client_stream(
-                                server_id.clone(),
-                                success.stream,
-                                rx_bytes,
-                                &event_tx,
-                                &should_quit,
-                                &mut server_writes,
-                                max_frame_size,
-                            ) {
-                                Ok(()) => {
-                                    let _ = model.set_connection_state(
-                                        &server_id,
-                                        supervisor::ConnectionState::Connected,
-                                    );
-                                    model.finish_add_remote();
-                                    let now = Instant::now();
-                                    // item 6 (Area 6): prioritize the just-added server's summary
-                                    // by the handler's explicit `server_id` (adding a remote does
-                                    // not set `active_server_id`). Put it in flight FIRST; the
-                                    // dedupe guard collapses the follow-on fan-out for this id.
-                                    start_single_secondary_summary_refresh(
-                                        model,
-                                        &server_id,
-                                        &state.ssh_bridges,
-                                        &mut state.pending_summary_refresh_server_ids,
-                                        &event_tx,
-                                    );
-                                    state.last_summary_refresh.insert(server_id.clone(), now);
-                                    refresh_client_supervisor_summaries(
-                                        model,
-                                        &mut state.pending_main_refresh,
-                                        &state.ssh_bridges,
-                                        &mut state.pending_summary_refresh_server_ids,
-                                        &event_tx,
-                                    );
-                                    start_missing_supervisor_summary_subscriptions(
-                                        model,
-                                        &mut state.summary_subscription_server_ids,
-                                        &state.ssh_bridges,
-                                        &event_tx,
-                                        &should_quit,
-                                    );
-                                    state.last_supervisor_summary_refresh = now;
-                                }
-                                Err(err) => {
-                                    let _ = model.set_connection_state(
-                                        &server_id,
-                                        connection_state_from_client_error(&err),
-                                    );
-                                    model.set_add_remote_error(err.to_string());
-                                }
-                            }
+                    Ok(remote) => {
+                        // Registration succeeded: close the form NOW and insert the host row in
+                        // `Connecting` state — provisioning (install/bridge) happens in the retry
+                        // sweep with live progress sub-lines under the banner, so the user is never
+                        // stuck in a modal waiting for a slow install (and a failure surfaces on
+                        // the row itself, retryable via the context menu or the status glyph).
+                        let server_id = state.supervisor_model.as_mut().map(|model| {
+                            model.finish_add_remote();
+                            let server_id = model.add_secondary_with_state(
+                                remote,
+                                supervisor::ConnectionState::Connecting,
+                            );
+                            model.set_update_progress(
+                                &server_id,
+                                Some("waiting to connect…".to_string()),
+                            );
+                            server_id
+                        });
+                        if let Some(server_id) = server_id {
+                            schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                         }
                     }
-                    Err(AddRemoteFailure::Message(err)) => {
-                        warn!(err = %err, "failed to add client remote");
+                    Err(err) => {
+                        warn!(err = %err, "failed to register client remote");
                         if let Some(model) = &mut state.supervisor_model {
                             model.set_add_remote_error(err);
-                        }
-                    }
-                    Err(AddRemoteFailure::NeedsRestartConfirm {
-                        destination,
-                        detail,
-                    }) => {
-                        warn!(
-                            destination = %destination,
-                            "add-remote blocked on an incompatible no-handoff server; prompting to restart"
-                        );
-                        if let Some(model) = &mut state.supervisor_model {
-                            model.set_add_remote_restart_confirm(destination, detail);
                         }
                     }
                 }
@@ -6615,34 +6588,55 @@ mod tests {
     }
 
     #[test]
-    fn classify_bridge_error_turns_restart_signal_into_confirm() {
+    fn classify_provision_failure_turns_restart_signal_into_confirm_stop() {
         let signal = crate::remote::RestartConfirmNeeded {
             destination: "macmini".to_string(),
             version: Some("0.5.10".to_string()),
             protocol: Some(6),
         };
-        let failure =
-            classify_add_remote_bridge_error(RemoteOpError::Failed(io::Error::other(signal)));
-        match failure {
-            AddRemoteFailure::NeedsRestartConfirm {
-                destination,
-                detail,
-            } => {
-                assert_eq!(destination, "macmini");
-                assert!(detail.contains("protocol 6") && detail.contains("Restart"));
-            }
-            other => panic!("expected NeedsRestartConfirm, got {other:?}"),
+        let err = ClientError::ConnectionFailed(io::Error::other(signal));
+        assert_eq!(
+            classify_provision_failure(&err),
+            ProvisionFailureDisposition::StopNeedsRestartConfirm
+        );
+    }
+
+    #[test]
+    fn classify_provision_failure_stops_on_terminal_errors() {
+        // Retrying cannot fix ssh auth, an unknown hostname, or an impossible seed/version.
+        for terminal in [
+            "Permission denied (publickey,password).",
+            "ssh: Could not resolve hostname nope: nodename nor servname provided",
+            "Host key verification failed.",
+            "installed remote herdr at \"$HOME/.local/bin/herdr\", but it reports `herdr 0.6.9`, not version 0.6.10-mx.1",
+            "this mx-channel build (0.6.10-mx.1) cannot seed remotes from the herdr.dev release manifest",
+            "remote herdr is incompatible and can't be upgraded in place — update it and retry",
+        ] {
+            let err = ClientError::ConnectionFailed(io::Error::other(terminal));
+            assert_eq!(
+                classify_provision_failure(&err),
+                ProvisionFailureDisposition::Stop,
+                "expected terminal stop for {terminal:?}"
+            );
         }
     }
 
     #[test]
-    fn classify_bridge_error_maps_plain_failures_to_message() {
-        let failure = classify_add_remote_bridge_error(RemoteOpError::Failed(io::Error::other(
+    fn classify_provision_failure_retries_transient_errors() {
+        // Network blips keep the conservative backoff retry running (pre-existing behaviour).
+        for transient in [
             "ssh: connect to host x port 22: Connection refused",
-        )));
-        match failure {
-            AddRemoteFailure::Message(msg) => assert!(msg.contains("cannot reach host")),
-            other => panic!("expected Message, got {other:?}"),
+            "ssh: connect to host claude-m3max port 22: Operation timed out",
+            "failed to start ssh remote bridge: no progress for 90s while installing herdr on the remote…",
+            "ssh bridge exited with exit status: 255",
+            "weird novel failure",
+        ] {
+            let err = ClientError::ConnectionFailed(io::Error::other(transient));
+            assert_eq!(
+                classify_provision_failure(&err),
+                ProvisionFailureDisposition::Retry,
+                "expected retry for {transient:?}"
+            );
         }
     }
 
@@ -6753,6 +6747,8 @@ mod tests {
             ssh_bridges: HashMap::new(),
             secondary_retries: HashMap::new(),
             manually_disconnected: HashSet::new(),
+            provision_failed: HashSet::new(),
+            retry_restart_incompatible: HashSet::new(),
             pending_update_remote: HashSet::new(),
             update_outcome_expiry: HashMap::new(),
             auto_update_suppressed: HashSet::new(),
@@ -7372,7 +7368,6 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                restart_incompatible: false,
             },
         )
         .unwrap();
@@ -7403,67 +7398,6 @@ mod tests {
             add_remote_error_message("some unmapped failure"),
             "some unmapped failure"
         );
-    }
-
-    #[test]
-    fn validate_add_remote_target_rejects_local_protocol_mismatch() {
-        let err = validate_add_remote_target(
-            crate::api::client::ConnectionTarget::LocalSession(Some("dev".into())),
-            |_| {
-                Ok(crate::api::RuntimeStatus {
-                    version: Some("0.6.0".into()),
-                    protocol: Some(crate::protocol::PROTOCOL_VERSION - 1),
-                    capabilities: None,
-                })
-            },
-        )
-        .unwrap_err();
-
-        assert!(err.contains("protocol mismatch"));
-        assert!(err.contains(&crate::protocol::PROTOCOL_VERSION.to_string()));
-    }
-
-    #[test]
-    fn validate_add_remote_target_accepts_ssh_bridge_api_socket() {
-        let err = validate_add_remote_target(
-            crate::api::client::ConnectionTarget::SocketPath(std::path::PathBuf::from(
-                "/tmp/herdr-prod-api.sock",
-            )),
-            |_| {
-                Ok(crate::api::RuntimeStatus {
-                    version: Some("0.6.0".into()),
-                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
-                    capabilities: None,
-                })
-            },
-        );
-
-        assert_eq!(err, Ok(()));
-    }
-
-    #[test]
-    fn validate_add_remote_target_retries_transient_bridge_timeout() {
-        let mut attempts = 0;
-
-        let err = validate_add_remote_target(
-            crate::api::client::ConnectionTarget::SocketPath(std::path::PathBuf::from(
-                "/tmp/herdr-prod-api.sock",
-            )),
-            |_| {
-                attempts += 1;
-                if attempts == 1 {
-                    return Err("Resource temporarily unavailable (os error 35)".to_string());
-                }
-                Ok(crate::api::RuntimeStatus {
-                    version: Some("0.6.0".into()),
-                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
-                    capabilities: None,
-                })
-            },
-        );
-
-        assert_eq!(err, Ok(()));
-        assert_eq!(attempts, 2);
     }
 
     #[test]
@@ -9866,7 +9800,6 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                restart_incompatible: false,
             })
         );
     }
@@ -10257,51 +10190,20 @@ mod tests {
             crate::api::SOCKET_PATH_ENV_VAR,
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
         ]);
-        let session_api_socket = crate::session::api_socket_path_for(Some("slowadd"));
-        let session_client_socket = crate::session::client_socket_path_for(Some("slowadd"));
         let main_api_socket = crate::api::socket_path();
-        std::fs::create_dir_all(session_api_socket.parent().unwrap()).unwrap();
         std::fs::create_dir_all(main_api_socket.parent().unwrap()).unwrap();
-        let session_api_listener =
-            std::os::unix::net::UnixListener::bind(&session_api_socket).unwrap();
-        let session_client_listener =
-            std::os::unix::net::UnixListener::bind(&session_client_socket).unwrap();
         let main_api_listener = std::os::unix::net::UnixListener::bind(&main_api_socket).unwrap();
 
-        let session_api_thread = std::thread::spawn(move || {
-            let (mut stream, _addr) = session_api_listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut request_line = String::new();
-            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
-            assert!(request_line.contains("\"ping\""));
-            std::thread::sleep(Duration::from_millis(750));
-            let _ = writeln!(
-                stream,
-                "{{\"id\":\"client-supervisor:status\",\"result\":{{\"type\":\"pong\",\"version\":\"0.6.4\",\"protocol\":{}}}}}",
-                PROTOCOL_VERSION
-            );
-        });
-        let session_client_thread = std::thread::spawn(move || {
-            let (mut stream, _addr) = session_client_listener.accept().unwrap();
-            let _hello: ClientMessage =
-                protocol::read_message(&mut stream, MAX_FRAME_SIZE).unwrap();
-            protocol::write_message(
-                &mut stream,
-                &ServerMessage::Welcome {
-                    version: PROTOCOL_VERSION,
-                    encoding: RenderEncoding::SemanticFrame,
-                    error: None,
-                },
-            )
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(250));
-        });
+        // The registration worker only talks to the LOCAL main API (`remote.add`) — provisioning
+        // happens later in the retry sweep — so a slow registry response is the only thing that
+        // could block. Delay it past a frame budget to prove the spawn itself never blocks.
         let main_api_thread = std::thread::spawn(move || {
             let (mut stream, _addr) = main_api_listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap();
             assert!(request_line.contains("\"remote.add\""));
+            std::thread::sleep(Duration::from_millis(250));
             let _ = writeln!(
                 stream,
                 "{{\"id\":\"client:remote-add\",\"result\":{{\"type\":\"remote_added\",\"remote\":{{\"id\":\"remote-slowadd\",\"name\":\"slowadd\",\"target\":{{\"type\":\"local\",\"session\":\"slowadd\"}},\"keybindings\":\"local\"}}}}}}"
@@ -10312,19 +10214,12 @@ mod tests {
             target: "local:slowadd".into(),
             name: Some("slowadd".into()),
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-            restart_incompatible: false,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let mut pending_add_remote = false;
 
         let started_at = Instant::now();
-        spawn_client_add_remote_submission(
-            draft,
-            (80, 24),
-            (0, 0),
-            &event_tx,
-            &mut pending_add_remote,
-        );
+        spawn_client_add_remote_submission(draft, &event_tx, &mut pending_add_remote);
         let elapsed = started_at.elapsed();
 
         assert!(pending_add_remote);
@@ -10338,13 +10233,12 @@ mod tests {
         let event = event_rx.blocking_recv().unwrap();
         match event {
             ClientLoopEvent::AddRemoteFinished { result, .. } => {
-                assert!(result.is_ok());
+                let remote = result.expect("registration should succeed");
+                assert_eq!(remote.id, "remote-slowadd");
             }
             _ => panic!("expected async add-remote result"),
         }
 
-        session_api_thread.join().unwrap();
-        session_client_thread.join().unwrap();
         main_api_thread.join().unwrap();
         std::fs::remove_dir_all(config_home).ok();
     }
@@ -10406,18 +10300,14 @@ mod tests {
             other => panic!("expected idle timeout, got {other:?}"),
         }
 
-        // And that timeout maps to a truthful, stage-named dialog message.
-        let failure = classify_add_remote_bridge_error(RemoteOpError::TimedOut {
+        // And that timeout maps to a truthful, stage-named error message.
+        let io_err = remote_op_error_io(RemoteOpError::TimedOut {
             idle: Duration::from_secs(90),
             stage: Some("installing herdr on the remote…".to_string()),
         });
-        match failure {
-            AddRemoteFailure::Message(msg) => {
-                assert!(msg.contains("installing herdr on the remote"), "got: {msg}");
-                assert!(msg.contains("no progress for 90s"), "got: {msg}");
-            }
-            other => panic!("expected a message failure, got {other:?}"),
-        }
+        let msg = io_err.to_string();
+        assert!(msg.contains("installing herdr on the remote"), "got: {msg}");
+        assert!(msg.contains("no progress for 90s"), "got: {msg}");
     }
 
     #[test]
@@ -11150,6 +11040,83 @@ mod tests {
             .pending_secondary_connect_server_ids
             .contains(&server_id));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provision_failed_host_retry_entry_dropped_until_explicit_retry() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        model.sync_remote_registry(vec![test_remote_definition("r1", "alpha")]);
+        let server_id = supervisor::ServerId::secondary("r1");
+
+        let mut state = test_client_state_with_model(model);
+        // A terminal provisioning failure (e.g. ssh auth) marked the host stopped.
+        state.provision_failed.insert(server_id.clone());
+        let now = Instant::now();
+        state.secondary_retries.insert(
+            server_id.clone(),
+            SecondaryRetryState {
+                attempt: 0,
+                next_retry_at: now,
+            },
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut server_writes = HashMap::new();
+        retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
+
+        // The sweep drops the entry and spawns nothing: a terminal failure stays down.
+        assert!(!state.secondary_retries.contains_key(&server_id));
+        assert!(!state
+            .pending_secondary_connect_server_ids
+            .contains(&server_id));
+        assert!(event_rx.try_recv().is_err());
+
+        // …and the periodic missing-stream sweep must not silently re-enqueue it either.
+        schedule_missing_secondary_stream_retries(&mut state, &server_writes, now);
+        assert!(
+            !state.secondary_retries.contains_key(&server_id),
+            "provision-failed host must not be re-enqueued by the background sweep"
+        );
+    }
+
+    #[test]
+    fn host_banner_glyph_click_retries_only_reconnectable_hosts() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        model.sync_remote_registry(vec![test_remote_definition("r1", "alpha")]);
+        let server_id = supervisor::ServerId::secondary("r1");
+        let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Disconnected);
+        assert!(model.server_is_reconnectable(&server_id));
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // A glyph press on the DOWN host dispatches the reconnect/retry.
+        assert_eq!(
+            dispatch_sidebar_hit_target(
+                compositor::SidebarHitTarget::HostBannerGlyph {
+                    server_id: server_id.clone(),
+                },
+                &mut model,
+                &down,
+            ),
+            ClientInputDispatch::ReconnectRemote {
+                server_id: server_id.clone(),
+            }
+        );
+
+        // On a CONNECTED host the glyph behaves like the plain banner (consume, no retry).
+        let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Connected);
+        assert_eq!(
+            dispatch_sidebar_hit_target(
+                compositor::SidebarHitTarget::HostBannerGlyph { server_id },
+                &mut model,
+                &down,
+            ),
+            ClientInputDispatch::Consumed
+        );
     }
 
     /// §G: `SetRemoteEnabled`/`DeleteRemote` dispatch targets `ServerId::main()` off the UI loop —

@@ -311,9 +311,6 @@ pub(crate) struct AddRemoteForm {
     /// on the in-progress status row in place of the static "connecting to remote…" so seeding a
     /// fresh machine reads as live progress (issue #32). `None` until the first stage arrives.
     pub(crate) progress: Option<String>,
-    /// Set when the worker reported an incompatible no-handoff remote server; the dialog shows a
-    /// y/N restart prompt instead of the spinner/error (issue #12, macmini).
-    pub(crate) restart_confirm: Option<AddRemoteRestartConfirm>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,17 +318,6 @@ pub(crate) struct AddRemoteDraft {
     pub(crate) target: String,
     pub(crate) name: Option<String>,
     pub(crate) keybindings: crate::remote_registry::RemoteKeybindingsSnapshot,
-    /// Set only when retrying after the user approved restarting an incompatible no-handoff remote
-    /// server (issue #12, macmini). Flows to `start_ssh_remote_bridge`.
-    pub(crate) restart_incompatible: bool,
-}
-
-/// Pending user decision: the remote runs an incompatible server that can't live-handoff, so we
-/// ask whether to restart it (interrupting its panes) before attaching.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AddRemoteRestartConfirm {
-    pub(crate) destination: String,
-    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,10 +570,12 @@ pub(crate) struct ClientSupervisorModel {
     // popup by this (clamped on-screen). Dragging the popup's top border accumulates here.
     overlay_drag_offset: (i16, i16),
     optimistic_focus: Option<(ServerId, OptimisticFocusTarget)>, // item 6 (always None in C0)
-    /// #44: per-host live "update" provisioning progress line, keyed by `ServerId` so the banner
-    /// sub-line targets the right host. Populated by `set_update_progress` from the update worker's
-    /// stage events; cleared when the update finishes. Threaded into `host_banner_specs`.
-    update_progress: std::collections::HashMap<ServerId, String>,
+    /// #44: per-host live provisioning progress LOG, keyed by `ServerId` so the banner sub-lines
+    /// target the right host. Fed one stage line at a time by `set_update_progress` from BOTH the
+    /// update worker and the add/reconnect provisioning worker; cleared when the operation finishes.
+    /// The full stage history renders as multiple sub-lines (tail-capped) under the banner, so a
+    /// slow install shows what already happened instead of a single mutating line.
+    update_progress: std::collections::HashMap<ServerId, Vec<String>>,
     /// #61: per-host TERMINAL update outcome (✓ success / ✗ failure) shown on the banner sub-line
     /// once an update finishes, so completion is observable rather than inferred from the spinner
     /// vanishing. Set by `set_update_outcome`; the client loop expires it on a timer (the model holds
@@ -679,14 +667,17 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// #44: set or clear the live "update" provisioning progress line for `id`. `Some(message)`
-    /// shows a banner sub-line under that host; `None` clears it (on finish/teardown). Mirrors
-    /// `set_server_download_bps` in spirit but keyed in a side map (the banner sub-line is render-only
-    /// and not tied to the `ManagedServer`'s persisted state).
+    /// #44: append a live provisioning progress line for `id` (`Some(message)`) or clear the whole
+    /// log (`None`, on finish/teardown). Consecutive duplicate stages collapse so a re-reported
+    /// stage doesn't spam the log. Mirrors `set_server_download_bps` in spirit but keyed in a side
+    /// map (the banner sub-lines are render-only, not tied to the `ManagedServer`'s persisted state).
     pub(crate) fn set_update_progress(&mut self, id: &ServerId, message: Option<String>) {
         match message {
             Some(message) => {
-                self.update_progress.insert(id.clone(), message);
+                let log = self.update_progress.entry(id.clone()).or_default();
+                if log.last() != Some(&message) {
+                    log.push(message);
+                }
             }
             None => {
                 self.update_progress.remove(id);
@@ -694,9 +685,12 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// #44: the current live "update" progress line for `id`, if an update is in flight.
+    /// #44: the latest live provisioning progress line for `id`, if an operation is in flight.
     pub(crate) fn update_progress_for(&self, id: &ServerId) -> Option<&str> {
-        self.update_progress.get(id).map(String::as_str)
+        self.update_progress
+            .get(id)
+            .and_then(|log| log.last())
+            .map(String::as_str)
     }
 
     /// #61: set the TERMINAL update outcome banner sub-line for `id` (a positive "✓ updated …" on
@@ -763,9 +757,21 @@ impl ClientSupervisorModel {
         &mut self,
         definition: crate::remote_registry::RemoteDefinitionSnapshot,
     ) -> ServerId {
+        self.add_secondary_with_state(definition, ConnectionState::Connected)
+    }
+
+    /// Add a freshly-registered secondary in an explicit connection state. The non-modal
+    /// add-remote flow inserts the host row as `Connecting` BEFORE any provisioning happens,
+    /// so the sidebar shows the host (with live progress sub-lines) while the retry sweep
+    /// brings the bridge up.
+    pub(crate) fn add_secondary_with_state(
+        &mut self,
+        definition: crate::remote_registry::RemoteDefinitionSnapshot,
+        connection_state: ConnectionState,
+    ) -> ServerId {
         let id = ServerId::secondary(definition.id.clone());
         self.servers
-            .push(managed_secondary(definition, ConnectionState::Connected));
+            .push(managed_secondary(definition, connection_state));
         id
     }
 
@@ -1004,6 +1010,19 @@ impl ClientSupervisorModel {
 
     pub(crate) fn server_connection_target(&self, id: &ServerId) -> Option<ServerConnectionTarget> {
         self.server(id).map(|server| server.target.clone())
+    }
+
+    /// Whether `id` is a secondary whose stream is down (disconnected or stuck on a protocol
+    /// mismatch) — i.e. a click on its banner status glyph should retry the connection.
+    pub(crate) fn server_is_reconnectable(&self, id: &ServerId) -> bool {
+        self.server(id).is_some_and(|server| {
+            server.role == ServerRole::Secondary
+                && !server.disabled
+                && matches!(
+                    server.connection_state,
+                    ConnectionState::Disconnected | ConnectionState::ProtocolMismatch { .. }
+                )
+        })
     }
 
     pub(crate) fn unconnected_secondary_server_ids(&self) -> Vec<ServerId> {
@@ -1491,7 +1510,6 @@ impl ClientSupervisorModel {
             error: None,
             in_progress: false,
             progress: None,
-            restart_confirm: None,
         });
     }
 
@@ -1514,43 +1532,6 @@ impl ClientSupervisorModel {
 
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return AddRemoteFormOutcome::Redraw;
-        }
-
-        // While the restart-confirm prompt is showing (issue #12, macmini), the form takes only the
-        // y/N decision — not field edits — so a stray keystroke can't silently dismiss it.
-        if self.add_remote_restart_confirm().is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    let Some(form) = self.add_remote_form_mut() else {
-                        return AddRemoteFormOutcome::Redraw;
-                    };
-                    form.restart_confirm = None;
-                    let target = form.target.trim().to_string();
-                    if target.is_empty() {
-                        form.error = Some("target required".to_string());
-                        return AddRemoteFormOutcome::Redraw;
-                    }
-                    let name = trimmed_optional(&form.name);
-                    return AddRemoteFormOutcome::Submit(AddRemoteDraft {
-                        target,
-                        name,
-                        keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                        restart_incompatible: true,
-                    });
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    if let Some(form) = self.add_remote_form_mut() {
-                        let destination = form
-                            .restart_confirm
-                            .take()
-                            .map(|confirm| confirm.destination)
-                            .unwrap_or_default();
-                        form.error = Some(format!("left {destination} unchanged"));
-                    }
-                    return AddRemoteFormOutcome::Redraw;
-                }
-                _ => return AddRemoteFormOutcome::Redraw,
-            }
         }
 
         match key.code {
@@ -1582,7 +1563,6 @@ impl ClientSupervisorModel {
                     target,
                     name,
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                    restart_incompatible: false,
                 })
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1660,23 +1640,6 @@ impl ClientSupervisorModel {
 
     pub(crate) fn finish_add_remote(&mut self) {
         self.close_client_overlay();
-    }
-
-    /// Show the y/N restart prompt for an incompatible no-handoff remote server (issue #12).
-    pub(crate) fn set_add_remote_restart_confirm(&mut self, destination: String, detail: String) {
-        if let Some(form) = self.add_remote_form_mut() {
-            form.in_progress = false;
-            form.error = None;
-            form.restart_confirm = Some(AddRemoteRestartConfirm {
-                destination,
-                detail,
-            });
-        }
-    }
-
-    pub(crate) fn add_remote_restart_confirm(&self) -> Option<&AddRemoteRestartConfirm> {
-        self.add_remote_form()
-            .and_then(|form| form.restart_confirm.as_ref())
     }
 
     // ----- item 3 (Area 5): remote-management overlay -----------------------------------------
@@ -2503,7 +2466,11 @@ impl ClientSupervisorModel {
                         space_count,
                         latency_ms: server.avg_ping_ms(),
                         download_bps: server.download_bps,
-                        update_progress: self.update_progress.get(&server.id).cloned(),
+                        progress_lines: self
+                            .update_progress
+                            .get(&server.id)
+                            .cloned()
+                            .unwrap_or_default(),
                         update_outcome: self.update_outcomes.get(&server.id).cloned(),
                     },
                 ));
@@ -3270,83 +3237,6 @@ mod tests {
         // Re-submitting (e.g. after the restart y/N) starts the progress fresh.
         model.set_add_remote_in_progress();
         assert_eq!(model.add_remote_form().unwrap().progress, None);
-    }
-
-    fn add_remote_char(model: &mut ClientSupervisorModel, ch: char) {
-        model.handle_add_remote_key(crate::input::TerminalKey::new(
-            crossterm::event::KeyCode::Char(ch),
-            crossterm::event::KeyModifiers::empty(),
-        ));
-    }
-
-    fn add_remote_key(
-        model: &mut ClientSupervisorModel,
-        code: crossterm::event::KeyCode,
-    ) -> AddRemoteFormOutcome {
-        model.handle_add_remote_key(crate::input::TerminalKey::new(
-            code,
-            crossterm::event::KeyModifiers::empty(),
-        ))
-    }
-
-    #[test]
-    fn add_remote_restart_confirm_yes_resubmits_with_restart_approval() {
-        let mut model = ClientSupervisorModel::new("local");
-        model.open_add_remote_form();
-        for ch in "macmini".chars() {
-            add_remote_char(&mut model, ch);
-        }
-        // Worker reported an incompatible no-handoff server (issue #12, macmini).
-        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
-        assert!(model.add_remote_restart_confirm().is_some());
-        assert!(!model.add_remote_in_progress());
-
-        // 'y' retries with restart approval, preserving the typed target, and clears the prompt.
-        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('y'));
-        assert_eq!(
-            outcome,
-            AddRemoteFormOutcome::Submit(AddRemoteDraft {
-                target: "macmini".into(),
-                name: None,
-                keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                restart_incompatible: true,
-            })
-        );
-        assert!(model.add_remote_restart_confirm().is_none());
-    }
-
-    #[test]
-    fn add_remote_restart_confirm_no_dismisses_without_submitting() {
-        let mut model = ClientSupervisorModel::new("local");
-        model.open_add_remote_form();
-        for ch in "macmini".chars() {
-            add_remote_char(&mut model, ch);
-        }
-        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
-
-        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('n'));
-        assert_eq!(outcome, AddRemoteFormOutcome::Redraw);
-        assert!(model.add_remote_restart_confirm().is_none());
-        assert!(
-            model.add_remote_form().unwrap().error.is_some(),
-            "declining should leave an explanatory message"
-        );
-    }
-
-    #[test]
-    fn add_remote_restart_confirm_ignores_field_edits() {
-        let mut model = ClientSupervisorModel::new("local");
-        model.open_add_remote_form();
-        for ch in "macmini".chars() {
-            add_remote_char(&mut model, ch);
-        }
-        model.set_add_remote_restart_confirm("macmini".into(), "detail".into());
-
-        // A stray character must not edit the target nor dismiss the prompt.
-        let outcome = add_remote_key(&mut model, crossterm::event::KeyCode::Char('z'));
-        assert_eq!(outcome, AddRemoteFormOutcome::Redraw);
-        assert!(model.add_remote_restart_confirm().is_some());
-        assert_eq!(model.add_remote_form().unwrap().target, "macmini");
     }
 
     #[test]
@@ -5125,7 +5015,6 @@ mod tests {
                 error: None,
                 in_progress: false,
                 progress: None,
-                restart_confirm: None,
             })
         );
     }
@@ -5192,7 +5081,6 @@ mod tests {
                 target: "local:dev".into(),
                 name: Some("dev".into()),
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
-                restart_incompatible: false,
             })
         );
     }
@@ -6259,23 +6147,30 @@ mod tests {
             .expect("remote banner present");
 
         // No progress yet.
-        assert_eq!(
-            model.host_banner_specs()[banner_index].1.update_progress,
-            None
-        );
+        assert!(model.host_banner_specs()[banner_index]
+            .1
+            .progress_lines
+            .is_empty());
 
+        // Stages ACCUMULATE into a log (consecutive duplicates collapse) so a slow install
+        // shows its history as multiple sub-lines.
+        model.set_update_progress(&remote, Some("detecting remote platform…".into()));
+        model.set_update_progress(&remote, Some("installing herdr on the remote…".into()));
         model.set_update_progress(&remote, Some("installing herdr on the remote…".into()));
         assert_eq!(
-            model.host_banner_specs()[banner_index].1.update_progress,
-            Some("installing herdr on the remote…".to_string())
+            model.host_banner_specs()[banner_index].1.progress_lines,
+            vec![
+                "detecting remote platform…".to_string(),
+                "installing herdr on the remote…".to_string(),
+            ]
         );
 
-        // Clearing returns the spec to None.
+        // Clearing empties the log.
         model.set_update_progress(&remote, None);
-        assert_eq!(
-            model.host_banner_specs()[banner_index].1.update_progress,
-            None
-        );
+        assert!(model.host_banner_specs()[banner_index]
+            .1
+            .progress_lines
+            .is_empty());
     }
 
     #[test]

@@ -616,25 +616,86 @@ pub struct HostBannerSpec {
     pub latency_ms: Option<u32>,
     /// Recent downstream frame throughput from this host in bytes/sec, if measured.
     pub download_bps: Option<u64>,
-    /// #44: live "update" provisioning progress line for this host, if an update is in flight.
-    /// When `Some`, the sidebar reserves a render-only sub-line row under the banner and draws a dim
-    /// spinner + this message; the banner row itself stays the only hit target (height 1).
-    pub update_progress: Option<String>,
-    /// #61: a TERMINAL update outcome shown in the sub-line in place of the in-flight progress once
-    /// an update finishes — a positive "✓ updated …" on success or "✗ update failed …" on failure,
-    /// so completion is observable and not merely inferred from the spinner disappearing. Short-lived
-    /// (the client expires it on a timer). Reserves the same sub-line row as `update_progress`.
+    /// #44: live provisioning progress LOG for this host (update or add/reconnect install), oldest
+    /// first. When non-empty, the sidebar reserves render-only sub-line rows under the banner —
+    /// completed stages dim, the last line gets the spinner; the banner row itself stays the only
+    /// hit target (height 1). Tail-capped at [`MAX_HOST_BANNER_SUB_LINES`] for layout.
+    pub progress_lines: Vec<String>,
+    /// #61: a TERMINAL update/provisioning outcome shown in the sub-lines in place of the in-flight
+    /// progress once an operation finishes — a positive "✓ updated …" on success or a (possibly
+    /// multiline) "✗ …" on failure, so completion is observable and not merely inferred from the
+    /// spinner disappearing. Success outcomes are short-lived (the client expires them on a timer);
+    /// provisioning failures persist until a retry clears them.
     pub update_outcome: Option<HostUpdateOutcome>,
 }
 
+/// Cap on render-reserved sub-line rows under a host banner (progress log tail / outcome lines).
+pub const MAX_HOST_BANNER_SUB_LINES: usize = 4;
+
 impl HostBannerSpec {
-    /// #44/#61: whether this banner reserves a render-only sub-line row beneath it — true while an
-    /// update is in flight (`update_progress`) OR while a terminal outcome is being shown
-    /// (`update_outcome`). The layout pass and the renderer agree on this single predicate so the
-    /// reserved row and the drawn row never drift.
-    pub fn has_sub_line(&self) -> bool {
-        self.update_progress.is_some() || self.update_outcome.is_some()
+    /// #44/#61: how many render-only sub-line rows this banner reserves beneath it — the terminal
+    /// outcome's lines when set (it wins over in-flight progress), otherwise the progress-log tail.
+    /// The layout pass and the renderer agree on this single function so the reserved rows and the
+    /// drawn rows never drift.
+    pub fn sub_lines(&self) -> Vec<HostBannerSubLine> {
+        if let Some(outcome) = &self.update_outcome {
+            return outcome
+                .message
+                .lines()
+                .take(MAX_HOST_BANNER_SUB_LINES)
+                .map(|line| HostBannerSubLine {
+                    text: line.to_string(),
+                    kind: if outcome.success {
+                        HostBannerSubLineKind::Success
+                    } else {
+                        HostBannerSubLineKind::Failure
+                    },
+                })
+                .collect();
+        }
+        let skip = self
+            .progress_lines
+            .len()
+            .saturating_sub(MAX_HOST_BANNER_SUB_LINES);
+        let last = self.progress_lines.len().saturating_sub(1);
+        self.progress_lines
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .map(|(idx, line)| HostBannerSubLine {
+                text: line.clone(),
+                kind: if idx == last {
+                    HostBannerSubLineKind::Active
+                } else {
+                    HostBannerSubLineKind::Done
+                },
+            })
+            .collect()
     }
+
+    pub fn sub_line_count(&self) -> u16 {
+        self.sub_lines().len() as u16
+    }
+}
+
+/// One render-only row under a host banner: a finished stage (dim), the in-flight stage
+/// (spinner), or a terminal outcome line (green/red).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBannerSubLine {
+    pub text: String,
+    pub kind: HostBannerSubLineKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostBannerSubLineKind {
+    /// A completed provisioning stage (dim, no spinner).
+    Done,
+    /// The in-flight stage (dim + spinner).
+    Active,
+    /// Terminal success line (green ✓ text).
+    Success,
+    /// Terminal failure line (red ✗ text).
+    Failure,
 }
 
 /// #61: a terminal one-click-update result surfaced on the host banner sub-line. `success` selects
@@ -2493,7 +2554,7 @@ mod tests {
             space_count: 2,
             latency_ms: None,
             download_bps: None,
-            update_progress: None,
+            progress_lines: Vec::new(),
             update_outcome: None,
         };
         assert_eq!(spec.display_name, "prod");
@@ -2513,7 +2574,7 @@ mod tests {
                     space_count: spec.space_count,
                     latency_ms: None,
                     download_bps: None,
-                    update_progress: None,
+                    progress_lines: Vec::new(),
                     update_outcome: None,
                 }
                 .connection_state,

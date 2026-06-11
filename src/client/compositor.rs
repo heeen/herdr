@@ -377,6 +377,13 @@ pub(crate) enum SidebarHitTarget {
     HostBanner {
         server_id: crate::client::supervisor::ServerId,
     },
+    /// The 1-cell status glyph at the left edge of a host banner (config `glyph = Left`). A
+    /// `Down(Left)` here RETRIES a disconnected/provision-failed host (the click affordance the
+    /// banner's failure sub-line points at); on a connected host it falls back to plain
+    /// banner behaviour.
+    HostBannerGlyph {
+        server_id: crate::client::supervisor::ServerId,
+    },
     /// #47: a row of the one open client menu (global launcher / workspace context / host context).
     /// Resolved by `hit_test_client_menu` from the SAME geometry the renderer uses. Replaces the old
     /// per-menu `ClientGlobalMenuItem` / `WorkspaceContextMenuRow` / `HostContextMenuRow` targets.
@@ -1618,6 +1625,16 @@ impl ClientCompositor {
         for banner in snapshot.app.view.host_banner_areas.iter() {
             if rect_contains(banner.rect, x, y) {
                 let server_id = snapshot.host_banner_server_ids.get(banner.banner_idx)?;
+                // The status glyph cell (left edge, when configured Left) is the retry
+                // affordance for a failed/disconnected host — same geometry the renderer uses
+                // (`render` puts the glyph at `banner_area.rect.x`).
+                if x == banner.rect.x
+                    && snapshot.app.sidebar_host.glyph == crate::config::HostBannerGlyph::Left
+                {
+                    return Some(SidebarHitTarget::HostBannerGlyph {
+                        server_id: server_id.clone(),
+                    });
+                }
                 return Some(SidebarHitTarget::HostBanner {
                     server_id: server_id.clone(),
                 });
@@ -2412,10 +2429,6 @@ fn render_client_shell(
                     in_progress: form.in_progress,
                     progress: form.progress.as_deref(),
                     spinner: crate::ui::spinner_frame(snapshot.app.spinner_tick),
-                    restart_confirm_destination: form
-                        .restart_confirm
-                        .as_ref()
-                        .map(|confirm| confirm.destination.as_str()),
                 };
                 if let Some(popup) = overlay_popup {
                     crate::ui::render_add_remote_overlay(

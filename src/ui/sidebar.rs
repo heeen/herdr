@@ -1342,18 +1342,18 @@ pub(crate) fn compute_workspace_list_areas_full(
                 row_y = row_y.saturating_add(row_height);
             }
             // item 2: advance one row AND push a banner area (tight, no gap).
-            // #44: when this banner is showing an in-flight "update" progress line, reserve a
-            // SECOND, render-only sub-line row beneath it (advance row_y by 2) — but keep the
-            // `HostBannerArea.rect.height == 1` so only the banner row is a hit target (render ==
-            // hit-test). The bottom-of-list guard requires the full 2-row span so a half-visible
-            // sub-row is dropped cleanly.
+            // #44: when this banner is showing in-flight provisioning progress or a terminal
+            // outcome, reserve render-only sub-line rows beneath it (advance row_y by 1 + N) — but
+            // keep the `HostBannerArea.rect.height == 1` so only the banner row is a hit target
+            // (render == hit-test). The bottom-of-list guard requires the full span so a
+            // half-visible sub-row is dropped cleanly.
             WorkspaceListEntry::HostBanner { banner_idx } => {
-                let updating = app
+                let sub_lines = app
                     .host_banners
                     .get(*banner_idx)
-                    .map(|spec| spec.has_sub_line())
-                    .unwrap_or(false);
-                let advance = if updating { 2 } else { 1 };
+                    .map(|spec| spec.sub_line_count())
+                    .unwrap_or(0);
+                let advance = 1 + sub_lines;
                 if row_y.saturating_add(advance) > body_bottom {
                     break;
                 }
@@ -1917,35 +1917,33 @@ fn render_workspace_list(
             );
         }
 
-        // #44/#61: render-only sub-line one row beneath the banner. The layout pass
-        // (`compute_workspace_list_areas_full`) already advanced row_y by 2 for any banner whose
-        // `has_sub_line()` is true, so the sub-row is reserved but is NOT a hit target (the banner
-        // area stays height 1 — render == hit-test). It shows EITHER an in-flight `update_progress`
-        // line (dim spinner + message, `overlay0` like the agent braille spinner) OR, once the update
-        // finishes, a terminal `update_outcome` (✓ green / ✗ red, no spinner) so completion/failure
-        // is observable rather than inferred from the spinner vanishing. Outcome wins when both are
-        // set. Guard the bottom of the list so a half-visible sub-row is never drawn.
-        let sub_line = spec
-            .update_outcome
-            .as_ref()
-            .map(|outcome| {
-                let color = if outcome.success { p.green } else { p.red };
-                (outcome.message.clone(), color)
-            })
-            .or_else(|| {
-                spec.update_progress.as_ref().map(|message| {
-                    let spinner = super::spinner_frame(app.spinner_tick);
-                    (format!("{spinner} {message}"), p.overlay0)
-                })
-            });
-        if let Some((text, color)) = sub_line {
-            let sub_y = row_y + 1;
-            if sub_y < list_bottom {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
-                    Rect::new(banner_area.rect.x, sub_y, banner_area.rect.width, 1),
-                );
+        // #44/#61: render-only sub-lines beneath the banner. The layout pass
+        // (`compute_workspace_list_areas_full`) already advanced row_y by 1 + `sub_line_count()`,
+        // so the sub-rows are reserved but are NOT hit targets (the banner area stays height 1 —
+        // render == hit-test). In-flight progress shows the stage history: finished stages dim with
+        // a `✓`, the last line carries the spinner; a terminal `update_outcome` (✓ green / ✗ red,
+        // possibly multiline for failures) wins over progress so completion/failure is observable
+        // rather than inferred from the spinner vanishing. Guard the bottom of the list so a
+        // half-visible sub-row is never drawn.
+        for (line_idx, sub_line) in spec.sub_lines().into_iter().enumerate() {
+            let sub_y = row_y + 1 + line_idx as u16;
+            if sub_y >= list_bottom {
+                break;
             }
+            use crate::app::state::HostBannerSubLineKind;
+            let (text, color) = match sub_line.kind {
+                HostBannerSubLineKind::Done => (format!("✓ {}", sub_line.text), p.overlay0),
+                HostBannerSubLineKind::Active => {
+                    let spinner = super::spinner_frame(app.spinner_tick);
+                    (format!("{spinner} {}", sub_line.text), p.overlay0)
+                }
+                HostBannerSubLineKind::Success => (sub_line.text, p.green),
+                HostBannerSubLineKind::Failure => (sub_line.text, p.red),
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+                Rect::new(banner_area.rect.x, sub_y, banner_area.rect.width, 1),
+            );
         }
     }
 
@@ -2933,7 +2931,7 @@ mod tests {
             space_count: 1,
             latency_ms: Some(50),
             download_bps: Some(312_000),
-            update_progress: None,
+            progress_lines: Vec::new(),
             update_outcome: None,
         };
         let (spans, width) = host_banner_metric_spans(&spec, &p);
@@ -5012,7 +5010,7 @@ lines = [
                 space_count: 1,
                 latency_ms: None,
                 download_bps: None,
-                update_progress: None,
+                progress_lines: Vec::new(),
                 update_outcome: None,
             })
             .collect();
@@ -5112,8 +5110,8 @@ lines = [
 
         // Updating: same layout, but the banner's spec carries an in-flight progress line.
         let mut updating = host_banner_app(&[false, true], &[1], &[HostBannerState::Connected]);
-        updating.host_banners[0].update_progress =
-            Some("installing herdr on the remote…".to_string());
+        updating.host_banners[0].progress_lines =
+            vec!["installing herdr on the remote…".to_string()];
         let (upd_cards, upd_banners, _) = compute_workspace_list_areas_full(&updating, area);
         let upd_banner = upd_banners[0];
         let upd_next = upd_cards
