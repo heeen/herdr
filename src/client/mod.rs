@@ -394,6 +394,17 @@ enum ClientInputDispatch {
     UpdateRemote {
         server_id: supervisor::ServerId,
     },
+    /// Worktree-menu parity: the "open worktree…" picker opened in its loading state; fetch the
+    /// workspace's `worktree.list` from the owning server off the UI loop and fill the picker.
+    FetchWorktreeList {
+        server_id: supervisor::ServerId,
+        workspace_id: String,
+    },
+    /// Worktree-menu parity: flip the group's client-local collapsed state — the same set the
+    /// sidebar chevron toggles; handled where `&mut compositor` is in scope.
+    ToggleWorktreeGroup {
+        group_key: String,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -495,6 +506,16 @@ fn dispatch_for_client_menu_outcome(
         // event channel are in scope.
         supervisor::ClientMenuOutcome::HostUpdate(server_id) => {
             ClientInputDispatch::UpdateRemote { server_id }
+        }
+        supervisor::ClientMenuOutcome::FetchWorktreeList {
+            server_id,
+            workspace_id,
+        } => ClientInputDispatch::FetchWorktreeList {
+            server_id,
+            workspace_id,
+        },
+        supervisor::ClientMenuOutcome::ToggleWorktreeGroup { group_key } => {
+            ClientInputDispatch::ToggleWorktreeGroup { group_key }
         }
     }
 }
@@ -613,6 +634,9 @@ fn dispatch_composited_input(
         || model.remote_manage_overlay().is_some()
         || model.rename_workspace_form().is_some()
         || model.confirm_close_workspace().is_some()
+        || model.new_worktree_form().is_some()
+        || model.confirm_delete_worktree().is_some()
+        || model.worktree_picker().is_some()
     {
         return dispatch_client_overlay_input(data, compositor, model, host_size);
     }
@@ -995,8 +1019,8 @@ fn open_focused_workspace_overlay(
         .workspace_label(&server_id, &workspace_id)
         .unwrap_or_else(|| workspace_id.clone());
     // #24/#33: keyboard-opened (no cursor); the menu is immediately promoted to rename/close below
-    // and never shown, so the anchor is irrelevant — use (0, 0).
-    model.open_workspace_context_menu(server_id, workspace_id, label, 0, 0);
+    // and never shown, so the anchor (and the group-collapse readout) is irrelevant — use (0, 0).
+    model.open_workspace_context_menu(server_id, workspace_id, label, None, 0, 0);
     match overlay {
         FocusedWorkspaceOverlay::Rename => model.open_rename_workspace(),
         FocusedWorkspaceOverlay::Close => model.open_confirm_close_workspace(),
@@ -1021,6 +1045,8 @@ fn dispatch_requires_loop_handling(dispatch: &ClientInputDispatch) -> bool {
             | ClientInputDispatch::DisconnectRemote { .. }
             | ClientInputDispatch::ReconnectRemote { .. }
             | ClientInputDispatch::UpdateRemote { .. }
+            | ClientInputDispatch::FetchWorktreeList { .. }
+            | ClientInputDispatch::ToggleWorktreeGroup { .. }
             | ClientInputDispatch::ApiRequest { .. }
             | ClientInputDispatch::ServerControl { .. }
             | ClientInputDispatch::Resize { .. }
@@ -1087,6 +1113,22 @@ fn dispatch_client_overlay_input(
                 if model.confirm_close_workspace().is_some() =>
             {
                 dispatch_for_confirm_close_outcome(model.handle_confirm_close_workspace_key(key))
+            }
+            crate::raw_input::RawInputEvent::Key(key) if model.new_worktree_form().is_some() => {
+                dispatch_for_new_worktree_outcome(model.handle_new_worktree_key(key))
+            }
+            crate::raw_input::RawInputEvent::Paste(text) if model.new_worktree_form().is_some() => {
+                dispatch_for_new_worktree_outcome(model.append_new_worktree_paste(&text))
+            }
+            crate::raw_input::RawInputEvent::Key(key)
+                if model.confirm_delete_worktree().is_some() =>
+            {
+                dispatch_for_confirm_delete_worktree_outcome(
+                    model.handle_confirm_delete_worktree_key(key),
+                )
+            }
+            crate::raw_input::RawInputEvent::Key(key) if model.worktree_picker().is_some() => {
+                dispatch_for_worktree_picker_outcome(model.handle_worktree_picker_key(key))
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 dispatch_composited_mouse_input(data.clone(), compositor, model, host_size, &mouse)
@@ -1227,10 +1269,17 @@ fn dispatch_composited_mouse_input(
                 let label = model
                     .workspace_label(&server_id, &workspace_id)
                     .unwrap_or_else(|| workspace_id.clone());
+                // The expand/collapse row needs the group's CLIENT-LOCAL collapsed state, which
+                // the compositor owns — capture it at open time so the baked label matches.
+                let group_collapsed = model
+                    .workspace_worktree_group(&server_id, &workspace_id)
+                    .filter(|(_, is_linked, has_children)| !is_linked && *has_children)
+                    .map(|(group_key, _, _)| compositor.space_key_is_collapsed(&group_key));
                 model.open_workspace_context_menu(
                     server_id,
                     workspace_id,
                     label,
+                    group_collapsed,
                     mouse.column,
                     mouse.row,
                 );
@@ -1728,6 +1777,91 @@ fn dispatch_for_confirm_close_outcome(
                 id: "client:workspace-close".into(),
                 method: crate::api::schema::Method::WorkspaceClose(
                     crate::api::schema::WorkspaceTarget { workspace_id },
+                ),
+            }),
+        },
+    }
+}
+
+/// Worktree-menu parity: map a `NewWorktreeOutcome` into a dispatch. `Submit` becomes a
+/// `worktree.create` round-trip to the OWNING server (focus the new space) with an `Immediate`
+/// refresh so the new row appears on the next summary.
+fn dispatch_for_new_worktree_outcome(
+    outcome: supervisor::NewWorktreeOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::NewWorktreeOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::NewWorktreeOutcome::Submit {
+            server_id,
+            workspace_id,
+            branch,
+        } => ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:worktree-create".into(),
+                method: crate::api::schema::Method::WorktreeCreate(
+                    crate::api::schema::WorktreeCreateParams {
+                        workspace_id: Some(workspace_id),
+                        branch: Some(branch),
+                        focus: true,
+                        ..Default::default()
+                    },
+                ),
+            }),
+        },
+    }
+}
+
+/// Worktree-menu parity: map a `ConfirmDeleteWorktreeOutcome` into a `worktree.remove`
+/// round-trip to the OWNING server (closes the space and deletes the linked checkout).
+fn dispatch_for_confirm_delete_worktree_outcome(
+    outcome: supervisor::ConfirmDeleteWorktreeOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::ConfirmDeleteWorktreeOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::ConfirmDeleteWorktreeOutcome::Confirm {
+            server_id,
+            workspace_id,
+        } => ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:worktree-remove".into(),
+                method: crate::api::schema::Method::WorktreeRemove(
+                    crate::api::schema::WorktreeRemoveParams {
+                        workspace_id,
+                        force: false,
+                    },
+                ),
+            }),
+        },
+    }
+}
+
+/// Worktree-menu parity: map a `WorktreePickerOutcome` into a `worktree.open` round-trip to the
+/// OWNING server (opens the picked checkout as a space and focuses it).
+fn dispatch_for_worktree_picker_outcome(
+    outcome: supervisor::WorktreePickerOutcome,
+) -> ClientInputDispatch {
+    match outcome {
+        supervisor::WorktreePickerOutcome::Redraw => ClientInputDispatch::Redraw,
+        supervisor::WorktreePickerOutcome::Open {
+            server_id,
+            workspace_id,
+            path,
+        } => ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh: ClientApiRefreshPolicy::Immediate,
+            request: Box::new(crate::api::schema::Request {
+                id: "client:worktree-open".into(),
+                method: crate::api::schema::Method::WorktreeOpen(
+                    crate::api::schema::WorktreeOpenParams {
+                        workspace_id: Some(workspace_id),
+                        path: Some(path),
+                        focus: true,
+                        ..Default::default()
+                    },
                 ),
             }),
         },
@@ -2302,6 +2436,13 @@ enum ClientLoopEvent {
         server_id: supervisor::ServerId,
         version: Option<String>,
         protocol: Option<u32>,
+    },
+    /// Worktree-menu parity: a `worktree.list` fetch for the open picker completed off the UI
+    /// loop. Filled into the picker via `fill_worktree_picker` (stale results are ignored there).
+    WorktreeListFetched {
+        server_id: supervisor::ServerId,
+        workspace_id: String,
+        result: Result<Vec<supervisor::WorktreePickerItem>, String>,
     },
     /// item 3 (Area 5): a remote-management `remote.set_enabled`/`remote.remove` request finished
     /// off the UI loop. The handler branches on `action` to apply teardown / reconnect.
@@ -3334,6 +3475,75 @@ fn run_client_update_remote(
     // live stream comes back up on the now-matching protocol (and re-fetches runtime status).
     drop(bridge);
     Ok(())
+}
+
+/// Worktree-menu parity: fetch `worktree.list` for the open picker from the OWNING server, off
+/// the UI loop. The target is resolved while we're on the loop (model + bridge map in scope);
+/// the round-trip runs on a worker thread and lands as `WorktreeListFetched`.
+fn spawn_worktree_list_fetch(
+    state: &mut ClientState,
+    server_id: supervisor::ServerId,
+    workspace_id: String,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let target = state
+        .supervisor_model
+        .as_ref()
+        .and_then(|model| api_target_for_supervisor_server(model, &server_id, &state.ssh_bridges));
+    let event_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let result = match target {
+            Some(target) => fetch_worktree_picker_items(target, &workspace_id),
+            None => Err("server is not reachable".to_string()),
+        };
+        let _ = event_tx.blocking_send(ClientLoopEvent::WorktreeListFetched {
+            server_id,
+            workspace_id,
+            result,
+        });
+    });
+}
+
+/// The blocking body of [`spawn_worktree_list_fetch`]: one `worktree.list` round-trip, mapped to
+/// picker rows (bare checkouts dropped — they can't be opened as a space).
+fn fetch_worktree_picker_items(
+    target: crate::api::client::ConnectionTarget,
+    workspace_id: &str,
+) -> Result<Vec<supervisor::WorktreePickerItem>, String> {
+    let mut api = crate::api::client::ApiClient::for_target(target);
+    let response = supervisor::SupervisorApi::request(
+        &mut api,
+        crate::api::schema::Request {
+            id: "client:worktree-list".into(),
+            method: crate::api::schema::Method::WorktreeList(
+                crate::api::schema::WorktreeListParams {
+                    workspace_id: Some(workspace_id.to_string()),
+                    cwd: None,
+                },
+            ),
+        },
+    )?;
+    match response.result {
+        crate::api::schema::ResponseResult::WorktreeList { worktrees, .. } => Ok(worktrees
+            .into_iter()
+            .filter(|worktree| !worktree.is_bare)
+            .map(|worktree| supervisor::WorktreePickerItem {
+                label: if worktree.label.is_empty() {
+                    worktree
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| worktree.path.clone())
+                } else {
+                    worktree.label.clone()
+                },
+                path: worktree.path,
+                open_workspace_id: worktree.open_workspace_id,
+            })
+            .collect()),
+        other => Err(format!(
+            "worktree.list returned unexpected result: {other:?}"
+        )),
+    }
 }
 
 fn spawn_client_add_remote_submission(
@@ -5008,6 +5218,33 @@ async fn run_client_loop(
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
+                            // Worktree-menu parity: fetch the workspace's worktree.list from the
+                            // OWNING server off the UI loop; the result lands as
+                            // `WorktreeListFetched` and fills the open picker.
+                            ClientInputDispatch::FetchWorktreeList {
+                                server_id,
+                                workspace_id,
+                            } => {
+                                spawn_worktree_list_fetch(
+                                    &mut state,
+                                    server_id,
+                                    workspace_id,
+                                    &event_tx,
+                                );
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            // Worktree-menu parity: the menu's expand/collapse row flips the SAME
+                            // client-local set the sidebar chevron toggles.
+                            ClientInputDispatch::ToggleWorktreeGroup { group_key } => {
+                                if let Some(compositor) = &mut state.compositor {
+                                    compositor.toggle_collapsed_space_key(group_key);
+                                }
+                                state.request_full_redraw();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
                             ClientInputDispatch::Resize { cols, rows } => {
                                 state.reported_size = (cols, rows);
                                 let msg = ClientMessage::Resize {
@@ -5729,6 +5966,19 @@ async fn run_client_loop(
                             model.set_add_remote_error(err);
                         }
                     }
+                }
+                state.request_full_redraw();
+                render_cached_composited_frame(&mut state);
+            }
+            // Worktree-menu parity: fill the open "open worktree…" picker (stale/closed pickers
+            // ignore the result inside `fill_worktree_picker`).
+            ClientLoopEvent::WorktreeListFetched {
+                server_id,
+                workspace_id,
+                result,
+            } => {
+                if let Some(model) = &mut state.supervisor_model {
+                    model.fill_worktree_picker(&server_id, &workspace_id, result);
                 }
                 state.request_full_redraw();
                 render_cached_composited_frame(&mut state);

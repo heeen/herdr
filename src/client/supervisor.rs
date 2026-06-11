@@ -253,14 +253,28 @@ pub(crate) enum ClientMenuAction {
     // workspace context menu
     OpenRename,
     OpenConfirmClose,
+    // workspace context menu — worktree rows (server-menu parity). Baked from the workspace's
+    // summary worktree info at open time, like the host rows bake connection state.
+    OpenNewWorktree,
+    OpenWorktreePicker,
+    OpenConfirmDeleteWorktree,
+    /// Toggle the worktree group's collapsed state (client-local, same set the chevron flips).
+    /// The label ("expand"/"collapse") is baked from the state captured at open time.
+    ToggleWorktreeGroup {
+        group_key: String,
+    },
     // host context menu
     HostAddSpace,
-    HostToggleEnabled { enabled: bool },
+    HostToggleEnabled {
+        enabled: bool,
+    },
     HostDisconnect,
     HostReconnect,
     HostUpdate,
     // #61: flip this remote's per-remote auto-update flag (baked from its current state at open time).
-    HostToggleAutoUpdate { auto_update: bool },
+    HostToggleAutoUpdate {
+        auto_update: bool,
+    },
 }
 
 /// #47: the typed outcome of activating a [`ClientMenu`] row, mapped by the client loop into a
@@ -288,6 +302,17 @@ pub(crate) enum ClientMenuOutcome {
     HostToggleAutoUpdate {
         remote_id: String,
         auto_update: bool,
+    },
+    /// The "open worktree…" picker opened in its loading state: the loop must fetch this
+    /// workspace's `worktree.list` off the UI thread and fill the picker via
+    /// [`ClientSupervisorModel::fill_worktree_picker`].
+    FetchWorktreeList {
+        server_id: ServerId,
+        workspace_id: String,
+    },
+    /// Flip the worktree group's client-local collapsed state (the compositor owns the set).
+    ToggleWorktreeGroup {
+        group_key: String,
     },
 }
 
@@ -339,6 +364,11 @@ enum ClientOverlayState {
     // confirm-close). All client-local; the action routes to the owning server via workspace.* API.
     RenameWorkspace(RenameWorkspaceForm),
     ConfirmCloseWorkspace(ConfirmCloseWorkspace),
+    // Worktree-menu parity: the follow-on overlays the worktree context-menu rows promote into.
+    // All route to the owning server via worktree.* API requests.
+    NewWorktree(NewWorktreeForm),
+    ConfirmDeleteWorktree(ConfirmDeleteWorktree),
+    WorktreePicker(WorktreePicker),
 }
 
 /// #23: the inline rename text overlay. Mirrors `AddRemoteForm` (a single editable text field +
@@ -381,6 +411,76 @@ pub(crate) enum ConfirmCloseOutcome {
     Confirm {
         server_id: ServerId,
         workspace_id: String,
+    },
+}
+
+/// Worktree-menu parity: the "new worktree" branch-name input. Mirrors `RenameWorkspaceForm`
+/// (one editable text field + error line); submit routes to a `worktree.create` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewWorktreeForm {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) branch: String,
+    pub(crate) error: Option<String>,
+}
+
+/// Worktree-menu parity: the "delete worktree checkout…" confirmation. Mirrors
+/// `ConfirmCloseWorkspace`; confirm routes to a `worktree.remove` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmDeleteWorktree {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) label: String,
+}
+
+/// Worktree-menu parity: the "open worktree…" picker. Opens in `loading` while the loop fetches
+/// `worktree.list` from the owning server off the UI thread, then shows the repo's checkouts;
+/// Enter opens the selected one via `worktree.open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreePicker {
+    pub(crate) server_id: ServerId,
+    pub(crate) workspace_id: String,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) items: Vec<WorktreePickerItem>,
+    pub(crate) selected: usize,
+}
+
+/// One row of the worktree picker: a checkout path plus its display label (branch or label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreePickerItem {
+    pub(crate) path: String,
+    pub(crate) label: String,
+    /// Already open as a workspace — selecting it focuses instead of re-opening.
+    pub(crate) open_workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NewWorktreeOutcome {
+    Redraw,
+    Submit {
+        server_id: ServerId,
+        workspace_id: String,
+        branch: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfirmDeleteWorktreeOutcome {
+    Redraw,
+    Confirm {
+        server_id: ServerId,
+        workspace_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreePickerOutcome {
+    Redraw,
+    Open {
+        server_id: ServerId,
+        workspace_id: String,
+        path: String,
     },
 }
 
@@ -1264,6 +1364,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -1275,6 +1378,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -1455,6 +1561,29 @@ impl ClientSupervisorModel {
                 self.open_confirm_close_workspace();
                 ClientMenuOutcome::Redraw
             }
+            ClientMenuAction::OpenNewWorktree => {
+                self.open_new_worktree_form();
+                ClientMenuOutcome::Redraw
+            }
+            ClientMenuAction::OpenWorktreePicker => {
+                // Open in the loading state and hand the fetch to the loop (the list lives on the
+                // owning server; the round-trip must stay off the UI thread).
+                match self.open_worktree_picker() {
+                    Some((server_id, workspace_id)) => ClientMenuOutcome::FetchWorktreeList {
+                        server_id,
+                        workspace_id,
+                    },
+                    None => ClientMenuOutcome::Redraw,
+                }
+            }
+            ClientMenuAction::OpenConfirmDeleteWorktree => {
+                self.open_confirm_delete_worktree();
+                ClientMenuOutcome::Redraw
+            }
+            ClientMenuAction::ToggleWorktreeGroup { group_key } => {
+                self.close_client_overlay();
+                ClientMenuOutcome::ToggleWorktreeGroup { group_key }
+            }
             ClientMenuAction::HostAddSpace => {
                 self.close_client_overlay();
                 host_server_id
@@ -1521,6 +1650,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -1664,6 +1796,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -1675,6 +1810,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -1921,28 +2059,97 @@ impl ClientSupervisorModel {
             .map(|ws| ws.label.clone())
     }
 
+    /// The workspace's worktree grouping, read from its summary: `(repo_key, is_linked,
+    /// has_linked_children)`. `None` for a non-git workspace. Drives the worktree rows of the
+    /// workspace context menu (server-menu parity) and the caller's collapsed-state lookup.
+    pub(crate) fn workspace_worktree_group(
+        &self,
+        server_id: &ServerId,
+        workspace_id: &str,
+    ) -> Option<(String, bool, bool)> {
+        let server = self.server(server_id)?;
+        let workspace = server
+            .summaries
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id == workspace_id)?;
+        let group_key = workspace.worktree_key.clone()?;
+        let is_linked = workspace.worktree_is_linked;
+        let has_linked_children = !is_linked
+            && server.summaries.workspaces.iter().any(|other| {
+                other.workspace_id != workspace_id
+                    && other.worktree_key.as_deref() == Some(group_key.as_str())
+                    && other.worktree_is_linked
+            });
+        Some((group_key, is_linked, has_linked_children))
+    }
+
     /// #23: open the workspace context menu for `(server_id, workspace_id)`, capturing the current
     /// `label` for the rename prefill and the close-confirm text. Mirrors `open_remote_manage_overlay`.
+    ///
+    /// Server-menu parity: bakes the same conditional worktree rows the server-rendered sidebar
+    /// shows (`ContextMenuState::items`): a git ROOT adds "new worktree" / "open worktree…"; a
+    /// LINKED checkout adds "delete worktree checkout…"; a root with linked children closes as a
+    /// group and gets the expand/collapse toggle. `group_collapsed` is the client-local collapsed
+    /// state captured by the caller (the compositor owns that set), `None` when not grouped.
     pub(crate) fn open_workspace_context_menu(
         &mut self,
         server_id: ServerId,
         workspace_id: String,
         label: String,
+        group_collapsed: Option<bool>,
         anchor_col: u16,
         anchor_row: u16,
     ) {
-        let items = vec![
+        let worktree = self.workspace_worktree_group(&server_id, &workspace_id);
+        let has_children = worktree
+            .as_ref()
+            .is_some_and(|(_, _, has_children)| *has_children);
+        let mut items = vec![
             ClientMenuItem {
                 label: "rename".to_string(),
                 selectable: true,
                 action: ClientMenuAction::OpenRename,
             },
             ClientMenuItem {
-                label: "close".to_string(),
+                label: if has_children { "close group" } else { "close" }.to_string(),
                 selectable: true,
                 action: ClientMenuAction::OpenConfirmClose,
             },
         ];
+        match &worktree {
+            Some((_, true, _)) => {
+                items.push(ClientMenuItem {
+                    label: "delete worktree checkout…".to_string(),
+                    selectable: true,
+                    action: ClientMenuAction::OpenConfirmDeleteWorktree,
+                });
+            }
+            Some((group_key, false, _)) => {
+                items.push(ClientMenuItem {
+                    label: "new worktree".to_string(),
+                    selectable: true,
+                    action: ClientMenuAction::OpenNewWorktree,
+                });
+                items.push(ClientMenuItem {
+                    label: "open worktree…".to_string(),
+                    selectable: true,
+                    action: ClientMenuAction::OpenWorktreePicker,
+                });
+                if has_children {
+                    if let Some(collapsed) = group_collapsed {
+                        items.push(ClientMenuItem {
+                            label: if collapsed { "expand" } else { "collapse" }.to_string(),
+                            selectable: true,
+                            action: ClientMenuAction::ToggleWorktreeGroup {
+                                group_key: group_key.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+            None => {}
+        }
         self.new_workspace_picker = None;
         self.overlay_drag_offset = (0, 0);
         let selected = Self::first_selectable_index(&items);
@@ -2102,6 +2309,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -2113,6 +2323,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::AddRemote(_)
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -2209,11 +2422,7 @@ impl ClientSupervisorModel {
     pub(crate) fn confirm_close_workspace(&self) -> Option<&ConfirmCloseWorkspace> {
         match &self.client_overlay {
             ClientOverlayState::ConfirmCloseWorkspace(confirm) => Some(confirm),
-            ClientOverlayState::None
-            | ClientOverlayState::Menu(_)
-            | ClientOverlayState::AddRemote(_)
-            | ClientOverlayState::ManageRemotes(_)
-            | ClientOverlayState::RenameWorkspace(_) => None,
+            _ => None,
         }
     }
 
@@ -2256,6 +2465,283 @@ impl ClientSupervisorModel {
                 ConfirmCloseOutcome::Redraw
             }
             _ => ConfirmCloseOutcome::Redraw,
+        }
+    }
+
+    // ----- worktree-menu parity: new-worktree form / delete-confirm / open-picker --------------
+
+    /// Promote the open workspace context menu into the "new worktree" branch-name input.
+    /// Mirrors `open_rename_workspace`.
+    pub(crate) fn open_new_worktree_form(&mut self) {
+        let form = match self.client_menu().map(|menu| &menu.kind) {
+            Some(ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                ..
+            }) => NewWorktreeForm {
+                server_id: server_id.clone(),
+                workspace_id: workspace_id.clone(),
+                branch: String::new(),
+                error: None,
+            },
+            _ => return,
+        };
+        self.overlay_drag_offset = (0, 0);
+        self.client_overlay = ClientOverlayState::NewWorktree(form);
+    }
+
+    pub(crate) fn new_worktree_form(&self) -> Option<&NewWorktreeForm> {
+        match &self.client_overlay {
+            ClientOverlayState::NewWorktree(form) => Some(form),
+            _ => None,
+        }
+    }
+
+    fn new_worktree_form_mut(&mut self) -> Option<&mut NewWorktreeForm> {
+        match &mut self.client_overlay {
+            ClientOverlayState::NewWorktree(form) => Some(form),
+            _ => None,
+        }
+    }
+
+    /// Text editing for the new-worktree branch input. Mirrors `handle_rename_workspace_key`;
+    /// Enter submits a non-empty trimmed branch name.
+    pub(crate) fn handle_new_worktree_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> NewWorktreeOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return NewWorktreeOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                NewWorktreeOutcome::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(form) = self.new_worktree_form_mut() else {
+                    return NewWorktreeOutcome::Redraw;
+                };
+                let branch = form.branch.trim().to_string();
+                if branch.is_empty() {
+                    form.error = Some("branch required".to_string());
+                    return NewWorktreeOutcome::Redraw;
+                }
+                let outcome = NewWorktreeOutcome::Submit {
+                    server_id: form.server_id.clone(),
+                    workspace_id: form.workspace_id.clone(),
+                    branch,
+                };
+                self.close_client_overlay();
+                outcome
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(form) = self.new_worktree_form_mut() {
+                    form.branch.clear();
+                    form.error = None;
+                }
+                NewWorktreeOutcome::Redraw
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.new_worktree_form_mut() {
+                    form.branch.pop();
+                    form.error = None;
+                }
+                NewWorktreeOutcome::Redraw
+            }
+            KeyCode::Char(ch) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                if let Some(form) = self.new_worktree_form_mut() {
+                    form.branch.push(ch);
+                    form.error = None;
+                }
+                NewWorktreeOutcome::Redraw
+            }
+            _ => NewWorktreeOutcome::Redraw,
+        }
+    }
+
+    pub(crate) fn append_new_worktree_paste(&mut self, text: &str) -> NewWorktreeOutcome {
+        if let Some(form) = self.new_worktree_form_mut() {
+            form.branch.push_str(text);
+            form.error = None;
+        }
+        NewWorktreeOutcome::Redraw
+    }
+
+    /// Promote the open workspace context menu into the delete-worktree confirmation.
+    /// Mirrors `open_confirm_close_workspace`.
+    pub(crate) fn open_confirm_delete_worktree(&mut self) {
+        let confirm = match self.client_menu().map(|menu| &menu.kind) {
+            Some(ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                label,
+            }) => ConfirmDeleteWorktree {
+                server_id: server_id.clone(),
+                workspace_id: workspace_id.clone(),
+                label: label.clone(),
+            },
+            _ => return,
+        };
+        self.overlay_drag_offset = (0, 0);
+        self.client_overlay = ClientOverlayState::ConfirmDeleteWorktree(confirm);
+    }
+
+    pub(crate) fn confirm_delete_worktree(&self) -> Option<&ConfirmDeleteWorktree> {
+        match &self.client_overlay {
+            ClientOverlayState::ConfirmDeleteWorktree(confirm) => Some(confirm),
+            _ => None,
+        }
+    }
+
+    /// Enter / y confirms the worktree-checkout delete, Esc / n cancels. Mirrors
+    /// `handle_confirm_close_workspace_key`.
+    pub(crate) fn handle_confirm_delete_worktree_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> ConfirmDeleteWorktreeOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return ConfirmDeleteWorktreeOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let Some(confirm) = self.confirm_delete_worktree() else {
+                    return ConfirmDeleteWorktreeOutcome::Redraw;
+                };
+                let outcome = ConfirmDeleteWorktreeOutcome::Confirm {
+                    server_id: confirm.server_id.clone(),
+                    workspace_id: confirm.workspace_id.clone(),
+                };
+                self.close_client_overlay();
+                outcome
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.close_client_overlay();
+                ConfirmDeleteWorktreeOutcome::Redraw
+            }
+            _ => ConfirmDeleteWorktreeOutcome::Redraw,
+        }
+    }
+
+    /// Promote the open workspace context menu into the "open worktree…" picker (loading state).
+    /// Returns the `(server_id, workspace_id)` the loop must fetch `worktree.list` for.
+    pub(crate) fn open_worktree_picker(&mut self) -> Option<(ServerId, String)> {
+        let (server_id, workspace_id) = match self.client_menu().map(|menu| &menu.kind) {
+            Some(ClientMenuKind::Workspace {
+                server_id,
+                workspace_id,
+                ..
+            }) => (server_id.clone(), workspace_id.clone()),
+            _ => return None,
+        };
+        self.overlay_drag_offset = (0, 0);
+        self.client_overlay = ClientOverlayState::WorktreePicker(WorktreePicker {
+            server_id: server_id.clone(),
+            workspace_id: workspace_id.clone(),
+            loading: true,
+            error: None,
+            items: Vec::new(),
+            selected: 0,
+        });
+        Some((server_id, workspace_id))
+    }
+
+    pub(crate) fn worktree_picker(&self) -> Option<&WorktreePicker> {
+        match &self.client_overlay {
+            ClientOverlayState::WorktreePicker(picker) => Some(picker),
+            _ => None,
+        }
+    }
+
+    fn worktree_picker_mut(&mut self) -> Option<&mut WorktreePicker> {
+        match &mut self.client_overlay {
+            ClientOverlayState::WorktreePicker(picker) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// Apply the off-thread `worktree.list` result to the open picker. Ignored when the picker
+    /// has been closed or re-targeted in the meantime (a stale fetch must not resurrect it).
+    pub(crate) fn fill_worktree_picker(
+        &mut self,
+        server_id: &ServerId,
+        workspace_id: &str,
+        result: Result<Vec<WorktreePickerItem>, String>,
+    ) {
+        let Some(picker) = self.worktree_picker_mut() else {
+            return;
+        };
+        if &picker.server_id != server_id || picker.workspace_id != workspace_id {
+            return;
+        }
+        picker.loading = false;
+        match result {
+            Ok(items) => {
+                picker.items = items;
+                picker.selected = 0;
+                picker.error = if picker.items.is_empty() {
+                    Some("no worktrees found for this repo".to_string())
+                } else {
+                    None
+                };
+            }
+            Err(error) => picker.error = Some(error),
+        }
+    }
+
+    /// Up/Down moves the selection, Enter opens the selected checkout (`worktree.open` on the
+    /// owning server), Esc closes. Mirrors the remote-manage overlay's key handling.
+    pub(crate) fn handle_worktree_picker_key(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> WorktreePickerOutcome {
+        use crossterm::event::{KeyCode, KeyEventKind};
+
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return WorktreePickerOutcome::Redraw;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_client_overlay();
+                WorktreePickerOutcome::Redraw
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = self.worktree_picker_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                WorktreePickerOutcome::Redraw
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = self.worktree_picker_mut() {
+                    if picker.selected + 1 < picker.items.len() {
+                        picker.selected += 1;
+                    }
+                }
+                WorktreePickerOutcome::Redraw
+            }
+            KeyCode::Enter => {
+                let Some(picker) = self.worktree_picker() else {
+                    return WorktreePickerOutcome::Redraw;
+                };
+                let Some(item) = picker.items.get(picker.selected) else {
+                    return WorktreePickerOutcome::Redraw;
+                };
+                let outcome = WorktreePickerOutcome::Open {
+                    server_id: picker.server_id.clone(),
+                    workspace_id: picker.workspace_id.clone(),
+                    path: item.path.clone(),
+                };
+                self.close_client_overlay();
+                outcome
+            }
+            _ => WorktreePickerOutcome::Redraw,
         }
     }
 
@@ -2674,6 +3160,9 @@ impl ClientSupervisorModel {
             | ClientOverlayState::ManageRemotes(_)
             | ClientOverlayState::RenameWorkspace(_)
             | ClientOverlayState::ConfirmCloseWorkspace(_) => None,
+            ClientOverlayState::NewWorktree(_)
+            | ClientOverlayState::ConfirmDeleteWorktree(_)
+            | ClientOverlayState::WorktreePicker(_) => None,
         }
     }
 
@@ -5504,6 +5993,240 @@ mod tests {
         assert!(!model.workspace_is_reorderable(&ServerId::secondary("nope"), "plain"));
     }
 
+    fn worktree_summary(
+        workspace_id: &str,
+        worktree_key: Option<&str>,
+        is_linked: bool,
+    ) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: workspace_id.into(),
+            label: workspace_id.into(),
+            branch: None,
+            focused: false,
+            worktree_key: worktree_key.map(str::to_string),
+            worktree_is_linked: is_linked,
+        }
+    }
+
+    fn model_with_worktree_summaries(workspaces: Vec<WorkspaceSummary>) -> ClientSupervisorModel {
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces,
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+    }
+
+    #[test]
+    fn workspace_menu_plain_workspace_has_rename_and_close_only() {
+        let mut model = model_with_worktree_summaries(vec![worktree_summary("plain", None, false)]);
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "plain".into(),
+            "plain".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(menu_labels(&model), vec!["rename", "close"]);
+    }
+
+    #[test]
+    fn workspace_menu_git_root_offers_new_and_open_worktree() {
+        // Server-menu parity: a git root WITHOUT linked children gets the create/open rows.
+        let mut model =
+            model_with_worktree_summaries(vec![worktree_summary("root", Some("repo-1"), false)]);
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "root".into(),
+            "root".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            menu_labels(&model),
+            vec!["rename", "close", "new worktree", "open worktree…"]
+        );
+    }
+
+    #[test]
+    fn workspace_menu_linked_worktree_offers_delete_checkout() {
+        let mut model = model_with_worktree_summaries(vec![
+            worktree_summary("root", Some("repo-1"), false),
+            worktree_summary("child", Some("repo-1"), true),
+        ]);
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "child".into(),
+            "child".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            menu_labels(&model),
+            vec!["rename", "close", "delete worktree checkout…"]
+        );
+    }
+
+    #[test]
+    fn workspace_menu_group_root_closes_group_and_toggles_collapse() {
+        let mut model = model_with_worktree_summaries(vec![
+            worktree_summary("root", Some("repo-1"), false),
+            worktree_summary("child", Some("repo-1"), true),
+        ]);
+        // Collapsed group → the toggle row reads "expand"; close reads "close group".
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "root".into(),
+            "root".into(),
+            Some(true),
+            0,
+            0,
+        );
+        assert_eq!(
+            menu_labels(&model),
+            vec![
+                "rename",
+                "close group",
+                "new worktree",
+                "open worktree…",
+                "expand"
+            ]
+        );
+        let toggle_index = 4;
+        let outcome = model.select_client_menu_item(toggle_index);
+        assert_eq!(
+            outcome,
+            ClientMenuOutcome::ToggleWorktreeGroup {
+                group_key: "repo-1".into()
+            }
+        );
+
+        // Expanded group → "collapse".
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "root".into(),
+            "root".into(),
+            Some(false),
+            0,
+            0,
+        );
+        assert_eq!(menu_labels(&model)[toggle_index], "collapse");
+    }
+
+    #[test]
+    fn workspace_menu_worktree_rows_promote_to_their_overlays() {
+        let mut model = model_with_worktree_summaries(vec![
+            worktree_summary("root", Some("repo-1"), false),
+            worktree_summary("child", Some("repo-1"), true),
+        ]);
+
+        // "new worktree" (row 2 on the root) → the branch input overlay.
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "root".into(),
+            "root".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(model.select_client_menu_item(2), ClientMenuOutcome::Redraw);
+        assert!(model.new_worktree_form().is_some());
+        // Submit flows the typed branch to a worktree.create outcome.
+        for ch in "feat-x".chars() {
+            let _ = model.handle_new_worktree_key(crate::input::TerminalKey::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::empty(),
+            ));
+        }
+        let outcome = model.handle_new_worktree_key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(
+            outcome,
+            NewWorktreeOutcome::Submit {
+                server_id: ServerId::main(),
+                workspace_id: "root".into(),
+                branch: "feat-x".into(),
+            }
+        );
+        assert!(model.new_worktree_form().is_none());
+
+        // "open worktree…" (row 3 on the root) → the picker in loading state + a fetch outcome.
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "root".into(),
+            "root".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            model.select_client_menu_item(3),
+            ClientMenuOutcome::FetchWorktreeList {
+                server_id: ServerId::main(),
+                workspace_id: "root".into(),
+            }
+        );
+        let picker = model.worktree_picker().expect("picker open");
+        assert!(picker.loading);
+        // The fetch result fills the rows; Enter opens the selected checkout.
+        model.fill_worktree_picker(
+            &ServerId::main(),
+            "root",
+            Ok(vec![WorktreePickerItem {
+                path: "/repos/x-feat".into(),
+                label: "feat".into(),
+                open_workspace_id: None,
+            }]),
+        );
+        let outcome = model.handle_worktree_picker_key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(
+            outcome,
+            WorktreePickerOutcome::Open {
+                server_id: ServerId::main(),
+                workspace_id: "root".into(),
+                path: "/repos/x-feat".into(),
+            }
+        );
+        assert!(model.worktree_picker().is_none());
+
+        // "delete worktree checkout…" (row 2 on the child) → the confirm overlay; y confirms.
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "child".into(),
+            "child".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(model.select_client_menu_item(2), ClientMenuOutcome::Redraw);
+        assert!(model.confirm_delete_worktree().is_some());
+        let outcome = model.handle_confirm_delete_worktree_key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(
+            outcome,
+            ConfirmDeleteWorktreeOutcome::Confirm {
+                server_id: ServerId::main(),
+                workspace_id: "child".into(),
+            }
+        );
+        assert!(model.confirm_delete_worktree().is_none());
+    }
+
     #[test]
     fn summary_subscription_excludes_stale_connected_disabled() {
         let mut model = ClientSupervisorModel::new("local");
@@ -5710,7 +6433,7 @@ mod tests {
         let label = model.workspace_label(&server_id, "ws-1").unwrap();
         assert_eq!(label, "feature");
 
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label, 0, 0);
+        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), label, None, 0, 0);
 
         let menu = model.client_menu().expect("menu open");
         assert_eq!(
@@ -5735,7 +6458,7 @@ mod tests {
     fn context_menu_nav_and_esc_dismiss() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), None, 0, 0);
 
         // Down moves to "close", k clamps back to "rename".
         assert_eq!(
@@ -5755,7 +6478,14 @@ mod tests {
     fn context_menu_enter_on_rename_opens_prefilled_rename_overlay() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
+        model.open_workspace_context_menu(
+            server_id.clone(),
+            "ws-1".into(),
+            "feature".into(),
+            None,
+            0,
+            0,
+        );
 
         assert_eq!(
             model.handle_client_menu_key(press(KeyCode::Enter)),
@@ -5772,7 +6502,14 @@ mod tests {
     fn rename_typing_builds_label_and_enter_submits_rename() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), String::new(), 0, 0);
+        model.open_workspace_context_menu(
+            server_id.clone(),
+            "ws-1".into(),
+            String::new(),
+            None,
+            0,
+            0,
+        );
         model.handle_client_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         for ch in "next".chars() {
@@ -5795,7 +6532,7 @@ mod tests {
     fn rename_empty_label_does_not_submit() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), None, 0, 0);
         model.handle_client_menu_key(press(KeyCode::Enter)); // -> rename overlay
 
         // clear the prefilled label with Ctrl-U, then Enter must NOT submit.
@@ -5818,7 +6555,14 @@ mod tests {
     fn context_menu_close_opens_confirm_and_enter_confirms_close() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id.clone(), "ws-1".into(), "feature".into(), 0, 0);
+        model.open_workspace_context_menu(
+            server_id.clone(),
+            "ws-1".into(),
+            "feature".into(),
+            None,
+            0,
+            0,
+        );
         // select "close" (index 1) then Enter -> confirm overlay.
         model.handle_client_menu_key(press(KeyCode::Down));
         assert_eq!(
@@ -5846,7 +6590,7 @@ mod tests {
     fn confirm_close_cancel_dismisses_without_request() {
         use crossterm::event::KeyCode;
         let (mut model, server_id) = model_with_workspace();
-        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), 0, 0);
+        model.open_workspace_context_menu(server_id, "ws-1".into(), "feature".into(), None, 0, 0);
         model.handle_client_menu_key(press(KeyCode::Down));
         model.handle_client_menu_key(press(KeyCode::Enter)); // -> confirm overlay
 

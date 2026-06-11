@@ -468,6 +468,10 @@ struct ClientSidebarSnapshot {
     // #23: the rename / confirm-close follow-on overlays a workspace menu row promotes into.
     rename_workspace: Option<crate::client::supervisor::RenameWorkspaceForm>,
     confirm_close_workspace: Option<crate::client::supervisor::ConfirmCloseWorkspace>,
+    // Worktree-menu parity: the worktree follow-on overlays (new / delete-confirm / open-picker).
+    new_worktree: Option<crate::client::supervisor::NewWorktreeForm>,
+    confirm_delete_worktree: Option<crate::client::supervisor::ConfirmDeleteWorktree>,
+    worktree_picker: Option<crate::client::supervisor::WorktreePicker>,
     // #47: the one drag offset (cols, rows) shared by EVERY overlay, cloned from the model. Render,
     // hit-test, and the content-exclusion rect shift the open overlay's default popup by this.
     overlay_drag_offset: (i16, i16),
@@ -601,6 +605,12 @@ impl ClientCompositor {
         if !self.collapsed_space_keys.remove(&key) {
             self.collapsed_space_keys.insert(key);
         }
+    }
+
+    /// Whether a worktree group is collapsed in this client's local view. Read by the workspace
+    /// context menu at open time so its expand/collapse row bakes the matching label.
+    pub(crate) fn space_key_is_collapsed(&self, key: &str) -> bool {
+        self.collapsed_space_keys.contains(key)
     }
 
     /// #22: test accessor for the client-local collapsed worktree-group set, so the chevron-toggle
@@ -1428,7 +1438,10 @@ impl ClientCompositor {
             // is hidden behind it, matching the two context menus).
             || model.client_menu().is_some()
             || model.rename_workspace_form().is_some()
-            || model.confirm_close_workspace().is_some();
+            || model.confirm_close_workspace().is_some()
+            || model.new_worktree_form().is_some()
+            || model.confirm_delete_worktree().is_some()
+            || model.worktree_picker().is_some();
 
         ComposedShell {
             frame,
@@ -1578,6 +1591,14 @@ impl ClientCompositor {
             if snapshot.confirm_close_workspace.is_some() {
                 return hit_test_confirm_close_workspace(&snapshot, popup, x, y);
             }
+        }
+        // Worktree-menu parity: the worktree follow-on overlays are keyboard-driven; while one is
+        // open it owns the host rect (a click resolves to nothing rather than a row beneath it).
+        if snapshot.new_worktree.is_some()
+            || snapshot.confirm_delete_worktree.is_some()
+            || snapshot.worktree_picker.is_some()
+        {
+            return None;
         }
 
         if x >= sidebar_width {
@@ -2324,6 +2345,9 @@ impl ClientSidebarSnapshot {
             overlay_popup: None,
             rename_workspace: model.rename_workspace_form().cloned(),
             confirm_close_workspace: model.confirm_close_workspace().cloned(),
+            new_worktree: model.new_worktree_form().cloned(),
+            confirm_delete_worktree: model.confirm_delete_worktree().cloned(),
+            worktree_picker: model.worktree_picker().cloned(),
         };
         // #53: ONE computation of the open overlay's geometry, from the just-built view. Every read
         // site (render / hit-test / hover-test / exclusion / drag / #56 hover overlay) reads this
@@ -2522,6 +2546,50 @@ fn render_client_shell(
                     crate::ui::render_confirm_close_workspace_overlay(
                         &snapshot.app.palette,
                         &confirm.label,
+                        frame,
+                        popup,
+                    );
+                }
+            }
+            // Worktree-menu parity: the three worktree follow-on overlays (keyboard-driven).
+            if let Some(form) = &snapshot.new_worktree {
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_new_worktree_overlay(
+                        &snapshot.app.palette,
+                        &form.branch,
+                        form.error.as_deref(),
+                        frame,
+                        popup,
+                    );
+                }
+            }
+            if let Some(confirm) = &snapshot.confirm_delete_worktree {
+                if let Some(popup) = overlay_popup {
+                    crate::ui::render_confirm_delete_worktree_overlay(
+                        &snapshot.app.palette,
+                        &confirm.label,
+                        frame,
+                        popup,
+                    );
+                }
+            }
+            if let Some(picker) = &snapshot.worktree_picker {
+                if let Some(popup) = overlay_popup {
+                    let rows: Vec<crate::ui::WorktreePickerRowView> = picker
+                        .items
+                        .iter()
+                        .map(|item| crate::ui::WorktreePickerRowView {
+                            label: &item.label,
+                            path: &item.path,
+                            open: item.open_workspace_id.is_some(),
+                        })
+                        .collect();
+                    crate::ui::render_worktree_picker_overlay(
+                        &snapshot.app.palette,
+                        picker.loading,
+                        picker.error.as_deref(),
+                        &rows,
+                        picker.selected,
                         frame,
                         popup,
                     );
@@ -2855,6 +2923,12 @@ fn open_overlay_popup_rect(
         crate::ui::rename_workspace_popup_rect(anchor_area)
     } else if snapshot.confirm_close_workspace.is_some() {
         crate::ui::confirm_close_workspace_popup_rect(anchor_area)
+    } else if snapshot.new_worktree.is_some() {
+        crate::ui::new_worktree_popup_rect(anchor_area)
+    } else if snapshot.confirm_delete_worktree.is_some() {
+        crate::ui::confirm_delete_worktree_popup_rect(anchor_area)
+    } else if let Some(picker) = snapshot.worktree_picker.as_ref() {
+        crate::ui::worktree_picker_popup_rect(anchor_area, picker.items.len())
     } else {
         None
     }?;

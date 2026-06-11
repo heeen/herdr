@@ -1496,6 +1496,219 @@ pub(crate) fn confirm_close_workspace_button_rects(inner: Rect) -> (Rect, Rect) 
     (rects[0], rects[1])
 }
 
+/// Worktree-menu parity: the outer popup rect for the new-worktree branch input — footer-anchored,
+/// like the rename overlay it mirrors.
+pub(crate) fn new_worktree_popup_rect(area: Rect) -> Option<Rect> {
+    bottom_left_popup_rect(area, 48, 7)
+}
+
+/// Worktree-menu parity: render the new-worktree branch input. Mirrors
+/// `render_rename_workspace_overlay` (one focused text field + create/cancel hints).
+pub(crate) fn render_new_worktree_overlay(
+    palette: &Palette,
+    branch: &str,
+    error: Option<&str>,
+    frame: &mut Frame,
+    popup: Rect,
+) {
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 4 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // input
+        Constraint::Length(1), // error
+        Constraint::Min(0),    // actions live on inner.height - 1
+    ])
+    .areas::<4>(inner);
+
+    render_modal_header(frame, rows[0], "new worktree", palette);
+    render_add_remote_field(frame, rows[1], "branch", branch, true, palette);
+
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
+            rows[2],
+        );
+    }
+
+    let (create_rect, cancel_rect) = rename_workspace_button_rects(inner);
+    render_action_button(
+        frame,
+        create_rect,
+        Some("↵"),
+        "create",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Worktree-menu parity: the delete-worktree confirm popup rect (centered red panel).
+pub(crate) fn confirm_delete_worktree_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 56, 7)
+}
+
+/// Worktree-menu parity: render the delete-worktree confirmation. Mirrors
+/// `render_confirm_close_workspace_overlay`, with the extra "deletes the checkout" warning line.
+pub(crate) fn render_confirm_delete_worktree_overlay(
+    palette: &Palette,
+    label: &str,
+    frame: &mut Frame,
+    popup: Rect,
+) {
+    let Some(inner) = render_panel_shell(frame, popup, palette.red, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 4 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " delete worktree checkout?",
+            Style::default()
+                .fg(palette.red)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " Delete {}? Closes the space and removes its checkout.",
+            truncate_text(label, inner.width.saturating_sub(48) as usize)
+        ))
+        .style(Style::default().fg(palette.text)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    let (delete_rect, cancel_rect) = confirm_close_workspace_button_rects(inner);
+    render_action_button(
+        frame,
+        delete_rect,
+        Some("↵"),
+        "delete",
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Worktree-menu parity: one ui-owned row of the "open worktree…" picker.
+pub(crate) struct WorktreePickerRowView<'a> {
+    pub label: &'a str,
+    pub path: &'a str,
+    /// Already open as a space (selecting it re-focuses instead of re-opening).
+    pub open: bool,
+}
+
+/// Worktree-menu parity: the picker popup rect — footer-anchored like the manage overlay, sized
+/// to the row count (header + rows + status, clamped by `bottom_left_popup_rect`).
+pub(crate) fn worktree_picker_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+    let height = (count.max(1) as u16).saturating_add(4).min(14);
+    bottom_left_popup_rect(area, 64, height)
+}
+
+/// Worktree-menu parity: render the "open worktree…" picker — a header, then one row per existing
+/// checkout (selected row highlighted), or a loading/error status line. Keyboard-driven
+/// (↑/↓ select, ↵ open, esc cancel).
+pub(crate) fn render_worktree_picker_overlay(
+    palette: &Palette,
+    loading: bool,
+    error: Option<&str>,
+    rows: &[WorktreePickerRowView<'_>],
+    selected: usize,
+    frame: &mut Frame,
+    popup: Rect,
+) {
+    let Some(inner) = render_panel_shell(frame, popup, palette.accent, palette.panel_bg) else {
+        return;
+    };
+    if inner.height < 2 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "open worktree",
+        palette,
+    );
+
+    let body_y = inner.y.saturating_add(1);
+    let body_height = inner.height.saturating_sub(2) as usize;
+    if loading {
+        frame.render_widget(
+            Paragraph::new(" loading worktrees…").style(Style::default().fg(palette.overlay0)),
+            Rect::new(inner.x, body_y, inner.width, 1),
+        );
+    } else if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(palette.red)),
+            Rect::new(inner.x, body_y, inner.width, 1),
+        );
+    } else {
+        // Keep the selected row visible: scroll the window so `selected` is always inside it.
+        let scroll = selected.saturating_sub(body_height.saturating_sub(1));
+        for (row_idx, row) in rows.iter().enumerate().skip(scroll).take(body_height) {
+            let y = body_y + (row_idx - scroll) as u16;
+            let is_selected = row_idx == selected;
+            let marker = if is_selected { "▸" } else { " " };
+            let open_suffix = if row.open { "  (open)" } else { "" };
+            let text = format!(" {marker} {}{open_suffix}  {}", row.label, row.path);
+            let style = if is_selected {
+                Style::default()
+                    .fg(panel_contrast_fg(palette))
+                    .bg(palette.accent)
+            } else if row.open {
+                Style::default().fg(palette.overlay0)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            frame.render_widget(
+                Paragraph::new(truncate_text(&text, inner.width as usize)).style(style),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(" ↵ open   esc cancel").style(Style::default().fg(palette.overlay0)),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+}
+
 /// #47: render the one client menu (launcher / workspace context / host context) as an
 /// anchor-anchored accent panel — a title header, an optional target sub-header, then a selectable
 /// list of rows. Geometry comes from `client_menu_inner_rect_at` / `client_menu_row_rect` (the SAME
