@@ -1095,7 +1095,7 @@ fn install_source_description_for(
     match seed {
         NonOverrideSeed::LocalExe => "the current local herdr binary".to_string(),
         NonOverrideSeed::Bundle => format!(
-            "the bundled {} binary from this multi-platform build",
+            "the {} fat bundle repacked from this multi-platform build",
             platform.asset_key()
         ),
         NonOverrideSeed::Download => format!(
@@ -1221,7 +1221,10 @@ fn self_bundle_seeds_platform(platform: &RemotePlatform) -> bool {
     }
 }
 
-/// Extract the carried `platform` binary from this build into a private temp file.
+/// Re-target this fat build for `platform` into a private temp file: the carried
+/// `platform` binary becomes the native image and every other platform (including this
+/// host's own image, compressed in) rides along, so the seeded remote can itself seed
+/// cross-platform offline — mac → linux → another mac works without downloads.
 /// Falls back to the download path if the entry is unexpectedly absent.
 fn extract_bundle_install_source(platform: &RemotePlatform) -> io::Result<InstallSource> {
     let exe = std::env::current_exe()?;
@@ -1231,7 +1234,8 @@ fn extract_bundle_install_source(platform: &RemotePlatform) -> io::Result<Instal
     let Some(entry) = index.entry_for(platform.os, platform.arch) else {
         return download_release_asset(platform);
     };
-    let bytes = crate::bundle::extract_entry(&exe, entry)?;
+    let bytes =
+        crate::bundle::repack_for_entry(&exe, &index, entry, crate::bundle::local_os_arch())?;
 
     let asset_key = platform.asset_key();
     let dir = private_download_dir(&asset_key)?;
@@ -3200,7 +3204,7 @@ mod tests {
         };
         assert_eq!(
             install_source_description_for(&platform, None, NonOverrideSeed::Bundle),
-            "the bundled linux-x86_64 binary from this multi-platform build"
+            "the linux-x86_64 fat bundle repacked from this multi-platform build"
         );
     }
 
@@ -3510,10 +3514,10 @@ mod tests {
         );
         assert_eq!(
             RemoteProvisionStage::Seeding {
-                source: "the bundled linux-aarch64 binary from this multi-platform build".into(),
+                source: "the linux-aarch64 fat bundle repacked from this multi-platform build".into(),
             }
             .label(),
-            "provisioning herdr from the bundled linux-aarch64 binary from this multi-platform build…"
+            "provisioning herdr from the linux-aarch64 fat bundle repacked from this multi-platform build…"
         );
     }
 }
