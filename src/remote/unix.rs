@@ -2253,7 +2253,15 @@ fn remote_client_command(
     command
 }
 
-fn local_forward_socket_path(target: &str, session_name: &str, kind: RemoteBridgeKind) -> PathBuf {
+/// `reserve` keeps that many bytes of headroom under the sun_path budget so a
+/// sibling path derived from this one (e.g. the api socket plus a "-client"
+/// suffix) still fits.
+fn local_forward_socket_path(
+    target: &str,
+    session_name: &str,
+    kind: RemoteBridgeKind,
+    reserve: usize,
+) -> PathBuf {
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
@@ -2263,7 +2271,7 @@ fn local_forward_socket_path(target: &str, session_name: &str, kind: RemoteBridg
     let readable = tmpdir.join(format!(
         "herdr-remote-{pid}-{target_clean}-{session_clean}-{kind_label}.sock"
     ));
-    if fits_unix_socket_path(&readable) {
+    if fits_unix_socket_path(&readable, reserve) {
         return readable;
     }
 
@@ -2277,25 +2285,35 @@ fn local_forward_socket_path(target: &str, session_name: &str, kind: RemoteBridg
     let hash = short_socket_hash(target, session_name, kind_label);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{kind_label}.{hash}.sock");
     let short_in_tmp = tmpdir.join(&short_name);
-    if fits_unix_socket_path(&short_in_tmp) {
+    if fits_unix_socket_path(&short_in_tmp, reserve) {
         return short_in_tmp;
     }
     PathBuf::from("/tmp").join(short_name)
 }
 
 fn remote_bridge_socket_paths(target: &str, session_name: &str) -> RemoteBridgePaths {
+    // The CLI-attach child (`herdr client`) re-derives its client socket from
+    // HERDR_SOCKET_PATH (the api socket), and that derivation outranks the explicit
+    // HERDR_CLIENT_SOCKET_PATH we also pass (see
+    // server::socket_paths::client_socket_path_from_overrides). Bind the client
+    // bridge at exactly the derived path so both views agree; the api path keeps
+    // headroom for the appended "-client".
+    let api_socket =
+        local_forward_socket_path(target, session_name, RemoteBridgeKind::Api, "-client".len());
+    let client_socket =
+        crate::server::socket_paths::derive_client_socket_from_api_socket(&api_socket);
     RemoteBridgePaths {
-        client_socket: local_forward_socket_path(target, session_name, RemoteBridgeKind::Client),
-        api_socket: local_forward_socket_path(target, session_name, RemoteBridgeKind::Api),
+        client_socket,
+        api_socket,
     }
 }
 
-fn fits_unix_socket_path(path: &Path) -> bool {
+fn fits_unix_socket_path(path: &Path, reserve: usize) -> bool {
     use std::os::unix::ffi::OsStrExt;
     // sun_path is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve
     // 1 byte for the trailing NUL and use the smaller cap for portability.
     const MAX: usize = 103;
-    path.as_os_str().as_bytes().len() <= MAX
+    path.as_os_str().as_bytes().len() + reserve <= MAX
 }
 
 fn short_socket_hash(target: &str, session: &str, kind: &str) -> String {
@@ -3455,7 +3473,7 @@ mod tests {
         let _guard = remote_env_lock().lock().unwrap();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
-        let path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Client);
+        let path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Client, 0);
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -3466,10 +3484,10 @@ mod tests {
             "expected readable name, got {filename}"
         );
         assert!(filename.contains("-dev-default-client."), "got {filename}");
-        let api_path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Api);
+        let api_path = local_forward_socket_path("dev", "default", RemoteBridgeKind::Api, 0);
         assert_ne!(path, api_path);
         assert!(
-            fits_unix_socket_path(&path),
+            fits_unix_socket_path(&path, 0),
             "socket path too long: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
@@ -3493,8 +3511,52 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or("")
             .contains("-api."));
-        assert!(fits_unix_socket_path(&paths.client_socket));
-        assert!(fits_unix_socket_path(&paths.api_socket));
+        assert!(fits_unix_socket_path(&paths.client_socket, 0));
+        assert!(fits_unix_socket_path(&paths.api_socket, 0));
+    }
+
+    #[test]
+    fn remote_bridge_client_socket_matches_child_api_derivation() {
+        let _guard = remote_env_lock().lock().unwrap();
+        // The CLI-attach child (`herdr client`) re-derives its client socket from
+        // HERDR_SOCKET_PATH; that derivation outranks the explicit
+        // HERDR_CLIENT_SOCKET_PATH we also pass (see
+        // server::socket_paths::client_socket_path_from_overrides). The bridge must
+        // bind exactly the derived path or the child connects to a socket nobody
+        // listens on and exits immediately.
+        let paths = remote_bridge_socket_paths("dev2-gv", "default");
+        assert_eq!(
+            paths.client_socket,
+            crate::server::socket_paths::derive_client_socket_from_api_socket(&paths.api_socket),
+        );
+    }
+
+    #[test]
+    fn remote_bridge_client_socket_fits_even_when_api_uses_hashed_fallback() {
+        let _guard = remote_env_lock().lock().unwrap();
+        // Deriving the client path appends "-client" to the api name, so the api
+        // path must reserve that headroom under the sun_path budget even in the
+        // hashed-fallback regime.
+        let paths = remote_bridge_socket_paths(
+            "longish-host.example.com",
+            "a-fairly-long-session-name-here",
+        );
+        assert!(
+            fits_unix_socket_path(&paths.api_socket, 0),
+            "api path too long: {} ({} bytes)",
+            paths.api_socket.display(),
+            socket_path_byte_len(&paths.api_socket)
+        );
+        assert!(
+            fits_unix_socket_path(&paths.client_socket, 0),
+            "derived client path too long: {} ({} bytes)",
+            paths.client_socket.display(),
+            socket_path_byte_len(&paths.client_socket)
+        );
+        assert_eq!(
+            paths.client_socket,
+            crate::server::socket_paths::derive_client_socket_from_api_socket(&paths.api_socket),
+        );
     }
 
     #[test]
@@ -3505,9 +3567,9 @@ mod tests {
         // short name, which fits under TMPDIR.
         let target = "longish-host.example.com";
         let session = "a-fairly-long-session-name-here";
-        let path = local_forward_socket_path(target, session, RemoteBridgeKind::Client);
+        let path = local_forward_socket_path(target, session, RemoteBridgeKind::Client, 0);
         assert!(
-            fits_unix_socket_path(&path),
+            fits_unix_socket_path(&path, 0),
             "socket path too long for sun_path: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
@@ -3528,8 +3590,9 @@ mod tests {
             "longish-host.example.com",
             "default",
             RemoteBridgeKind::Client,
+            0,
         );
-        let fits = fits_unix_socket_path(&path);
+        let fits = fits_unix_socket_path(&path, 0);
         let parent = path.parent().map(Path::to_path_buf);
         let filename = path
             .file_name()
