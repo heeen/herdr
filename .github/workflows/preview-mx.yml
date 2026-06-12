@@ -40,8 +40,12 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
+          # Date + HHMM (UTC) make preview versions humanly orderable: `herdr status`
+          # surfaces this stamp as `build: YYYY.MM.DD.HHMM` — the SAME number the tap
+          # derives from the tag for the brew formula version, so status and brew agree.
           day="$(date -u +%Y-%m-%d)"
-          build_id="$day-$short_sha"
+          hhmm="$(date -u +%H%M)"
+          build_id="$day-$hhmm-$short_sha"
           base_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           {
             echo "short_sha=$short_sha"

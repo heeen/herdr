@@ -93,6 +93,9 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
 
     println!("client:");
     println!("  version: {}", crate::build_info::version());
+    if let Some(stamp) = crate::build_info::build_stamp(&crate::build_info::version()) {
+        println!("  build: {stamp}");
+    }
     println!(
         "  channel: {}",
         crate::config::Config::load().config.update.channel.as_str()
@@ -125,6 +128,9 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
     }
 
     println!("version: {}", crate::build_info::version());
+    if let Some(stamp) = crate::build_info::build_stamp(&crate::build_info::version()) {
+        println!("build: {stamp}");
+    }
     println!(
         "channel: {}",
         crate::config::Config::load().config.update.channel.as_str()
@@ -141,6 +147,9 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
         } => {
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
+            if let Some(stamp) = version.as_deref().and_then(crate::build_info::build_stamp) {
+                println!("{indent}build: {stamp}");
+            }
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
