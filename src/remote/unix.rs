@@ -300,6 +300,22 @@ impl SshTarget {
         {
             command.arg("-o").arg("ConnectTimeout=10");
         }
+        // herdr's ssh sessions are pure exec/stdio channels and never need the port forwards
+        // the user's ssh_config sets up for interactive use. Inheriting LocalForward/
+        // RemoteForward breaks every probe and bridge when the forward port is already held —
+        // typically by the user's own interactive session to the same host, or by herdr's own
+        // bridge to a sibling host forwarding the same port ("ssh works by hand, but
+        // add-remote sticks at connecting") — with `bind: Address already in use`. Clear them
+        // the way scp does, unless the user explicitly asked this herdr connection to forward.
+        let user_forwards = self.options.iter().any(|opt| {
+            opt.contains("ClearAllForwardings")
+                || opt.starts_with("-L")
+                || opt.starts_with("-R")
+                || opt.starts_with("-D")
+        });
+        if !user_forwards {
+            command.arg("-o").arg("ClearAllForwardings=yes");
+        }
         command.args(&self.options);
         if !self.options.iter().any(|opt| opt == "-T") {
             command.arg("-T");
@@ -2325,12 +2341,22 @@ mod tests {
     fn ssh_target_command_inserts_dash_t_before_bare_destination() {
         assert_eq!(
             ssh_argv(&SshTarget::bare("iq-64"), "uname -s"),
-            ["-o", "ConnectTimeout=10", "-T", "iq-64", "uname -s"]
+            [
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-T",
+                "iq-64",
+                "uname -s"
+            ]
         );
     }
 
     #[test]
     fn ssh_target_command_emits_options_before_destination() {
+        // An explicit user `-L` keeps its forward: ClearAllForwardings is NOT injected,
+        // since it would clear command-line forwards too.
         let target = SshTarget::new(
             "iq-64",
             vec![
@@ -2357,11 +2383,42 @@ mod tests {
     }
 
     #[test]
+    fn ssh_target_command_clears_config_forwardings_without_user_forwards() {
+        // ssh_config-inherited LocalForward/RemoteForward must not leak into herdr's
+        // exec/bridge sessions: a held forward port (the user's own interactive ssh, or a
+        // sibling herdr bridge) would fail every connection with `bind: Address already in
+        // use`. Non-forwarding user options keep the clear.
+        let target = SshTarget::new("iq-64", vec!["-J".into(), "jump".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-o", "ClearAllForwardings=yes"]));
+
+        // Any explicit forward flag (or an explicit ClearAllForwardings) disables it.
+        for forward in [vec!["-D".into(), "1080".into()], vec!["-R8000:h:80".into()]] {
+            let target = SshTarget::new("iq-64", forward);
+            let argv = ssh_argv(&target, "x");
+            assert!(!argv.contains(&"ClearAllForwardings=yes".to_string()));
+        }
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "ClearAllForwardings=no".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ClearAllForwardings=yes".to_string()));
+    }
+
+    #[test]
     fn ssh_target_command_does_not_duplicate_user_supplied_dash_t() {
         let target = SshTarget::new("iq-64", vec!["-T".into()]);
         assert_eq!(
             ssh_argv(&target, "x"),
-            ["-o", "ConnectTimeout=10", "-T", "iq-64", "x"]
+            [
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-T",
+                "iq-64",
+                "x"
+            ]
         );
     }
 
@@ -2370,7 +2427,15 @@ mod tests {
         let target = SshTarget::new("iq-64", vec!["-o".into(), "ConnectTimeout=3".into()]);
         assert_eq!(
             ssh_argv(&target, "x"),
-            ["-o", "ConnectTimeout=3", "-T", "iq-64", "x"]
+            [
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ConnectTimeout=3",
+                "-T",
+                "iq-64",
+                "x"
+            ]
         );
     }
 
