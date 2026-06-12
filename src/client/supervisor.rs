@@ -103,6 +103,12 @@ pub(crate) struct WorkspaceSummary {
     // non-linked member is the group parent). `None` key = a standalone (ungrouped) workspace.
     pub(crate) worktree_key: Option<String>,
     pub(crate) worktree_is_linked: bool,
+    // Worktree-MENU provenance, mirrored from the wire `WorkspaceInfo.git`: set when the checkout
+    // is a git repo even WITHOUT worktree-space membership, so the workspace context menu can
+    // offer worktree actions on plain git workspaces (server-menu parity). NEVER used for
+    // grouping — `worktree_key` stays the only grouping signal.
+    pub(crate) git_repo_key: Option<String>,
+    pub(crate) git_is_linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2062,6 +2068,11 @@ impl ClientSupervisorModel {
     /// The workspace's worktree grouping, read from its summary: `(repo_key, is_linked,
     /// has_linked_children)`. `None` for a non-git workspace. Drives the worktree rows of the
     /// workspace context menu (server-menu parity) and the caller's collapsed-state lookup.
+    ///
+    /// Mirrors the server menu's two-tier detection: worktree-space MEMBERSHIP when present,
+    /// otherwise the plain-git signal (`WorkspaceInfo.git`) — so a git workspace that has never
+    /// created a worktree still gets the "new worktree" / "open worktree…" rows. Grouping
+    /// (`has_linked_children`) keys on membership only, exactly like the sidebar renderer.
     pub(crate) fn workspace_worktree_group(
         &self,
         server_id: &ServerId,
@@ -2073,8 +2084,10 @@ impl ClientSupervisorModel {
             .workspaces
             .iter()
             .find(|ws| ws.workspace_id == workspace_id)?;
-        let group_key = workspace.worktree_key.clone()?;
-        let is_linked = workspace.worktree_is_linked;
+        let (group_key, is_linked) = match &workspace.worktree_key {
+            Some(key) => (key.clone(), workspace.worktree_is_linked),
+            None => (workspace.git_repo_key.clone()?, workspace.git_is_linked),
+        };
         let has_linked_children = !is_linked
             && server.summaries.workspaces.iter().any(|other| {
                 other.workspace_id != workspace_id
@@ -3616,6 +3629,13 @@ impl ServerSummary {
                         .worktree
                         .as_ref()
                         .is_some_and(|w| w.is_linked_worktree),
+                    // Plain-git signal for the worktree context-menu rows (older servers
+                    // don't send it — the menu then degrades to membership-only, as before).
+                    git_repo_key: workspace.git.as_ref().map(|git| git.repo_key.clone()),
+                    git_is_linked: workspace
+                        .git
+                        .as_ref()
+                        .is_some_and(|git| git.is_linked_worktree),
                 })
                 .collect(),
             agents: agents
@@ -3876,6 +3896,7 @@ mod tests {
             active_tab_id: "tab-1".into(),
             agent_status: crate::api::schema::AgentStatus::Idle,
             worktree: None,
+            git: None,
         }
     }
 
@@ -5915,6 +5936,8 @@ mod tests {
                             focused: true,
                             worktree_key: None,
                             worktree_is_linked: false,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-b".into(),
@@ -5923,6 +5946,8 @@ mod tests {
                             focused: false,
                             worktree_key: None,
                             worktree_is_linked: false,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                     ],
                     agents: Vec::new(),
@@ -5971,6 +5996,8 @@ mod tests {
                             focused: false,
                             worktree_key: None,
                             worktree_is_linked: false,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                         WorkspaceSummary {
                             workspace_id: "wt-child".into(),
@@ -5979,6 +6006,8 @@ mod tests {
                             focused: false,
                             worktree_key: Some("repo-1".into()),
                             worktree_is_linked: true,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                     ],
                     agents: Vec::new(),
@@ -6005,6 +6034,8 @@ mod tests {
             focused: false,
             worktree_key: worktree_key.map(str::to_string),
             worktree_is_linked: is_linked,
+            git_repo_key: None,
+            git_is_linked: false,
         }
     }
 
@@ -6052,6 +6083,40 @@ mod tests {
         assert_eq!(
             menu_labels(&model),
             vec!["rename", "close", "new worktree", "open worktree…"]
+        );
+    }
+
+    #[test]
+    fn workspace_menu_plain_git_repo_without_membership_offers_worktree_rows() {
+        // The screenshot bug: a git workspace that has never created a worktree carries NO
+        // worktree-space membership (`worktree_key: None`) — only the plain-git signal
+        // (`WorkspaceInfo.git`). The menu must still offer the create/open rows, mirroring
+        // the server menu's `git_space` fallback.
+        let mut workspace = worktree_summary("herdr", None, false);
+        workspace.git_repo_key = Some("repo-herdr".into());
+        let mut model = model_with_worktree_summaries(vec![workspace]);
+        model.open_workspace_context_menu(
+            ServerId::main(),
+            "herdr".into(),
+            "herdr".into(),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            menu_labels(&model),
+            vec!["rename", "close", "new worktree", "open worktree…"]
+        );
+
+        // A plain-git LINKED checkout (opened manually, no membership) gets the delete row.
+        let mut linked = worktree_summary("wt", None, false);
+        linked.git_repo_key = Some("repo-herdr".into());
+        linked.git_is_linked = true;
+        let mut model = model_with_worktree_summaries(vec![linked]);
+        model.open_workspace_context_menu(ServerId::main(), "wt".into(), "wt".into(), None, 0, 0);
+        assert_eq!(
+            menu_labels(&model),
+            vec!["rename", "close", "delete worktree checkout…"]
         );
     }
 

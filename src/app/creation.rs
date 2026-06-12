@@ -348,6 +348,15 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            // CACHED metadata only (kept fresh by the background git refresh) — summaries
+            // are a hot path, so no live filesystem probe here, unlike the server context
+            // menu's on-click `git_space_metadata` fallback.
+            git: ws
+                .git_space()
+                .map(|space| crate::api::schema::WorkspaceGitInfo {
+                    repo_key: space.key.clone(),
+                    is_linked_worktree: space.is_linked_worktree,
+                }),
         }
     }
 }

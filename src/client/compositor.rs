@@ -4935,6 +4935,8 @@ mod tests {
                             focused,
                             worktree_key: None,
                             worktree_is_linked: false,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         }],
                         agents: Vec::new(),
                     },
@@ -5218,6 +5220,8 @@ mod tests {
                 focused: i == 0,
                 worktree_key: None,
                 worktree_is_linked: false,
+                git_repo_key: None,
+                git_is_linked: false,
             })
             .collect();
         model
@@ -7494,6 +7498,8 @@ mod tests {
                             focused: true,
                             worktree_key: Some("repo-key".into()),
                             worktree_is_linked: false,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                         WorkspaceSummary {
                             workspace_id: "child".into(),
@@ -7502,6 +7508,8 @@ mod tests {
                             focused: false,
                             worktree_key: Some("repo-key".into()),
                             worktree_is_linked: true,
+                            git_repo_key: None,
+                            git_is_linked: false,
                         },
                     ],
                     agents: Vec::new(),

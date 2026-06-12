@@ -8642,6 +8642,8 @@ mod tests {
                 focused: idx == 0,
                 worktree_key: None,
                 worktree_is_linked: false,
+                git_repo_key: None,
+                git_is_linked: false,
             })
             .collect();
         model
@@ -8662,6 +8664,8 @@ mod tests {
                 focused: false,
                 worktree_key: None,
                 worktree_is_linked: false,
+                git_repo_key: None,
+                git_is_linked: false,
             })
             .collect();
         model

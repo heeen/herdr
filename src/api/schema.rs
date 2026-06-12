@@ -862,6 +862,12 @@ pub struct WorkspaceInfo {
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// Present when the workspace's checkout is a git repo even WITHOUT worktree-space
+    /// membership (from the workspace's cached git metadata) — the signal client menus
+    /// need to offer worktree actions on a plain git workspace, mirroring the server
+    /// context menu's `git_space` fallback. `worktree` stays the GROUPING signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<WorkspaceGitInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,6 +876,12 @@ pub struct WorkspaceWorktreeInfo {
     pub repo_name: String,
     pub repo_root: String,
     pub checkout_path: String,
+    pub is_linked_worktree: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGitInfo {
+    pub repo_key: String,
     pub is_linked_worktree: bool,
 }
 
@@ -1629,6 +1641,7 @@ mod tests {
                         checkout_path: "/worktrees/herdr/worktree-api".into(),
                         is_linked_worktree: true,
                     }),
+                    git: None,
                 },
                 tab: TabInfo {
                     tab_id: "w_1:1".into(),
