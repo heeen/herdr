@@ -76,6 +76,16 @@ const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 // Client state
 // ---------------------------------------------------------------------------
 
+struct ClientLoopConfig {
+    sound_config: crate::config::SoundConfig,
+    mouse_scroll_lines: usize,
+    redraw_on_focus_gained: bool,
+    kitty_graphics_enabled: bool,
+    mouse_capture_active: bool,
+    #[cfg(unix)]
+    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+}
+
 /// State tracking for the thin client.
 struct ClientState {
     /// Stateful semantic-frame encoder used when the server sends FrameData.
@@ -99,6 +109,9 @@ struct ClientState {
     /// Rows scrolled for one direct-attach wheel notch.
     #[cfg(unix)]
     mouse_scroll_lines: usize,
+    /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    #[cfg(unix)]
+    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
     #[cfg(windows)]
@@ -314,13 +327,6 @@ struct ClientRenderPlan {
 #[derive(Debug, Default)]
 #[cfg(windows)]
 struct AttachEscapeState;
-
-#[derive(Debug)]
-#[cfg(windows)]
-struct PendingCursorReveal {
-    due_at: Instant,
-    bytes: Vec<u8>,
-}
 
 #[derive(Debug, Default)]
 #[cfg(unix)]
@@ -4875,6 +4881,8 @@ async fn run_client_loop(
         pending_full_render: false,
         last_composited_render_at: Instant::now(),
         last_summary_refresh: HashMap::new(),
+        #[cfg(unix)]
+        remote_image_paste_key: None,
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -4889,14 +4897,16 @@ async fn run_client_loop(
         spawn_main_supervisor_bootstrap(&event_tx);
     }
 
+    let host_color_query_sent = state.attach_escape.is_none() && should_query_host_terminal_theme();
+
     // Spawn the stdin reader thread.
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
     std::thread::spawn(move || {
-        input::stdin_reader_loop(stdin_tx, &stdin_quit);
+        input::stdin_reader_loop(stdin_tx, &stdin_quit, host_color_query_sent);
     });
 
-    if state.attach_escape.is_none() && should_query_host_terminal_theme() {
+    if host_color_query_sent {
         query_host_terminal_theme();
     }
 
@@ -5546,6 +5556,21 @@ async fn run_client_loop(
                     ServerMessage::Clipboard { data } => {
                         forward_clipboard(&data);
                         let _ = io::stdout().flush();
+                    }
+                    ServerMessage::WindowTitle { title } => {
+                        if server_id != active_server_id(&state) {
+                            continue;
+                        }
+                        let mut stdout = io::stdout();
+                        match title.as_deref() {
+                            Some(title) => {
+                                let _ = write!(stdout, "\x1b]0;{title}\x07");
+                            }
+                            None => {
+                                let _ = stdout.write_all(b"\x1b]0;\x07");
+                            }
+                        }
+                        let _ = stdout.flush();
                     }
                     ServerMessage::ReloadSoundConfig => {
                         reload_local_client_config(

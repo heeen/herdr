@@ -528,6 +528,7 @@ impl NewWorkspaceRoute {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: std::collections::HashMap::new(),
                         },
                     ),
                 },
@@ -4523,6 +4524,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: std::collections::HashMap::new(),
                         },
                     ),
                 }
@@ -4627,6 +4629,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: std::collections::HashMap::new(),
                         },
                     ),
                 },

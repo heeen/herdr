@@ -57,7 +57,13 @@ impl App {
 
     pub(super) fn save_theme(&mut self, name: &str) {
         if self.update_config_file("theme", |content| {
-            crate::config::upsert_section_value(content, "theme", "name", &format!("\"{name}\""))
+            let content = crate::config::upsert_section_value(
+                content,
+                "theme",
+                "name",
+                &format!("\"{name}\""),
+            );
+            crate::config::upsert_section_bool(&content, "theme", "auto_switch", false)
         }) {
             self.apply_config_from_disk(false);
         }
@@ -189,6 +195,27 @@ impl App {
                 content,
                 "ui",
                 "agent_panel_scope",
+                &format!("\"{value}\""),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
+        let value = match sort {
+            crate::app::state::AgentPanelSort::Spaces => {
+                crate::config::AgentPanelSortConfig::Spaces.as_str()
+            }
+            crate::app::state::AgentPanelSort::Priority => {
+                crate::config::AgentPanelSortConfig::Priority.as_str()
+            }
+        };
+        if self.update_config_file("agent panel sort", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "agent_panel_sort",
                 &format!("\"{value}\""),
             )
         }) {

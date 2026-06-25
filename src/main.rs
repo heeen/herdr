@@ -42,6 +42,18 @@ fn pop_keyboard_enhancement_flags() -> io::Result<()> {
     Ok(())
 }
 
+fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
+    use std::io::Write;
+
+    let sequence = if enabled {
+        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE
+    } else {
+        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE
+    };
+    io::stdout().write_all(sequence.as_bytes())?;
+    io::stdout().flush()
+}
+
 mod agent_resume;
 mod api;
 mod app;
@@ -65,6 +77,8 @@ mod logging;
 mod pane;
 mod persist;
 mod platform;
+mod plugin_command;
+mod plugin_paths;
 mod product_announcements;
 mod protocol;
 mod pty;
@@ -103,6 +117,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 #                  vesper
 # name = "catppuccin"
 
+# Follow host terminal light/dark appearance and switch Herdr UI themes.
+# Existing manual behavior is unchanged unless this is true.
+# auto_switch = false
+# dark_name = "catppuccin"
+# light_name = "catppuccin-latte"
+
 # Override individual color tokens on top of the base theme.
 # Accepts: hex (#rrggbb), named colors, rgb(r,g,b), or panel_bg = "reset"
 # [theme.custom]
@@ -126,9 +146,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # new_cwd = "follow"
 
 [update]
-# Update channel used by background checks and `herdr update`.
+# Update channel used by background version checks and `herdr update`.
 # Use "stable" for normal releases or "preview" for opt-in preview builds.
 # channel = "stable"
+
+# Check herdr.dev for new Herdr versions in the background.
+# version_check = true
+
+# Check herdr.dev for remote agent-detection manifest updates in the background.
+# manifest_check = true
 
 [keys]
 # Prefix key to enter prefix mode (default: "ctrl+b")
@@ -160,6 +186,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # previous_agent = ""     # optional, unset by default
 # next_agent = ""         # optional, unset by default
 # focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"
+# remote_image_paste = "ctrl+v" # only active in herdr --remote; empty disables raw-key image paste
 # new_tab = "prefix+c"
 # rename_tab = "prefix+shift+t"
 # previous_tab = "prefix+p"
@@ -248,11 +275,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to create tabs immediately with generated names.
 # prompt_new_tab_name = true
 
+# Draw borders around split panes.
+# pane_borders = true
+
+# Keep split panes visually separated instead of sharing divider borders.
+# pane_gaps = true
+
 # Show detected/reported agent labels in split pane borders when no manual pane name is set.
 # show_agent_labels_on_pane_borders = false
 
-# Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
-# agent_panel_scope = "all"
+# Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
+# "workspaces" is accepted as an alias for "spaces".
+# agent_panel_sort = "spaces"
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
@@ -355,8 +389,8 @@ pane_history = false
 # Optional allow-list: only reveal for focused panes whose detected agent
 # matches one of these names. Empty means apply to any focused pane.
 # If the list contains no valid names, the reveal does not apply.
-# Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
-# kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder.
+# Accepted: pi, claude, codex, gemini, cursor, devin, cline, opencode,
+# copilot, kimi, kiro, droid, amp, grok, hermes, kilo, qodercli, qoder.
 # cjk_ime_agents = []
 # Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
 # Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
@@ -704,6 +738,7 @@ fn main() -> io::Result<()> {
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        let _ = set_host_color_scheme_reports(false);
         let _ = pop_keyboard_enhancement_flags();
         ratatui::restore();
         original_hook(info);
@@ -730,6 +765,7 @@ fn main() -> io::Result<()> {
             execute!(io::stdout(), DisableMouseCapture)?;
         }
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
+        set_host_color_scheme_reports(true)?;
         push_keyboard_enhancement_flags()?;
 
         // Some hosts do not honor Kitty keyboard enhancement pushes for
@@ -767,6 +803,7 @@ fn main() -> io::Result<()> {
             DisableBracketedPaste,
             DisableMouseCapture
         )?;
+        set_host_color_scheme_reports(false)?;
         ratatui::restore();
 
         // Drop app (and all workspaces/panes) before runtime shuts down

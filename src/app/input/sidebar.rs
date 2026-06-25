@@ -433,7 +433,7 @@ impl AppState {
         best.map(|(insert_idx, _)| insert_idx)
     }
 
-    pub(super) fn on_agent_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
+    pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
         }
@@ -442,7 +442,7 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_scope);
+        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -501,6 +501,25 @@ impl AppState {
     /// affordance/banner/card/agent entry. The ` new`/`menu` affordances hover only when drawn
     /// (`self.mouse_capture` + `launcher_enabled`, matching the renderer's draw gate). The caller
     /// gates this to `in_sidebar && !sidebar_collapsed` in a navigate-ish mode. No server traffic.
+    /// herdr-mx: hit-test the client-side agent-panel scope toggle (current/all) in the
+    /// monolithic sidebar. The multi-remote client drives the same toggle from the compositor.
+    pub(super) fn on_agent_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+        );
+        let rect = crate::ui::agent_panel_scope_toggle_rect(detail_area, self.agent_panel_scope);
+        rect.width > 0
+            && col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height
+    }
+
     pub(super) fn resolve_sidebar_hover(
         &self,
         col: u16,
@@ -577,7 +596,7 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelScope, AppState, DragTarget, Mode, SidebarAgentItem},
+        app::state::{AgentPanelScope, AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem},
         detect::Agent,
         workspace::Workspace,
     };
@@ -835,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_agent_panel_toggle_switches_scope() {
+    fn clicking_agent_panel_toggle_switches_sort() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -847,23 +866,15 @@ mod tests {
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
         );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope);
+        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
 
-        assert_eq!(
-            app.state.agent_panel_scope,
-            AgentPanelScope::CurrentWorkspace
-        );
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
-        let snapshot = capture_snapshot(&app.state);
-        assert_eq!(
-            snapshot.agent_panel_scope,
-            AgentPanelScope::CurrentWorkspace
-        );
     }
 
     #[test]
@@ -896,7 +907,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
@@ -1527,7 +1537,8 @@ mod tests {
         let labels: Vec<_> = app.state.workspaces[0]
             .tabs
             .iter()
-            .map(|tab| tab.display_name())
+            .enumerate()
+            .map(|(tab_idx, _)| app.state.workspaces[0].tab_display_name(tab_idx).unwrap())
             .collect();
         assert_eq!(labels, vec!["foo", "2", "3"]);
         assert_eq!(
@@ -1536,6 +1547,9 @@ mod tests {
         );
         assert!(app.state.workspaces[0].tabs[1].custom_name.is_none());
         assert!(app.state.workspaces[0].tabs[2].custom_name.is_none());
+        assert_eq!(app.state.workspaces[0].tabs[0].number, 2);
+        assert_eq!(app.state.workspaces[0].tabs[1].number, 3);
+        assert_eq!(app.state.workspaces[0].tabs[2].number, 1);
         assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
         assert_eq!(app.state.workspaces[0].active_tab, 2);
     }

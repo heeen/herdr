@@ -88,12 +88,12 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() {
+        if path.exists() && UnixStream::connect(path).is_ok() {
             return;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("file did not appear at {}", path.display());
+    panic!("socket did not accept connections at {}", path.display());
 }
 
 fn spawn_server(

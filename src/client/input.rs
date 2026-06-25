@@ -23,6 +23,9 @@ use tokio::sync::mpsc;
 
 use super::ClientLoopEvent;
 
+#[cfg(any(windows, test))]
+mod windows_vti;
+
 // ---------------------------------------------------------------------------
 // Stdin reader thread
 // ---------------------------------------------------------------------------
@@ -32,20 +35,35 @@ use super::ClientLoopEvent;
 /// This runs on a dedicated thread because stdin reading is blocking.
 /// The main loop receives the raw bytes and forwards them as
 /// `ClientMessage::Input` to the server.
-pub fn stdin_reader_loop(event_tx: mpsc::Sender<ClientLoopEvent>, should_quit: &Arc<AtomicBool>) {
+pub fn stdin_reader_loop(
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    host_color_query_sent: bool,
+) {
     #[cfg(windows)]
-    return windows_stdin_reader_loop(event_tx, should_quit);
+    {
+        let _ = host_color_query_sent;
+        windows_stdin_reader_loop(event_tx, should_quit);
+    }
 
     #[cfg(unix)]
-    unix_stdin_reader_loop(event_tx, should_quit);
+    unix_stdin_reader_loop(event_tx, should_quit, host_color_query_sent);
 }
 
 #[cfg(unix)]
-fn unix_stdin_reader_loop(event_tx: mpsc::Sender<ClientLoopEvent>, should_quit: &Arc<AtomicBool>) {
+fn unix_stdin_reader_loop(
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    host_color_query_sent: bool,
+) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut scratch = [0u8; 4096];
     let mut framer = crate::raw_input::RawInputByteFramer::default();
+    if host_color_query_sent {
+        framer.host_color_query_sent();
+        framer.enable_host_color_scheme_change_tracking();
+    }
 
     while !should_quit.load(Ordering::Acquire) {
         match reader.read(&mut scratch) {
@@ -61,12 +79,25 @@ fn unix_stdin_reader_loop(event_tx: mpsc::Sender<ClientLoopEvent>, should_quit: 
                 }
 
                 if stdin_read_ready(&reader, 10) == Some(false) {
-                    for data in framer.flush_timeout() {
+                    let had_pending = framer.has_pending_input();
+                    let chunks = framer.flush_timeout();
+                    let held_escape = had_pending && chunks.is_empty();
+                    for data in chunks {
                         if event_tx
                             .blocking_send(ClientLoopEvent::StdinInput(data))
                             .is_err()
                         {
                             return;
+                        }
+                    }
+                    if held_escape && stdin_read_ready(&reader, 10) == Some(false) {
+                        for data in framer.flush_timeout() {
+                            if event_tx
+                                .blocking_send(ClientLoopEvent::StdinInput(data))
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                 }
@@ -83,6 +114,23 @@ fn unix_stdin_reader_loop(event_tx: mpsc::Sender<ClientLoopEvent>, should_quit: 
 
 #[cfg(windows)]
 fn windows_stdin_reader_loop(
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+) {
+    if !super::windows_vti_input_backend_enabled() {
+        windows_crossterm_reader_loop(event_tx, should_quit);
+    } else {
+        match windows_vti::console_input_handle() {
+            Ok(handle) if windows_vti::virtual_terminal_input_enabled(handle) => {
+                windows_vti::raw_console_reader_loop(handle, event_tx, should_quit);
+            }
+            _ => windows_crossterm_reader_loop(event_tx, should_quit),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_crossterm_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) {
@@ -226,7 +274,7 @@ fn send_windows_raw_events(
         .is_ok()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_client_input_event_from_raw(
     event: crate::raw_input::RawInputEvent,
 ) -> Option<crate::protocol::ClientInputEvent> {
@@ -254,6 +302,7 @@ fn windows_client_input_event_from_raw(
             Some(crate::protocol::ClientInputEvent::FocusLost)
         }
         crate::raw_input::RawInputEvent::HostDefaultColor { .. }
+        | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }

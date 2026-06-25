@@ -2,9 +2,12 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+mod env;
 mod integrations;
+mod layouts;
 mod panes;
 mod remotes;
+pub(crate) mod plugins;
 mod responses;
 mod tabs;
 mod workspaces;
@@ -57,13 +60,44 @@ impl App {
             return;
         }
 
+        if let AppEvent::PluginCommandFinished {
+            log_id,
+            finished_unix_ms,
+            exit_code,
+            stdout,
+            stderr,
+            error,
+        } = ev
+        {
+            self.state.plugin_commands_in_flight =
+                self.state.plugin_commands_in_flight.saturating_sub(1);
+            if let Some(log) = self
+                .state
+                .plugin_command_logs
+                .iter_mut()
+                .find(|log| log.log_id == log_id)
+            {
+                log.finished_unix_ms = Some(finished_unix_ms);
+                log.exit_code = exit_code;
+                log.stdout = Some(stdout);
+                log.stderr = Some(stderr);
+                log.error = error;
+                log.status = if log.error.is_none() && log.exit_code == Some(0) {
+                    crate::api::schema::PluginCommandStatus::Succeeded
+                } else {
+                    crate::api::schema::PluginCommandStatus::Failed
+                };
+            }
+            return;
+        }
+
         if let AppEvent::WorktreeAddFinished(result) = ev {
-            self.handle_worktree_add_finished(result);
+            self.handle_worktree_add_finished(*result);
             return;
         }
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
-            self.handle_worktree_remove_finished(result);
+            self.handle_worktree_remove_finished(*result);
             return;
         }
 
@@ -86,7 +120,25 @@ impl App {
         }
 
         let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
-            self.overlay_panes.remove(pane_id)
+            self.overlay_panes.remove(pane_id).map(|overlay| {
+                let was_overlay_active =
+                    self.state
+                        .is_active_pane(overlay.ws_idx, overlay.tab_idx, *pane_id);
+                let tab_before_exit = self
+                    .state
+                    .workspaces
+                    .get(overlay.ws_idx)
+                    .and_then(|ws| ws.tabs.get(overlay.tab_idx));
+                let was_overlay_focused_in_tab =
+                    tab_before_exit.is_some_and(|tab| tab.layout.focused() == *pane_id);
+                let tab_zoomed_before_exit = tab_before_exit.map(|tab| tab.zoomed);
+                (
+                    overlay,
+                    was_overlay_active,
+                    was_overlay_focused_in_tab,
+                    tab_zoomed_before_exit,
+                )
+            })
         } else {
             None
         };
@@ -159,8 +211,19 @@ impl App {
             self.emit_pane_state_update(update);
         }
         self.sync_agent_metadata_deadline();
-        if let Some(overlay) = overlay_state {
-            self.restore_overlay_after_exit(overlay);
+        if let Some((
+            overlay,
+            was_overlay_active,
+            was_overlay_focused_in_tab,
+            tab_zoomed_before_exit,
+        )) = overlay_state
+        {
+            self.restore_overlay_after_exit(
+                overlay,
+                was_overlay_active,
+                was_overlay_focused_in_tab,
+                tab_zoomed_before_exit,
+            );
         }
 
         if self.local_terminal_notifications
@@ -285,7 +348,13 @@ impl App {
         self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
     }
 
-    fn restore_overlay_after_exit(&mut self, overlay: OverlayPaneState) {
+    fn restore_overlay_after_exit(
+        &mut self,
+        overlay: OverlayPaneState,
+        was_overlay_active: bool,
+        was_overlay_focused_in_tab: bool,
+        tab_zoomed_before_exit: Option<bool>,
+    ) {
         for temp_file in &overlay.temp_files {
             let _ = std::fs::remove_file(temp_file);
         }
@@ -297,14 +366,23 @@ impl App {
             return;
         }
 
-        ws.active_tab = overlay.tab_idx;
+        if !was_overlay_focused_in_tab {
+            if let Some(tab_zoomed_before_exit) = tab_zoomed_before_exit {
+                ws.tabs[overlay.tab_idx].zoomed = tab_zoomed_before_exit;
+            }
+            return;
+        }
+
+        if was_overlay_active {
+            ws.active_tab = overlay.tab_idx;
+        }
         let tab = &mut ws.tabs[overlay.tab_idx];
         if tab.panes.contains_key(&overlay.previous_focus) {
             tab.layout.focus_pane(overlay.previous_focus);
         }
         tab.zoomed = overlay.previous_zoomed;
 
-        if self.state.active == Some(overlay.ws_idx) {
+        if was_overlay_active && self.state.active == Some(overlay.ws_idx) {
             self.state.mode = Mode::Terminal;
         }
     }
@@ -339,6 +417,9 @@ impl App {
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
             .unwrap_or_else(|| self.state.estimate_pane_size());
+        let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
+            return false;
+        };
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -347,6 +428,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -372,7 +454,7 @@ impl App {
         true
     }
 
-    pub(crate) fn emit_pane_state_update(&self, update: &crate::app::actions::PaneStateUpdate) {
+    pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
             return;
         };
@@ -572,7 +654,8 @@ impl App {
         }
     }
 
-    pub(super) fn emit_event(&self, event: crate::api::schema::EventEnvelope) {
+    pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
+        self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
     }
 
@@ -731,6 +814,15 @@ impl App {
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }
+            Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
+                return responses::encode_success(
+                    request.id,
+                    ResponseResult::ClientWindowTitle {
+                        changed: false,
+                        reason: crate::api::schema::ClientWindowTitleReason::NoForegroundClient,
+                    },
+                );
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
@@ -750,11 +842,21 @@ impl App {
             }
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {
-                return self.handle_worktree_create(request.id, params);
+                let _ = params;
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "worktree.create is handled asynchronously by the app runtime",
+                );
             }
             Method::WorktreeOpen(params) => return self.handle_worktree_open(request.id, params),
             Method::WorktreeRemove(params) => {
-                return self.handle_worktree_remove(request.id, params);
+                let _ = params;
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "worktree.remove is handled asynchronously by the app runtime",
+                );
             }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
@@ -772,8 +874,14 @@ impl App {
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
+            Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
+            Method::PaneProcessInfo(params) => {
+                return self.handle_pane_process_info(request.id, params);
+            }
+            Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
+            Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
             Method::PaneNeighbor(params) => return self.handle_pane_neighbor(request.id, params),
             Method::PaneEdges(params) => return self.handle_pane_edges(request.id, params),
             Method::PaneFocusDirection(params) => {
@@ -781,6 +889,7 @@ impl App {
             }
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
+            Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
@@ -810,6 +919,39 @@ impl App {
             }
             Method::IntegrationUninstall(params) => {
                 return self.handle_integration_uninstall(request.id, params);
+            }
+            Method::PluginLink(params) => {
+                return self.handle_plugin_link(request.id, params);
+            }
+            Method::PluginList(params) => {
+                return self.handle_plugin_list(request.id, params);
+            }
+            Method::PluginUnlink(params) => {
+                return self.handle_plugin_unlink(request.id, params);
+            }
+            Method::PluginEnable(params) => {
+                return self.handle_plugin_enable(request.id, params);
+            }
+            Method::PluginDisable(params) => {
+                return self.handle_plugin_disable(request.id, params);
+            }
+            Method::PluginActionList(params) => {
+                return self.handle_plugin_action_list(request.id, params);
+            }
+            Method::PluginActionInvoke(params) => {
+                return self.handle_plugin_action_invoke(request.id, params);
+            }
+            Method::PluginLogList(params) => {
+                return self.handle_plugin_log_list(request.id, params);
+            }
+            Method::PluginPaneOpen(params) => {
+                return self.handle_plugin_pane_open(request.id, params);
+            }
+            Method::PluginPaneFocus(params) => {
+                return self.handle_plugin_pane_focus(request.id, params);
+            }
+            Method::PluginPaneClose(params) => {
+                return self.handle_plugin_pane_close(request.id, params);
             }
             _ => {
                 return responses::encode_error(
@@ -1000,6 +1142,37 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git init failed for {}", path.display());
+    }
+
+    fn app_with_overlay(
+        workspace: crate::workspace::Workspace,
+        overlay_pane: crate::layout::PaneId,
+        previous_focus: crate::layout::PaneId,
+        previous_zoomed: bool,
+    ) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        app.overlay_panes.insert(
+            overlay_pane,
+            OverlayPaneState {
+                ws_idx: 0,
+                tab_idx: 0,
+                previous_focus,
+                previous_zoomed,
+                temp_files: Vec::new(),
+            },
+        );
+        app
     }
 
     #[tokio::test]
@@ -1225,6 +1398,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pane_process_info_returns_response_for_existing_pane() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("process-info")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "process_info".into(),
+            method: crate::api::schema::Method::PaneProcessInfo(
+                crate::api::schema::PaneProcessInfoParams {
+                    pane_id: Some(target.clone()),
+                },
+            ),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_process_info");
+        assert_eq!(response["result"]["process_info"]["pane_id"], target);
+    }
+
+    #[test]
+    fn client_window_title_api_reports_no_foreground_client_in_app_mode() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let set = app.handle_api_request(crate::api::schema::Request {
+            id: "title_set".into(),
+            method: crate::api::schema::Method::ClientWindowTitleSet(
+                crate::api::schema::ClientWindowTitleSetParams {
+                    title: "plugin review".into(),
+                },
+            ),
+        });
+        let set: serde_json::Value = serde_json::from_str(&set).unwrap();
+        assert_eq!(set["result"]["type"], "client_window_title");
+        assert_eq!(set["result"]["changed"], false);
+        assert_eq!(set["result"]["reason"], "no_foreground_client");
+
+        let clear = app.handle_api_request(crate::api::schema::Request {
+            id: "title_clear".into(),
+            method: crate::api::schema::Method::ClientWindowTitleClear(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        });
+        let clear: serde_json::Value = serde_json::from_str(&clear).unwrap();
+        assert_eq!(clear["result"]["type"], "client_window_title");
+        assert_eq!(clear["result"]["reason"], "no_foreground_client");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn herdr_toast_context_uses_live_root_runtime_cwd_label() {
@@ -1275,6 +1517,7 @@ mod tests {
             0,
             crate::terminal_theme::TerminalTheme::default(),
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1366,6 +1609,7 @@ mod tests {
             0,
             crate::terminal_theme::TerminalTheme::default(),
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1410,6 +1654,66 @@ mod tests {
             runtime.shutdown();
         }
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn overlay_exit_preserves_focus_changed_before_exit() {
+        let mut workspace = crate::workspace::Workspace::test_new("overlay");
+        let previous_focus = workspace.tabs[0].root_pane;
+        let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].zoomed = true;
+        let new_tab = workspace.test_add_tab(Some("new"));
+        workspace.switch_tab(new_tab);
+        let mut app = app_with_overlay(workspace, overlay_pane, previous_focus, true);
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: overlay_pane,
+        });
+
+        let overlay_tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(app.state.workspaces[0].active_tab, new_tab);
+        assert_eq!(overlay_tab.layout.focused(), previous_focus);
+        assert!(overlay_tab.zoomed);
+        assert!(app.overlay_panes.is_empty());
+    }
+
+    #[test]
+    fn overlay_exit_preserves_same_tab_focus_changed_before_exit() {
+        let mut workspace = crate::workspace::Workspace::test_new("overlay");
+        let previous_focus = workspace.tabs[0].root_pane;
+        let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(previous_focus);
+        workspace.tabs[0].zoomed = true;
+        let mut app = app_with_overlay(workspace, overlay_pane, previous_focus, false);
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: overlay_pane,
+        });
+
+        let tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(app.state.workspaces[0].active_tab, 0);
+        assert_eq!(tab.layout.focused(), previous_focus);
+        assert!(tab.zoomed);
+        assert!(app.overlay_panes.is_empty());
+    }
+
+    #[test]
+    fn overlay_exit_restores_previous_focus_when_overlay_still_focused() {
+        let mut workspace = crate::workspace::Workspace::test_new("overlay");
+        let previous_focus = workspace.tabs[0].root_pane;
+        let overlay_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].zoomed = true;
+        let mut app = app_with_overlay(workspace, overlay_pane, previous_focus, false);
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: overlay_pane,
+        });
+
+        let tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(app.state.workspaces[0].active_tab, 0);
+        assert_eq!(tab.layout.focused(), previous_focus);
+        assert!(!tab.zoomed);
+        assert!(app.overlay_panes.is_empty());
     }
 
     #[tokio::test]

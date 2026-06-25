@@ -60,7 +60,7 @@ pub fn session_ref_from_report(
         return None;
     }
 
-    if agent == "pi" {
+    if agent == "pi" || agent == "omp" {
         return _agent_session_path
             .and_then(AgentSessionRef::path)
             .or_else(|| agent_session_id.and_then(AgentSessionRef::id));
@@ -69,12 +69,22 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
+    match value.as_deref().map(str::trim) {
+        Some(source @ ("startup" | "resume" | "clear" | "compact" | "new")) => {
+            Some(source.to_string())
+        }
+        _ => None,
+    }
+}
+
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
+            | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
             | ("herdr:qodercli", "qodercli")
             | ("herdr:cursor", "cursor")
@@ -91,7 +101,7 @@ pub fn session_ref_from_snapshot(
         return None;
     }
     let session_ref = match (agent, kind) {
-        ("pi", AgentSessionRefKind::Path) => AgentSessionRef::path(value)?,
+        ("pi" | "omp", AgentSessionRefKind::Path) => AgentSessionRef::path(value)?,
         (_, AgentSessionRefKind::Id) => AgentSessionRef::id(value)?,
         _ => return None,
     };
@@ -121,6 +131,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:copilot", "copilot", AgentSessionRefKind::Id) => {
             vec!["copilot".into(), format!("--resume={}", session_ref.value)]
         }
+        ("herdr:devin", "devin", AgentSessionRefKind::Id) => {
+            vec!["devin".into(), "--resume".into(), session_ref.value.clone()]
+        }
         ("herdr:droid", "droid", AgentSessionRefKind::Id) => {
             vec!["droid".into(), "--resume".into(), session_ref.value.clone()]
         }
@@ -129,6 +142,11 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         }
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
+        }
+        ("herdr:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+            // omp resume is `-r, --resume=<value>` (ID prefix or path); it has no
+            // `--session` flag, unlike pi.
+            vec!["omp".into(), format!("--resume={}", session_ref.value)]
         }
         ("herdr:hermes", "hermes", AgentSessionRefKind::Id) => {
             vec![
@@ -184,8 +202,10 @@ fn is_official_agent_source(source: &str, agent: &str) -> bool {
         ("herdr:claude", "claude")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
+            | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
             | ("herdr:kimi", "kimi")
+            | ("herdr:omp", "omp")
             | ("herdr:pi", "pi")
             | ("herdr:hermes", "hermes")
             | ("herdr:opencode", "opencode")
@@ -222,6 +242,7 @@ mod tests {
     fn native_state_reservation_excludes_full_lifecycle_sources() {
         assert!(is_reserved_native_state_source("herdr:claude", "claude"));
         assert!(is_reserved_native_state_source("herdr:codex", "codex"));
+        assert!(is_reserved_native_state_source("herdr:devin", "devin"));
         assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
         assert!(!is_reserved_native_state_source(
             "herdr:opencode",
@@ -232,6 +253,7 @@ mod tests {
     #[test]
     fn planner_allows_supported_agents() {
         let pi_session = absolute_test_path("pi-session.jsonl");
+        let omp_session = absolute_test_path("omp-session.jsonl");
         assert_eq!(
             plan(
                 "herdr:claude",
@@ -264,6 +286,16 @@ mod tests {
         );
         assert_eq!(
             plan(
+                "herdr:devin",
+                "devin",
+                &AgentSessionRef::id("devin-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["devin", "--resume", "devin-session"]
+        );
+        assert_eq!(
+            plan(
                 "herdr:droid",
                 "droid",
                 &AgentSessionRef::id("droid-session").unwrap()
@@ -291,6 +323,16 @@ mod tests {
             .unwrap()
             .argv,
             vec!["pi", "--session", pi_session.as_str()]
+        );
+        assert_eq!(
+            plan(
+                "herdr:omp",
+                "omp",
+                &AgentSessionRef::path(&omp_session).unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["omp", format!("--resume={omp_session}").as_str()]
         );
         assert_eq!(
             plan(
@@ -362,8 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn report_ref_prefers_pi_path_and_validates_values() {
+    fn report_ref_prefers_pi_and_omp_paths_and_validates_values() {
         let pi_session = absolute_test_path("pi-session.jsonl");
+        let omp_session = absolute_test_path("omp-session.jsonl");
         let claude_session = absolute_test_path("claude-session");
         let copilot_session = absolute_test_path("copilot-session");
         let session_ref = session_ref_from_report(
@@ -382,6 +425,35 @@ mod tests {
                 .is_none()
         );
         assert!(session_ref_from_report("custom:pi", "pi", Some("pi-id".into()), None).is_none());
+
+        let session_ref = session_ref_from_report(
+            "herdr:omp",
+            "omp",
+            Some("omp-id".into()),
+            Some(omp_session.clone()),
+        )
+        .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Path);
+        assert_eq!(session_ref.value, omp_session);
+
+        let session_ref =
+            session_ref_from_report("herdr:omp", "omp", Some("omp-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "omp-id");
+        let session_ref = session_ref_from_report(
+            "herdr:omp",
+            "omp",
+            Some("omp-id".into()),
+            Some("relative.jsonl".into()),
+        )
+        .unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "omp-id");
+        assert!(
+            session_ref_from_report("herdr:omp", "omp", None, Some("relative.jsonl".into()))
+                .is_none()
+        );
+
         assert!(
             session_ref_from_report("herdr:claude", "claude", None, Some(claude_session)).is_none()
         );
@@ -395,6 +467,11 @@ mod tests {
             session_ref_from_report("herdr:copilot", "copilot", None, Some(copilot_session))
                 .is_none()
         );
+
+        let session_ref =
+            session_ref_from_report("herdr:devin", "devin", Some("devin-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "devin-id");
 
         let session_ref =
             session_ref_from_report("herdr:droid", "droid", Some("droid-id".into()), None).unwrap();
@@ -426,6 +503,36 @@ mod tests {
     }
 
     #[test]
+    fn normalize_session_start_source_allows_known_values() {
+        assert_eq!(
+            normalize_session_start_source(Some("startup".into())),
+            Some("startup".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("resume".into())),
+            Some("resume".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("clear".into())),
+            Some("clear".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("compact".into())),
+            Some("compact".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("new".into())),
+            Some("new".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some(" resume ".into())),
+            Some("resume".into())
+        );
+        assert_eq!(normalize_session_start_source(Some("other".into())), None);
+        assert_eq!(normalize_session_start_source(None), None);
+    }
+
+    #[test]
     fn ids_are_data_not_shell_text() {
         let id = "abc; rm -rf /";
         let codex_plan = plan("herdr:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
@@ -438,6 +545,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(copilot_plan.argv, vec!["copilot", "--resume=abc; rm -rf /"]);
+
+        let devin_plan = plan("herdr:devin", "devin", &AgentSessionRef::id(id).unwrap()).unwrap();
+        assert_eq!(devin_plan.argv, vec!["devin", "--resume", id]);
     }
 
     #[test]
@@ -446,6 +556,7 @@ mod tests {
         let opencode_session = absolute_test_path("opencode-session");
         let kilo_session = absolute_test_path("kilo-session");
         let copilot_session = absolute_test_path("copilot-session");
+        let devin_session = absolute_test_path("devin-session");
         assert!(plan(
             "herdr:hermes",
             "hermes",
@@ -468,6 +579,12 @@ mod tests {
             "herdr:copilot",
             "copilot",
             &AgentSessionRef::path(&copilot_session).unwrap()
+        )
+        .is_none());
+        assert!(plan(
+            "herdr:devin",
+            "devin",
+            &AgentSessionRef::path(&devin_session).unwrap()
         )
         .is_none());
         assert!(session_ref_from_snapshot(
@@ -496,6 +613,13 @@ mod tests {
             "copilot",
             AgentSessionRefKind::Id,
             "copilot-session"
+        )
+        .is_some());
+        assert!(session_ref_from_snapshot(
+            "herdr:devin",
+            "devin",
+            AgentSessionRefKind::Id,
+            "devin-session"
         )
         .is_some());
     }

@@ -84,7 +84,8 @@ pub(crate) use self::{
     },
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_entry_row_count,
-        agent_panel_scroll_metrics, agent_panel_scrollbar_rect, agent_panel_toggle_rect,
+        agent_panel_scope_toggle_rect, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
+        agent_panel_toggle_rect,
         collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
         compute_workspace_list_areas_full, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
         normalized_workspace_scroll, sidebar_section_divider_rect, workspace_drop_indicator_row,
@@ -110,7 +111,7 @@ pub(crate) use self::{
         mobile_switcher_areas, mobile_switcher_max_scroll, mobile_switcher_target_at,
         mobile_switcher_workspace_doc_range, MobileSwitcherTarget,
     },
-    panes::pane_is_scrolled_back,
+    panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
     tabs::compute_tab_bar_view,
     widgets::{centered_popup_rect, modal_stack_areas},
 };
@@ -348,7 +349,13 @@ fn compute_view_internal(
     let split_borders = app
         .active
         .and_then(|i| app.workspaces.get(i))
-        .map(|ws| ws.layout.splits(terminal_area))
+        .map(|ws| {
+            if ws.zoomed {
+                Vec::new()
+            } else {
+                ws.layout.splits(terminal_area)
+            }
+        })
         .unwrap_or_default();
 
     let pane_infos = compute_pane_infos(
@@ -425,7 +432,13 @@ fn compute_mobile_view(
     let split_borders = app
         .active
         .and_then(|i| app.workspaces.get(i))
-        .map(|ws| ws.layout.splits(terminal_area))
+        .map(|ws| {
+            if ws.zoomed {
+                Vec::new()
+            } else {
+                ws.layout.splits(terminal_area)
+            }
+        })
         .unwrap_or_default();
 
     let pane_infos = compute_pane_infos(
@@ -1140,6 +1153,7 @@ mod tests {
             rect: Rect::new(0, 0, 12, 8),
             inner_rect: Rect::new(1, 1, 9, 6),
             scrollbar_rect: Some(Rect::new(10, 1, 1, 6)),
+            borders: ratatui::widgets::Borders::ALL,
             is_focused: true,
         };
 

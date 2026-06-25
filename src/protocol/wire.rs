@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
 /// v14: `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame` (delta-desync
-/// recovery).
+/// recovery); upstream v14 also adds `pane.move` (relocate a running pane across tabs/workspaces).
 pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
@@ -148,7 +148,7 @@ pub enum ClientInputEvent {
 }
 
 impl ClientKeyKind {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::KeyEventKind) -> Self {
         match kind {
             crossterm::event::KeyEventKind::Press => Self::Press,
@@ -167,7 +167,7 @@ impl ClientKeyKind {
 }
 
 impl ClientKeyCode {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(code: crossterm::event::KeyCode) -> Option<Self> {
         use crossterm::event::KeyCode;
         Some(match code {
@@ -219,7 +219,7 @@ impl ClientKeyCode {
 }
 
 impl ClientMouseButton {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(button: crossterm::event::MouseButton) -> Self {
         match button {
             crossterm::event::MouseButton::Left => Self::Left,
@@ -238,7 +238,7 @@ impl ClientMouseButton {
 }
 
 impl ClientMouseKind {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::MouseEventKind) -> Option<Self> {
         use crossterm::event::MouseEventKind;
         Some(match kind {
@@ -777,6 +777,12 @@ pub enum ServerMessage {
         data: String,
     },
 
+    /// Set the foreground client's outer terminal window title.
+    WindowTitle {
+        /// Sanitized title to write with OSC 0. `None` restores Herdr's default title.
+        title: Option<String>,
+    },
+
     /// Client-local runtime config changed on disk; refresh it without reconnecting.
     ReloadSoundConfig,
 
@@ -1277,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn client_message_wire_tags_preserve_protocol_13_order() {
+    fn client_message_wire_tags_preserve_protocol_14_order() {
         fn tag(msg: &ClientMessage) -> u8 {
             *bincode::serde::encode_to_vec(msg, bincode::config::standard())
                 .unwrap()
@@ -1625,6 +1631,17 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_window_title_roundtrip() {
+        for title in [Some("herdr api".to_owned()), None] {
+            let msg = ServerMessage::WindowTitle { title };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]

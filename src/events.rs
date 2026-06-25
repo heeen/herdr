@@ -10,15 +10,44 @@ use crate::layout::PaneId;
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
+pub struct ApiWorktreeAddRequest {
+    pub id: String,
+    pub operation_id: u64,
+    pub checkout_key: std::path::PathBuf,
+    pub source_workspace_id: Option<String>,
+    pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    pub source_checkout_path: std::path::PathBuf,
+    pub source_repo_root: std::path::PathBuf,
+    pub repo_key: String,
+    pub repo_name: String,
+    pub label: Option<String>,
+    pub focus: bool,
+    pub respond_to: std::sync::mpsc::Sender<String>,
+}
+
+#[derive(Debug)]
 pub struct WorktreeAddResult {
     pub path: std::path::PathBuf,
+    pub api_request: Option<ApiWorktreeAddRequest>,
     pub result: Result<(), String>,
+}
+
+#[derive(Debug)]
+pub struct ApiWorktreeRemoveRequest {
+    pub id: String,
+    pub operation_id: u64,
+    pub checkout_key: std::path::PathBuf,
+    pub respond_to: std::sync::mpsc::Sender<String>,
 }
 
 #[derive(Debug)]
 pub struct WorktreeRemoveResult {
     pub workspace_id: String,
     pub path: std::path::PathBuf,
+    pub workspace: Option<Box<crate::api::schema::WorkspaceInfo>>,
+    pub worktree: Option<Box<crate::api::schema::WorktreeInfo>>,
+    pub forced: bool,
+    pub api_request: Option<ApiWorktreeRemoveRequest>,
     pub result: Result<(), String>,
 }
 
@@ -55,6 +84,7 @@ pub enum AppEvent {
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        session_start_source: Option<String>,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {
@@ -111,8 +141,17 @@ pub enum AppEvent {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
+    /// A plugin action or event command finished.
+    PluginCommandFinished {
+        log_id: String,
+        finished_unix_ms: u64,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    },
     /// Background `git worktree add` completed.
-    WorktreeAddFinished(WorktreeAddResult),
+    WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
-    WorktreeRemoveFinished(WorktreeRemoveResult),
+    WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
 }

@@ -23,23 +23,13 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
-#[cfg(target_os = "macos")]
-fn modified_url_click_modifier() -> KeyModifiers {
-    KeyModifiers::SUPER
-}
-
-#[cfg(not(target_os = "macos"))]
 fn modified_url_click_modifier() -> KeyModifiers {
     KeyModifiers::CONTROL
 }
 
 #[cfg(test)]
 #[test]
-fn modified_url_click_modifier_matches_platform_primary_modifier() {
-    #[cfg(target_os = "macos")]
-    assert_eq!(modified_url_click_modifier(), KeyModifiers::SUPER);
-
-    #[cfg(not(target_os = "macos"))]
+fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
     assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
 }
 
@@ -266,7 +256,7 @@ impl App {
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
-        let previous_agent_panel_scope = self.state.agent_panel_scope;
+        let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
@@ -320,8 +310,8 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
-        if self.state.agent_panel_scope != previous_agent_panel_scope {
-            self.save_agent_panel_scope(self.state.agent_panel_scope);
+        if self.state.agent_panel_sort != previous_agent_panel_sort {
+            self.save_agent_panel_sort(self.state.agent_panel_sort);
         }
 
         if let Some(content) = self.state.request_clipboard_write.take() {
@@ -365,6 +355,13 @@ impl App {
         };
 
         self.last_pane_click = None;
+        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+            }
+        }
         if let Err(err) = crate::platform::open_url(&url) {
             tracing::warn!(err = %err, url = %url, "failed to open pane URL");
         }
@@ -538,6 +535,7 @@ impl AppState {
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
                 crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
+                Vec::new(),
             ) {
                 let new_id = new_pane.pane_id;
                 terminal_runtimes.insert(new_pane.terminal.id.clone(), new_pane.runtime);
@@ -616,7 +614,6 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         &terminal_runtimes,
         state.active,
         state.selected,
-        state.agent_panel_scope,
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
@@ -648,7 +645,9 @@ fn wait_for_file(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         if let Ok(content) = std::fs::read_to_string(path) {
-            return content;
+            if !content.is_empty() {
+                return content;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

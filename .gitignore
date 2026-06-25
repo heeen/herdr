@@ -11,9 +11,13 @@ __pycache__/
 !/docs/next/
 !/docs/next/**
 /.local/
+/backlog
 
 /.pi/todos
 /.pi/issues
 /.pi/cache
 /result
 /result-*
+
+/.wrangler/
+**/.wrangler/
