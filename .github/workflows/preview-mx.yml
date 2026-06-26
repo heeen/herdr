@@ -68,11 +68,15 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: herdr-linux-aarch64
+          # macos-15 pinned (not macos-latest): with the vendored libghostty-vt's required
+          # zig 0.15.2, the aarch64-macos link fails on the macos-26/Tahoe SDK (undefined
+          # libSystem symbols). macos-15-arm64 is the last image this exact toolchain built
+          # on (2026-06-12 mx preview); upstream uses the same zig 0.15.2 + macos-latest.
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: herdr-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: herdr-macos-aarch64
     runs-on: ${{ matrix.os }}
     env:
