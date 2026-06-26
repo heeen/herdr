@@ -188,7 +188,10 @@ jobs:
             if [ -n "$prev" ]; then
               echo "Changes since \`$prev\`:"
               echo
-              git log --oneline "$prev"..HEAD | sed 's/^/- /' | head -40
+              # `git log -n 40` (not `| head -40`): under `set -o pipefail`, head closing the
+              # pipe early SIGPIPEs sed when the range exceeds 40 commits (e.g. a big upstream
+              # merge), failing the step. Limiting git log itself avoids the broken pipe.
+              git log --oneline -n 40 "$prev"..HEAD | sed 's/^/- /'
             fi
           } > PREVIEW_NOTES.md
 
