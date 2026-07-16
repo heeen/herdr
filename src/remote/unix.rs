@@ -335,7 +335,9 @@ impl SshTarget {
                 || opt == "-S"
         }) {
             command.arg("-o").arg("ControlMaster=auto");
-            command.arg("-o").arg(control_path_option());
+            command
+                .arg("-o")
+                .arg(control_path_option(&self.destination, &self.options));
             command.arg("-o").arg("ControlPersist=60");
         }
         // herdr's ssh sessions are pure exec/stdio channels and never need the port forwards
@@ -365,13 +367,31 @@ impl SshTarget {
 }
 
 /// #72: the `ControlPath` option for the shared per-target ssh control master. Lives in the
-/// per-user temp dir (private on macOS/systemd) under a fixed name — NO pid — so every herdr
-/// process of this user shares one master per target. `%C` is ssh's 40-char connection hash.
-fn control_path_option() -> String {
-    format!(
-        "ControlPath={}",
-        std::env::temp_dir().join("herdr-cm-%C").display()
-    )
+/// per-user temp dir (private on macOS/systemd) under a short herdr-computed hash of the
+/// (destination, options) target — NO pid, so every herdr process of this user shares one master
+/// per target. Deliberately NOT ssh's `%C`: the 40-char %C plus the temporary
+/// `.<16 random chars>` suffix ssh appends while binding the master listener overflows sun_path
+/// (104 bytes) under macOS' long per-user TMPDIR — every master setup failed with
+/// `unix_listener: path too long` and mux was silently disabled (caught in live verification).
+/// Falls back to /tmp when even the short name cannot fit.
+fn control_path_option(destination: &str, options: &[String]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    destination.hash(&mut hasher);
+    for opt in options {
+        0u8.hash(&mut hasher);
+        opt.hash(&mut hasher);
+    }
+    let name = format!("herdr-cm-{:016x}", hasher.finish());
+    // Reserve the 17 bytes of ssh's temporary `.<16 chars>` master-listener suffix.
+    let in_tmpdir = std::env::temp_dir().join(&name);
+    let path = if fits_unix_socket_path(&in_tmpdir, 17) {
+        in_tmpdir
+    } else {
+        PathBuf::from("/tmp").join(&name)
+    };
+    format!("ControlPath={}", path.display())
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -2434,7 +2454,7 @@ mod tests {
     /// #72: the unconditional option set injected before user options — connect timeout,
     /// keepalive, and the shared control master. `ClearAllForwardings=yes` is NOT included
     /// (it is suppressed by user forwards). Shared by the exact-argv assertions below.
-    fn injected_base_options() -> Vec<String> {
+    fn injected_base_options(destination: &str, options: &[String]) -> Vec<String> {
         vec![
             "-o".into(),
             "ConnectTimeout=10".into(),
@@ -2445,7 +2465,7 @@ mod tests {
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
-            control_path_option(),
+            control_path_option(destination, options),
             "-o".into(),
             "ControlPersist=60".into(),
         ]
@@ -2453,7 +2473,7 @@ mod tests {
 
     #[test]
     fn ssh_target_command_inserts_dash_t_before_bare_destination() {
-        let mut expected = injected_base_options();
+        let mut expected = injected_base_options("iq-64", &[]);
         expected.extend([
             "-o".into(),
             "ClearAllForwardings=yes".into(),
@@ -2499,17 +2519,15 @@ mod tests {
     fn ssh_target_command_emits_options_before_destination() {
         // An explicit user `-L` keeps its forward: ClearAllForwardings is NOT injected,
         // since it would clear command-line forwards too.
-        let target = SshTarget::new(
-            "iq-64",
-            vec![
-                "-L".into(),
-                "9000:localhost:9000".into(),
-                "-J".into(),
-                "jump".into(),
-            ],
-        );
+        let options: Vec<String> = vec![
+            "-L".into(),
+            "9000:localhost:9000".into(),
+            "-J".into(),
+            "jump".into(),
+        ];
+        let target = SshTarget::new("iq-64", options.clone());
         // the user `-L` suppresses ClearAllForwardings; the base options are still injected.
-        let mut expected = injected_base_options();
+        let mut expected = injected_base_options("iq-64", &options);
         expected.extend([
             "-L".into(),
             "9000:localhost:9000".into(),
@@ -2547,8 +2565,9 @@ mod tests {
 
     #[test]
     fn ssh_target_command_does_not_duplicate_user_supplied_dash_t() {
-        let target = SshTarget::new("iq-64", vec!["-T".into()]);
-        let mut expected = injected_base_options();
+        let options: Vec<String> = vec!["-T".into()];
+        let target = SshTarget::new("iq-64", options.clone());
+        let mut expected = injected_base_options("iq-64", &options);
         expected.extend([
             "-o".into(),
             "ClearAllForwardings=yes".into(),
@@ -2561,8 +2580,9 @@ mod tests {
 
     #[test]
     fn ssh_target_command_respects_user_connect_timeout() {
-        let target = SshTarget::new("iq-64", vec!["-o".into(), "ConnectTimeout=3".into()]);
-        let mut expected: Vec<String> = injected_base_options()
+        let options: Vec<String> = vec!["-o".into(), "ConnectTimeout=3".into()];
+        let target = SshTarget::new("iq-64", options.clone());
+        let mut expected: Vec<String> = injected_base_options("iq-64", &options)
             .into_iter()
             .skip(2) // the user pinned ConnectTimeout — ours is not injected
             .collect();
