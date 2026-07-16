@@ -1376,6 +1376,10 @@ impl App {
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                // Restored from pre-merge mx (2df71bf:1250) — the v0.7.1 merge dropped the scope's
+                // live apply, so `save_agent_panel_scope` persisted without taking effect.
+                self.state.agent_panel_scope =
+                    agent_panel_scope_from_config(config.ui.agent_panel_scope);
                 self.state.agent_panel_scroll = 0;
                 // #58: the multi-remote client renders the sidebar from the server-pushed UiSettings,
                 // so a sidebar-config change must signal clients to re-fetch immediately — otherwise
