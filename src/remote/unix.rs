@@ -2747,6 +2747,60 @@ mod tests {
         assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
+    /// #72: dropping the bridge SIGTERMs in-flight bridge ssh children — a teardown/reconnect
+    /// must not strand ssh processes (each held a live sshd session remotely). The `ssh` binary
+    /// is shimmed via PATH (nextest runs one process per test, so the env mutation is isolated).
+    #[test]
+    fn bridge_drop_kills_inflight_ssh_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-bridge-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var("PATH").unwrap();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+
+        let socket = dir.join("bridge.sock");
+        let bridge = SshStdioBridge::start(
+            SshTarget::bare("test-host"),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "test".into(),
+            RemoteBridgeKind::Api,
+        )
+        .unwrap();
+
+        // Keep the local connection open so the worker sits in child.wait() on the fake ssh.
+        let _conn = UnixStream::connect(&socket).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            let registered = bridge.children.lock().unwrap().iter().next().copied();
+            if let Some(pid) = registered {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bridge never spawned its ssh child"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        drop(bridge);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "in-flight ssh child survived the bridge drop"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        std::env::set_var("PATH", old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn extract_remote_args_removes_space_form() {
         let args = vec![
