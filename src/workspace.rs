@@ -34,6 +34,11 @@ pub(crate) struct SidebarPlaceholderTab {
     pub custom_name: Option<String>,
     pub number: usize,
     pub pane_terminals: Vec<(TerminalId, bool)>,
+    /// #76: index into `pane_terminals` of the pane that holds focus in this tab (wired from
+    /// `agent.focused`), or `None` when no agent in the tab is focused. The agents-panel highlight
+    /// reads the placeholder layout's focused pane (`is_active_pane`), so without this the focus
+    /// always sits on the tab's last split pane instead of the summary-focused agent.
+    pub focused_pane: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -211,6 +216,7 @@ impl Workspace {
                 custom_name: None,
                 number: 1,
                 pane_terminals: vec![(TerminalId::alloc(), true)],
+                focused_pane: None,
             });
         }
 
@@ -218,6 +224,9 @@ impl Workspace {
         let mut next_public_pane_number = 1usize;
         let mut tabs = Vec::with_capacity(tab_specs.len());
         for spec in tab_specs {
+            // #76: `spec.pane_terminals` is moved out below; read the focus index first (it is a
+            // `Copy` `Option<usize>`) so it survives the consumption of the spec's panes.
+            let focused_pane = spec.focused_pane;
             let mut pane_terminals = spec.pane_terminals;
             if pane_terminals.is_empty() {
                 pane_terminals.push((TerminalId::alloc(), true));
@@ -225,6 +234,9 @@ impl Workspace {
 
             let (mut layout, root_id) = TileLayout::new();
             let mut panes = HashMap::new();
+            // #76: record created pane ids in insertion order (root first, then each split) so the
+            // `focused_pane` index into `pane_terminals` maps back to the layout pane to focus.
+            let mut pane_ids = vec![root_id];
 
             let (root_terminal_id, root_seen) = pane_terminals[0].clone();
             let mut root_pane = PaneState::new(root_terminal_id);
@@ -240,6 +252,15 @@ impl Workspace {
                 panes.insert(pane_id, pane);
                 public_pane_numbers.insert(pane_id, next_public_pane_number);
                 next_public_pane_number += 1;
+                pane_ids.push(pane_id);
+            }
+
+            // #76: `split_focused` leaves layout focus on the LAST split pane; move it onto the
+            // summary-focused agent's pane so the agents-panel highlight (`is_active_pane`) matches.
+            if let Some(idx) = focused_pane {
+                if let Some(&pane_id) = pane_ids.get(idx) {
+                    layout.focus_pane(pane_id);
+                }
             }
 
             tabs.push(Tab {
