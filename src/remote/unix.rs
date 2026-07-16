@@ -300,6 +300,44 @@ impl SshTarget {
         {
             command.arg("-o").arg("ConnectTimeout=10");
         }
+        // #72: keepalive. Without it a hung TCP (sleep/wake, network switch, dropped VPN) left the
+        // bridge ssh — and its sshd session on the remote — alive for hours while reconnects
+        // stacked fresh connections on top, until the remote's sshd stopped accepting new ones.
+        // Dead links now self-terminate within ~60s on both ends. Skip when the user pinned either
+        // knob in their own options.
+        if !self
+            .options
+            .iter()
+            .any(|opt| opt.contains("ServerAliveInterval"))
+        {
+            command.arg("-o").arg("ServerAliveInterval=15");
+        }
+        if !self
+            .options
+            .iter()
+            .any(|opt| opt.contains("ServerAliveCountMax"))
+        {
+            command.arg("-o").arg("ServerAliveCountMax=4");
+        }
+        // #72: multiplex every herdr ssh session onto ONE TCP/sshd connection per target. The api
+        // bridge dials a NEW ssh per local connection and the active remote polls at 400ms — that
+        // alone is ~2.5 fresh sshd connections/sec, and under latency the in-flight ones stack
+        // toward sshd's MaxStartups refusal. `%C` hashes (local host, remote host, port, user) so
+        // the socket path stays short and per-target; `ControlPersist=60` keeps the master warm
+        // across polls and retires it 60s after the last session. If the master cannot be set up
+        // (path too long, mux disabled server-side) ssh degrades to a plain direct connection —
+        // exactly the old behavior. Skip when the user pinned any mux knob.
+        if !self.options.iter().any(|opt| {
+            opt.contains("ControlMaster")
+                || opt.contains("ControlPath")
+                || opt.contains("ControlPersist")
+                || opt == "-M"
+                || opt == "-S"
+        }) {
+            command.arg("-o").arg("ControlMaster=auto");
+            command.arg("-o").arg(control_path_option());
+            command.arg("-o").arg("ControlPersist=60");
+        }
         // herdr's ssh sessions are pure exec/stdio channels and never need the port forwards
         // the user's ssh_config sets up for interactive use. Inheriting LocalForward/
         // RemoteForward breaks every probe and bridge when the forward port is already held —
@@ -324,6 +362,16 @@ impl SshTarget {
         command.arg(remote_command);
         command
     }
+}
+
+/// #72: the `ControlPath` option for the shared per-target ssh control master. Lives in the
+/// per-user temp dir (private on macOS/systemd) under a fixed name — NO pid — so every herdr
+/// process of this user shares one master per target. `%C` is ssh's 40-char connection hash.
+fn control_path_option() -> String {
+    format!(
+        "ControlPath={}",
+        std::env::temp_dir().join("herdr-cm-%C").display()
+    )
 }
 
 /// How `prepare_remote_herdr` / `ensure_remote_server_ready` resolve the install + restart
@@ -2046,6 +2094,10 @@ struct SshStdioBridge {
     local_socket: PathBuf,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    // #72: pids of in-flight bridge ssh children. SIGTERMed on Drop so a teardown/reconnect never
+    // strands ssh processes (each stranded one held a live sshd session on the remote until its
+    // TCP finally died).
+    children: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
 }
 
 fn spawn_bridge_worker(
@@ -2077,6 +2129,8 @@ impl SshStdioBridge {
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
+        let children = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let thread_children = Arc::clone(&children);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -2088,6 +2142,7 @@ impl SshStdioBridge {
                         let worker_target = target.clone();
                         let worker_remote_herdr = remote_herdr.clone();
                         let worker_session_name = session_name.clone();
+                        let worker_children = Arc::clone(&thread_children);
                         spawn_bridge_worker(stream, move |stream| {
                             bridge_connection(
                                 stream,
@@ -2095,6 +2150,7 @@ impl SshStdioBridge {
                                 &worker_remote_herdr,
                                 &worker_session_name,
                                 kind,
+                                &worker_children,
                             )
                         });
                     }
@@ -2113,6 +2169,7 @@ impl SshStdioBridge {
             local_socket,
             should_stop,
             thread: Some(thread),
+            children,
         })
     }
 }
@@ -2120,6 +2177,16 @@ impl SshStdioBridge {
 impl Drop for SshStdioBridge {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
+        // #72: terminate in-flight bridge ssh children. Their workers then unblock out of
+        // `child.wait()` and deregister; the remote sshd session closes with the TCP connection
+        // instead of lingering until a network-level timeout.
+        if let Ok(children) = self.children.lock() {
+            for pid in children.iter() {
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
         let _ = std::fs::remove_file(&self.local_socket);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -2133,6 +2200,7 @@ fn bridge_connection(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     kind: RemoteBridgeKind,
+    children: &std::sync::Mutex<std::collections::HashSet<u32>>,
 ) -> io::Result<()> {
     let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
@@ -2147,6 +2215,10 @@ fn bridge_connection(
     let mut child = command
         .spawn()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
+    // #72: register for the owning bridge's Drop-time SIGTERM sweep; deregistered after wait().
+    if let Ok(mut children) = children.lock() {
+        children.insert(child.id());
+    }
     let mut child_stdin = child
         .stdin
         .take()
@@ -2166,7 +2238,11 @@ fn bridge_connection(
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
-    let status = child.wait()?;
+    let status = child.wait();
+    if let Ok(mut children) = children.lock() {
+        children.remove(&child.id());
+    }
+    let status = status?;
     let _ = upload.join();
     let _ = download.join();
 
@@ -2355,20 +2431,68 @@ mod tests {
             .collect()
     }
 
+    /// #72: the unconditional option set injected before user options — connect timeout,
+    /// keepalive, and the shared control master. `ClearAllForwardings=yes` is NOT included
+    /// (it is suppressed by user forwards). Shared by the exact-argv assertions below.
+    fn injected_base_options() -> Vec<String> {
+        vec![
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+            "-o".into(),
+            "ServerAliveInterval=15".into(),
+            "-o".into(),
+            "ServerAliveCountMax=4".into(),
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            control_path_option(),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ]
+    }
+
     #[test]
     fn ssh_target_command_inserts_dash_t_before_bare_destination() {
-        assert_eq!(
-            ssh_argv(&SshTarget::bare("iq-64"), "uname -s"),
-            [
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ClearAllForwardings=yes",
-                "-T",
-                "iq-64",
-                "uname -s"
-            ]
+        let mut expected = injected_base_options();
+        expected.extend([
+            "-o".into(),
+            "ClearAllForwardings=yes".into(),
+            "-T".into(),
+            "iq-64".into(),
+            "uname -s".to_string(),
+        ]);
+        assert_eq!(ssh_argv(&SshTarget::bare("iq-64"), "uname -s"), expected);
+    }
+
+    /// #72: hung-link keepalive and the shared control master are injected by default, and each
+    /// yields to a user-pinned option instead of double-configuring ssh.
+    #[test]
+    fn ssh_target_command_respects_user_keepalive_and_mux_options() {
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "ServerAliveInterval=5".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ServerAliveInterval=15".to_string()));
+        assert!(
+            argv.contains(&"ServerAliveCountMax=4".to_string()),
+            "the other keepalive knob is still injected"
         );
+        assert!(argv.contains(&"ControlMaster=auto".to_string()));
+
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "ControlMaster=no".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(
+            !argv.contains(&"ControlMaster=auto".to_string()),
+            "a user ControlMaster suppresses the injected mux trio"
+        );
+        assert!(!argv.iter().any(|arg| arg.starts_with("ControlPath=")));
+        assert!(!argv.contains(&"ControlPersist=60".to_string()));
+        assert!(
+            argv.contains(&"ServerAliveInterval=15".to_string()),
+            "keepalive is independent of the mux gate"
+        );
+
+        let target = SshTarget::new("iq-64", vec!["-S".into(), "/tmp/x".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ControlMaster=auto".to_string()));
     }
 
     #[test]
@@ -2384,20 +2508,18 @@ mod tests {
                 "jump".into(),
             ],
         );
-        assert_eq!(
-            ssh_argv(&target, "uname -s"),
-            [
-                "-o",
-                "ConnectTimeout=10",
-                "-L",
-                "9000:localhost:9000",
-                "-J",
-                "jump",
-                "-T",
-                "iq-64",
-                "uname -s"
-            ]
-        );
+        // the user `-L` suppresses ClearAllForwardings; the base options are still injected.
+        let mut expected = injected_base_options();
+        expected.extend([
+            "-L".into(),
+            "9000:localhost:9000".into(),
+            "-J".into(),
+            "jump".into(),
+            "-T".into(),
+            "iq-64".into(),
+            "uname -s".to_string(),
+        ]);
+        assert_eq!(ssh_argv(&target, "uname -s"), expected);
     }
 
     #[test]
@@ -2426,35 +2548,34 @@ mod tests {
     #[test]
     fn ssh_target_command_does_not_duplicate_user_supplied_dash_t() {
         let target = SshTarget::new("iq-64", vec!["-T".into()]);
-        assert_eq!(
-            ssh_argv(&target, "x"),
-            [
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ClearAllForwardings=yes",
-                "-T",
-                "iq-64",
-                "x"
-            ]
-        );
+        let mut expected = injected_base_options();
+        expected.extend([
+            "-o".into(),
+            "ClearAllForwardings=yes".into(),
+            "-T".into(),
+            "iq-64".into(),
+            "x".to_string(),
+        ]);
+        assert_eq!(ssh_argv(&target, "x"), expected);
     }
 
     #[test]
     fn ssh_target_command_respects_user_connect_timeout() {
         let target = SshTarget::new("iq-64", vec!["-o".into(), "ConnectTimeout=3".into()]);
-        assert_eq!(
-            ssh_argv(&target, "x"),
-            [
-                "-o",
-                "ClearAllForwardings=yes",
-                "-o",
-                "ConnectTimeout=3",
-                "-T",
-                "iq-64",
-                "x"
-            ]
-        );
+        let mut expected: Vec<String> = injected_base_options()
+            .into_iter()
+            .skip(2) // the user pinned ConnectTimeout — ours is not injected
+            .collect();
+        expected.extend([
+            "-o".into(),
+            "ClearAllForwardings=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=3".into(),
+            "-T".into(),
+            "iq-64".into(),
+            "x".to_string(),
+        ]);
+        assert_eq!(ssh_argv(&target, "x"), expected);
     }
 
     fn probe_lines(version: &str, protocol: u32, bridge_ok: bool) -> String {
