@@ -293,11 +293,7 @@ impl SshTarget {
         let mut command = Command::new("ssh");
         // Bound the connect phase so an unreachable host fails fast instead of stalling for the OS
         // TCP timeout. Skip if the user already pinned a ConnectTimeout in their own options.
-        if !self
-            .options
-            .iter()
-            .any(|opt| opt.contains("ConnectTimeout"))
-        {
+        if !options_pin_keyword(&self.options, "connecttimeout") {
             command.arg("-o").arg("ConnectTimeout=10");
         }
         // #72: keepalive. Without it a hung TCP (sleep/wake, network switch, dropped VPN) left the
@@ -305,34 +301,26 @@ impl SshTarget {
         // stacked fresh connections on top, until the remote's sshd stopped accepting new ones.
         // Dead links now self-terminate within ~60s on both ends. Skip when the user pinned either
         // knob in their own options.
-        if !self
-            .options
-            .iter()
-            .any(|opt| opt.contains("ServerAliveInterval"))
-        {
+        if !options_pin_keyword(&self.options, "serveraliveinterval") {
             command.arg("-o").arg("ServerAliveInterval=15");
         }
-        if !self
-            .options
-            .iter()
-            .any(|opt| opt.contains("ServerAliveCountMax"))
-        {
+        if !options_pin_keyword(&self.options, "serveralivecountmax") {
             command.arg("-o").arg("ServerAliveCountMax=4");
         }
         // #72: multiplex every herdr ssh session onto ONE TCP/sshd connection per target. The api
         // bridge dials a NEW ssh per local connection and the active remote polls at 400ms — that
         // alone is ~2.5 fresh sshd connections/sec, and under latency the in-flight ones stack
-        // toward sshd's MaxStartups refusal. `%C` hashes (local host, remote host, port, user) so
-        // the socket path stays short and per-target; `ControlPersist=60` keeps the master warm
-        // across polls and retires it 60s after the last session. If the master cannot be set up
-        // (path too long, mux disabled server-side) ssh degrades to a plain direct connection —
-        // exactly the old behavior. Skip when the user pinned any mux knob.
+        // toward sshd's MaxStartups refusal. `ControlPersist=60` keeps the master warm across
+        // polls and retires it 60s after the last session. If the master cannot be set up (path
+        // too long, mux disabled server-side) ssh degrades to a plain direct connection — exactly
+        // the old behavior. Skip when the user pinned any mux knob (`-S`/`-M` may be glued to
+        // their argument: `-S/tmp/cm`, `-MM`).
         if !self.options.iter().any(|opt| {
-            opt.contains("ControlMaster")
-                || opt.contains("ControlPath")
-                || opt.contains("ControlPersist")
-                || opt == "-M"
-                || opt == "-S"
+            options_pin_keyword(std::slice::from_ref(opt), "controlmaster")
+                || options_pin_keyword(std::slice::from_ref(opt), "controlpath")
+                || options_pin_keyword(std::slice::from_ref(opt), "controlpersist")
+                || opt.starts_with("-M")
+                || opt.starts_with("-S")
         }) {
             command.arg("-o").arg("ControlMaster=auto");
             command
@@ -347,8 +335,9 @@ impl SshTarget {
         // bridge to a sibling host forwarding the same port ("ssh works by hand, but
         // add-remote sticks at connecting") — with `bind: Address already in use`. Clear them
         // the way scp does, unless the user explicitly asked this herdr connection to forward.
+        // (The `-L`/`-R`/`-D` flag checks stay case-SENSITIVE: ssh flags are, unlike keywords.)
         let user_forwards = self.options.iter().any(|opt| {
-            opt.contains("ClearAllForwardings")
+            options_pin_keyword(std::slice::from_ref(opt), "clearallforwardings")
                 || opt.starts_with("-L")
                 || opt.starts_with("-R")
                 || opt.starts_with("-D")
@@ -364,6 +353,18 @@ impl SshTarget {
         command.arg(remote_command);
         command
     }
+}
+
+/// #72: whether the user's options already pin the given ssh keyword. OpenSSH keywords are
+/// case-INSENSITIVE and `-o` may glue its argument (`-oserveraliveinterval=0` is valid), while
+/// herdr's injected defaults come FIRST on the argv and OpenSSH is first-value-wins — so a missed
+/// match would silently override the user's explicit setting. Case-fold before the substring
+/// check; a false positive (the keyword appearing inside an unrelated value) merely skips the
+/// injection, i.e. degrades to the old behavior.
+fn options_pin_keyword(options: &[String], keyword_lower: &str) -> bool {
+    options
+        .iter()
+        .any(|opt| opt.to_ascii_lowercase().contains(keyword_lower))
 }
 
 /// #72: the `ControlPath` option for the shared per-target ssh control master. Lives in the
@@ -2513,6 +2514,38 @@ mod tests {
         let target = SshTarget::new("iq-64", vec!["-S".into(), "/tmp/x".into()]);
         let argv = ssh_argv(&target, "x");
         assert!(!argv.contains(&"ControlMaster=auto".to_string()));
+    }
+
+    /// #72 (trinity review): OpenSSH keywords are case-insensitive and `-o`/`-S` may glue their
+    /// argument — a user opt-out in any valid spelling must suppress the injected default, or
+    /// first-value-wins would silently override it.
+    #[test]
+    fn ssh_target_command_honors_non_canonical_user_option_spellings() {
+        // lowercase keyword via separate -o
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "serveraliveinterval=0".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ServerAliveInterval=15".to_string()));
+
+        // glued lowercase -o form
+        let target = SshTarget::new("iq-64", vec!["-ocontrolmaster=no".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ControlMaster=auto".to_string()));
+        assert!(!argv.iter().any(|arg| arg.starts_with("ControlPath=")));
+
+        // glued -S<path> mux socket
+        let target = SshTarget::new("iq-64", vec!["-S/tmp/cm".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ControlMaster=auto".to_string()));
+
+        // -MM master mode
+        let target = SshTarget::new("iq-64", vec!["-MM".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ControlMaster=auto".to_string()));
+
+        // lowercase clearallforwardings opt-out keeps the clear from double-injecting
+        let target = SshTarget::new("iq-64", vec!["-o".into(), "clearallforwardings=no".into()]);
+        let argv = ssh_argv(&target, "x");
+        assert!(!argv.contains(&"ClearAllForwardings=yes".to_string()));
     }
 
     #[test]
