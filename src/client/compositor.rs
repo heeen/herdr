@@ -2113,12 +2113,17 @@ impl ClientSidebarSnapshot {
                         custom_name: agent.tab_label.clone(),
                         number: group + 1,
                         pane_terminals: Vec::new(),
+                        focused_pane: None,
                     });
                     tab_routes.push(Vec::new());
                     group
                 });
+                // #76: the summary-focused agent drives both the active tab AND that tab's focused
+                // pane — record the index this agent's pane will take (== current len, before the
+                // push below) so the placeholder layout focuses the matching pane for the highlight.
                 if agent.focused {
                     active_tab = group;
+                    tab_specs[group].focused_pane = Some(tab_specs[group].pane_terminals.len());
                 }
                 tab_specs[group].pane_terminals.push((terminal_id, seen));
                 tab_routes[group].push(AgentRoute {
@@ -5553,6 +5558,160 @@ mod tests {
         assert!(snapshot.app.workspaces[remote_idx]
             .focused_pane_id()
             .is_some());
+    }
+
+    #[test]
+    fn agents_panel_highlights_summary_focused_agent_pane() {
+        // Pins the bug: the sidebar agents-panel highlight must follow the FOCUSED agent's
+        // pane, not the tab layout's LAST pane. Two agents share one tab ("t1") and the server
+        // marks the FIRST (alpha) focused. `sidebar_placeholder_with_tabs` builds each tab
+        // layout by repeated `split_focused`, leaving layout focus on the last-split pane
+        // (beta) — so today `is_active_pane` lights beta instead of alpha. Pure summary truth
+        // (no secondary, no clicks) exercises the server-pane-focus direction.
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![
+                        AgentSummary {
+                            agent_id: "agent-a".into(),
+                            workspace_id: "main-herdr".into(),
+                            label: "alpha".into(),
+                            status: "idle".into(),
+                            focused: true,
+                            pane_label: None,
+                            tab_id: "t1".into(),
+                            tab_label: None,
+                        },
+                        AgentSummary {
+                            agent_id: "agent-b".into(),
+                            workspace_id: "main-herdr".into(),
+                            label: "beta".into(),
+                            status: "idle".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: "t1".into(),
+                            tab_label: None,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+
+        // Resolve entries by agent label so the assertions don't depend on row ordering.
+        let entries = crate::ui::agent_panel_entries(&snapshot.app);
+        let entry_a = entries
+            .iter()
+            .find(|entry| entry.agent_label == Some("alpha".into()))
+            .expect("alpha agent panel entry should exist");
+        let entry_b = entries
+            .iter()
+            .find(|entry| entry.agent_label == Some("beta".into()))
+            .expect("beta agent panel entry should exist");
+
+        // The highlight must land on alpha (the server-focused agent), not beta (the tab's
+        // last pane). This is the assertion that fails today.
+        assert!(
+            snapshot
+                .app
+                .is_active_pane(entry_a.ws_idx, entry_a.tab_idx, entry_a.pane_id),
+            "alpha (server-focused agent) should be the highlighted pane"
+        );
+        assert!(
+            !snapshot
+                .app
+                .is_active_pane(entry_b.ws_idx, entry_b.tab_idx, entry_b.pane_id),
+            "beta (unfocused agent) must not be highlighted"
+        );
+    }
+
+    #[test]
+    fn agents_panel_highlight_follows_agent_click_optimistically() {
+        // Pins the same bug from the client agents-tab click direction: neither agent is
+        // server-focused, then the client optimistically focuses agent-a via
+        // `focus_agent_route`. The highlight must follow the optimistically-focused agent's
+        // pane (alpha), not the tab layout's last pane (beta).
+        let mut model = ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![
+                        AgentSummary {
+                            agent_id: "agent-a".into(),
+                            workspace_id: "main-herdr".into(),
+                            label: "alpha".into(),
+                            status: "idle".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: "t1".into(),
+                            tab_label: None,
+                        },
+                        AgentSummary {
+                            agent_id: "agent-b".into(),
+                            workspace_id: "main-herdr".into(),
+                            label: "beta".into(),
+                            status: "idle".into(),
+                            focused: false,
+                            pane_label: None,
+                            tab_id: "t1".into(),
+                            tab_label: None,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        // The client agents-tab click: optimistically mark agent-a focused.
+        model.focus_agent_route(&ServerId::main(), "agent-a");
+
+        let compositor = ClientCompositor::new(26);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+
+        let entries = crate::ui::agent_panel_entries(&snapshot.app);
+        let entry_a = entries
+            .iter()
+            .find(|entry| entry.agent_label == Some("alpha".into()))
+            .expect("alpha agent panel entry should exist");
+        let entry_b = entries
+            .iter()
+            .find(|entry| entry.agent_label == Some("beta".into()))
+            .expect("beta agent panel entry should exist");
+
+        // The optimistic click focuses alpha; the highlight must follow it, not stay on the
+        // tab's last pane (beta). This is the assertion that fails today.
+        assert!(
+            snapshot
+                .app
+                .is_active_pane(entry_a.ws_idx, entry_a.tab_idx, entry_a.pane_id),
+            "alpha (optimistically-focused agent) should be the highlighted pane"
+        );
+        assert!(
+            !snapshot
+                .app
+                .is_active_pane(entry_b.ws_idx, entry_b.tab_idx, entry_b.pane_id),
+            "beta (unfocused agent) must not be highlighted"
+        );
     }
 
     #[test]
