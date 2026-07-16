@@ -6,8 +6,7 @@ use tracing::warn;
 use crate::{
     app::state::{
         AgentPanelScope, AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState,
-        DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
+        DragTarget, MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
         WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
