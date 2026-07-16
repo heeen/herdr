@@ -6992,6 +6992,7 @@ mod tests {
     fn test_client_state_with_model(model: supervisor::ClientSupervisorModel) -> ClientState {
         ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            remote_image_paste_key: None,
             frame_stats: ClientFrameStats::default(),
             mouse_capture_active: false,
             reported_size: (80, 24),
@@ -9741,6 +9742,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),
@@ -9807,6 +9809,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),
@@ -9843,6 +9846,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),
