@@ -76,6 +76,10 @@ const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 // Client state
 // ---------------------------------------------------------------------------
 
+// #73: the v0.7.1 merge kept this definition but dropped its construction/consumer from the
+// client loop (present on merge parent 58b9fec:840,990). Allow dead_code until the wiring is
+// re-ported; remove the allow with #73.
+#[allow(dead_code)]
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -110,6 +114,9 @@ struct ClientState {
     #[cfg(unix)]
     mouse_scroll_lines: usize,
     /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    /// #73: the v0.7.1 merge dropped the readers (the upstream #59 image-paste bridging,
+    /// 58b9fec:1119,1237). Allow dead_code until re-ported; remove the allow with #73.
+    #[allow(dead_code)]
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.

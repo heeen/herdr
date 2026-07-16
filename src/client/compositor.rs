@@ -510,6 +510,10 @@ impl ClientCompositor {
         }
     }
 
+    /// The RESTING (expanded) sidebar width. #71: production geometry must use
+    /// `effective_sidebar_width` (collapse-aware) instead — the last production caller of this
+    /// accessor was the collapsed-click-offset bug. Test-only accessor now.
+    #[cfg(test)]
     pub(crate) fn sidebar_width(&self) -> u16 {
         self.sidebar_width
     }
