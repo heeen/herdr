@@ -76,6 +76,10 @@ const ADD_REMOTE_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 // Client state
 // ---------------------------------------------------------------------------
 
+// #73: the v0.7.1 merge kept this definition but dropped its construction/consumer from the
+// client loop (present on merge parent 58b9fec:840,990). Allow dead_code until the wiring is
+// re-ported; remove the allow with #73.
+#[allow(dead_code)]
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -110,6 +114,9 @@ struct ClientState {
     #[cfg(unix)]
     mouse_scroll_lines: usize,
     /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    /// #73: the v0.7.1 merge dropped the readers (the upstream #59 image-paste bridging,
+    /// 58b9fec:1119,1237). Allow dead_code until re-ported; remove the allow with #73.
+    #[allow(dead_code)]
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
@@ -673,7 +680,10 @@ fn dispatch_composited_input(
             .iter()
             .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
     {
-        let sidebar_width = compositor.sidebar_width().min(host_size.0);
+        // #71: subtract the collapse-aware origin (mini width while collapsed / mid-slide), the
+        // SAME value render + hit_test + content_size read — the resting `sidebar_width()` here
+        // forwarded collapsed-mode content clicks offset by (expanded − mini) columns.
+        let sidebar_width = compositor.effective_sidebar_width(host_size.0);
         let mut forwarded = Vec::new();
         for event in &events {
             let crate::raw_input::RawInputEvent::Mouse(mouse) = event else {
@@ -1246,7 +1256,9 @@ fn dispatch_composited_mouse_input(
     // through so a content `Moved` still forwards its bytes via `translate_content_mouse_input`.
     // The `Redraw` arm recomposes locally (commit 3d47acd: no supervisor request, no server I/O).
     if matches!(mouse.kind, MouseEventKind::Moved) {
-        let sidebar_width = compositor.sidebar_width().min(host_size.0);
+        // #71: gate hover interception on the collapse-aware width so content motion in the
+        // mini↔expanded gap still forwards to the pane instead of being eaten as sidebar hover.
+        let sidebar_width = compositor.effective_sidebar_width(host_size.0);
         if mouse.column < sidebar_width
             || compositor.hover().is_some()
             || compositor.has_pending_hover()
@@ -1480,7 +1492,10 @@ fn dispatch_composited_mouse_input(
         return dispatch_sidebar_hit_target(target, model, mouse);
     }
 
-    let sidebar_width = compositor.sidebar_width().min(host_size.0);
+    // #71: consume/translate against the collapse-aware origin — the resting width consumed every
+    // click in the (mini..expanded) column gap and offset every forwarded content click while the
+    // sidebar was collapsed or mid-slide.
+    let sidebar_width = compositor.effective_sidebar_width(host_size.0);
     if mouse.column < sidebar_width {
         return ClientInputDispatch::Consumed;
     }
@@ -6992,6 +7007,7 @@ mod tests {
     fn test_client_state_with_model(model: supervisor::ClientSupervisorModel) -> ClientState {
         ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            remote_image_paste_key: None,
             frame_stats: ClientFrameStats::default(),
             mouse_capture_active: false,
             reported_size: (80, 24),
@@ -8016,6 +8032,76 @@ mod tests {
             model.client_menu().is_none(),
             "an outside press dismissed the menu"
         );
+    }
+
+    // #71: with the sidebar COLLAPSED (mini strip), a content click must translate against the
+    // collapse-aware origin (mini width), not the resting expanded width — the old gates consumed
+    // clicks in the (mini..expanded) gap as "sidebar" and forwarded the rest offset left by
+    // (expanded − mini) columns.
+    #[test]
+    fn collapsed_content_click_forwards_with_mini_origin() {
+        let (mut model, _remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::new(26);
+        let host = (60u16, 24u16);
+        compositor.toggle_sidebar_collapsed();
+        while compositor.sidebar_width_animating() {
+            compositor.step_sidebar_width_animation();
+        }
+        let mini = compositor.effective_sidebar_width(host.0);
+        assert!(mini < 26, "collapse must settle below the resting width");
+
+        // A click between the mini strip and the old expanded edge is CONTENT, not sidebar.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch =
+            dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &click);
+        let expected = crate::input::encode_mouse_button(
+            click.kind,
+            click.column - mini,
+            click.row,
+            click.modifiers,
+            crate::input::MouseProtocolEncoding::Sgr,
+        )
+        .expect("sgr encoding for a left press");
+        match dispatch {
+            ClientInputDispatch::Forward(bytes) => assert_eq!(
+                bytes, expected,
+                "collapsed content click must forward translated by the MINI origin"
+            ),
+            other => panic!("collapsed content click must forward, got {other:?}"),
+        }
+
+        // Expanded behavior is unchanged: the same flow translates by the resting width again.
+        compositor.toggle_sidebar_collapsed();
+        while compositor.sidebar_width_animating() {
+            compositor.step_sidebar_width_animation();
+        }
+        let expanded = compositor.effective_sidebar_width(host.0);
+        assert_eq!(expanded, 26);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch =
+            dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &click);
+        let expected = crate::input::encode_mouse_button(
+            click.kind,
+            click.column - expanded,
+            click.row,
+            click.modifiers,
+            crate::input::MouseProtocolEncoding::Sgr,
+        )
+        .expect("sgr encoding for a left press");
+        match dispatch {
+            ClientInputDispatch::Forward(bytes) => assert_eq!(bytes, expected),
+            other => panic!("expanded content click must forward, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9741,6 +9827,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),
@@ -9807,6 +9894,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),
@@ -9843,6 +9931,7 @@ mod tests {
                             cwd: None,
                             focus: true,
                             label: None,
+                            env: Default::default(),
                         },
                     ),
                 }),

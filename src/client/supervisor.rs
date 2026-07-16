@@ -506,6 +506,21 @@ pub(crate) enum OptimisticFocusTarget {
     Agent(String),
 }
 
+/// #39: whether an applied summary AGREES with the optimistic focus target — i.e. the server has
+/// visibly applied the focus the client requested, so the optimistic override can retire.
+fn summary_confirms_focus_target(summary: &ServerSummary, target: &OptimisticFocusTarget) -> bool {
+    match target {
+        OptimisticFocusTarget::Workspace(workspace_id) => summary
+            .workspaces
+            .iter()
+            .any(|ws| ws.focused && ws.workspace_id == *workspace_id),
+        OptimisticFocusTarget::Agent(agent_id) => summary
+            .agents
+            .iter()
+            .any(|agent| agent.focused && agent.agent_id == *agent_id),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NewWorkspaceRoute {
     CreateOn(ServerId),
@@ -677,6 +692,13 @@ pub(crate) struct ClientSupervisorModel {
     // popup by this (clamped on-screen). Dragging the popup's top border accumulates here.
     overlay_drag_offset: (i16, i16),
     optimistic_focus: Option<(ServerId, OptimisticFocusTarget)>, // item 6 (always None in C0)
+    /// #39: how many applied summaries have DISAGREED with the live optimistic focus. A summary
+    /// fetched before the focus request landed server-side must not clobber the optimistic
+    /// highlight (the click-then-snap-back flicker); but a focus that silently never lands must
+    /// not pin the highlight forever either. Confirming summaries retire the override
+    /// immediately; after `OPTIMISTIC_FOCUS_MAX_STALE_APPLIES` disagreeing applies, summary truth
+    /// wins. Counter-based (not wall-clock) because the model holds no clock.
+    optimistic_focus_stale_applies: u8,
     /// #44: per-host live provisioning progress LOG, keyed by `ServerId` so the banner sub-lines
     /// target the right host. Fed one stage line at a time by `set_update_progress` from BOTH the
     /// update worker and the add/reconnect provisioning worker; cleared when the operation finishes.
@@ -691,6 +713,12 @@ pub(crate) struct ClientSupervisorModel {
 }
 
 const SUPERVISOR_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// #39: disagreeing summary applies tolerated before the optimistic focus yields to summary
+/// truth. At the active remote's 400ms poll cadence this bounds a silently-lost focus request's
+/// stale highlight to ~1.2s, while comfortably outlasting the one or two in-flight pre-focus
+/// summaries that used to snap the highlight back on every click.
+const OPTIMISTIC_FOCUS_MAX_STALE_APPLIES: u8 = 3;
 
 pub(crate) trait SupervisorApi {
     fn request(
@@ -769,6 +797,7 @@ impl ClientSupervisorModel {
             client_overlay: ClientOverlayState::None,
             overlay_drag_offset: (0, 0),
             optimistic_focus: None,
+            optimistic_focus_stale_applies: 0,
             update_progress: std::collections::HashMap::new(),
             update_outcomes: std::collections::HashMap::new(),
         }
@@ -1078,9 +1107,10 @@ impl ClientSupervisorModel {
             return Err(());
         };
         server.summaries = summary;
-        // item 6 (Area 6): authoritative summary wins — clear the optimistic focus override
-        // for this server so the highlight reconciles to the freshly applied truth.
-        self.clear_optimistic_focus_for_server(id);
+        // #39: reconcile — retire the optimistic focus only once the applied summary CONFIRMS it
+        // (or it has overstayed its stale-apply budget). Unconditional clearing let a summary
+        // fetched BEFORE the focus request landed snap the highlight back on every click.
+        self.reconcile_optimistic_focus_after_summary(id);
         Ok(())
     }
 
@@ -1194,10 +1224,10 @@ impl ClientSupervisorModel {
                         server.connection_state = ConnectionState::Connected;
                         server.summaries = summary;
                     }
-                    // item 6 (Area 6): authoritative summary arrived for this server — drop the
-                    // optimistic focus override. `Err(_)` results carry no fresh truth and do
-                    // NOT clear (the highlight stays optimistic until truth or failure arrives).
-                    self.clear_optimistic_focus_for_server(&server_id);
+                    // #39: a fresh summary arrived — retire the optimistic override only when it
+                    // confirms the target (or the stale-apply budget ran out). `Err(_)` results
+                    // carry no fresh truth and never touch the override.
+                    self.reconcile_optimistic_focus_after_summary(&server_id);
                 }
                 Err(connection_state) => {
                     if let Some(server) = self.server_mut(&server_id) {
@@ -1218,6 +1248,34 @@ impl ClientSupervisorModel {
     fn clear_optimistic_focus_for_server(&mut self, server_id: &ServerId) {
         if matches!(&self.optimistic_focus, Some((id, _)) if id == server_id) {
             self.optimistic_focus = None;
+            self.optimistic_focus_stale_applies = 0;
+        }
+    }
+
+    /// #39: called after a fresh summary has been stored for `server_id`. Retires the optimistic
+    /// focus override when the summary agrees with it (truth caught up — the normal path, one
+    /// poll after the focus request lands), or when
+    /// [`OPTIMISTIC_FOCUS_MAX_STALE_APPLIES`] disagreeing summaries have been applied (the focus
+    /// request evidently never landed; stop overriding so summary truth wins). A disagreeing
+    /// summary within the budget leaves the override in place — it was fetched before the focus
+    /// applied and must not snap the highlight back.
+    fn reconcile_optimistic_focus_after_summary(&mut self, server_id: &ServerId) {
+        let Some((focus_server, target)) = self.optimistic_focus.as_ref() else {
+            return;
+        };
+        if focus_server != server_id {
+            return;
+        }
+        let confirmed = self
+            .server(server_id)
+            .is_some_and(|server| summary_confirms_focus_target(&server.summaries, target));
+        if confirmed {
+            self.clear_optimistic_focus_for_server(server_id);
+            return;
+        }
+        self.optimistic_focus_stale_applies = self.optimistic_focus_stale_applies.saturating_add(1);
+        if self.optimistic_focus_stale_applies >= OPTIMISTIC_FOCUS_MAX_STALE_APPLIES {
+            self.clear_optimistic_focus_for_server(server_id);
         }
     }
 
@@ -2819,6 +2877,7 @@ impl ClientSupervisorModel {
             server_id.clone(),
             OptimisticFocusTarget::Workspace(workspace_id.to_string()),
         ));
+        self.optimistic_focus_stale_applies = 0;
         FocusRoute::Workspace {
             server_id: server_id.clone(),
             workspace_id: workspace_id.to_string(),
@@ -2854,6 +2913,7 @@ impl ClientSupervisorModel {
             server_id.clone(),
             OptimisticFocusTarget::Agent(agent_id.to_string()),
         ));
+        self.optimistic_focus_stale_applies = 0;
         FocusRoute::Agent {
             server_id: server_id.clone(),
             target: agent_id.to_string(),
@@ -5286,55 +5346,161 @@ mod tests {
             .all(|row| !row.focused));
     }
 
+    /// #39: a summary fetched BEFORE the focus request landed (still reporting the OLD focus)
+    /// must not snap the highlight back to the old row — the optimistic override survives
+    /// disagreeing applies within the stale budget.
     #[test]
-    fn optimistic_focus_cleared_when_summary_applied() {
+    fn optimistic_focus_survives_stale_summary() {
         let (mut model, remote_id) = optimistic_focus_model();
 
-        // Apply via apply_secondary_summary_results (authoritative wins).
         model.focus_workspace_route(&remote_id, "remote-api");
-        model.apply_secondary_summary_results([(
-            remote_id.clone(),
-            Ok(ServerSummary {
-                workspaces: vec![WorkspaceSummary {
+        // A stale in-flight summary still reporting the pre-click focus (remote-web).
+        let stale = ServerSummary {
+            workspaces: vec![
+                WorkspaceSummary {
                     workspace_id: "remote-api".into(),
                     label: "api".into(),
                     branch: None,
                     focused: false,
                     ..Default::default()
-                }],
-                agents: Vec::new(),
-            }),
-        )]);
+                },
+                WorkspaceSummary {
+                    workspace_id: "remote-web".into(),
+                    label: "web".into(),
+                    branch: None,
+                    focused: true,
+                    ..Default::default()
+                },
+            ],
+            agents: Vec::new(),
+        };
+        model.apply_secondary_summary_results([(remote_id.clone(), Ok(stale.clone()))]);
         assert!(
             model
                 .workspace_rows()
                 .iter()
-                .filter(|row| row.server_id == remote_id)
-                .all(|row| !row.focused),
-            "summary truth (focused == false) wins after apply"
+                .any(|row| row.workspace_id.as_deref() == Some("remote-api") && row.focused),
+            "the clicked row stays highlighted through a stale summary apply"
         );
 
-        // Apply via set_summary (also clears).
-        model.focus_workspace_route(&remote_id, "remote-api");
+        // The next poll reflects the applied focus — the override retires and truth carries on.
+        let confirming = ServerSummary {
+            workspaces: vec![
+                WorkspaceSummary {
+                    workspace_id: "remote-api".into(),
+                    label: "api".into(),
+                    branch: None,
+                    focused: true,
+                    ..Default::default()
+                },
+                WorkspaceSummary {
+                    workspace_id: "remote-web".into(),
+                    label: "web".into(),
+                    branch: None,
+                    focused: false,
+                    ..Default::default()
+                },
+            ],
+            agents: Vec::new(),
+        };
+        model.apply_secondary_summary_results([(remote_id.clone(), Ok(confirming))]);
+        // After retirement, a LATER server-side focus change is honored (no pinning).
+        model.apply_secondary_summary_results([(remote_id.clone(), Ok(stale))]);
+        assert!(
+            model
+                .workspace_rows()
+                .iter()
+                .any(|row| row.workspace_id.as_deref() == Some("remote-web") && row.focused),
+            "once confirmed and retired, summary truth drives the highlight again"
+        );
+    }
+
+    /// #39: an agent-focus click must survive a stale summary too — including via `set_summary`
+    /// (the main-server apply path).
+    #[test]
+    fn optimistic_agent_focus_survives_stale_set_summary() {
+        let (mut model, remote_id) = optimistic_focus_model();
+
+        model.focus_agent_route(&remote_id, "remote-agent");
         model
             .set_summary(
                 &remote_id,
                 ServerSummary {
-                    workspaces: vec![WorkspaceSummary {
-                        workspace_id: "remote-web".into(),
-                        label: "web".into(),
-                        branch: None,
-                        focused: true,
-                        ..Default::default()
+                    workspaces: vec![
+                        WorkspaceSummary {
+                            workspace_id: "remote-api".into(),
+                            label: "api".into(),
+                            branch: None,
+                            focused: false,
+                            ..Default::default()
+                        },
+                        WorkspaceSummary {
+                            workspace_id: "remote-web".into(),
+                            label: "web".into(),
+                            branch: None,
+                            focused: true,
+                            ..Default::default()
+                        },
+                    ],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                        pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
                     }],
-                    agents: Vec::new(),
                 },
             )
             .unwrap();
-        assert!(model
-            .workspace_rows()
-            .iter()
-            .any(|row| row.workspace_id.as_deref() == Some("remote-web") && row.focused));
+        let groups = model.agent_groups();
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| group.agents.iter())
+                .any(|agent| agent.agent_id == "remote-agent" && agent.focused),
+            "the clicked agent stays highlighted through a stale set_summary"
+        );
+    }
+
+    /// #39: a focus request that silently never lands must not pin the highlight forever —
+    /// after the stale-apply budget, summary truth wins.
+    #[test]
+    fn optimistic_focus_expires_after_stale_apply_budget() {
+        let (mut model, remote_id) = optimistic_focus_model();
+
+        model.focus_workspace_route(&remote_id, "remote-api");
+        let stale = ServerSummary {
+            workspaces: vec![
+                WorkspaceSummary {
+                    workspace_id: "remote-api".into(),
+                    label: "api".into(),
+                    branch: None,
+                    focused: false,
+                    ..Default::default()
+                },
+                WorkspaceSummary {
+                    workspace_id: "remote-web".into(),
+                    label: "web".into(),
+                    branch: None,
+                    focused: true,
+                    ..Default::default()
+                },
+            ],
+            agents: Vec::new(),
+        };
+        for _ in 0..OPTIMISTIC_FOCUS_MAX_STALE_APPLIES {
+            model.apply_secondary_summary_results([(remote_id.clone(), Ok(stale.clone()))]);
+        }
+        assert!(
+            model
+                .workspace_rows()
+                .iter()
+                .any(|row| row.workspace_id.as_deref() == Some("remote-web") && row.focused),
+            "after the stale budget the summary's focused row wins"
+        );
         assert!(model
             .workspace_rows()
             .iter()

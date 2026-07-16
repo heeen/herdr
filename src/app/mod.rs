@@ -1376,6 +1376,10 @@ impl App {
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                // Restored from pre-merge mx (2df71bf:1250) — the v0.7.1 merge dropped the scope's
+                // live apply, so `save_agent_panel_scope` persisted without taking effect.
+                self.state.agent_panel_scope =
+                    agent_panel_scope_from_config(config.ui.agent_panel_scope);
                 self.state.agent_panel_scroll = 0;
                 // #58: the multi-remote client renders the sidebar from the server-pushed UiSettings,
                 // so a sidebar-config change must signal clients to re-fetch immediately — otherwise
@@ -2883,6 +2887,34 @@ mod tests {
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("agent_panel_sort = \"priority\""));
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_agent_panel_scope_persists_then_applies_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("save-agent-panel-scope");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(
+            app.state.agent_panel_scope,
+            state::AgentPanelScope::AllWorkspaces
+        );
+
+        app.save_agent_panel_scope(state::AgentPanelScope::CurrentWorkspace);
+
+        assert_eq!(
+            app.state.agent_panel_scope,
+            state::AgentPanelScope::CurrentWorkspace
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("agent_panel_scope = \"current\""));
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);

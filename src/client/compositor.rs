@@ -510,6 +510,10 @@ impl ClientCompositor {
         }
     }
 
+    /// The RESTING (expanded) sidebar width. #71: production geometry must use
+    /// `effective_sidebar_width` (collapse-aware) instead — the last production caller of this
+    /// accessor was the collapsed-click-offset bug. Test-only accessor now.
+    #[cfg(test)]
     pub(crate) fn sidebar_width(&self) -> u16 {
         self.sidebar_width
     }
@@ -1508,7 +1512,11 @@ impl ClientCompositor {
         )
     }
 
-    fn effective_sidebar_width(&self, host_width: u16) -> u16 {
+    // #71: pub(crate) — the content mouse-forwarding gates in `client/mod.rs` must subtract the
+    // SAME collapse-aware origin render/hit-test/content_size use; they previously used the
+    // resting `sidebar_width()`, so a collapsed client forwarded content clicks offset by
+    // (expanded − mini) columns and swallowed clicks in the gap as sidebar clicks.
+    pub(crate) fn effective_sidebar_width(&self, host_width: u16) -> u16 {
         if host_width <= 1 {
             return 0;
         }

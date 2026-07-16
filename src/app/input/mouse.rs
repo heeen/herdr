@@ -5,8 +5,8 @@ use tracing::warn;
 
 use crate::{
     app::state::{
-        AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
+        AgentPanelScope, AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState,
+        DragTarget, MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
         WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
@@ -549,6 +549,16 @@ impl AppState {
                         self.agent_panel_sort = match self.agent_panel_sort {
                             AgentPanelSort::Spaces => AgentPanelSort::Priority,
                             AgentPanelSort::Priority => AgentPanelSort::Spaces,
+                        };
+                        self.agent_panel_scroll = 0;
+                        self.mark_session_dirty();
+                        return None;
+                    }
+
+                    if self.on_agent_panel_scope_toggle(mouse.column, mouse.row) {
+                        self.agent_panel_scope = match self.agent_panel_scope {
+                            AgentPanelScope::CurrentWorkspace => AgentPanelScope::AllWorkspaces,
+                            AgentPanelScope::AllWorkspaces => AgentPanelScope::CurrentWorkspace,
                         };
                         self.agent_panel_scroll = 0;
                         self.mark_session_dirty();

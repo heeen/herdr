@@ -1246,6 +1246,7 @@ mod tests {
             }],
             active: Some(0),
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
@@ -1336,9 +1337,12 @@ mod tests {
             }],
             active: Some(0),
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            remote_registry: Default::default(),
+            pane_id_aliases: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1441,9 +1445,12 @@ mod tests {
             }],
             active: Some(0),
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            remote_registry: Default::default(),
+            pane_id_aliases: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1552,6 +1559,7 @@ mod tests {
             }],
             active: Some(0),
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
@@ -1745,6 +1753,7 @@ mod tests {
             }],
             active: Some(0),
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),

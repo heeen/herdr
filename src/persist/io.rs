@@ -204,6 +204,7 @@ mod tests {
             workspaces: vec![],
             active: None,
             selected: 0,
+            agent_panel_scope: Default::default(),
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
