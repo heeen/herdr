@@ -1166,7 +1166,9 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
 
     let mut crash_output = String::new();
     let thin_exited = {
-        let deadline = Instant::now() + Duration::from_secs(12);
+        // 30s: slow CI runners have taken >12s between SIGKILL delivery and the thin
+        // client observing the closed stream (local runs finish in ~5s).
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut exited = false;
         let mut buf = [0u8; 1024];
         while Instant::now() < deadline {
