@@ -3054,7 +3054,12 @@ fn hit_test_confirm_close_workspace(
 fn agent_panel_toggle_hit_rect(app: &crate::app::AppState) -> Rect {
     let (_, detail_area) =
         crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
-    crate::ui::agent_panel_scope_toggle_rect(detail_area, app.agent_panel_scope)
+    // Pre-existing label mismatch (broke hover==render on mx before the v0.7.4 merge): the
+    // renderer still draws the SORT toggle label here (`render_agent_detail` →
+    // `agent_panel_toggle_rect`), while the client toggles SCOPE on click. Hit/hover geometry
+    // must cover the cells actually drawn, so derive it from the rendered (sort) label until
+    // the in-flight scope-label render work lands.
+    crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_sort)
 }
 
 /// #25: collapsed-mode row hit-test. The collapsed renderer draws (top→bottom) a narrow
@@ -3353,7 +3358,8 @@ fn compute_hover_geometry(snapshot: &ClientSidebarSnapshot) -> HoverGeometry {
         geom.new_button = Some(app.sidebar_new_button_rect());
         geom.menu_button = Some(app.global_launcher_rect());
     }
-    let toggle_rect = crate::ui::agent_panel_scope_toggle_rect(detail_area, app.agent_panel_scope);
+    // See `agent_panel_toggle_hit_rect`: geometry must track the RENDERED (sort-label) toggle.
+    let toggle_rect = crate::ui::agent_panel_toggle_rect(detail_area, app.agent_panel_sort);
     if toggle_rect != Rect::default() {
         geom.scope_toggle = Some(toggle_rect);
     }

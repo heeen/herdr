@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid,
+    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
 const WORKTREE_BOOTSTRAP_MANAGED_COMPONENT: &str = "example.worktree-bootstrap-ef876653ffc3";
@@ -325,6 +325,23 @@ fn run_cli_in_dir(socket_path: &Path, args: &[&str], current_dir: &Path) -> std:
     command.output().unwrap()
 }
 
+fn pane_topology_snapshot(list_response: &serde_json::Value) -> Vec<serde_json::Value> {
+    list_response["result"]["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pane| {
+            serde_json::json!({
+                "pane_id": pane["pane_id"],
+                "terminal_id": pane["terminal_id"],
+                "workspace_id": pane["workspace_id"],
+                "tab_id": pane["tab_id"],
+                "focused": pane["focused"],
+            })
+        })
+        .collect()
+}
+
 fn run_cli_json(socket_path: &Path, args: &[&str]) -> serde_json::Value {
     let output = run_cli(socket_path, args);
     parse_cli_json_output(args, output)
@@ -518,6 +535,52 @@ fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     let mut reader = BufReader::new(stream);
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+fn write_fake_pong(
+    stream: &mut UnixStream,
+    request: &serde_json::Value,
+    version: &str,
+    protocol: u32,
+) {
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id": request["id"],
+            "result": {
+                "type": "pong",
+                "version": version,
+                "protocol": protocol,
+                "capabilities": {
+                    "live_handoff": true,
+                    "detached_server_daemon": true
+                }
+            }
+        })
+    )
+    .unwrap();
+    stream.flush().unwrap();
+}
+
+fn accept_fake_cli_operation(listener: &UnixListener) -> (UnixStream, String) {
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if request["method"] != "ping" {
+            return (stream, line);
+        }
+
+        write_fake_pong(
+            &mut stream,
+            &request,
+            "different-build-same-protocol",
+            CURRENT_PROTOCOL,
+        );
+    }
 }
 
 fn run_claude_hook(action: &str, hook_input: &str) -> Option<serde_json::Value> {
@@ -835,10 +898,7 @@ fn pane_run_sends_one_send_input_request_with_enter_key() {
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {
-        let (mut first_stream, _) = listener.accept().unwrap();
-        let mut first_line = String::new();
-        let mut first_reader = BufReader::new(first_stream.try_clone().unwrap());
-        first_reader.read_line(&mut first_line).unwrap();
+        let (mut first_stream, first_line) = accept_fake_cli_operation(&listener);
         first_stream
             .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
             .unwrap();
@@ -898,6 +958,58 @@ fn pane_run_sends_one_send_input_request_with_enter_key() {
 }
 
 #[test]
+fn workspace_report_metadata_sends_token_patch() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, line) = accept_fake_cli_operation(&listener);
+        stream
+            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        line
+    });
+
+    let run = run_cli(
+        &socket_path,
+        &[
+            "workspace",
+            "report-metadata",
+            "2",
+            "--source",
+            "user:jj",
+            "--token",
+            "jj_status=2 changes",
+            "--token",
+            "summary=clean",
+            "--clear-token",
+            "old",
+            "--ttl-ms",
+            "5000",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let request: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+    assert_eq!(request["method"], "workspace.report_metadata");
+    assert_eq!(request["params"]["workspace_id"], "2");
+    assert_eq!(request["params"]["tokens"]["jj_status"], "2 changes");
+    assert_eq!(request["params"]["tokens"]["summary"], "clean");
+    assert!(request["params"]["tokens"]["old"].is_null());
+    assert_eq!(request["params"]["ttl_ms"], 5000);
+
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn pane_report_metadata_sends_presentation_request() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -905,10 +1017,7 @@ fn pane_report_metadata_sends_presentation_request() {
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        reader.read_line(&mut line).unwrap();
+        let (mut stream, line) = accept_fake_cli_operation(&listener);
         stream
             .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
             .unwrap();
@@ -931,10 +1040,14 @@ fn pane_report_metadata_sends_presentation_request() {
             "Refactor auth",
             "--display-agent",
             "Claude auth",
-            "--custom-status",
-            "middleware",
             "--state-label",
             "working=deep in the mines",
+            "--token",
+            "summary=reviewing auth",
+            "--token",
+            "model=opus",
+            "--clear-token",
+            "old",
             "--ttl-ms",
             "3600000",
         ],
@@ -954,11 +1067,13 @@ fn pane_report_metadata_sends_presentation_request() {
     assert!(request["params"]["applies_to_source"].is_null());
     assert_eq!(request["params"]["title"], "Refactor auth");
     assert_eq!(request["params"]["display_agent"], "Claude auth");
-    assert_eq!(request["params"]["custom_status"], "middleware");
     assert_eq!(
         request["params"]["state_labels"]["working"],
         "deep in the mines"
     );
+    assert_eq!(request["params"]["tokens"]["summary"], "reviewing auth");
+    assert_eq!(request["params"]["tokens"]["model"], "opus");
+    assert!(request["params"]["tokens"]["old"].is_null());
     assert_eq!(request["params"]["ttl_ms"], 3_600_000);
 
     cleanup_test_base(&base);
@@ -978,8 +1093,8 @@ fn pane_report_metadata_rejects_blank_source_before_socket_request() {
             "1-1",
             "--source",
             "   ",
-            "--custom-status",
-            "middleware",
+            "--token",
+            "summary=middleware",
         ],
     );
 
@@ -1009,8 +1124,8 @@ fn pane_report_metadata_rejects_blank_applies_to_source_before_socket_request() 
             "user:claude-title",
             "--applies-to-source",
             "   ",
-            "--custom-status",
-            "middleware",
+            "--token",
+            "summary=middleware",
         ],
     );
 
@@ -1029,6 +1144,9 @@ fn help_commands_exit_successfully() {
     let help_cases: &[&[&str]] = &[
         &["-h"],
         &["--help"],
+        &["api", "-h"],
+        &["api", "schema", "-h"],
+        &["completion", "-h"],
         &["status", "-h"],
         &["server", "-h"],
         &["workspace", "-h"],
@@ -1058,6 +1176,46 @@ fn help_commands_exit_successfully() {
 }
 
 #[test]
+fn completion_command_prints_zsh_script_without_session_startup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["completion", "zsh"])
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#compdef herdr"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("bash elvish fish powershell zsh"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("'--direction[]:DIRECTION:(right down)'"),
+        "pane split/plugin pane open should complete --direction right|down without requiring equals: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--cwd=[]"),
+        "zsh completions should not suggest equals-style values unsupported by most manual parsers: {stdout}"
+    );
+    assert!(
+        !stdout.contains("--direction=[]"),
+        "zsh completions should not suggest equals-style direction values: {stdout}"
+    );
+    assert!(
+        !stdout.contains("live-handoff"),
+        "internal server handoff command should not be completed: {stdout}"
+    );
+}
+
+#[test]
 fn root_help_hides_explicit_client_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("--help")
@@ -1070,6 +1228,126 @@ fn root_help_hides_explicit_client_command() {
         !stdout.contains("herdr client"),
         "root help should not advertise the internal client command: {stdout}"
     );
+}
+
+#[test]
+fn root_help_advertises_api_schema_command_group() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("herdr api <subcommand>"),
+        "root help should advertise the api command group: {stdout}"
+    );
+}
+
+#[test]
+fn api_schema_default_output_is_a_short_summary() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["api", "schema"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Herdr API schema"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Use `herdr api schema --json`"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.len() < 400,
+        "summary should stay small enough for terminal output: {stdout}"
+    );
+}
+
+#[test]
+fn api_schema_json_prints_bundled_schema() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["api", "schema", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(schema
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|protocol| protocol > 0));
+    assert_eq!(
+        schema
+            .get("schemas")
+            .and_then(serde_json::Value::as_object)
+            .map(serde_json::Map::len),
+        Some(5)
+    );
+}
+
+#[test]
+fn api_snapshot_prints_live_session_snapshot() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            let (mut stream, line) = accept_fake_cli_operation(&listener);
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "session.snapshot");
+            assert_eq!(request["id"], "cli:api:snapshot");
+
+            let response = serde_json::json!({
+                "id": "cli:api:snapshot",
+                "result": {
+                    "type": "ok",
+                    "marker": "snapshot-passthrough"
+                }
+            });
+            writeln!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+            let _ = fs::remove_file(socket_path);
+        }
+    });
+
+    let value = run_cli_json(&socket_path, &["api", "snapshot"]);
+
+    assert_eq!(value["result"]["marker"], "snapshot-passthrough");
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn api_schema_output_writes_bundled_schema_to_file() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let schema_path = base.join("herdr-api.schema.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args(["api", "schema", "--output"])
+        .arg(&schema_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("wrote API schema"),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let schema: serde_json::Value =
+        serde_json::from_slice(&fs::read(&schema_path).unwrap()).unwrap();
+    assert!(schema
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|protocol| protocol > 0));
+
+    cleanup_test_base(&base);
 }
 
 #[test]
@@ -1345,7 +1623,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
     let status_stdout = String::from_utf8_lossy(&integration_status.stdout);
-    assert!(status_stdout.contains("pi: current (v3)"));
+    assert!(status_stdout.contains("pi: current (v5)"));
     assert!(status_stdout.contains("claude: not installed"));
 
     let integration_uninstall = Command::new(env!("CARGO_BIN_EXE_herdr"))
@@ -1441,7 +1719,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 14"),
+        full_stdout.contains("  protocol: 18"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -1474,7 +1752,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 14"),
+        server_stdout.contains("protocol: 18"),
         "stdout: {server_stdout}"
     );
 
@@ -1486,7 +1764,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 14"),
+        client_stdout.contains("protocol: 18"),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -1496,7 +1774,7 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 14);
+    assert_eq!(full_json["client"]["protocol"], 18);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
@@ -1510,12 +1788,12 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 14);
+    assert_eq!(server_json["protocol"], 18);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 14);
+    assert_eq!(client_json["protocol"], 18);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
@@ -1577,25 +1855,19 @@ fn server_stop_command_shuts_down_running_server() {
         "server stop should not print stdout: {}",
         String::from_utf8_lossy(&stopped.stdout)
     );
+    assert!(
+        !socket_path.exists() || UnixStream::connect(&socket_path).is_err(),
+        "api socket should be removed or stale before server stop returns"
+    );
+    assert!(
+        !client_socket.exists() || UnixStream::connect(&client_socket).is_err(),
+        "client socket should be removed or stale before server stop returns"
+    );
 
     let pid = herdr.child.process_id();
     let exit_status = herdr.child.wait().unwrap();
     unregister_spawned_herdr_pid(pid);
     assert!(exit_status.success(), "server stop should exit cleanly");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && (socket_path.exists() || client_socket.exists()) {
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    assert!(
-        !socket_path.exists() || UnixStream::connect(&socket_path).is_err(),
-        "api socket should be removed or stale after server stop"
-    );
-    assert!(
-        !client_socket.exists() || UnixStream::connect(&client_socket).is_err(),
-        "client socket should be removed or stale after server stop"
-    );
 
     cleanup_spawned_herdr(herdr, base);
 }
@@ -2194,6 +2466,98 @@ fn worktree_open_existing_checkout_by_path_and_branch() {
 }
 
 #[test]
+fn config_check_reports_invalid_config_without_server() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[keys\nnew_workspace = \"g\"\n",
+    )
+    .unwrap();
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(
+        checked.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert!(stdout.contains("config: issues found"), "{stdout}");
+    assert!(stdout.contains("TOML parse error"), "{stdout}");
+    assert!(stdout.contains("line 1"), "{stdout}");
+
+    fs::write(
+        config_dir.join("config.toml"),
+        "[ui]\nsidebar_min_width = 50\nsidebar_max_width = 30\n",
+    )
+    .unwrap();
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(stdout.contains("sidebar_min_width (50)"), "{stdout}");
+    assert!(stdout.contains("sidebar_max_width (30)"), "{stdout}");
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn config_check_reports_unreadable_config_path() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_path = config_home.join(app_dir_name()).join("config.toml");
+    fs::create_dir_all(&config_path).unwrap();
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+
+    assert_eq!(checked.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert!(stdout.contains("config: issues found"), "{stdout}");
+    assert!(stdout.contains("config read error"), "{stdout}");
+    assert!(stdout.contains("using defaults"), "{stdout}");
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn config_check_reports_ok_when_config_is_missing() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+
+    assert!(checked.status.success());
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert!(stdout.contains("config: ok"), "{stdout}");
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn config_check_rejects_json_output() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check", "--json"]);
+
+    assert_eq!(checked.status.code(), Some(2));
+    assert!(checked.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stderr),
+        "usage: herdr config check\n"
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn worktree_cli_rejects_local_argument_errors_before_socket_use() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -2309,13 +2673,95 @@ fn tab_management_commands_work() {
 
 #[test]
 fn agent_start_command_works() {
+    use std::os::unix::fs::PermissionsExt;
+
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let captured_args = base.join("pi-args");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexport HERDR_AGENT=pi\n'{}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do\n  [ \"$prompt\" = \"do not transition\" ] && continue\n  '{}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state working >/dev/null\n  '{}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\ndone\n",
+            captured_args.display(),
+            env!("CARGO_BIN_EXE_herdr"),
+            env!("CARGO_BIN_EXE_herdr"),
+            env!("CARGO_BIN_EXE_herdr"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
     wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = run_cli_json(&socket_path, &["pane", "list"]);
+    let before_topology = pane_topology_snapshot(&before);
+
+    let missing = run_cli(
+        &socket_path,
+        &[
+            "agent", "start", "missing", "--kind", "pi", "--pane", "w999:p1",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(missing["error"]["code"], "agent_pane_not_found");
+    assert_eq!(
+        pane_topology_snapshot(&run_cli_json(&socket_path, &["pane", "list"])),
+        before_topology
+    );
+
+    for unsafe_arg in ["tab\tcompletion", "escape\x1b[201~"] {
+        let rejected = run_cli(
+            &socket_path,
+            &[
+                "agent",
+                "start",
+                "invalid-argument",
+                "--kind",
+                "pi",
+                "--pane",
+                &pane_id,
+                "--",
+                unsafe_arg,
+            ],
+        );
+        assert_eq!(rejected.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&rejected.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_agent_argument");
+    }
+
+    for invalid_timeout in ["3000", "300001"] {
+        let rejected = run_cli(
+            &socket_path,
+            &[
+                "agent",
+                "start",
+                "invalid-timeout",
+                "--kind",
+                "pi",
+                "--pane",
+                &pane_id,
+                "--timeout",
+                invalid_timeout,
+            ],
+        );
+        assert_eq!(rejected.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&rejected.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_agent_timeout");
+    }
 
     let started = run_cli_json(
         &socket_path,
@@ -2323,47 +2769,253 @@ fn agent_start_command_works() {
             "agent",
             "start",
             "main",
-            "--cwd",
-            base.to_str().unwrap(),
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
             "--",
-            "/bin/sh",
-            "-c",
-            "printf cli-agent-start-ok; sleep 2",
-            "--session",
-            "child-session",
+            "--name",
+            "scratch",
+            "--no-session",
         ],
     );
     assert_eq!(started["result"]["type"], "agent_started");
     assert_eq!(started["result"]["agent"]["name"], "main");
-    assert_eq!(started["result"]["argv"][0], "/bin/sh");
-    assert_eq!(started["result"]["argv"][3], "--session");
-    assert_eq!(started["result"]["argv"][4], "child-session");
-    let terminal_id = started["result"]["agent"]["terminal_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(started["result"]["agent"]["agent"], "pi");
+    assert_eq!(started["result"]["agent"]["pane_id"], pane_id);
+    assert_eq!(started["result"]["argv"][0], "pi");
+    assert_eq!(started["result"]["argv"][1], "--name");
+    assert_eq!(started["result"]["argv"][2], "scratch");
+    assert_eq!(started["result"]["argv"][3], "--no-session");
+    assert_eq!(
+        fs::read_to_string(&captured_args).unwrap(),
+        "--name\nscratch\n--no-session\n"
+    );
 
-    let listed = run_cli_json(&socket_path, &["agent", "list"]);
-    assert_eq!(listed["result"]["agents"][0]["terminal_id"], terminal_id);
-    assert_eq!(listed["result"]["agents"][0]["name"], "main");
+    let literal_flag_prompt = run_cli(&socket_path, &["agent", "prompt", "main", "--wait"]);
+    assert!(
+        literal_flag_prompt.status.success(),
+        "flag-shaped prompt was not treated literally: {}",
+        String::from_utf8_lossy(&literal_flag_prompt.stderr)
+    );
 
-    let duplicate = run_cli(
+    let after = run_cli_json(&socket_path, &["pane", "list"]);
+    assert_eq!(pane_topology_snapshot(&after), before_topology);
+
+    let stale_idle = run_cli(
         &socket_path,
         &[
             "agent",
-            "start",
+            "prompt",
             "main",
-            "--cwd",
-            base.to_str().unwrap(),
-            "--",
-            "/bin/sh",
-            "-c",
-            "true",
+            "do not transition",
+            "--wait",
+            "--timeout",
+            "200",
         ],
+    );
+    assert_eq!(stale_idle.status.code(), Some(1));
+    let stale_idle: serde_json::Value = serde_json::from_slice(&stale_idle.stderr).unwrap();
+    assert_eq!(stale_idle["error"]["code"], "timeout");
+
+    let prompted = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "prompt",
+            "main",
+            "Review this diff",
+            "--wait",
+            "--timeout",
+            "2000",
+        ],
+    );
+    assert!(
+        prompted.status.success(),
+        "prompt failed: {}",
+        String::from_utf8_lossy(&prompted.stderr)
+    );
+    let prompted: serde_json::Value = serde_json::from_slice(&prompted.stdout).unwrap();
+    assert_eq!(prompted["result"]["type"], "agent_prompted");
+
+    let duplicate = run_cli(
+        &socket_path,
+        &["agent", "start", "main", "--kind", "pi", "--pane", &pane_id],
     );
     assert!(!duplicate.status.success());
     let duplicate_json: serde_json::Value = serde_json::from_slice(&duplicate.stderr).unwrap();
     assert_eq!(duplicate_json["error"]["code"], "agent_name_taken");
+
+    let busy = run_cli(
+        &socket_path,
+        &[
+            "agent", "start", "second", "--kind", "pi", "--pane", &pane_id,
+        ],
+    );
+    assert!(!busy.status.success());
+    let busy_json: serde_json::Value = serde_json::from_slice(&busy.stderr).unwrap();
+    assert_eq!(busy_json["error"]["code"], "agent_pane_busy");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_start_rejects_a_shell_replaced_by_a_foreground_program() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let topology = pane_topology_snapshot(&run_cli_json(&socket_path, &["pane", "list"]));
+    assert!(
+        run_cli(&socket_path, &["pane", "run", &pane_id, "exec sleep 5"])
+            .status
+            .success()
+    );
+    thread::sleep(Duration::from_millis(150));
+
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "1000",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_pane_busy");
+    assert_eq!(
+        pane_topology_snapshot(&run_cli_json(&socket_path, &["pane", "list"])),
+        topology
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_start_timeout_releases_the_name_for_reuse() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nunset HERDR_AGENT\nexec /bin/sleep 20\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "3100",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "timeout");
+
+    let reused = run_cli(&socket_path, &["agent", "rename", &pane_id, "worker"]);
+    assert!(
+        reused.status.success(),
+        "name was not released: {}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_start_reports_detected_kind_mismatch_before_released_name() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\nHERDR_AGENT=codex exec /bin/sleep 10\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&started.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_kind_mismatch");
+
+    let reused = run_cli(&socket_path, &["agent", "rename", &pane_id, "worker"]);
+    assert!(reused.status.success());
 
     cleanup_spawned_herdr(herdr, base);
 }
@@ -2404,19 +3056,178 @@ fn agent_commands_work() {
     let fetched = run_cli_json(&socket_path, &["agent", "get", "worker"]);
     assert_eq!(fetched["result"]["agent"]["pane_id"], root_pane_id);
 
-    let waited = run_cli_json(
+    let reported = run_cli(
         &socket_path,
         &[
-            "agent",
-            "wait",
-            "worker",
-            "--status",
-            "unknown",
-            "--timeout",
-            "100",
+            "pane",
+            "report-agent",
+            &root_pane_id,
+            "--source",
+            "custom:test",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
         ],
     );
+    assert!(reported.status.success());
+    let waited = run_cli_json(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "100"],
+    );
     assert_eq!(waited["result"]["agent"]["pane_id"], root_pane_id);
+
+    // A stale semantic report must not allow prompt text into the resumed shell.
+    let prompted = run_cli(
+        &socket_path,
+        &["agent", "prompt", "worker", "echo prompt-must-not-run"],
+    );
+    assert_eq!(prompted.status.code(), Some(1));
+    let prompted_json: serde_json::Value = serde_json::from_slice(&prompted.stderr).unwrap();
+    assert_eq!(prompted_json["error"]["code"], "agent_not_ready");
+
+    let working = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &root_pane_id,
+            "--source",
+            "custom:wait",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    );
+    assert!(working.status.success());
+    let blocked_socket = socket_path.clone();
+    let blocked_pane = root_pane_id.clone();
+    let blocked_transition = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        let blocked = run_cli(
+            &blocked_socket,
+            &[
+                "pane",
+                "report-agent",
+                &blocked_pane,
+                "--source",
+                "custom:wait",
+                "--agent",
+                "pi",
+                "--state",
+                "blocked",
+            ],
+        );
+        assert!(blocked.status.success());
+    });
+    let waited = run_cli_json(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "2000"],
+    );
+    blocked_transition.join().unwrap();
+    assert_eq!(waited["result"]["agent"]["agent_status"], "blocked");
+    let immediate_blocked =
+        run_cli_json(&socket_path, &["agent", "wait", "worker", "--timeout", "1"]);
+    assert_eq!(
+        immediate_blocked["result"]["agent"]["agent_status"],
+        "blocked"
+    );
+
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &root_pane_id,
+            "--source",
+            "custom:wait",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    )
+    .status
+    .success());
+    let idle_socket = socket_path.clone();
+    let idle_pane = root_pane_id.clone();
+    let idle_transition = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        assert!(run_cli(
+            &idle_socket,
+            &[
+                "pane",
+                "report-agent",
+                &idle_pane,
+                "--source",
+                "custom:wait",
+                "--agent",
+                "pi",
+                "--state",
+                "idle",
+            ],
+        )
+        .status
+        .success());
+    });
+    let idle_wait = run_cli_json(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "2000"],
+    );
+    idle_transition.join().unwrap();
+    assert!(matches!(
+        idle_wait["result"]["agent"]["agent_status"].as_str(),
+        Some("idle" | "done")
+    ));
+
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &root_pane_id,
+            "--source",
+            "custom:wait",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    )
+    .status
+    .success());
+    let timed_out = run_cli(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "100"],
+    );
+    assert_eq!(timed_out.status.code(), Some(1));
+    let timeout: serde_json::Value = serde_json::from_slice(&timed_out.stderr).unwrap();
+    assert_eq!(timeout["error"]["code"], "timeout");
+
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &root_pane_id,
+            "--source",
+            "custom:wait",
+            "--agent",
+            "pi",
+            "--state",
+            "unknown",
+        ],
+    )
+    .status
+    .success());
+    let unknown = run_cli(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "1000"],
+    );
+    assert_eq!(unknown.status.code(), Some(1));
+    let unknown: serde_json::Value = serde_json::from_slice(&unknown.stderr).unwrap();
+    assert_eq!(unknown["error"]["code"], "agent_not_running");
 
     let read = run_cli_json(
         &socket_path,
@@ -2435,6 +3246,261 @@ fn agent_commands_work() {
 
     let focused = run_cli_json(&socket_path, &["agent", "focus", "reviewer"]);
     assert_eq!(focused["result"]["agent"]["focused"], true);
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_wait_returns_immediately_for_unseen_done_agent() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let first = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let second_tab = run_cli_json(
+        &socket_path,
+        &["tab", "create", "--workspace", workspace_id],
+    );
+    let second_tab_id = second_tab["result"]["tab"]["tab_id"].as_str().unwrap();
+    assert_ne!(second_tab_id, "w1:t1");
+    assert!(run_cli(&socket_path, &["tab", "focus", second_tab_id])
+        .status
+        .success());
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &first,
+            "--source",
+            "custom:done",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    )
+    .status
+    .success());
+    assert!(
+        run_cli(&socket_path, &["agent", "rename", &first, "worker"])
+            .status
+            .success()
+    );
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &first,
+            "--source",
+            "custom:done",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+
+    let waited = run_cli_json(&socket_path, &["agent", "wait", "worker", "--timeout", "1"]);
+    assert_eq!(waited["result"]["agent"]["agent_status"], "done");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_wait_pins_the_original_terminal_when_name_is_reused() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let first = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &first, "--direction", "right"],
+    );
+    let second = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &first,
+            "--source",
+            "custom:race",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    )
+    .status
+    .success());
+    assert!(
+        run_cli(&socket_path, &["agent", "rename", &first, "worker"])
+            .status
+            .success()
+    );
+
+    let wait_socket = socket_path.clone();
+    let waiter = thread::spawn(move || {
+        run_cli(
+            &wait_socket,
+            &["agent", "wait", "worker", "--timeout", "2000"],
+        )
+    });
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        run_cli(&socket_path, &["agent", "rename", "worker", "--clear"])
+            .status
+            .success()
+    );
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &second,
+            "--source",
+            "custom:race",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+    assert!(
+        run_cli(&socket_path, &["agent", "rename", &second, "worker"])
+            .status
+            .success()
+    );
+
+    let waited = waiter.join().unwrap();
+    assert_eq!(waited.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_name_not_found");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn agent_wait_ignores_other_panes_and_errors_when_its_pane_closes() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let first = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let split = run_cli_json(
+        &socket_path,
+        &["pane", "split", &first, "--direction", "right"],
+    );
+    let second = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &first,
+            "--source",
+            "custom:close",
+            "--agent",
+            "pi",
+            "--state",
+            "working",
+        ],
+    )
+    .status
+    .success());
+    assert!(
+        run_cli(&socket_path, &["agent", "rename", &first, "worker"])
+            .status
+            .success()
+    );
+
+    let wait_socket = socket_path.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done_tx.send(run_cli(
+            &wait_socket,
+            &["agent", "wait", "worker", "--timeout", "3000"],
+        ));
+    });
+    thread::sleep(Duration::from_millis(150));
+    assert!(run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            &second,
+            "--source",
+            "custom:close",
+            "--agent",
+            "pi",
+            "--state",
+            "idle",
+        ],
+    )
+    .status
+    .success());
+    thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    assert!(run_cli(&socket_path, &["pane", "close", &first])
+        .status
+        .success());
+    let waited = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(waited.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert!(matches!(
+        error["error"]["code"].as_str(),
+        Some("agent_not_found" | "pane_not_found")
+    ));
 
     cleanup_spawned_herdr(herdr, base);
 }
@@ -3689,10 +4755,7 @@ command = ["sh", "-c", "echo new"]
     let listener = UnixListener::bind(&socket_path).unwrap();
     let managed_checkout_for_server = managed_checkout.clone();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        let mut first_line = String::new();
-        let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        first_reader.read_line(&mut first_line).unwrap();
+        let (mut first, first_line) = accept_fake_cli_operation(&listener);
         let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();
         assert_eq!(first_request["method"], "plugin.list");
         writeln!(
@@ -3726,10 +4789,7 @@ command = ["sh", "-c", "echo new"]
         .unwrap();
         first.flush().unwrap();
 
-        let (mut second, _) = listener.accept().unwrap();
-        let mut second_line = String::new();
-        let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        second_reader.read_line(&mut second_line).unwrap();
+        let (mut second, second_line) = accept_fake_cli_operation(&listener);
         let second_request: serde_json::Value = serde_json::from_str(&second_line).unwrap();
         assert_eq!(second_request["method"], "plugin.link");
         second
@@ -3818,10 +4878,7 @@ command = ["sh", "-c", "echo install"]
     let listener = UnixListener::bind(&socket_path).unwrap();
     let managed_checkout_for_server = managed_checkout.clone();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        let mut first_line = String::new();
-        let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        first_reader.read_line(&mut first_line).unwrap();
+        let (mut first, first_line) = accept_fake_cli_operation(&listener);
         let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();
         assert_eq!(first_request["method"], "plugin.list");
         first
@@ -3830,10 +4887,7 @@ command = ["sh", "-c", "echo install"]
         first.write_all(b"\n").unwrap();
         first.flush().unwrap();
 
-        let (mut second, _) = listener.accept().unwrap();
-        let mut second_line = String::new();
-        let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        second_reader.read_line(&mut second_line).unwrap();
+        let (mut second, second_line) = accept_fake_cli_operation(&listener);
         let second_request: serde_json::Value = serde_json::from_str(&second_line).unwrap();
         assert_eq!(second_request["method"], "plugin.link");
         writeln!(
@@ -3859,10 +4913,7 @@ command = ["sh", "-c", "echo install"]
         .unwrap();
         second.flush().unwrap();
 
-        let (mut third, _) = listener.accept().unwrap();
-        let mut third_line = String::new();
-        let mut third_reader = BufReader::new(third.try_clone().unwrap());
-        third_reader.read_line(&mut third_line).unwrap();
+        let (mut third, third_line) = accept_fake_cli_operation(&listener);
         let third_request: serde_json::Value = serde_json::from_str(&third_line).unwrap();
         assert_eq!(third_request["method"], "plugin.unlink");
         assert_eq!(
@@ -3955,20 +5006,14 @@ command = ["sh", "-c", "echo install"]
     let listener = UnixListener::bind(&socket_path).unwrap();
     let managed_checkout_for_server = managed_checkout.clone();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        let mut first_line = String::new();
-        let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        first_reader.read_line(&mut first_line).unwrap();
+        let (mut first, _first_line) = accept_fake_cli_operation(&listener);
         first
             .write_all(br#"{"id":"cli:plugin","result":{"type":"plugin_list","plugins":[]}}"#)
             .unwrap();
         first.write_all(b"\n").unwrap();
         first.flush().unwrap();
 
-        let (mut second, _) = listener.accept().unwrap();
-        let mut second_line = String::new();
-        let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        second_reader.read_line(&mut second_line).unwrap();
+        let (mut second, _second_line) = accept_fake_cli_operation(&listener);
         writeln!(
             second,
             "{}",
@@ -3992,10 +5037,7 @@ command = ["sh", "-c", "echo install"]
         .unwrap();
         second.flush().unwrap();
 
-        let (mut third, _) = listener.accept().unwrap();
-        let mut third_line = String::new();
-        let mut third_reader = BufReader::new(third.try_clone().unwrap());
-        third_reader.read_line(&mut third_line).unwrap();
+        let (mut third, third_line) = accept_fake_cli_operation(&listener);
         let third_request: serde_json::Value = serde_json::from_str(&third_line).unwrap();
         assert_eq!(third_request["method"], "plugin.unlink");
         third
@@ -4029,6 +5071,345 @@ command = ["sh", "-c", "echo install"]
         "checkout should stay when server cleanup fails"
     );
 
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn cli_rejects_protocol_mismatch_before_wait_agent_status_request() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut first_stream, _) = listener.accept().unwrap();
+        let mut first_line = String::new();
+        let mut first_reader = BufReader::new(first_stream.try_clone().unwrap());
+        first_reader.read_line(&mut first_line).unwrap();
+        let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        if first_request["method"] == "ping" {
+            write_fake_pong(&mut first_stream, &first_request, "0.7.1", 14);
+        } else {
+            first_stream
+                .write_all(
+                    br#"{"id":"cli:wait:agent-status","error":{"code":"not_implemented","message":"method not implemented yet"}}"#,
+                )
+                .unwrap();
+        }
+        if first_request["method"] != "ping" {
+            first_stream.write_all(b"\n").unwrap();
+            first_stream.flush().unwrap();
+        }
+
+        let mut second_line = None;
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((second_stream, _)) => {
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(second_stream);
+                    reader.read_line(&mut line).unwrap();
+                    second_line = Some(line);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("second accept failed: {err}"),
+            }
+        }
+
+        (first_line, second_line)
+    });
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-status",
+            "1-1",
+            "--status",
+            "idle",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(waited.status.code(), Some(1));
+    assert!(waited.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert_eq!(error["id"], "cli:wait:agent-status");
+    assert_eq!(error["error"]["code"], "protocol_mismatch");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("client protocol {CURRENT_PROTOCOL}")),
+        "message: {message}"
+    );
+    assert!(message.contains("server protocol 14"), "message: {message}");
+    assert!(message.contains("restart"), "message: {message}");
+
+    let (first_line, second_line) = server.join().unwrap();
+    let first_request: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+    assert_eq!(first_request["method"], "ping");
+    assert!(
+        second_line.is_none(),
+        "mismatched CLI sent an operational request: {second_line:?}"
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn cli_allows_same_protocol_different_version_and_preserves_server_error() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut ping_stream, _) = listener.accept().unwrap();
+        let mut ping_line = String::new();
+        BufReader::new(ping_stream.try_clone().unwrap())
+            .read_line(&mut ping_line)
+            .unwrap();
+        let ping: serde_json::Value = serde_json::from_str(&ping_line).unwrap();
+        assert_eq!(ping["method"], "ping");
+        write_fake_pong(
+            &mut ping_stream,
+            &ping,
+            "0.7.1-compatible-build",
+            CURRENT_PROTOCOL,
+        );
+
+        let (mut operation_stream, _) = listener.accept().unwrap();
+        let mut operation_line = String::new();
+        BufReader::new(operation_stream.try_clone().unwrap())
+            .read_line(&mut operation_line)
+            .unwrap();
+        let operation: serde_json::Value = serde_json::from_str(&operation_line).unwrap();
+        assert_eq!(operation["method"], "events.wait");
+        operation_stream
+            .write_all(
+                br#"{"id":"cli:wait:agent-status","error":{"code":"not_implemented","message":"compatible server error"}}"#,
+            )
+            .unwrap();
+        operation_stream.write_all(b"\n").unwrap();
+        operation_stream.flush().unwrap();
+    });
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-status",
+            "1-1",
+            "--status",
+            "idle",
+            "--timeout",
+            "5000",
+        ],
+    );
+
+    assert_eq!(waited.status.code(), Some(1));
+    assert!(waited.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert_eq!(error["id"], "cli:wait:agent-status");
+    assert_eq!(error["error"]["code"], "not_implemented");
+    assert_eq!(error["error"]["message"], "compatible server error");
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn agent_wait_reports_poll_transport_failure_as_structured_error() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        for request_number in 0..2 {
+            let (mut ping_stream, _) = listener.accept().unwrap();
+            let mut ping_line = String::new();
+            BufReader::new(ping_stream.try_clone().unwrap())
+                .read_line(&mut ping_line)
+                .unwrap();
+            let ping: serde_json::Value = serde_json::from_str(&ping_line).unwrap();
+            assert_eq!(ping["method"], "ping");
+            write_fake_pong(&mut ping_stream, &ping, "current", CURRENT_PROTOCOL);
+
+            let (mut get_stream, _) = listener.accept().unwrap();
+            let mut get_line = String::new();
+            BufReader::new(get_stream.try_clone().unwrap())
+                .read_line(&mut get_line)
+                .unwrap();
+            let get: serde_json::Value = serde_json::from_str(&get_line).unwrap();
+            assert_eq!(get["method"], "agent.get");
+            if request_number == 0 {
+                writeln!(
+                    get_stream,
+                    "{}",
+                    serde_json::json!({
+                        "id": get["id"],
+                        "result": {
+                            "type": "agent_info",
+                            "agent": {
+                                "name": "worker",
+                                "pane_id": "w1:p1",
+                                "terminal_id": "term_1",
+                                "agent_status": "working"
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                get_stream.flush().unwrap();
+            }
+        }
+    });
+
+    let waited = run_cli(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "5000"],
+    );
+    assert_eq!(waited.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_wait_transport_failed");
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn agent_wait_rechecks_protocol_before_subscription() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut first_ping_stream, _) = listener.accept().unwrap();
+        let mut first_ping_line = String::new();
+        BufReader::new(first_ping_stream.try_clone().unwrap())
+            .read_line(&mut first_ping_line)
+            .unwrap();
+        let first_ping: serde_json::Value = serde_json::from_str(&first_ping_line).unwrap();
+        assert_eq!(first_ping["method"], "ping");
+        write_fake_pong(
+            &mut first_ping_stream,
+            &first_ping,
+            "current",
+            CURRENT_PROTOCOL,
+        );
+
+        let (mut get_stream, _) = listener.accept().unwrap();
+        let mut get_line = String::new();
+        BufReader::new(get_stream.try_clone().unwrap())
+            .read_line(&mut get_line)
+            .unwrap();
+        let get_request: serde_json::Value = serde_json::from_str(&get_line).unwrap();
+        assert_eq!(get_request["method"], "agent.get");
+        get_stream
+            .write_all(
+                br#"{"id":"cli:agent:wait:resolve","result":{"type":"agent_info","agent":{"name":"worker","pane_id":"w1:p1","terminal_id":"t1","agent_status":"working"}}}"#,
+            )
+            .unwrap();
+        get_stream.write_all(b"\n").unwrap();
+        get_stream.flush().unwrap();
+
+        let (mut second_ping_stream, _) = listener.accept().unwrap();
+        let mut second_ping_line = String::new();
+        BufReader::new(second_ping_stream.try_clone().unwrap())
+            .read_line(&mut second_ping_line)
+            .unwrap();
+        let second_ping: serde_json::Value = serde_json::from_str(&second_ping_line).unwrap();
+        assert_eq!(second_ping["method"], "ping");
+        write_fake_pong(&mut second_ping_stream, &second_ping, "0.7.1", 14);
+
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => panic!("agent wait polled agent state after protocol mismatch"),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    });
+
+    let waited = run_cli(
+        &socket_path,
+        &["agent", "wait", "worker", "--timeout", "5000"],
+    );
+
+    assert_eq!(waited.status.code(), Some(1));
+    assert!(waited.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&waited.stderr).unwrap();
+    assert_eq!(error["id"], "cli:agent:wait");
+    assert_eq!(error["error"]["code"], "protocol_mismatch");
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn server_live_handoff_bypasses_protocol_guard() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "server.live_handoff");
+        stream
+            .write_all(br#"{"id":"cli:server:live-handoff","result":{"type":"ok"}}"#)
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+    });
+
+    let handoff = run_cli(&socket_path, &["server", "live-handoff"]);
+    assert!(
+        handoff.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn plugin_list_preserves_protocol_mismatch_envelope() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "ping");
+        write_fake_pong(&mut stream, &request, "0.7.1", 14);
+    });
+
+    let listed = run_cli(&socket_path, &["plugin", "list", "--json"]);
+    assert_eq!(listed.status.code(), Some(1));
+    assert!(listed.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&listed.stderr).unwrap();
+    assert_eq!(error["id"], "cli:plugin");
+    assert_eq!(error["error"]["code"], "protocol_mismatch");
+    server.join().unwrap();
     cleanup_test_base(&base);
 }
 
@@ -4085,6 +5466,48 @@ fn wait_agent_status_exits_immediately_when_status_already_matches() {
     assert_eq!(waited_json["event"], "pane.agent_status_changed");
     assert_eq!(waited_json["data"]["agent_status"], "idle");
     assert_eq!(waited_json["data"]["agent"], "pi");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn wait_agent_status_times_out_when_status_does_not_match() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_timeout_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-status",
+            "1-1",
+            "--status",
+            "blocked",
+            "--timeout",
+            "100",
+        ],
+    );
+    assert!(!waited.status.success());
+    assert!(
+        String::from_utf8_lossy(&waited.stderr)
+            .contains("timed out waiting for agent status change"),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
 
     cleanup_spawned_herdr(herdr, base);
 }

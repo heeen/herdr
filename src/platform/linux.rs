@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashSet, VecDeque},
     io::Write,
     os::fd::RawFd,
     path::PathBuf,
@@ -10,42 +11,115 @@ use super::{
     LimitedRead, Signal,
 };
 
+// Upstream host-cursor/WSL heuristics; consumers live in the upstream client loop, which this
+// fork replaced with the multi-remote client. Kept for the drawn-cursor port (upstream-merge follow-up).
+#[allow(dead_code)]
+const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcGroupMember {
+    pid: u32,
+    comm: String,
+}
+
 pub fn raise_server_nofile_limit() {}
 
+// Upstream host-cursor/WSL heuristics; consumers live in the upstream client loop, which this
+// fork replaced with the multi-remote client. Kept for the drawn-cursor port (upstream-merge follow-up).
+#[allow(dead_code)]
+pub(crate) fn should_draw_host_cursor_by_default() -> bool {
+    running_inside_wsl()
+}
+
+#[allow(dead_code)]
+fn running_inside_wsl() -> bool {
+    proc_file_indicates_wsl("/proc/sys/kernel/osrelease")
+        || proc_file_indicates_wsl("/proc/version")
+        || WSL_MARKER_ENV_VARS
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        || std::path::Path::new("/run/WSL").exists()
+}
+
+#[allow(dead_code)]
+fn proc_file_indicates_wsl(path: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text_indicates_wsl(&text))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn text_indicates_wsl(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("microsoft") || text.contains("wsl")
+}
+
+fn raw_command_argv(command: &str, flag: &str) -> Vec<std::ffi::OsString> {
+    vec!["/bin/sh".into(), flag.into(), command.into()]
+}
+
+pub(crate) fn detached_custom_command_process_platform(command: &str) -> std::process::Command {
+    let argv = raw_command_argv(command, "-lc");
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command
+}
+
+pub(crate) fn pane_custom_command_pty_builder_platform(
+    command: &str,
+) -> portable_pty::CommandBuilder {
+    portable_pty::CommandBuilder::from_argv(raw_command_argv(command, "-c"))
+}
+
+pub(crate) fn scrollback_editor_argv(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let quoted_path = shell_quote(&path.display().to_string());
+    let command = format!(
+        r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
+    );
+    Ok(vec!["/bin/sh".to_string(), "-c".to_string(), command])
+}
+
+pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
+    super::interactive_unix_shell_command(argv, shell_name, shell_quote)
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Collect the foreground terminal job for a given child PID.
+pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
+    super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
+}
+
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     let tpgid = foreground_process_group_id(child_pid)?;
-    let mut processes = Vec::new();
-
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let file_name = entry.file_name();
-        let pid_str = file_name.to_str()?;
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        let pid: u32 = match pid_str.parse() {
-            Ok(pid) => pid,
-            Err(_) => continue,
-        };
-
-        let Some((pgrp, name)) = process_pgrp_and_comm(pid) else {
-            continue;
-        };
-        if pgrp as u32 != tpgid {
-            continue;
-        }
-
-        let argv = process_argv(pid);
-        processes.push(ForegroundProcess {
-            pid,
-            name,
-            argv0: None,
-            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
-            argv,
-        });
-    }
+    let members = foreground_process_group_members(child_pid, tpgid)?;
+    let processes = members
+        .into_iter()
+        .map(|member| {
+            let argv = process_argv(member.pid);
+            ForegroundProcess {
+                pid: member.pid,
+                name: member.comm,
+                argv0: None,
+                cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+                argv,
+            }
+        })
+        .collect::<Vec<_>>();
 
     if processes.is_empty() {
         return None;
@@ -55,6 +129,95 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
         process_group_id: tpgid,
         processes,
     })
+}
+
+fn foreground_process_group_members(
+    child_pid: u32,
+    process_group_id: u32,
+) -> Option<Vec<ProcGroupMember>> {
+    foreground_process_group_members_with(
+        child_pid,
+        process_group_id,
+        process_task_ids,
+        process_task_children,
+        live_process_group_member,
+    )
+}
+
+fn foreground_process_group_members_with(
+    child_pid: u32,
+    process_group_id: u32,
+    task_ids: impl FnMut(u32) -> Vec<u32>,
+    task_children: impl FnMut(u32, u32) -> Vec<u32>,
+    mut live_member: impl FnMut(u32, u32) -> Option<ProcGroupMember>,
+) -> Option<Vec<ProcGroupMember>> {
+    let mut members = process_tree_pids([child_pid, process_group_id], task_ids, task_children)
+        .into_iter()
+        .filter_map(|pid| live_member(process_group_id, pid))
+        .collect::<Vec<_>>();
+    members.sort_unstable_by_key(|member| member.pid);
+    (!members.is_empty()).then_some(members)
+}
+
+fn process_tree_pids(
+    roots: impl IntoIterator<Item = u32>,
+    mut task_ids: impl FnMut(u32) -> Vec<u32>,
+    mut task_children: impl FnMut(u32, u32) -> Vec<u32>,
+) -> Vec<u32> {
+    let mut pending = VecDeque::new();
+    let mut visited = HashSet::new();
+    for pid in roots {
+        if pid > 0 && visited.insert(pid) {
+            pending.push_back(pid);
+        }
+    }
+
+    let mut pids = Vec::new();
+    while let Some(pid) = pending.pop_front() {
+        pids.push(pid);
+        for tid in task_ids(pid) {
+            for child_pid in task_children(pid, tid) {
+                if child_pid > 0 && visited.insert(child_pid) {
+                    pending.push_back(child_pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn process_task_ids(pid: u32) -> Vec<u32> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| numeric_file_name(&entry))
+        .collect()
+}
+
+fn process_task_children(pid: u32, tid: u32) -> Vec<u32> {
+    let Some(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children")).ok()
+    else {
+        return Vec::new();
+    };
+    children
+        .split_whitespace()
+        .filter_map(|child| child.parse::<u32>().ok())
+        .collect()
+}
+
+fn numeric_file_name(entry: &std::fs::DirEntry) -> Option<u32> {
+    let file_name = entry.file_name();
+    let value = file_name.to_str()?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn live_process_group_member(process_group_id: u32, pid: u32) -> Option<ProcGroupMember> {
+    let (pgrp, comm) = process_pgrp_and_comm(pid)?;
+    (pgrp > 0 && pgrp as u32 == process_group_id).then_some(ProcGroupMember { pid, comm })
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
@@ -94,6 +257,10 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
 
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_pgrp_and_comm_from_stat(&stat)
+}
+
+fn process_pgrp_and_comm_from_stat(stat: &str) -> Option<(i32, String)> {
     let close = stat.rfind(')')?;
     let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
     let rest = stat.get(close + 2..)?;
@@ -130,18 +297,7 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
         return None;
     }
     let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    parse_agent_env_hint(&environ)
-}
-
-fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agent> {
-    for record in environ.split(|&byte| byte == 0) {
-        let Some(value) = record.strip_prefix(b"HERDR_AGENT=") else {
-            continue;
-        };
-        let value = std::str::from_utf8(value).ok()?;
-        return crate::detect::parse_agent_label(value);
-    }
-    None
+    super::parse_agent_env_hint(&environ)
 }
 
 pub fn session_processes(child_pid: u32) -> Vec<u32> {
@@ -510,6 +666,7 @@ fn process_session_id(pid: u32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+    use std::{cell::RefCell, collections::HashMap};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -517,21 +674,151 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_env_hint_accepts_known_agents() {
+    fn wsl_marker_detection_matches_kernel_release_text() {
+        assert!(text_indicates_wsl("5.15.167.4-microsoft-standard-WSL2"));
+        assert!(text_indicates_wsl("4.4.0-19041-Microsoft"));
+        assert!(!text_indicates_wsl("6.8.0-64-generic"));
+        assert!(!text_indicates_wsl(""));
+    }
+
+    #[test]
+    fn foreground_members_follow_the_pane_tree_and_filter_by_process_group() {
+        let tasks = HashMap::from([
+            (100, vec![100, 101]),
+            (200, vec![200]),
+            (201, vec![201]),
+            (210, vec![210]),
+            (220, vec![220]),
+            (221, vec![221]),
+            (300, vec![300]),
+        ]);
+        let children = HashMap::from([
+            ((100, 100), vec![200, 201, 300]),
+            ((100, 101), vec![210]),
+            ((200, 200), vec![220]),
+            ((220, 220), vec![221]),
+        ]);
+        let processes = HashMap::from([
+            (100, (100, "shell")),
+            (200, (200, "leader")),
+            (201, (200, "pipeline")),
+            (210, (200, "thread-child")),
+            (220, (220, "intermediate")),
+            (221, (200, "nested-agent")),
+            (300, (300, "background")),
+            (9999, (200, "unrelated-host-process")),
+        ]);
+        let task_reads = RefCell::new(Vec::new());
+        let child_reads = RefCell::new(Vec::new());
+        let member_reads = RefCell::new(Vec::new());
+
+        let members = foreground_process_group_members_with(
+            100,
+            200,
+            |pid| {
+                task_reads.borrow_mut().push(pid);
+                tasks.get(&pid).cloned().unwrap_or_default()
+            },
+            |pid, tid| {
+                child_reads.borrow_mut().push((pid, tid));
+                children.get(&(pid, tid)).cloned().unwrap_or_default()
+            },
+            |process_group_id, pid| {
+                member_reads.borrow_mut().push(pid);
+                let (pgrp, comm) = processes.get(&pid)?;
+                (*pgrp == process_group_id).then(|| ProcGroupMember {
+                    pid,
+                    comm: (*comm).to_string(),
+                })
+            },
+        )
+        .unwrap();
+
         assert_eq!(
-            parse_agent_env_hint(b"PATH=/bin\0HERDR_AGENT=claude\0TERM=xterm\0"),
-            Some(crate::detect::Agent::Claude)
+            members
+                .into_iter()
+                .map(|member| (member.pid, member.comm))
+                .collect::<Vec<_>>(),
+            vec![
+                (200, "leader".to_string()),
+                (201, "pipeline".to_string()),
+                (210, "thread-child".to_string()),
+                (221, "nested-agent".to_string()),
+            ]
         );
+        assert!(child_reads.borrow().contains(&(100, 101)));
+        assert!(task_reads.borrow().contains(&220));
+        assert!(!task_reads.borrow().contains(&9999));
+        assert!(!member_reads.borrow().contains(&9999));
+    }
+
+    #[test]
+    fn foreground_members_degrade_to_the_direct_group_leader() {
+        let members = foreground_process_group_members_with(
+            100,
+            200,
+            |_| Vec::new(),
+            |_, _| Vec::new(),
+            |process_group_id, pid| {
+                (pid == process_group_id).then(|| ProcGroupMember {
+                    pid,
+                    comm: "leader".to_string(),
+                })
+            },
+        )
+        .unwrap();
+
         assert_eq!(
-            parse_agent_env_hint(b"HERDR_AGENT=codex"),
-            Some(crate::detect::Agent::Codex)
+            members,
+            vec![ProcGroupMember {
+                pid: 200,
+                comm: "leader".to_string()
+            }]
         );
     }
 
     #[test]
-    fn parse_agent_env_hint_ignores_missing_or_unknown_agents() {
-        assert_eq!(parse_agent_env_hint(b"PATH=/bin\0TERM=xterm\0"), None);
-        assert_eq!(parse_agent_env_hint(b"HERDR_AGENT=not-an-agent\0"), None);
+    fn foreground_members_observe_new_children_without_a_snapshot_cache() {
+        let children = RefCell::new(HashMap::from([((100, 100), vec![200])]));
+        let discover = || {
+            foreground_process_group_members_with(
+                100,
+                200,
+                |pid| vec![pid],
+                |pid, tid| {
+                    children
+                        .borrow()
+                        .get(&(pid, tid))
+                        .cloned()
+                        .unwrap_or_default()
+                },
+                |process_group_id, pid| {
+                    [200, 201]
+                        .contains(&pid)
+                        .then(|| ProcGroupMember {
+                            pid,
+                            comm: format!("member-{pid}"),
+                        })
+                        .filter(|_| process_group_id == 200)
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(discover(), vec![200]);
+        children.borrow_mut().insert((100, 100), vec![200, 201]);
+        assert_eq!(discover(), vec![200, 201]);
+    }
+
+    #[test]
+    fn proc_stat_parsing_keeps_group_leader_inputs_live() {
+        assert_eq!(
+            process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
+            Some((456, "name with ) paren".to_string()))
+        );
     }
 
     #[test]
@@ -800,5 +1087,16 @@ mod tests {
         let args = std::fs::read_to_string(&path).expect("args file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(args, "--\n-danger\nbody\n");
+    }
+
+    #[test]
+    fn scrollback_editor_argv_preserves_unix_editor_shell_semantics() {
+        let path = std::path::Path::new("/tmp/herdr scrollback.txt");
+        let argv = scrollback_editor_argv(path).unwrap();
+
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv[1], "-c");
+        assert!(argv[2].contains("EDITOR:-vi"));
+        assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
     }
 }

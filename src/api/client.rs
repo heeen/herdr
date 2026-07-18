@@ -130,6 +130,24 @@ impl ApiClient {
     }
 }
 
+pub struct EventStream {
+    reader: BufReader<LocalStream>,
+}
+
+impl EventStream {
+    pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
+        read_optional_json_line(&mut self.reader)
+    }
+
+    #[allow(dead_code)] // Typed companion to next_value; kept for API parity with subscribe().
+    pub fn next_event(&mut self) -> Result<Option<SubscriptionEventEnvelope>, ApiClientError> {
+        self.next_value()?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(ApiClientError::Json)
+    }
+}
+
 enum TimeoutKind {
     Send,
     Recv,
@@ -149,23 +167,6 @@ fn set_timeout_best_effort(
         #[cfg(windows)]
         Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
         Err(err) => Err(err),
-    }
-}
-
-pub struct EventStream {
-    reader: BufReader<LocalStream>,
-}
-
-impl EventStream {
-    pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
-        read_optional_json_line(&mut self.reader)
-    }
-
-    pub fn next_event(&mut self) -> Result<Option<SubscriptionEventEnvelope>, ApiClientError> {
-        self.next_value()?
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(ApiClientError::Json)
     }
 }
 

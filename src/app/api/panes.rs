@@ -14,18 +14,18 @@ use crate::api::schema::{
     PaneZoomResult, ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
-use crate::app::{App, Mode};
+use crate::app::App;
+#[cfg(test)]
+use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
-    normalize_reported_agent_label,
+    detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
+    normalize_metadata_ttl, normalize_reported_agent_label, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
+#[cfg(test)]
+use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
-
-const METADATA_SOURCE_MAX_CHARS: usize = 80;
-const METADATA_TTL_MIN_MS: u64 = 1;
-const METADATA_TTL_MAX_MS: u64 = 86_400_000;
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -51,14 +51,7 @@ impl App {
         };
         let (rows, cols) = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
-            let follow_cwd = self.state.workspaces.get(ws_idx).and_then(|ws| {
-                let tab_idx = ws.find_tab_index_for_pane(target_pane_id)?;
-                ws.tabs.get(tab_idx)?.cwd_for_pane(
-                    target_pane_id,
-                    &self.state.terminals,
-                    &self.terminal_runtimes,
-                )
-            });
+            let follow_cwd = self.follow_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
             Some(self.resolve_new_terminal_cwd(follow_cwd))
         });
         let default_shell = self.state.default_shell.clone();
@@ -109,7 +102,7 @@ impl App {
             self.state.switch_workspace_tab(ws_idx, target_tab_idx);
             self.state
                 .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
-            self.state.mode = Mode::Terminal;
+            self.state.settle_terminal_mode_after_focus();
         }
         self.terminal_runtimes
             .insert(new_pane.terminal.id.clone(), new_pane.runtime);
@@ -124,6 +117,7 @@ impl App {
             event: EventKind::PaneCreated,
             data: EventData::PaneCreated { pane: pane.clone() },
         });
+        self.emit_layout_updated_event(ws_idx, target_tab_idx);
 
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
@@ -158,6 +152,24 @@ impl App {
             return pane_not_found(id, &target.pane_id);
         };
 
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_focus(&mut self, id: String, target: PaneTarget) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(_tab_idx) = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+
+        self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        self.state.mark_active_tab_seen();
+        self.state.settle_terminal_mode_after_focus();
+
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
@@ -345,7 +357,7 @@ impl App {
         if let Some(target_pane_id) = target {
             self.state.focus_pane_in_workspace(ws_idx, target_pane_id);
             self.state.switch_workspace_tab(ws_idx, tab_idx);
-            self.state.mode = Mode::Terminal;
+            self.state.settle_terminal_mode_after_focus();
         }
         let focused_pane_id = self
             .state
@@ -408,6 +420,9 @@ impl App {
             return encode_error(id, "pane_layout_unavailable", "pane layout unavailable");
         };
         let focused_pane_id = layout.focused_pane_id.clone();
+        if changed {
+            self.emit_layout_updated_snapshot(layout.clone());
+        }
 
         encode_success(
             id,
@@ -577,6 +592,9 @@ impl App {
             return encode_error(id, "pane_layout_unavailable", "pane layout unavailable");
         };
         let focused_pane_id = layout.focused_pane_id.clone();
+        if changed {
+            self.emit_layout_updated_snapshot(layout.clone());
+        }
 
         encode_success(
             id,
@@ -930,7 +948,7 @@ impl App {
                 .switch_workspace_tab(target_ws_idx, target_tab_idx);
             self.state
                 .record_pane_focus_change(previous_focus, target_ws_idx, moved_pane_id);
-            self.state.mode = Mode::Terminal;
+            self.state.settle_terminal_mode_after_focus();
         }
         let created_workspace = created_workspace.then(|| self.workspace_info(target_ws_idx));
         let created_tab = if created_tab {
@@ -962,7 +980,7 @@ impl App {
             previous_workspace_id: previous_workspace_id.clone(),
             previous_tab_id: previous_tab_id.clone(),
             pane: Box::new(pane.clone()),
-            source_layout: source_layout.map(Box::new),
+            source_layout: source_layout.clone().map(Box::new),
             target_layout: Box::new(target_layout),
             created_workspace: created_workspace.clone(),
             created_tab: created_tab.clone(),
@@ -1015,6 +1033,10 @@ impl App {
                 closed_tab_id: source_removed_tab_id,
             },
         });
+        if let Some(source_layout) = source_layout {
+            self.emit_layout_updated_snapshot(source_layout);
+        }
+        self.emit_layout_updated_snapshot((*move_result.target_layout).clone());
 
         encode_success(id, ResponseResult::PaneMove { move_result })
     }
@@ -1083,11 +1105,14 @@ impl App {
         if outcome.changed || outcome.focus_changed {
             self.schedule_session_save();
         }
-        self.state.mode = Mode::Terminal;
+        self.state.settle_terminal_mode_after_focus();
         let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) else {
             return encode_error(id, "pane_layout_unavailable", "pane layout unavailable");
         };
         let focused_pane_id = layout.focused_pane_id.clone();
+        if outcome.changed || outcome.focus_changed {
+            self.emit_layout_updated_snapshot(layout.clone());
+        }
 
         encode_success(
             id,
@@ -1249,7 +1274,6 @@ impl App {
             agent_label,
             state: detect_state_from_api(params.state),
             message: params.message,
-            custom_status: normalize_custom_status(params.custom_status),
             seq: params.seq,
         });
 
@@ -1291,7 +1315,7 @@ impl App {
         id: String,
         params: PaneReportMetadataParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let agent_label = match params.agent.as_deref() {
@@ -1307,15 +1331,21 @@ impl App {
         };
         let raw_title_set = params.title.is_some();
         let raw_display_agent_set = params.display_agent.is_some();
-        let raw_custom_status_set = params.custom_status.is_some();
         let raw_state_labels_set = !params.state_labels.is_empty();
+        let tokens = if params.tokens.is_empty() {
+            None
+        } else {
+            match normalize_metadata_tokens(params.tokens) {
+                Ok(tokens) => Some(tokens),
+                Err(message) => return encode_error(id, "invalid_metadata_token", message),
+            }
+        };
         let ttl = match normalize_metadata_ttl(params.ttl_ms) {
             Ok(ttl) => ttl,
             Err(message) => return encode_error(id, "invalid_metadata_ttl", message),
         };
         let title = normalize_presentation_text(params.title);
         let display_agent = normalize_presentation_text(params.display_agent);
-        let custom_status = normalize_custom_status(params.custom_status);
         let applies_to_source = match params.applies_to_source {
             Some(applies_to_source) => match normalize_metadata_source(applies_to_source) {
                 Ok(applies_to_source) => Some(applies_to_source),
@@ -1335,7 +1365,6 @@ impl App {
         };
         if raw_title_set && params.clear_title
             || raw_display_agent_set && params.clear_display_agent
-            || raw_custom_status_set && params.clear_custom_status
             || raw_state_labels_set && params.clear_state_labels
         {
             return encode_error(
@@ -1346,11 +1375,10 @@ impl App {
         }
         if title.is_none()
             && display_agent.is_none()
-            && custom_status.is_none()
             && state_labels.is_empty()
+            && tokens.is_none()
             && !params.clear_title
             && !params.clear_display_agent
-            && !params.clear_custom_status
             && !params.clear_state_labels
         {
             return encode_error(
@@ -1359,22 +1387,84 @@ impl App {
                 "missing metadata field to set or clear",
             );
         }
-        self.handle_internal_event(crate::events::AppEvent::HookMetadataReported {
-            pane_id,
-            source,
-            agent_label,
-            applies_to_source,
-            title,
-            display_agent,
-            custom_status,
-            state_labels,
-            clear_title: params.clear_title,
-            clear_display_agent: params.clear_display_agent,
-            clear_custom_status: params.clear_custom_status,
-            clear_state_labels: params.clear_state_labels,
-            seq: params.seq,
-            ttl,
+        let presentation_requested = title.is_some()
+            || display_agent.is_some()
+            || !state_labels.is_empty()
+            || params.clear_title
+            || params.clear_display_agent
+            || params.clear_state_labels;
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if !terminal.metadata_report_sequence_is_fresh(&source, params.seq) {
+            return encode_success(id, ResponseResult::Ok {});
+        }
+        if let Some(tokens) = tokens.as_ref() {
+            if terminal.metadata_tokens.key_count_after_patch(tokens)
+                > MAX_METADATA_TOKEN_KEYS_PER_RESOURCE
+            {
+                return encode_error(
+                    id,
+                    "metadata_token_limit",
+                    format!(
+                        "pane metadata may contain at most {MAX_METADATA_TOKEN_KEYS_PER_RESOURCE} tokens"
+                    ),
+                );
+            }
+        }
+        match terminal.accept_metadata_report(&source, params.seq, tokens.is_some()) {
+            Ok(true) => {}
+            Ok(false) => return encode_success(id, ResponseResult::Ok {}),
+            Err(()) => {
+                return encode_error(
+                    id,
+                    "metadata_sequence_source_limit",
+                    format!(
+                        "pane metadata may track at most {} sequenced sources",
+                        crate::metadata_tokens::MAX_SEQUENCE_SOURCES
+                    ),
+                );
+            }
+        }
+        let token_changed = tokens.is_some_and(|tokens| {
+            let changed = terminal
+                .metadata_tokens
+                .patch(tokens, ttl, std::time::Instant::now());
+            if changed {
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
+            changed
         });
+
+        if presentation_requested {
+            self.handle_internal_event(crate::events::AppEvent::HookMetadataReported {
+                pane_id,
+                source,
+                agent_label,
+                applies_to_source,
+                title,
+                display_agent,
+                state_labels,
+                clear_title: params.clear_title,
+                clear_display_agent: params.clear_display_agent,
+                clear_state_labels: params.clear_state_labels,
+                seq: None,
+                ttl,
+            });
+        }
+        if token_changed {
+            self.sync_agent_metadata_deadline();
+            self.emit_pane_updated(ws_idx, pane_id);
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -1447,20 +1537,16 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-            Ok(encoded_keys) => encoded_keys,
+        let bytes = match super::super::api_helpers::encode_api_input(
+            runtime,
+            &params.text,
+            &params.keys,
+        ) {
+            Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if !params.text.is_empty() {
-            let text_bytes = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            return encode_error(id, "pane_send_failed", err.to_string());
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1482,6 +1568,7 @@ impl App {
             return Err(pane_not_found(id, &target.pane_id));
         };
         let workspace_id = self.public_workspace_id(ws_idx);
+        let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
         if self.state.close_pane_would_close_workspace(ws_idx, pane_id)
             && self.state.confirm_implicit_worktree_group_close(ws_idx)
         {
@@ -1499,7 +1586,7 @@ impl App {
             };
             ws.close_pane(pane_id)
         };
-        self.state.plugin_panes.remove(&pane_id);
+        self.state.remove_plugin_pane_records([pane_id]);
         if should_close_workspace {
             self.state.selected = ws_idx;
             self.state.close_selected_workspace();
@@ -1529,6 +1616,9 @@ impl App {
                     workspace_id,
                 },
             });
+            if let Some((ws_idx, tab_idx)) = layout_update_target {
+                self.emit_layout_updated_event(ws_idx, tab_idx);
+            }
         }
 
         Ok(())
@@ -1557,41 +1647,6 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
-}
-
-fn normalize_metadata_source(value: String) -> Result<String, &'static str> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("metadata source must not be empty");
-    }
-    if value.chars().count() > METADATA_SOURCE_MAX_CHARS {
-        return Err("metadata source must be 80 characters or fewer");
-    }
-    if !value.chars().all(metadata_source_char_is_valid) {
-        return Err(
-            "metadata source may contain only ASCII letters, digits, colon, dot, underscore, and hyphen",
-        );
-    }
-    Ok(value.to_string())
-}
-
-fn metadata_source_char_is_valid(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-')
-}
-
-fn normalize_metadata_ttl(
-    ttl_ms: Option<u64>,
-) -> Result<Option<std::time::Duration>, &'static str> {
-    let Some(ttl_ms) = ttl_ms else {
-        return Ok(None);
-    };
-    if ttl_ms < METADATA_TTL_MIN_MS {
-        return Err("metadata ttl_ms must be at least 1");
-    }
-    if ttl_ms > METADATA_TTL_MAX_MS {
-        return Err("metadata ttl_ms must be 86400000 or less");
-    }
-    Ok(Some(std::time::Duration::from_millis(ttl_ms)))
 }
 
 fn normalize_presentation_text(value: Option<String>) -> Option<String> {
@@ -1695,7 +1750,11 @@ impl App {
         find_in_direction(source, direction.into(), &panes)
     }
 
-    fn pane_layout_snapshot(&self, ws_idx: usize, tab_idx: usize) -> Option<PaneLayoutSnapshot> {
+    pub(super) fn pane_layout_snapshot(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+    ) -> Option<PaneLayoutSnapshot> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
         let area = self.state.view.terminal_area;
@@ -1743,6 +1802,40 @@ impl App {
             panes,
             splits,
         })
+    }
+
+    pub(crate) fn emit_layout_updated_event(&mut self, ws_idx: usize, tab_idx: usize) {
+        if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
+            self.emit_layout_updated_snapshot(layout);
+        }
+    }
+
+    pub(super) fn emit_layout_updated_snapshot(&mut self, layout: PaneLayoutSnapshot) {
+        self.emit_event(EventEnvelope {
+            event: EventKind::LayoutUpdated,
+            data: EventData::LayoutUpdated { layout },
+        });
+    }
+
+    pub(crate) fn layout_update_target_after_pane_removal(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> Option<(usize, usize)> {
+        let tab_idx = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .find_tab_index_for_pane(pane_id)?;
+        let pane_count = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .tabs
+            .get(tab_idx)?
+            .layout
+            .pane_count();
+        (pane_count > 1).then_some((ws_idx, tab_idx))
     }
 }
 
@@ -1859,6 +1952,7 @@ mod tests {
     use crate::{
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},
         config::Config,
+        detect::{Agent, AgentState},
         workspace::Workspace,
     };
 
@@ -1889,19 +1983,34 @@ mod tests {
         (app, public_pane_id, rx)
     }
 
+    fn app_with_scrollback_runtime() -> (App, String, PaneId) {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let lines = (0..20)
+            .map(|line| format!("line {line:02}\n"))
+            .collect::<String>();
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            20,
+            5,
+            1000,
+            lines.as_bytes(),
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, public_pane_id, pane_id)
+    }
+
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
         PaneReportMetadataParams {
             pane_id,
             source: "user:metadata.test-1".into(),
             agent: None,
             applies_to_source: None,
-            title: None,
+            title: Some("activity".into()),
             display_agent: None,
-            custom_status: Some("activity".into()),
             state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
             clear_title: false,
             clear_display_agent: false,
-            clear_custom_status: false,
             clear_state_labels: false,
             seq: None,
             ttl_ms: None,
@@ -1941,6 +2050,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_get_exposes_scroll_metrics() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.scroll_up(3);
+
+        let response = app.handle_pane_get(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        let scroll = pane.scroll.expect("scroll metrics");
+        assert_eq!(scroll.offset_from_bottom, 3);
+        assert!(scroll.max_offset_from_bottom >= scroll.offset_from_bottom);
+        assert_eq!(scroll.viewport_rows, 5);
+    }
+
+    #[tokio::test]
     async fn api_pane_send_keys_preserves_legacy_control_c_aliases() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(3);
 
@@ -1977,6 +2112,61 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"+"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_keys_sends_shifted_punctuation_as_text_in_kitty_mode() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"\x1b[>7u",
+                1,
+            );
+        app.state.insert_test_runtime(internal_pane_id, runtime);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id,
+                keys: vec!["shift+?".into()],
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"?"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_brackets_text_and_enter_atomically() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.lookup_runtime_sender(0, internal_pane_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "A != B".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -2106,7 +2296,6 @@ mod tests {
             agent: "pi".into(),
             state: crate::api::schema::PaneAgentState::Working,
             message: None,
-            custom_status: None,
             seq: Some(1),
             agent_session_id: None,
             agent_session_path: None,
@@ -2366,6 +2555,7 @@ mod tests {
         assert_eq!(swap.source_pane_id, source_public);
         assert_eq!(swap.target_pane_id, None);
         assert_eq!(swap.layout.panes.len(), 1);
+        assert!(app.event_hub.events_after(0).is_empty());
     }
 
     #[test]
@@ -2499,6 +2689,49 @@ mod tests {
             app.state.workspaces[0].tabs[0].terminal_id(source),
             Some(&source_terminal)
         );
+    }
+
+    #[test]
+    fn api_pane_move_focuses_copy_mode_pane_back_into_copy_mode() {
+        let mut app = app_with_linked_worktree();
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
+        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
+        seed_terminal_states(&mut app);
+        app.state.copy_mode = Some(crate::app::state::CopyModeState {
+            pane_id: source,
+            cursor_row: 0,
+            cursor_col: 0,
+            entry_offset_from_bottom: 0,
+            selection: None,
+            search: Default::default(),
+        });
+        let source_public = app.public_pane_id(0, source).unwrap();
+        let target_public = app.public_pane_id(0, target).unwrap();
+        let target_tab_public = app.public_tab_id(0, target_tab).unwrap();
+
+        let response = app.handle_pane_move(
+            "req".into(),
+            PaneMoveParams {
+                pane_id: source_public,
+                destination: PaneMoveDestination::Tab {
+                    tab_id: target_tab_public,
+                    target_pane_id: Some(target_public),
+                    split: SplitDirection::Right,
+                    ratio: None,
+                },
+                focus: true,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneMove { move_result } = success.result else {
+            panic!("expected pane move response");
+        };
+        assert!(move_result.changed);
+        assert_eq!(app.state.mode, Mode::Copy);
+        assert_eq!(app.state.copy_mode.expect("copy mode").pane_id, source);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), source);
     }
 
     #[test]
@@ -2657,11 +2890,29 @@ mod tests {
             .iter()
             .map(|(_, envelope)| envelope.event)
             .collect();
-        assert_eq!(events, vec![EventKind::TabCreated, EventKind::PaneMoved]);
+        assert_eq!(
+            events,
+            vec![
+                EventKind::TabCreated,
+                EventKind::PaneMoved,
+                EventKind::LayoutUpdated,
+                EventKind::LayoutUpdated,
+            ]
+        );
         match &envelopes[0].1.data {
             EventData::TabCreated { tab } => assert!(tab.focused),
             other => panic!("expected tab created event, got {other:?}"),
         }
+        assert!(matches!(
+            &envelopes[2].1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap()
+        ));
+        assert!(matches!(
+            &envelopes[3].1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 1).unwrap()
+        ));
     }
 
     #[test]
@@ -2778,6 +3029,7 @@ mod tests {
                 EventKind::WorkspaceCreated,
                 EventKind::TabCreated,
                 EventKind::PaneMoved,
+                EventKind::LayoutUpdated,
             ]
         );
         match &envelopes[2].1.data {
@@ -2787,6 +3039,14 @@ mod tests {
         match &envelopes[3].1.data {
             EventData::TabCreated { tab } => assert!(tab.focused),
             other => panic!("expected tab created event, got {other:?}"),
+        }
+        match &envelopes[5].1.data {
+            EventData::LayoutUpdated { layout } => assert_eq!(
+                layout.tab_id,
+                app.public_tab_id(0, 0)
+                    .expect("created workspace should have a first tab")
+            ),
+            other => panic!("expected layout updated event, got {other:?}"),
         }
     }
 
@@ -3001,6 +3261,11 @@ mod tests {
         assert_eq!(zoom.focused_pane_id, zoom.pane_id);
         assert!(zoom.zoomed);
         assert!(zoom.layout.zoomed);
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap() && layout.zoomed
+        ));
 
         let response = app.handle_pane_zoom("req".into(), PaneZoomParams::default());
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -3012,6 +3277,11 @@ mod tests {
         assert!(!zoom.focus_changed);
         assert!(!zoom.zoomed);
         assert!(!zoom.layout.zoomed);
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap() && !layout.zoomed
+        ));
     }
 
     #[test]
@@ -3050,6 +3320,48 @@ mod tests {
 
         assert_eq!(app.state.active, Some(0));
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(first));
+    }
+
+    #[test]
+    fn api_pane_zoom_focuses_copy_mode_pane_back_into_copy_mode() {
+        let mut app = app_with_linked_worktree();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let target = app.state.workspaces[1].tabs[0].root_pane;
+        let _other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let _target_other =
+            app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces[1].tabs[0].layout.focus_pane(target);
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Terminal;
+        app.state.copy_mode = Some(crate::app::state::CopyModeState {
+            pane_id: source,
+            cursor_row: 0,
+            cursor_col: 0,
+            entry_offset_from_bottom: 0,
+            selection: None,
+            search: Default::default(),
+        });
+        let source_public = app.public_pane_id(0, source).unwrap();
+
+        let response = app.handle_pane_zoom(
+            "req".into(),
+            PaneZoomParams {
+                pane_id: Some(source_public),
+                mode: PaneZoomMode::On,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneZoom { zoom } = success.result else {
+            panic!("expected pane zoom response");
+        };
+        assert!(zoom.focus_changed);
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.mode, Mode::Copy);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(source));
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target));
     }
 
     #[test]
@@ -3187,6 +3499,11 @@ mod tests {
         assert_eq!(zoom.reason, Some(PaneZoomReason::AlreadyZoomed));
         assert!(zoom.zoomed);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(right));
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.focused_pane_id == app.public_pane_id(0, right).unwrap()
+        ));
     }
 
     #[test]
@@ -3326,6 +3643,12 @@ mod tests {
         assert_eq!(resize.layout.focused_pane_id, right_public);
         assert!((resize.layout.splits[0].ratio - 0.6).abs() < f32::EPSILON);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(right));
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap()
+                    && (layout.splits[0].ratio - 0.6).abs() < f32::EPSILON
+        ));
     }
 
     #[test]
@@ -3359,6 +3682,85 @@ mod tests {
     }
 
     #[test]
+    fn api_pane_focus_focuses_direct_target_across_tabs_and_workspaces() {
+        let mut app = app_with_linked_worktree();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        let target_tab_idx = app.state.workspaces[1].test_add_tab(Some("target"));
+        app.state.workspaces[1].switch_tab(target_tab_idx);
+        let target_pane = app.state.workspaces[1].tabs[target_tab_idx].root_pane;
+        app.state.ensure_test_terminals();
+        let target_public = app.public_pane_id(1, target_pane).unwrap();
+        app.state.switch_workspace(0);
+        assert_eq!(app.state.active, Some(0));
+
+        let response = app.handle_pane_focus(
+            "req".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: target_public.clone(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.pane_id, target_public);
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.workspaces[1].active_tab, target_tab_idx);
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target_pane));
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn api_pane_focus_marks_already_focused_done_pane_seen() {
+        let mut app = app_with_linked_worktree();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.outer_terminal_focus = Some(false);
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Idle;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
+        app.state.workspaces[0].tabs[0].layout.focus_pane(pane_id);
+
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_pane_focus(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Idle);
+    }
+
+    #[test]
+    fn api_pane_focus_rejects_invalid_pane_id() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_pane_focus(
+            "req".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: "pane_missing".into(),
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
     fn api_pane_focus_direction_no_neighbor_is_noop() {
         let mut app = app_with_linked_worktree();
         let root = app.state.workspaces[0].tabs[0].root_pane;
@@ -3383,6 +3785,116 @@ mod tests {
         assert_eq!(focus.source_pane_id, root_public.clone());
         assert_eq!(focus.focused_pane_id, Some(root_public));
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+    }
+
+    #[test]
+    fn pane_metadata_tokens_patch_and_clear_through_dispatcher() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        for (tokens, expected) in [
+            (
+                std::collections::HashMap::from([
+                    ("summary".into(), Some("reviewing auth".into())),
+                    ("model".into(), Some("opus".into())),
+                ]),
+                std::collections::HashMap::from([
+                    ("summary".into(), "reviewing auth".into()),
+                    ("model".into(), "opus".into()),
+                ]),
+            ),
+            (
+                std::collections::HashMap::from([
+                    ("summary".into(), Some("done".into())),
+                    ("model".into(), None),
+                ]),
+                std::collections::HashMap::from([("summary".into(), "done".into())]),
+            ),
+        ] {
+            let mut params = metadata_params(pane_id.clone());
+            params.title = None;
+            params.tokens = tokens;
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "set".into(),
+                method: crate::api::schema::Method::PaneReportMetadata(params),
+            });
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(success.result, ResponseResult::Ok {});
+
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "get".into(),
+                method: crate::api::schema::Method::PaneGet(PaneTarget {
+                    pane_id: pane_id.clone(),
+                }),
+            });
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::PaneInfo { pane } = success.result else {
+                panic!("expected pane info");
+            };
+            assert_eq!(pane.tokens, expected);
+        }
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        assert!(app.state.terminals[&terminal_id].agent_metadata.is_empty());
+    }
+
+    #[test]
+    fn pane_tokens_are_independent_from_presentation_guards() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Claude), AgentState::Working);
+        let mut params = metadata_params(pane_id);
+        params.title = None;
+        params.agent = Some("codex".into());
+        params.tokens =
+            std::collections::HashMap::from([("summary".into(), Some("global".into()))]);
+
+        let response = app.handle_pane_report_metadata("guarded".into(), params);
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal_id].metadata_tokens.values(),
+            std::collections::HashMap::from([("summary".into(), "global".into())])
+        );
+    }
+
+    #[test]
+    fn pane_metadata_uses_one_sequence_for_presentation_and_tokens() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut presentation = metadata_params(pane_id.clone());
+        presentation.seq = Some(10);
+        let response = app.handle_pane_report_metadata("presentation".into(), presentation);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let mut stale_token = metadata_params(pane_id.clone());
+        stale_token.title = None;
+        stale_token.tokens =
+            std::collections::HashMap::from([("summary".into(), Some("stale".into()))]);
+        stale_token.seq = Some(9);
+        let response = app.handle_pane_report_metadata("stale".into(), stale_token);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        assert!(app.state.terminals[&terminal_id]
+            .metadata_tokens
+            .values()
+            .is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use serde_json::Value;
 use support::{
     cleanup_test_base, client_handshake, encode_varint_u16, encode_varint_u32, frame_message,
     read_server_message, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid, wait_for_socket, wait_until,
+    unregister_spawned_herdr_pid, wait_for_socket, wait_until, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -274,9 +274,9 @@ fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result
     Err("timed out waiting for Frame message".into())
 }
 
-fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
+fn frame_text(frame: &FrameWire) -> String {
     if frame.cells.is_empty() {
-        return false;
+        return String::new();
     }
 
     let width = frame.width.max(1) as usize;
@@ -293,7 +293,7 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
         let _ = (cursor.x, cursor.y, cursor.visible, cursor.shape);
     }
 
-    text.contains(needle)
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -319,8 +319,11 @@ fn client_connects_and_receives_frame() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14, "server should report protocol version 14");
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(
+        version, CURRENT_PROTOCOL,
+        "server should report current protocol version"
+    );
     assert!(
         error.is_none(),
         "handshake should not have error: {:?}",
@@ -387,8 +390,8 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     stream
@@ -396,6 +399,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut found_diagnostic = false;
+    let mut last_frame_text = String::new();
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, payload)) => {
@@ -403,7 +407,10 @@ fn client_sees_headless_startup_config_diagnostic() {
                 let (variant, payload) = support::inflate_compressed_frame(variant, &payload);
                 if variant == 1 {
                     let frame = decode_frame_payload(&payload).expect("decode frame");
-                    if frame_contains_text(&frame, "config parse error") {
+                    last_frame_text = frame_text(&frame);
+                    if last_frame_text.contains("config.toml")
+                        && last_frame_text.contains("herdr config check")
+                    {
                         found_diagnostic = true;
                         break;
                     }
@@ -415,16 +422,192 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     assert!(
         found_diagnostic,
-        "attached client should see startup config parse diagnostic"
+        "attached client should see startup config parse diagnostic; last frame:\n{last_frame_text}"
     );
 
     cleanup_spawned_herdr(spawned, base);
 }
 
 #[test]
-fn client_input_forwarded_to_pane() {
-    // Stdin input is forwarded to server as ClientMessage::Input.
-    // Server routes client input to the correct PTY.
+fn server_unreachable_shows_clear_error() {
+    // when server is unreachable, the client exits quickly
+    // with an actionable connection-failed message.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    register_runtime_dir(&runtime_dir);
+    fs::write(
+        config_home.join("herdr/config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("client")
+        .env("HERDR_DISABLE_SOUND", "1")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .expect("client command should run");
+
+    assert!(
+        !output.status.success(),
+        "client should fail when no server is running"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to connect to server"),
+        "stderr should mention connection failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("Is herdr server running?"),
+        "stderr should include actionable guidance: {stderr}"
+    );
+    assert!(
+        stderr.contains("Socket path:"),
+        "stderr should include attempted socket path: {stderr}"
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn server_crash_after_attach_causes_lost_connection_error() {
+    // attach a real thin client connection, kill server unexpectedly,
+    // assert clean non-zero client exit plus lost-connection signal.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    // Attach a real thin client (client subcommand) through PTY so handshake and
+    // terminal setup paths are exercised.
+    let mut thin_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+
+    // Prove attached before kill by waiting for recognizable rendered app content.
+    let mut thin_reader = thin_client
+        ._master
+        .as_ref()
+        .expect("thin client master")
+        .try_clone_reader()
+        .expect("clone client PTY reader");
+    let (attached_before_kill, attach_output) = {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut buf = [0u8; 4096];
+        let mut seen = false;
+        let mut output = String::new();
+        while Instant::now() < deadline {
+            match thin_reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let out = String::from_utf8_lossy(&buf[..n]);
+                    output.push_str(&out);
+                    if out.contains("\u{2500}")
+                        || out.contains("workspace")
+                        || out.contains("pane")
+                        || out.contains("terminal")
+                    {
+                        seen = true;
+                        break;
+                    }
+                    if output.to_lowercase().contains("herdr:") {
+                        break;
+                    }
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(30)),
+                Err(_) => thread::sleep(Duration::from_millis(30)),
+            }
+        }
+        (seen, output)
+    };
+    assert!(
+        attached_before_kill,
+        "thin client must complete attach and receive frame before server crash; output: {attach_output:?}"
+    );
+
+    // Kill server unexpectedly.
+    if let Some(pid) = spawned.child.process_id() {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    spawned.close_master();
+
+    // Client should exit non-zero after connection loss.
+    let mut crash_output = String::new();
+    let exited = {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if thin_client.child.try_wait().ok().flatten().is_some() {
+                exited = true;
+                break;
+            }
+            // Keep draining client output so the process can progress to exit.
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = thin_reader.read(&mut buf) {
+                if n > 0 {
+                    crash_output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        exited
+    };
+    assert!(exited, "thin client should exit after server SIGKILL");
+
+    let status = thin_client.child.wait().expect("wait thin client status");
+    assert!(
+        !status.success(),
+        "thin client should exit non-zero after lost server connection"
+    );
+
+    // Drain trailing output and require the explicit user-visible lost-connection message.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline {
+        match thin_reader.read(&mut buf) {
+            Ok(n) if n > 0 => crash_output.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Ok(_) => break,
+            Err(_) => break,
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    let crash_output_lc = crash_output.to_lowercase();
+    assert!(
+        crash_output_lc.contains("lost connection to server"),
+        "thin client must emit explicit lost-connection message after server crash; output: {crash_output:?}"
+    );
+
+    // Ensure server is gone.
+    let _ = spawned.child.wait();
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn client_receives_frame_after_pane_output() {
+    // End-to-end test: server renders, client receives Frame.
+    // This test verifies the full flow:
+    // 1. Start server
+    // 2. Connect client, handshake
+    // 3. Send input to pane (echo command)
+    // 4. Wait for a new frame from the server
+    // 5. Verify the frame contains the pane output
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -439,8 +622,8 @@ fn client_input_forwarded_to_pane() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Send an Input message containing "echo hello\n".
@@ -493,8 +676,8 @@ fn client_resize_sends_message() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain the initial frame(s).
@@ -552,8 +735,8 @@ fn server_shutdown_sends_message_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Send SIGINT so the server takes the graceful shutdown path and
@@ -686,8 +869,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -703,7 +886,7 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
         }
     }
 
-    // The client should receive a ServerShutdown message (variant 4)
+    // The client should receive a ServerShutdown message (variant 3)
     // before the connection is closed, not just an abrupt EOF.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -712,8 +895,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     match result {
         Ok((variant, _payload)) => {
             assert_eq!(
-                variant, 4,
-                "expected ServerShutdown (variant 4), got variant {variant}"
+                variant, 3,
+                "expected ServerShutdown (variant 3), got variant {variant}"
             );
         }
         Err(e) => {
@@ -785,8 +968,8 @@ fn client_receives_notify_on_agent_state_change() {
     // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -837,8 +1020,8 @@ fn client_receives_notify_on_agent_state_change() {
     let mut report_response = String::new();
     report_reader.read_line(&mut report_response).unwrap();
 
-    // Read messages from the client stream and look for Notify (variant 5).
-    // Notify = ServerMessage variant index 5.
+    // Read messages from the client stream and look for Notify (variant 4).
+    // Notify = ServerMessage variant index 4 in the mx wire layout.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -847,7 +1030,7 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
+                if variant == 4 {
                     // ServerMessage::Notify — found it!
                     found_notify = true;
                     break;
@@ -933,7 +1116,7 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
+                if variant == 4 {
                     // Found a Notify message — that's good enough.
                     // The test already verified the Blocked→Notify path above.
                     found_done_notify = true;

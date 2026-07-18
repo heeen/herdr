@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,12 +14,16 @@ use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
-use crate::api::wait::wait_for_output;
+use crate::api::wait::{wait_for_event, wait_for_output};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
-    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalStream,
-    SocketFileIdentity,
+    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
+    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
+    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
+
+mod pane_graphics_stream;
+pub(crate) use pane_graphics_stream::cancel_inactive_streams as cancel_inactive_pane_graphics_streams;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -62,6 +66,7 @@ pub fn start_server(
         event_hub,
         Some(ServerCapabilities {
             live_handoff: crate::platform::capabilities().live_handoff,
+            detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         }),
     )
 }
@@ -153,14 +158,14 @@ fn handle_connection(
 
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
-        Err(err) => {
+        Err(request_error) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
                     id: String::new(),
                     error: ErrorBody {
                         code: "invalid_request".into(),
-                        message: format!("invalid request: {err}"),
+                        message: format!("invalid request: {request_error}"),
                     },
                 },
             )?;
@@ -174,6 +179,22 @@ fn handle_connection(
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
+        Method::PaneGraphicsStream(params) => {
+            let result =
+                pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
                 stream,
@@ -188,6 +209,38 @@ fn handle_connection(
                     &request_id,
                     method,
                     "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
+        Method::EventsWait(params) => {
+            let Some(response) = wait_for_event(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                event_hub,
+                running,
+            )?
+            else {
+                crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "client_disconnected",
+                    changes_ui,
+                );
+                return Ok(());
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
                     changes_ui,
                 ),
                 Err(err) => {
@@ -223,6 +276,7 @@ fn handle_connection(
             result
         }
         method_body => {
+            let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let response = handle_request(
                 Request {
                     id: request_id.clone(),
@@ -230,8 +284,10 @@ fn handle_connection(
                 },
                 api_tx,
                 capabilities,
+                Some(response_write_rx),
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
+            let _ = response_write_tx.send(());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
                     &request_id,
@@ -252,6 +308,7 @@ fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -266,7 +323,12 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
-        _ => dispatch_to_app(request, api_tx),
+        _ => dispatch_to_app_with_timeout_and_write_completion(
+            request,
+            api_tx,
+            None,
+            response_write_complete,
+        ),
     }
 }
 
@@ -288,11 +350,14 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::NotificationShow(_) => "notification.show",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
+        Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
         Method::WorkspaceFocus(_) => "workspace.focus",
         Method::WorkspaceRename(_) => "workspace.rename",
+        Method::WorkspaceMove(_) => "workspace.move",
+        Method::WorkspaceReportMetadata(_) => "workspace.report_metadata",
         Method::WorkspaceClose(_) => "workspace.close",
         Method::WorkspaceReorder(_) => "workspace.reorder",
         Method::WorktreeList(_) => "worktree.list",
@@ -304,6 +369,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabGet(_) => "tab.get",
         Method::TabFocus(_) => "tab.focus",
         Method::TabRename(_) => "tab.rename",
+        Method::TabMove(_) => "tab.move",
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
@@ -313,6 +379,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentRename(_) => "agent.rename",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentPrompt(_) => "agent.prompt",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
         Method::PaneMove(_) => "pane.move",
@@ -321,6 +388,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneProcessInfo(_) => "pane.process_info",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
+        Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
         Method::PaneEdges(_) => "pane.edges",
         Method::PaneFocusDirection(_) => "pane.focus_direction",
@@ -328,17 +396,26 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
+        Method::PaneFocus(_) => "pane.focus",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneRead(_) => "pane.read",
+        Method::PaneGraphicsSet(_) => "pane.graphics.set",
+        Method::PaneGraphicsClear(_) => "pane.graphics.clear",
+        Method::PaneGraphicsInfo(_) => "pane.graphics.info",
+        Method::PaneGraphicsStream(_) => "pane.graphics.stream",
+        Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
+        Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
+        Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
         Method::PaneClose(_) => "pane.close",
+        Method::PopupClose(_) => "popup.close",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
@@ -375,48 +452,189 @@ fn api_response_outcome(response: &str) -> &'static str {
 }
 
 fn read_initial_request_line(stream: &mut LocalStream) -> std::io::Result<Option<String>> {
-    stream.set_nonblocking(true)?;
-    let deadline = Instant::now() + INITIAL_REQUEST_TIMEOUT;
+    read_initial_request_line_with_timeout(stream, INITIAL_REQUEST_TIMEOUT)
+}
+
+fn read_initial_request_line_with_timeout(
+    stream: &mut LocalStream,
+    timeout: Duration,
+) -> std::io::Result<Option<String>> {
+    read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
+}
+
+fn read_initial_request_line_with_limits(
+    stream: &mut LocalStream,
+    timeout: Duration,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    set_local_stream_polling(stream, true)?;
+    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
 
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                stream.set_nonblocking(false)?;
-                return Ok(None);
-            }
-            Ok(_) => {
+    let result = loop {
+        let read = match poll_local_stream_read(stream, &mut byte) {
+            Ok(read) => read,
+            Err(err) => break Err(err),
+        };
+        match read {
+            LocalStreamRead::Closed => break Ok(None),
+            LocalStreamRead::Data => {
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
-                    stream.set_nonblocking(false)?;
-                    return String::from_utf8(bytes)
+                    break String::from_utf8(bytes)
                         .map(Some)
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
-                if bytes.len() > MAX_INITIAL_REQUEST_BYTES {
-                    stream.set_nonblocking(false)?;
-                    return Err(io::Error::new(
+                if bytes.len() > max_bytes {
+                    break Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "api request line is too large",
                     ));
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            LocalStreamRead::Pending => {
                 if Instant::now() >= deadline {
-                    stream.set_nonblocking(false)?;
-                    return Err(io::Error::new(
+                    break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
                 }
                 std::thread::sleep(CONNECTION_POLL_INTERVAL);
             }
-            Err(err) => {
-                stream.set_nonblocking(false)?;
-                return Err(err);
-            }
         }
+    };
+    set_local_stream_polling(stream, false)?;
+    result
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc::{self, Receiver};
+
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-api-{name}-{}-{}.sock",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        (client, server, path)
+    }
+
+    fn spawn_connection(
+        server: LocalStream,
+    ) -> (Receiver<std::io::Result<()>>, std::thread::JoinHandle<()>) {
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            );
+            done_tx.send(result).unwrap();
+        });
+        (done_rx, thread)
+    }
+
+    #[test]
+    fn windows_delayed_partial_initial_request_returns_pong() {
+        let (mut client, server, path) = local_stream_pair("delayed-request");
+        let (done_rx, server_thread) = spawn_connection(server);
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "idle connected client must not be treated as closed"
+        );
+
+        client
+            .write_all(br#"{"id":"delayed","method":"ping","params":{}}"#)
+            .unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "partial request must wait for its newline"
+        );
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let mut response = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response)
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "delayed");
+        assert_eq!(response["result"]["type"], "pong");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_disconnected_initial_request_returns_promptly() {
+        let (client, server, path) = local_stream_pair("disconnected-request");
+        let (done_rx, server_thread) = spawn_connection(server);
+
+        drop(client);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnected connection handler must finish promptly")
+            .unwrap();
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_idle_initial_request_honors_timeout() {
+        let (_client, mut server, path) = local_stream_pair("request-timeout");
+
+        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_millis(50))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_initial_request_enforces_size_limit() {
+        let (mut client, mut server, path) = local_stream_pair("request-size-limit");
+        client.write_all(b"12345").unwrap();
+        client.flush().unwrap();
+
+        let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "api request line is too large");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn windows_initial_request_rejects_invalid_utf8() {
+        let (mut client, mut server, path) = local_stream_pair("request-invalid-utf8");
+        client.write_all(&[0xff, b'\n']).unwrap();
+        client.flush().unwrap();
+
+        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(1))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -517,44 +735,7 @@ pub(super) fn should_stop_connection(
         return Ok(true);
     }
 
-    probe_stream_closed(stream)
-}
-
-fn probe_stream_closed(stream: &mut LocalStream) -> std::io::Result<bool> {
-    stream.set_nonblocking(true)?;
-    let mut probe = [0u8; 1];
-    let status = match stream.read(&mut probe) {
-        Ok(0) => Ok(true),
-        Ok(_) => Ok(true),
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(err) if is_connection_closed_error(&err) => Ok(true),
-        Err(err) => Err(err),
-    };
-    stream.set_nonblocking(false)?;
-    status
-}
-
-fn is_connection_closed_error(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::WriteZero
-    )
-}
-
-fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender) -> String {
-    dispatch_to_app_with_timeout(request, api_tx, None)
+    local_stream_peer_closed(stream)
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -562,11 +743,21 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
+    dispatch_to_app_with_timeout_and_write_completion(request, api_tx, timeout, None)
+}
+
+fn dispatch_to_app_with_timeout_and_write_completion(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
+        response_write_complete,
     }) {
         return error_response_json(
             request_id,
@@ -622,6 +813,7 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -654,6 +846,67 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    fn pane_info(
+        pane_id: &str,
+        agent_status: crate::api::schema::AgentStatus,
+    ) -> crate::api::schema::PaneInfo {
+        crate::api::schema::PaneInfo {
+            pane_id: pane_id.into(),
+            terminal_id: "term_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            focused: true,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status,
+            state_labels: HashMap::new(),
+            tokens: HashMap::new(),
+            agent_session: None,
+            scroll: None,
+            revision: 0,
+        }
+    }
+
+    fn spawn_pane_get_responder(
+        agent_status: crate::api::schema::AgentStatus,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                match msg.request.method {
+                    Method::PaneGet(_) => msg
+                        .respond_to
+                        .send(
+                            serde_json::to_string(&SuccessResponse {
+                                id: msg.request.id,
+                                result: ResponseResult::PaneInfo {
+                                    pane: pane_info("pane_1", agent_status),
+                                },
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    Method::EventsWait(_) => msg
+                        .respond_to
+                        .send(error_response_json(
+                            msg.request.id,
+                            "unexpected_dispatch",
+                            "events.wait should be handled by the api server".into(),
+                        ))
+                        .unwrap(),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        });
+        (api_tx, responder)
     }
 
     #[test]
@@ -746,7 +999,11 @@ mod tests {
                 method: Method::Ping(crate::api::schema::PingParams::default()),
             },
             &tx,
-            Some(ServerCapabilities { live_handoff: true }),
+            Some(ServerCapabilities {
+                live_handoff: true,
+                detached_server_daemon: true,
+            }),
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -763,7 +1020,8 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread = std::thread::spawn(move || handle_request(request_for_thread, &tx, None));
+        let thread =
+            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None));
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
@@ -780,6 +1038,157 @@ mod tests {
         let response = thread.join().unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_2");
+    }
+
+    #[test]
+    fn dispatched_request_reports_response_write_completion() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let (mut client, server, _path) = local_stream_pair("write-ack");
+        client
+            .write_all(br#"{"id":"req_write","method":"workspace.list","params":{}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        let msg = api_rx.blocking_recv().unwrap();
+        let response_write_complete = msg
+            .response_write_complete
+            .expect("socket-dispatched requests include write completion");
+        msg.respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: msg.request.id,
+                    result: ResponseResult::Ok {},
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        response_write_complete
+            .recv_timeout(Duration::from_secs(1))
+            .expect("response write completion");
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response.id, "req_write");
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn events_wait_agent_status_returns_initial_match() {
+        let (api_tx, responder) =
+            spawn_pane_get_responder(crate::api::schema::AgentStatus::Blocked);
+
+        let (mut client, server, _path) = local_stream_pair("api-events-wait-initial");
+        client
+            .write_all(br#"{"id":"wait_1","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"blocked"},"timeout_ms":1000}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let event_hub = EventHub::default();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "wait_1");
+        assert_eq!(response["result"]["type"], "wait_matched");
+        assert_eq!(
+            response["result"]["event"]["data"]["agent_status"],
+            "blocked"
+        );
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn events_wait_agent_status_times_out_server_side() {
+        let (api_tx, responder) =
+            spawn_pane_get_responder(crate::api::schema::AgentStatus::Unknown);
+
+        let (mut client, server, _path) = local_stream_pair("api-events-wait-timeout");
+        client
+            .write_all(br#"{"id":"wait_2","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"blocked"},"timeout_ms":30}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let event_hub = EventHub::default();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "wait_2");
+        assert_eq!(response["error"]["code"], "timeout");
+        assert_eq!(
+            response["error"]["message"],
+            "timed out waiting for event match"
+        );
+        drop(api_tx);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn events_wait_agent_status_returns_not_found_when_pane_closes() {
+        let event_hub = EventHub::default();
+        let responder_event_hub = event_hub.clone();
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut pane_get_count = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::PaneGet(_) = msg.request.method else {
+                    panic!("unexpected request: {:?}", msg.request.method);
+                };
+                pane_get_count += 1;
+                let response = if pane_get_count == 1 {
+                    serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id,
+                        result: ResponseResult::PaneInfo {
+                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
+                        },
+                    })
+                    .unwrap()
+                } else {
+                    if pane_get_count == 2 {
+                        responder_event_hub.push(crate::api::schema::EventEnvelope {
+                            event: crate::api::schema::EventKind::PaneClosed,
+                            data: crate::api::schema::EventData::PaneClosed {
+                                pane_id: "pane_1".into(),
+                                workspace_id: "ws_1".into(),
+                            },
+                        });
+                    }
+                    error_response_json(
+                        msg.request.id,
+                        "pane_not_found",
+                        "pane pane_1 not found".into(),
+                    )
+                };
+                msg.respond_to.send(response).unwrap();
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("wait-close");
+        client
+            .write_all(br#"{"id":"wait_close","method":"events.wait","params":{"match_event":{"event":"pane_agent_status_changed","pane_id":"pane_1","agent_status":"done"},"timeout_ms":500}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "wait_close");
+        assert_eq!(response["error"]["code"], "pane_not_found");
+        assert_eq!(response["error"]["message"], "pane pane_1 not found");
+        drop(api_tx);
+        responder.join().unwrap();
     }
 
     #[test]
@@ -912,7 +1321,6 @@ mod tests {
                 agent: Some("pi".into()),
                 title: None,
                 display_agent: None,
-                custom_status: None,
                 state_labels: std::collections::HashMap::new(),
             },
         });
@@ -958,5 +1366,39 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pane_graphics_request_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn maximum_public_graphics_request_fits_initial_json_line() {
+        let request = Request {
+            id: "graphics-max".into(),
+            method: Method::PaneGraphicsSet(crate::api::schema::PaneGraphicsSetParams {
+                pane_id: "pane_1".into(),
+                owner: String::new(),
+                format: crate::api::schema::PaneGraphicsFormat::Png,
+                image_width: 1,
+                image_height: 1,
+                data_base64: base64::engine::general_purpose::STANDARD
+                    .encode(vec![1_u8; crate::api::schema::PANE_GRAPHICS_SET_MAX_BYTES]),
+                data: None,
+                placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
+            }),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+
+        assert!(encoded.len() < MAX_INITIAL_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn duplicate_method_cannot_be_reinterpreted_as_graphics_stream() {
+        let encoded = r#"{"id":"duplicate","method":"ping","method":"pane.graphics.stream","params":{"pane_id":"pane_1"}}"#;
+
+        assert!(serde_json::from_str::<Request>(encoded).is_err());
     }
 }

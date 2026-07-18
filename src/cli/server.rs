@@ -30,7 +30,13 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    super::send_ok_request(Method::ServerStop(EmptyParams::default()))
+    match crate::session::stop_active_server() {
+        Ok(()) => Ok(0),
+        Err(err) => {
+            eprintln!("{err}");
+            Ok(1)
+        }
+    }
 }
 
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
@@ -196,7 +202,9 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     };
     let params = live_handoff_params_with_cli_defaults(params)?;
 
-    let response = super::send_request(&Request {
+    // Live handoff is itself a protocol-mismatch recovery path, so it must
+    // reach the running server without the normal CLI compatibility guard.
+    let response = super::send_request_unchecked(&Request {
         id: "cli:server:live-handoff".into(),
         method: Method::ServerLiveHandoff(params),
     })?;

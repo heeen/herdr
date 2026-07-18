@@ -64,7 +64,9 @@ pub enum ToastDelivery {
     System,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToastHerdrPosition {
     TopLeft,
@@ -120,6 +122,23 @@ impl AgentPanelScopeConfig {
             Self::All => "all",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostCursorModeConfig {
+    #[default]
+    Auto,
+    Native,
+    Drawn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarCollapsedModeConfig {
+    #[default]
+    Compact,
+    Hidden,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,7 +275,7 @@ impl Default for SessionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigReloadStatus {
     Applied,
@@ -779,10 +798,18 @@ pub struct UiConfig {
     pub sidebar_min_width: u16,
     /// Maximum sidebar width (columns) when expanded. Default: 36.
     pub sidebar_max_width: u16,
+    /// Start with the sidebar collapsed. Default: false.
+    pub sidebar_start_collapsed: bool,
+    /// Collapsed sidebar presentation. Default: compact.
+    pub sidebar_collapsed_mode: SidebarCollapsedModeConfig,
     /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
+    /// Copy text selected with the mouse. Default: true.
+    pub copy_on_select: bool,
+    /// Host cursor policy. Default: auto.
+    pub host_cursor: HostCursorModeConfig,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
     pub right_click_passthrough_modifier: RightClickPassthroughModifierConfig,
     /// Force a full host-terminal redraw when the outer terminal regains focus. Default: true.
@@ -793,12 +820,16 @@ pub struct UiConfig {
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
+    /// Ask for a workspace name before interactive creation. Default: false.
+    pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. Default: true.
     pub pane_borders: bool,
     /// Keep split panes visually separated instead of sharing divider borders. Default: true.
     pub pane_gaps: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
+    /// Hide the tab row when the workspace has one tab. Default: false.
+    pub hide_tab_bar_when_single_tab: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// herdr-mx: agent sidebar scope. Saved values are "current" or "all". Default: "all".
@@ -1342,8 +1373,8 @@ pub struct AdvancedConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
-    /// Add a keepalive fallback under the user's ssh config for the `--remote`
-    /// bridge. Set false to run plain ssh unchanged. Default: true.
+    /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
+    /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
 }
 
@@ -1382,7 +1413,7 @@ pub struct ExperimentalConfig {
     /// if the list contains no valid names, the reveal does not apply.
     /// Accepted names: pi, claude, codex, gemini, cursor, devin, cline,
     /// opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo,
-    /// qodercli, qoder.
+    /// qodercli, qoder, maki.
     /// Default: empty.
     pub cjk_ime_agents: Vec<String>,
     /// Cursor shape rendered for the IME anchor when
@@ -1473,16 +1504,22 @@ impl Default for UiConfig {
             sidebar_width: 26,
             sidebar_min_width: 18,
             sidebar_max_width: 36,
+            sidebar_start_collapsed: false,
+            sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
+            copy_on_select: true,
+            host_cursor: HostCursorModeConfig::Auto,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
             mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
+            prompt_new_workspace_name: false,
             pane_borders: true,
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
+            hide_tab_bar_when_single_tab: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             agent_panel_scope: AgentPanelScopeConfig::All,
             accent: "cyan".into(),
@@ -1641,6 +1678,24 @@ manifest_check = false
         assert!(!config.update.manifest_check);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_config_defaults_to_preview() {
+        let empty: Config = toml::from_str("").unwrap();
+        let without_update_channel: Config =
+            toml::from_str("[update]\nversion_check = false").unwrap();
+
+        assert_eq!(
+            Config::default().update.channel,
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(empty.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(
+            without_update_channel.update.channel,
+            UpdateChannelConfig::Preview
+        );
+    }
+
     #[test]
     fn terminal_default_shell_defaults_empty_and_parses() {
         let default_config = Config::default();
@@ -1735,17 +1790,20 @@ agent_panel_scope = "current"
         assert!(default_config.ui.pane_borders);
         assert!(default_config.ui.pane_gaps);
         assert!(!default_config.ui.show_agent_labels_on_pane_borders);
+        assert!(!default_config.ui.hide_tab_bar_when_single_tab);
 
         let toml = r#"
 [ui]
 pane_borders = false
 pane_gaps = true
 show_agent_labels_on_pane_borders = true
+hide_tab_bar_when_single_tab = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_borders);
         assert!(config.ui.pane_gaps);
         assert!(config.ui.show_agent_labels_on_pane_borders);
+        assert!(config.ui.hide_tab_bar_when_single_tab);
     }
 
     #[test]
@@ -1772,6 +1830,19 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn prompt_new_workspace_name_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.prompt_new_workspace_name);
+
+        let toml = r#"
+[ui]
+prompt_new_workspace_name = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.prompt_new_workspace_name);
     }
 
     #[test]
@@ -1862,6 +1933,38 @@ mobile_width_threshold = 96
     }
 
     #[test]
+    fn sidebar_start_collapsed_defaults_off_and_parses_on() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.sidebar_start_collapsed);
+
+        let toml = r#"
+[ui]
+sidebar_start_collapsed = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.sidebar_start_collapsed);
+    }
+
+    #[test]
+    fn sidebar_collapsed_mode_defaults_compact_and_parses_hidden() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.sidebar_collapsed_mode,
+            SidebarCollapsedModeConfig::Compact
+        );
+
+        let toml = r#"
+[ui]
+sidebar_collapsed_mode = "hidden"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.sidebar_collapsed_mode,
+            SidebarCollapsedModeConfig::Hidden
+        );
+    }
+
+    #[test]
     fn validated_sidebar_bounds_rejects_inverted() {
         assert_eq!(validated_sidebar_bounds(18, 36), Some((18, 36)));
         assert_eq!(validated_sidebar_bounds(20, 20), Some((20, 20)));
@@ -1881,6 +1984,19 @@ mouse_capture = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.mouse_capture);
+    }
+
+    #[test]
+    fn copy_on_select_default_on_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.copy_on_select);
+
+        let toml = r#"
+[ui]
+copy_on_select = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.copy_on_select);
     }
 
     #[test]
