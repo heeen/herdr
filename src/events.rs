@@ -73,7 +73,6 @@ pub enum AppEvent {
         agent_label: String,
         state: AgentState,
         message: Option<String>,
-        custom_status: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
     },
@@ -94,11 +93,9 @@ pub enum AppEvent {
         applies_to_source: Option<String>,
         title: Option<String>,
         display_agent: Option<String>,
-        custom_status: Option<String>,
         state_labels: std::collections::HashMap<String, String>,
         clear_title: bool,
         clear_display_agent: bool,
-        clear_custom_status: bool,
         clear_state_labels: bool,
         seq: Option<u64>,
         ttl: Option<std::time::Duration>,
@@ -130,6 +127,11 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// Prefix-mode ASCII input-source request, emitted on entering/leaving the ASCII input
+    /// realm. The foreground process applies the host-local TIS switch (`active = true`) /
+    /// restore (`active = false`): the client in server mode (via server forwarding), the
+    /// app itself in monolithic mode.
+    PrefixInputSource { active: bool },
     /// A pane child reported its shell current directory through terminal
     /// metadata such as OSC 7.
     TerminalCwdReported {

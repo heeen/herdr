@@ -215,7 +215,7 @@ fn agent_panel_entries_with_runtimes(
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
-                        custom_status: detail.custom_status,
+                        custom_status: detail.tokens.get("status").cloned(),
                         state_labels: detail.state_labels,
                         working_duration: detail.working_duration,
                     }
@@ -242,7 +242,7 @@ fn agent_panel_entries_with_runtimes(
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
-                        custom_status: detail.custom_status,
+                        custom_status: detail.tokens.get("status").cloned(),
                         state_labels: detail.state_labels,
                         working_duration: detail.working_duration,
                     })
@@ -923,7 +923,11 @@ pub(crate) fn workspace_parent_group_state(
     })
 }
 
-fn grouped_child_display_label(label: &str, branch: Option<&str>, has_custom_name: bool) -> String {
+pub(crate) fn grouped_child_display_label(
+    label: &str,
+    branch: Option<&str>,
+    has_custom_name: bool,
+) -> String {
     if has_custom_name {
         return label.to_string();
     }
@@ -950,7 +954,7 @@ pub(crate) struct HostBannerArea {
     pub rect: Rect,
 }
 
-fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
         Some(WorkspaceListEntry::Workspace { indented: true, .. })
@@ -973,6 +977,21 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
 }
 
 pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, false)
+}
+
+/// Like [`workspace_list_entries`] but always expands worktree groups, ignoring
+/// `collapsed_space_keys`, and emits ONLY `Workspace` entries (no divider/host-banner
+/// rows). The mobile switcher has no collapse affordance, always shows the full
+/// worktree tree, and computes its row math assuming every entry is a workspace row.
+pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, true)
+        .into_iter()
+        .filter(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. }))
+        .collect()
+}
+
+fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
     let mut members_by_key = HashMap::<String, Vec<usize>>::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
         if let Some(space) = ws.worktree_space() {
@@ -1041,7 +1060,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             });
             continue;
         };
-        let collapsed = app.collapsed_space_keys.contains(&space.key);
+        let collapsed = !force_expanded && app.collapsed_space_keys.contains(&space.key);
         entries.push(WorkspaceListEntry::Workspace {
             ws_idx: parent_idx,
             indented: false,
@@ -1277,6 +1296,27 @@ fn agent_panel_visible_count(app: &AppState, area: Rect) -> usize {
         }
     }
     visible
+}
+
+/// Smallest scroll adjustment that brings agent-panel entry `target` into view, mirroring the
+/// upstream helper of the same name but computed against this fork's uniform entry-row geometry.
+pub(crate) fn agent_panel_scroll_for_target(
+    app: &AppState,
+    area: Rect,
+    current_scroll: usize,
+    target: usize,
+) -> usize {
+    let total = agent_panel_entries(app).len();
+    let visible = agent_panel_visible_count(app, area);
+    let max_scroll = total.saturating_sub(visible);
+    if target < current_scroll {
+        return target.min(max_scroll);
+    }
+    let mut scroll = current_scroll.min(max_scroll);
+    if visible > 0 && target >= scroll.saturating_add(visible) {
+        scroll = target.saturating_add(1).saturating_sub(visible);
+    }
+    scroll.min(max_scroll)
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
@@ -3220,17 +3260,25 @@ lines = [
         let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
             .attached_terminal_id
             .clone();
-        app.terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .set_hook_authority_with_custom_status(
+        {
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_hook_authority(
                 "test".into(),
                 "codex".into(),
                 AgentState::Working,
                 None,
-                Some("planning".into()),
                 None,
             );
+            // custom_status now reads the "status" metadata token (upstream 5cfe5e5 migration).
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "status".to_string(),
+                    Some("planning".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+        }
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(42, 8);
@@ -3269,14 +3317,7 @@ lines = [
         app.terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_hook_authority_with_custom_status(
-                "test".into(),
-                "codex".into(),
-                AgentState::Idle,
-                None,
-                None,
-                None,
-            );
+            .set_hook_authority("test".into(), "codex".into(), AgentState::Idle, None, None);
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let backend = ratatui::backend::TestBackend::new(42, 8);

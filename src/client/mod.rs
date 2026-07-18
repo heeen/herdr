@@ -2145,13 +2145,7 @@ fn setup_terminal_with_capabilities(
     }
 
     let modify_other_keys_mode = enable_client_protocols
-        .then(|| {
-            crate::input::host_modify_other_keys_mode(
-                std::env::var("TMUX").is_ok(),
-                std::env::var("TERM_PROGRAM").ok().as_deref(),
-                std::env::var_os("WEZTERM_PANE").is_some(),
-            )
-        })
+        .then(crate::input::host_modify_other_keys_mode)
         .flatten();
     if let Some(mode) = modify_other_keys_mode {
         io::stdout().write_all(mode.set_sequence())?;
@@ -2174,7 +2168,17 @@ fn write_terminal_restore_postlude(writer: &mut impl io::Write) -> io::Result<()
     writer.flush()
 }
 
+/// Process-wide mirror of the host mouse-capture state, shared with the stdin reader so it can
+/// drop SGR mouse sequences whenever capture is off (upstream aa0768b, adapted to the mx client).
+fn host_mouse_capture_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static FLAG: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    FLAG.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
 fn set_mouse_capture(enabled: bool) -> io::Result<()> {
+    host_mouse_capture_flag().store(enabled, std::sync::atomic::Ordering::Release);
     if enabled {
         execute!(io::stdout(), EnableMouseCapture)
     } else {
@@ -4917,8 +4921,14 @@ async fn run_client_loop(
     // Spawn the stdin reader thread.
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
+    let stdin_mouse_capture_active = host_mouse_capture_flag();
     std::thread::spawn(move || {
-        input::stdin_reader_loop(stdin_tx, &stdin_quit, host_color_query_sent);
+        input::stdin_reader_loop(
+            stdin_tx,
+            &stdin_quit,
+            host_color_query_sent,
+            stdin_mouse_capture_active,
+        );
     });
 
     if host_color_query_sent {
@@ -5006,6 +5016,8 @@ async fn run_client_loop(
     }
 
     // Main event loop.
+    // This (foreground) client owns the prefix ASCII input-source switch; a no-op on non-macOS.
+    let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
     while !should_quit.load(Ordering::Acquire) {
         // item 5: wake sooner (80ms) when the sidebar is animating, else keep the 100ms
         // housekeeping cadence (idle behavior unchanged). The gate reads the cached model only
@@ -5461,6 +5473,14 @@ async fn run_client_loop(
                 match protocol::decompress_server_message(message) {
                     ServerMessage::Frame(frame_data) => {
                         render_incoming_server_frame(&mut state, &server_id, frame_data);
+                    }
+                    ServerMessage::PrefixInputSource { active } => {
+                        use crate::platform::PrefixInputSource as _;
+                        if active {
+                            prefix_input_source.switch_to_ascii();
+                        } else {
+                            prefix_input_source.restore();
+                        }
                     }
                     ServerMessage::Pong { nonce } => {
                         // issue #13: true round-trip latency over the persistent stream (no per-ping

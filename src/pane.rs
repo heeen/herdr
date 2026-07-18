@@ -40,7 +40,10 @@ use self::agent_detection::{
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
-pub(crate) use self::terminal::{TerminalDirtyPatch, TerminalDirtyPatchOutcome};
+pub(crate) use self::terminal::{
+    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalTextMatch, TerminalTextPoint,
+    TerminalWordMotion,
+};
 pub use self::{
     state::PaneState,
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
@@ -62,21 +65,26 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
-    identity: Option<PaneLaunchIdentity>,
+    identity: PaneLaunchIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PaneLaunchIdentity {
-    workspace_id: String,
-    tab_id: String,
-    pane_id: String,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PaneLaunchIdentity {
+    #[default]
+    Inherit,
+    Managed {
+        workspace_id: String,
+        tab_id: String,
+        pane_id: String,
+    },
+    OmitPane,
 }
 
 impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
-            identity: None,
+            identity: PaneLaunchIdentity::Inherit,
         }
     }
 
@@ -86,11 +94,16 @@ impl PaneLaunchEnv {
         tab_id: String,
         pane_id: String,
     ) -> Self {
-        self.identity = Some(PaneLaunchIdentity {
+        self.identity = PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
             pane_id,
-        });
+        };
+        self
+    }
+
+    pub(crate) fn without_pane_identity(mut self) -> Self {
+        self.identity = PaneLaunchIdentity::OmitPane;
         self
     }
 }
@@ -101,13 +114,20 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
-    if let Some(identity) = &launch_env.identity {
-        cmd.env(
-            crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
-            &identity.workspace_id,
-        );
-        cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, &identity.tab_id);
-        cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, &identity.pane_id);
+    match &launch_env.identity {
+        PaneLaunchIdentity::Inherit => {}
+        PaneLaunchIdentity::Managed {
+            workspace_id,
+            tab_id,
+            pane_id,
+        } => {
+            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+            cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
+            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+        }
+        PaneLaunchIdentity::OmitPane => {
+            cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+        }
     }
 }
 
@@ -121,6 +141,13 @@ struct PendingAgentRelease {
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
+    windows_powershell_prompt_cwd_reporting: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentDetection {
+    Enabled,
+    Disabled,
 }
 
 fn active_pending_release(
@@ -913,7 +940,7 @@ pub struct PaneRuntime {
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
-    detect_handle: tokio::task::AbortHandle,
+    detect_handle: Option<tokio::task::AbortHandle>,
 }
 
 enum PaneRuntimeIo {
@@ -1057,7 +1084,9 @@ impl Drop for PaneRuntime {
     fn drop(&mut self) {
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
-        self.detect_handle.abort();
+        if let Some(handle) = &self.detect_handle {
+            handle.abort();
+        }
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1222,12 +1251,34 @@ impl<'a> PaneShellConfig<'a> {
     }
 }
 
+/// Target platform for shell launch policy. Parameterized (instead of raw
+/// `cfg!` checks at each decision point) so every branch stays testable on
+/// every host platform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShellLaunchTarget {
+    Windows,
+    Macos,
+    OtherUnix,
+}
+
+impl ShellLaunchTarget {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::OtherUnix
+        }
+    }
+}
+
 fn shell_mode_uses_login_shell(
     mode: crate::config::ShellModeConfig,
-    target_is_macos: bool,
+    target: ShellLaunchTarget,
 ) -> bool {
     match mode {
-        crate::config::ShellModeConfig::Auto => target_is_macos,
+        crate::config::ShellModeConfig::Auto => target == ShellLaunchTarget::Macos,
         crate::config::ShellModeConfig::Login => true,
         crate::config::ShellModeConfig::NonLogin => false,
     }
@@ -1279,57 +1330,80 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
         })
 }
 
+/// Sourced via `-NoExit -Command` when launching PowerShell on Windows. It
+/// wraps whatever `prompt` function the user's profile left behind so each
+/// prompt render appends the cwd as OSC 9;9 — the sequence Windows Terminal
+/// and ConEmu standardized for shell integration. PowerShell never updates
+/// its Win32 process cwd on `Set-Location`, so prompt-time reporting is the
+/// only reliable cwd source on Windows.
+///
+/// The snippet must not contain double quotes: powershell.exe parses its
+/// command line with its own rules that disagree with the ArgvQuote escaping
+/// portable-pty applies, and embedded `\"` sequences get corrupted in
+/// transit. Single-quoted strings and `[char]` codes keep the round-trip
+/// byte-exact, and the OSC 9;9 payload is emitted unquoted (the original
+/// ConEmu form, which the cwd tracker accepts).
+///
+/// The original prompt must be invoked before any other statement in the
+/// wrapper: anything that runs first resets `$?`, so a status-aware user
+/// prompt would show success after a failed command (verified on 5.1).
+pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
+
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
-    target_is_macos: bool,
+    target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
-    if shell_mode_uses_login_shell(shell_config.mode, target_is_macos) {
+    if shell_mode_uses_login_shell(shell_config.mode, target) {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
         Ok(cmd)
     } else {
         let mut cmd = CommandBuilder::new(&shell);
-        apply_windows_powershell_cwd_reporting(&mut cmd, &shell);
+        if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
+            cmd.args([
+                "-NoExit",
+                "-Command",
+                WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
+            ]);
+        }
         Ok(cmd)
     }
 }
 
 fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<CommandBuilder> {
-    pane_shell_command_builder_for_target(shell_config, cfg!(target_os = "macos"))
+    pane_shell_command_builder_for_target(shell_config, ShellLaunchTarget::current())
 }
 
-#[cfg(windows)]
-fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
-    if !is_windows_powershell_shell(shell) {
-        return;
-    }
-    cmd.arg("-NoExit");
-    cmd.arg("-Command");
-    cmd.arg(windows_powershell_cwd_prompt_wrapper());
+/// True when panes launch an interactive PowerShell directly on Windows.
+/// Gates the prompt-based cwd reporting pipeline and the agent-exit shell
+/// respawn recovery.
+pub(crate) fn uses_windows_powershell_pane_shell(shell_config: PaneShellConfig<'_>) -> bool {
+    uses_windows_powershell_pane_shell_for_target(shell_config, ShellLaunchTarget::current())
 }
 
-#[cfg(not(windows))]
-fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
-    let _ = (cmd, shell);
+fn uses_windows_powershell_pane_shell_for_target(
+    shell_config: PaneShellConfig<'_>,
+    target: ShellLaunchTarget,
+) -> bool {
+    target == ShellLaunchTarget::Windows
+        && !shell_mode_uses_login_shell(shell_config.mode, target)
+        && is_powershell_shell(&pane_shell(shell_config.default_shell))
 }
 
-#[cfg(windows)]
-fn is_windows_powershell_shell(shell: &str) -> bool {
-    let name = Path::new(shell)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
+fn is_powershell_shell(shell: &str) -> bool {
+    // Split on both separators by hand: `Path::file_name` only treats `\` as
+    // a separator on Windows hosts, and this predicate must evaluate Windows
+    // shell paths correctly from tests on any host.
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or(shell)
         .to_ascii_lowercase();
     matches!(
         name.as_str(),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
     )
-}
-
-#[cfg(windows)]
-fn windows_powershell_cwd_prompt_wrapper() -> &'static str {
-    r#"$global:__HERDR_ORIGINAL_PROMPT = if (Test-Path Function:\prompt) { (Get-Command prompt -CommandType Function).ScriptBlock } else { { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " } }; function global:prompt { try { if ($PWD.Provider.Name -eq 'FileSystem') { $uri = ([System.Uri]$PWD.ProviderPath).AbsoluteUri; [Console]::Write("$([char]27)]7;$uri$([char]7)") } } catch {}; & $global:__HERDR_ORIGINAL_PROMPT }"#
 }
 
 fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -1362,7 +1436,9 @@ fn publish_reported_cwd(
 
 impl PaneRuntime {
     pub fn shutdown(mut self) {
-        self.detect_handle.abort();
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1386,7 +1462,9 @@ impl PaneRuntime {
                 "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
             );
         }
-        self.detect_handle.abort();
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
         self.preserve_processes_on_drop = true;
     }
 
@@ -1432,6 +1510,7 @@ impl PaneRuntime {
             },
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
+            terminal_title: self.terminal_title(),
             initial_history_ansi: None,
         }
     }
@@ -1499,6 +1578,8 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
+        let windows_powershell_prompt_cwd_reporting =
+            uses_windows_powershell_pane_shell(shell_config);
         let mut cmd = pane_shell_command_builder(shell_config)?;
         cmd.cwd(cwd);
         apply_pane_terminal_env(&mut cmd);
@@ -1517,7 +1598,9 @@ impl PaneRuntime {
             SpawnInitialState {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
+                windows_powershell_prompt_cwd_reporting,
             },
+            AgentDetection::Enabled,
         )
     }
 
@@ -1530,15 +1613,14 @@ impl PaneRuntime {
         cwd: std::path::PathBuf,
         command: &str,
         launch_env: &PaneLaunchEnv,
+        agent_detection: AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg(command);
+        let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
         cmd.cwd(cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
@@ -1554,9 +1636,12 @@ impl PaneRuntime {
             cmd,
             "failed to spawn command pane",
             SpawnInitialState::default(),
+            agent_detection,
         )
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_argv_command(
         pane_id: PaneId,
         rows: u16,
@@ -1564,6 +1649,7 @@ impl PaneRuntime {
         cwd: std::path::PathBuf,
         argv: &[String],
         launch_env: &PaneLaunchEnv,
+        agent_detection: AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
@@ -1595,6 +1681,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn argv command pane",
             SpawnInitialState::default(),
+            agent_detection,
         )
     }
 
@@ -1618,6 +1705,7 @@ impl PaneRuntime {
             keyboard_protocol_flags,
             keyboard_protocol_ansi,
             input_state,
+            terminal_title,
             initial_history_ansi,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
@@ -1628,9 +1716,6 @@ impl PaneRuntime {
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        terminal
-            .enable_grapheme_cluster_mode()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
         if crate::kitty_graphics::is_enabled() {
             terminal
                 .enable_kitty_graphics()
@@ -1638,6 +1723,7 @@ impl PaneRuntime {
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+        pane_terminal.seed_terminal_title(terminal_title);
         if let Some(input_state) = input_state {
             pane_terminal.seed_handoff_input_state(input_state);
         }
@@ -1738,10 +1824,12 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
-            detect_handle,
+            detect_handle: Some(detect_handle),
         })
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_command_builder(
         pane_id: PaneId,
         rows: u16,
@@ -1754,14 +1842,12 @@ impl PaneRuntime {
         cmd: CommandBuilder,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
+        agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        terminal
-            .enable_grapheme_cluster_mode()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         if crate::kitty_graphics::is_enabled() {
             terminal
@@ -1770,6 +1856,9 @@ impl PaneRuntime {
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+        pane_terminal.set_windows_powershell_prompt_cwd_reporting(
+            initial_state.windows_powershell_prompt_cwd_reporting,
+        );
         if let Some(ansi) = initial_state.history_ansi {
             pane_terminal.seed_history_ansi(ansi);
         }
@@ -1825,7 +1914,9 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                observe_detection_content_change(bytes, &detection_content_seq);
+                if agent_detection == AgentDetection::Enabled {
+                    observe_detection_content_change(bytes, &detection_content_seq);
+                }
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
                 }
@@ -1868,7 +1959,9 @@ impl PaneRuntime {
         };
 
         // --- Detection task ---
-        let (detect_handle, detect_reset_notify, pending_release) = {
+        let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
+            == AgentDetection::Enabled
+        {
             use crate::detect;
             use std::time::{Duration, Instant};
 
@@ -2226,7 +2319,13 @@ impl PaneRuntime {
                     }
                 }
             });
-            (handle.abort_handle(), detect_reset_notify, pending_release)
+            (
+                Some(handle.abort_handle()),
+                detect_reset_notify,
+                pending_release,
+            )
+        } else {
+            (None, Arc::new(Notify::new()), Arc::new(Mutex::new(None)))
         };
 
         Ok(Self {
@@ -2264,6 +2363,11 @@ impl PaneRuntime {
     #[cfg(test)]
     pub(crate) fn agent_detection_reset_notify_for_test(&self) -> Arc<Notify> {
         self.detect_reset_notify.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
+        self.detect_handle.is_some()
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
@@ -2333,6 +2437,34 @@ impl PaneRuntime {
         self.terminal.scroll_metrics()
     }
 
+    pub(crate) fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch> {
+        self.terminal.search_text_matches(query, case_sensitive)
+    }
+
+    pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
+        self.terminal.text_match_is_current(text_match)
+    }
+
+    pub(crate) fn text_matches_are_current(
+        &self,
+        text_matches: &[crate::pane::TerminalTextMatch],
+    ) -> Vec<bool> {
+        self.terminal.text_matches_are_current(text_matches)
+    }
+
+    pub(crate) fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.terminal.word_motion_target(row, col, motion)
+    }
+
     pub fn input_state(&self) -> Option<InputState> {
         self.terminal.input_state()
     }
@@ -2367,6 +2499,10 @@ impl PaneRuntime {
 
     pub fn detection_text(&self) -> String {
         self.terminal.detection_text()
+    }
+
+    pub fn terminal_title(&self) -> Option<String> {
+        self.terminal.terminal_title()
     }
 
     pub fn agent_osc_title(&self) -> String {
@@ -2450,6 +2586,14 @@ impl PaneRuntime {
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.send_bytes(self.paste_payload(text)).await
+    }
+
+    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_bytes(self.paste_payload(text))
+    }
+
+    fn paste_payload(&self, text: String) -> Bytes {
         let bracketed = self
             .input_state()
             .map(|state| state.bracketed_paste)
@@ -2459,7 +2603,7 @@ impl PaneRuntime {
         } else {
             text
         };
-        self.send_bytes(Bytes::from(payload)).await
+        Bytes::from(payload)
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
@@ -2553,6 +2697,7 @@ impl PaneRuntime {
         {
             return Some(cwd);
         }
+
         let pid = self.child_pid.load(Ordering::Relaxed);
         crate::platform::process_cwd(pid)
     }
@@ -2560,6 +2705,22 @@ impl PaneRuntime {
     pub fn child_pid(&self) -> Option<u32> {
         let pid = self.child_pid.load(Ordering::Acquire);
         (pid > 0).then_some(pid)
+    }
+
+    pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
+        #[cfg(unix)]
+        {
+            let leader_cwd = self
+                .io
+                .foreground_process_group_id()
+                .and_then(usable_process_cwd);
+            leader_cwd.or_else(|| self.cwd())
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.cwd()
+        }
     }
 
     /// Get the current working directory of the process group controlling the pane PTY.
@@ -2654,7 +2815,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
-                detect_handle: tokio::spawn(async {}).abort_handle(),
+                detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
         )
@@ -2664,6 +2825,16 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follow_cwd_falls_back_to_reported_pane_cwd_without_foreground_group() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let cwd = std::env::temp_dir();
+        *runtime.reported_cwd.lock().unwrap() = Some(cwd.clone());
+
+        assert_eq!(runtime.follow_cwd(), Some(cwd));
+    }
 
     #[test]
     fn shutdown_liveness_treats_reaped_direct_child_as_gone() {
@@ -2762,19 +2933,23 @@ mod tests {
     fn shell_mode_auto_uses_login_shell_only_on_macos() {
         assert!(shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Auto,
-            true
+            ShellLaunchTarget::Macos
         ));
         assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Auto,
-            false
+            ShellLaunchTarget::OtherUnix
+        ));
+        assert!(!shell_mode_uses_login_shell(
+            crate::config::ShellModeConfig::Auto,
+            ShellLaunchTarget::Windows
         ));
         assert!(shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Login,
-            false
+            ShellLaunchTarget::OtherUnix
         ));
         assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::NonLogin,
-            true
+            ShellLaunchTarget::Macos
         ));
     }
 
@@ -2783,7 +2958,7 @@ mod tests {
     fn login_shell_builder_uses_default_prog_with_resolved_shell_env() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Login),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
         assert!(cmd.is_default_prog());
@@ -2798,7 +2973,7 @@ mod tests {
     fn auto_shell_builder_uses_login_shell_on_macos_target() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Auto),
-            true,
+            ShellLaunchTarget::Macos,
         )
         .unwrap();
         assert!(cmd.is_default_prog());
@@ -2812,32 +2987,112 @@ mod tests {
     fn auto_shell_builder_keeps_direct_shell_on_non_macos_target() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Auto),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
         assert!(!cmd.is_default_prog());
         assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("/bin/sh")]);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_powershell_shell_builder_wraps_cwd_reporting_prompt() {
+    fn windows_powershell_builder_injects_prompt_cwd_shell_integration() {
+        for shell in [
+            "powershell.exe",
+            "pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::NonLogin),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cmd.get_argv(),
+                &[
+                    std::ffi::OsString::from(shell),
+                    std::ffi::OsString::from("-NoExit"),
+                    std::ffi::OsString::from("-Command"),
+                    std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+                ]
+            );
+        }
+
+        let script = WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND;
+        assert!(script.contains("]9;9;"), "missing OSC 9;9 emit: {script}");
+        assert!(
+            script.contains("$global:__HerdrOriginalPrompt = $function:prompt"),
+            "must wrap the profile-defined prompt: {script}"
+        );
+        assert!(
+            script.contains("$null -eq $global:__HerdrOriginalPrompt"),
+            "wrap must be idempotent for nested sessions: {script}"
+        );
+        assert!(
+            script.contains("'FileSystem'"),
+            "must not report non-filesystem provider paths: {script}"
+        );
+        assert!(
+            !script.contains('"'),
+            "double quotes corrupt the powershell.exe command-line round-trip: {script}"
+        );
+        let invoke_original = script
+            .find("@(& $global:__HerdrOriginalPrompt)")
+            .expect("wrapper must invoke the original prompt");
+        let cwd_lookup = script
+            .find("$loc =")
+            .expect("wrapper must look up the current location");
+        assert!(
+            invoke_original < cwd_lookup,
+            "original prompt must run first or $? is reset before a status-aware prompt reads it: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_non_powershell_builder_launches_plain_shell() {
         let cmd = pane_shell_command_builder_for_target(
-            PaneShellConfig::new("powershell.exe", crate::config::ShellModeConfig::NonLogin),
-            false,
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows,
         )
         .unwrap();
-        let argv: Vec<_> = cmd
-            .get_argv()
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
 
-        assert_eq!(argv[0], "powershell.exe");
-        assert!(argv.iter().any(|arg| arg == "-NoExit"));
-        assert!(argv
-            .iter()
-            .any(|arg| arg.contains("]7;") && arg.contains("Function:\\prompt")));
+        assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("cmd.exe")]);
+    }
+
+    #[test]
+    fn unix_powershell_builder_launches_plain_shell() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("pwsh", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::OtherUnix,
+        )
+        .unwrap();
+
+        assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("pwsh")]);
+    }
+
+    #[test]
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
+        let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
+        assert!(uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::OtherUnix
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::Macos
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows
+        ));
     }
 
     #[test]
@@ -2847,7 +3102,7 @@ mod tests {
                 "/__herdr_missing_shell__",
                 crate::config::ShellModeConfig::Login,
             ),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -2879,7 +3134,7 @@ mod tests {
 
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
 
@@ -2955,16 +3210,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_runtime_state_captures_terminal_input_state() {
+    async fn handoff_runtime_state_captures_terminal_input_and_title_state() {
         let runtime = PaneRuntime::test_with_screen_bytes(
             80,
             24,
             b"\x1b[>5u\x1b[>4;2m\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1002h\x1b[?1006h",
         );
 
+        runtime.test_process_pty_bytes("\x1b]2;✳ 修复🙂标题\x1b\\".as_bytes());
+        runtime.terminal.clear_agent_osc_state();
+        assert_eq!(runtime.agent_osc_title(), "");
         let pane = runtime.handoff_runtime_state(12);
 
         assert_eq!(pane.keyboard_protocol_flags, 5);
+        assert_eq!(pane.terminal_title.as_deref(), Some("✳ 修复🙂标题"));
         assert_eq!(
             pane.input_state,
             Some(InputState {
@@ -3028,7 +3287,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            detect_handle: tokio::spawn(async {}).abort_handle(),
+            detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
         assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
@@ -3059,7 +3318,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            detect_handle: tokio::spawn(async {}).abort_handle(),
+            detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
         assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));

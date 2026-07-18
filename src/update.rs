@@ -304,7 +304,7 @@ fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned,
 {
-    let output = Command::new("curl")
+    let output = crate::noninteractive_process::curl_command()
         .args([
             "-sfL",
             "--retry",
@@ -518,7 +518,7 @@ fn homebrew_update_from_formula_json(
 fn check_homebrew_latest() -> Result<Option<Version>, String> {
     let current = Version::current();
 
-    let output = Command::new("curl")
+    let output = crate::noninteractive_process::curl_command()
         .args([
             "-sfL",
             "--retry",
@@ -581,7 +581,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
 
     // Download the exact asset URL (pinned to the release we checked)
-    let status = Command::new("curl")
+    let status = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&tmp_path)
         .arg(&release.download_url)
@@ -2771,7 +2771,10 @@ mod tests {
             server: crate::api::RuntimeStatus {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
-                capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    detached_server_daemon: true,
+                }),
             },
         };
 

@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid,
+    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -763,7 +763,7 @@ fn client_handshake(
 
 fn connect_raw_client(client_socket: &Path, cols: u16, rows: u16) -> UnixStream {
     let mut stream = UnixStream::connect(client_socket).expect("should connect to client socket");
-    client_handshake(&mut stream, 14, cols, rows).expect("handshake should succeed");
+    client_handshake(&mut stream, CURRENT_PROTOCOL, cols, rows).expect("handshake should succeed");
     stream
 }
 
@@ -1003,13 +1003,26 @@ fn multi_client_effective_size_shrinks_when_smaller_client_joins() {
 
     let mut small = connect_raw_client(&client_socket, 80, 24);
     assert!(wait_for_frame(&mut small, Duration::from_secs(2)));
-    let with_small_size = read_pane_tty_size(&api_socket, &pane_id, Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last_seen_size = None;
+    let mut size_with_small_client = None;
+    while Instant::now() < deadline {
+        if let Some(size) =
+            try_read_pane_tty_size(&api_socket, &pane_id, Duration::from_millis(400))
+        {
+            last_seen_size = Some(size);
+            if size.0 < large_only_size.0 && size.1 < large_only_size.1 {
+                size_with_small_client = Some(size);
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
 
     assert!(
-        with_small_size.0 < large_only_size.0 && with_small_size.1 < large_only_size.1,
-        "effective pane size should shrink when smaller client joins: before={:?}, after={:?}",
-        large_only_size,
-        with_small_size
+        size_with_small_client.is_some(),
+        "effective pane size should shrink when smaller client joins: before={large_only_size:?}, last_seen={last_seen_size:?}"
     );
 
     cleanup_spawned_herdr(server, base);
@@ -1098,9 +1111,16 @@ fn multi_client_disconnect_recalculates_to_next_smallest() {
 
     let size_with_three = read_pane_tty_size(&api_socket, &pane_id, Duration::from_secs(5));
 
+    drain_server_messages(&mut c100, Duration::from_millis(250));
+
     // Smallest client disconnects; effective size should increase to the next-smallest.
     send_client_detach(&mut c80);
     drop(c80);
+
+    assert!(
+        wait_for_frame(&mut c100, Duration::from_secs(2)),
+        "next-smallest client should receive resized-up frame"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut size_after_smallest_disconnect = None;

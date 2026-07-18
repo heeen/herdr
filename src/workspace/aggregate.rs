@@ -14,15 +14,21 @@ pub struct PaneDetail {
     pub tab_label: String,
     pub pane_label: Option<String>,
     pub label: String,
+    // Terminal titles feed the API surface (AgentInfo); the mx segments sidebar does not render
+    // them, so nothing reads these here yet (upstream-merge follow-up: title tokens).
+    #[allow(dead_code)]
+    pub terminal_title: Option<String>,
+    #[allow(dead_code)]
+    pub terminal_title_stripped: Option<String>,
     pub agent_label: String,
     #[allow(dead_code)]
     pub agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
-    pub custom_status: Option<String>,
     pub state_labels: HashMap<String, String>,
     pub working_duration: Option<WorkingDuration>,
+    pub tokens: HashMap<String, String>,
 }
 
 impl Tab {
@@ -62,14 +68,16 @@ impl Tab {
                     tab_label: tab_label.to_string(),
                     pane_label: terminal.manual_label.clone(),
                     label: agent_label.clone(),
+                    terminal_title: terminal.terminal_title.clone(),
+                    terminal_title_stripped: terminal.terminal_title_stripped(),
                     agent_label,
                     agent: terminal.effective_known_agent(),
                     state: terminal.state,
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
-                    custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     working_duration: terminal.working_duration_at(now),
+                    tokens: terminal.metadata_tokens.values(),
                 })
             })
             .collect()

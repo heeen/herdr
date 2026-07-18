@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
-    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
+    AgentPromptParams, AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams,
+    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -16,6 +16,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send" => agent_send(&args[1..]),
+        "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
@@ -269,82 +270,41 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
-
-    let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>");
-        return Ok(2);
-    };
-    if separator == args.len() - 1 {
-        eprintln!("agent start requires argv after --");
-        return Ok(2);
-    }
-
-    let mut cwd = None;
-    let mut workspace_id = None;
-    let mut tab_id = None;
-    let mut split = None;
-    let mut focus = false;
-    let mut env = HashMap::new();
-
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut kind = None;
+    let mut pane_id = None;
+    let mut timeout_ms = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
-            "--cwd" => {
+            "--kind" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --cwd");
+                    eprintln!("missing value for --kind");
                     return Ok(2);
                 };
-                cwd = Some(value.clone());
+                kind = Some(value.clone());
                 index += 2;
             }
-            "--workspace" => {
+            "--pane" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --workspace");
+                    eprintln!("missing value for --pane");
                     return Ok(2);
                 };
-                workspace_id = Some(super::normalize_workspace_id(value));
+                pane_id = Some(super::normalize_pane_id(value));
                 index += 2;
             }
-            "--tab" => {
+            "--timeout" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --tab");
+                    eprintln!("missing value for --timeout");
                     return Ok(2);
                 };
-                tab_id = Some(super::normalize_tab_id(value));
-                index += 2;
-            }
-            "--split" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --split");
-                    return Ok(2);
-                };
-                split = Some(super::parse_split_direction(value)?);
-                index += 2;
-            }
-            "--focus" => {
-                focus = true;
-                index += 1;
-            }
-            "--no-focus" => {
-                focus = false;
-                index += 1;
-            }
-            "--env" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --env");
-                    return Ok(2);
-                };
-                let (key, value) = match super::parse_env_assignment(value) {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                };
-                env.insert(key, value);
+                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
                 index += 2;
             }
             other => {
@@ -353,20 +313,63 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-
-    super::print_response(&super::send_request(&Request {
+    let Some(kind) = kind else {
+        eprintln!("missing required --kind");
+        return Ok(2);
+    };
+    let Some(pane_id) = pane_id else {
+        eprintln!("missing required --pane");
+        return Ok(2);
+    };
+    let Some(expected_kind) = crate::detect::parse_agent_label(&kind) else {
+        eprintln!("unsupported interactive agent kind: {kind}");
+        return Ok(2);
+    };
+    let expected_kind = crate::detect::agent_label(expected_kind).to_string();
+    let mut response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
             name: name.clone(),
-            cwd,
-            workspace_id,
-            tab_id,
-            split,
-            focus,
-            argv: args[separator + 1..].to_vec(),
-            env,
+            kind,
+            pane_id: pane_id.clone(),
+            args: if separator < args.len() {
+                args[separator + 1..].to_vec()
+            } else {
+                Vec::new()
+            },
+            timeout_ms,
         }),
-    })?)
+    })?;
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let Some(terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
+        return super::print_response(&cli_agent_error(
+            "cli:agent:start",
+            "agent_start_failed",
+            "agent start response did not include terminal_id",
+        ));
+    };
+    let terminal_id = terminal_id.to_string();
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    let waited = wait_for_named_agent(
+        &terminal_id,
+        name,
+        Some(timeout),
+        AgentWaitMode::Start {
+            expected_kind: &expected_kind,
+        },
+    );
+    match waited {
+        Ok(Ok(agent)) => {
+            response["result"]["agent"] = agent;
+            super::print_response(&response)
+        }
+        Ok(Err(error)) => super::print_response(&error),
+        Err(err) => {
+            print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
+        }
+    }
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -439,24 +442,13 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+        eprintln!("usage: herdr agent wait <name> [--timeout MS]");
         return Ok(2);
     };
-
     let mut timeout_ms = None;
-    let mut desired_status = None;
-
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
-            "--status" => {
-                let Some(value) = args.get(index + 1) else {
-                    eprintln!("missing value for --status");
-                    return Ok(2);
-                };
-                desired_status = Some(parse_agent_wait_status(value)?);
-                index += 2;
-            }
             "--timeout" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --timeout");
@@ -466,7 +458,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                 index += 2;
             }
             "help" | "--help" | "-h" => {
-                eprintln!("usage: herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+                eprintln!("usage: herdr agent wait <name> [--timeout MS]");
                 return Ok(0);
             }
             other => {
@@ -475,67 +467,234 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-
-    let Some(agent_status) = desired_status else {
-        eprintln!("missing required --status");
-        return Ok(2);
-    };
-
-    let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
-    if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+    let initial = resolve_agent_target(target, "cli:agent:wait:resolve")?;
+    if initial.get("error").is_some() {
+        return super::print_response(&initial);
     }
-    if response["result"]["agent"]["agent_status"]
-        .as_str()
-        .is_some_and(|current| agent_wait_status_satisfied(agent_status, current))
-    {
-        println!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(0);
+    let agent = &initial["result"]["agent"];
+    if agent["name"].as_str() != Some(target) {
+        return super::print_response(&cli_agent_error(
+            "cli:agent:wait",
+            "agent_name_not_found",
+            format!("named agent {target} not found"),
+        ));
     }
-
-    let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
-        eprintln!("agent wait failed: response did not include pane_id");
-        return Ok(1);
+    match agent["agent_status"].as_str().unwrap_or("unknown") {
+        "idle" | "done" | "blocked" => return super::print_response(&initial),
+        "unknown" => {
+            return super::print_response(&cli_agent_error(
+                "cli:agent:wait",
+                "agent_not_running",
+                "agent is no longer running",
+            ))
+        }
+        _ => {}
+    }
+    let Some(terminal_id) = agent["terminal_id"].as_str() else {
+        return super::print_response(&cli_agent_error(
+            "cli:agent:wait",
+            "agent_wait_failed",
+            "agent response did not include terminal_id",
+        ));
     };
-
-    let subscriptions = if agent_status == AgentStatus::Idle {
-        vec![
-            Subscription::PaneAgentStatusChanged {
-                pane_id: Some(pane_id.to_owned()),
-                agent_status: Some(AgentStatus::Idle),
-            },
-            Subscription::PaneAgentStatusChanged {
-                pane_id: Some(pane_id.to_owned()),
-                agent_status: Some(AgentStatus::Done),
-            },
-        ]
-    } else {
-        vec![Subscription::PaneAgentStatusChanged {
-            pane_id: Some(pane_id.to_owned()),
-            agent_status: Some(agent_status),
-        }]
+    let timeout = timeout_ms.map(Duration::from_millis);
+    let waited = match wait_for_named_agent(terminal_id, target, timeout, AgentWaitMode::Current) {
+        Ok(waited) => waited,
+        Err(err) => {
+            return print_agent_transport_error(
+                err,
+                "cli:agent:wait",
+                "agent_wait_transport_failed",
+            )
+        }
     };
+    match waited {
+        Ok(agent) => super::print_response(&serde_json::json!({
+            "id": "cli:agent:wait",
+            "result": { "type": "agent_info", "agent": agent }
+        })),
+        Err(error) => super::print_response(&error),
+    }
+}
 
-    super::wait_for_agent_change(
-        Request {
-            id: "cli:agent:wait".into(),
-            method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
-                subscriptions,
-            }),
-        },
-        timeout_ms,
-        "timed out waiting for agent status change",
+#[derive(Clone, Copy)]
+enum AgentWaitMode<'a> {
+    Start { expected_kind: &'a str },
+    Current,
+    AfterPrompt { baseline_state_change_seq: u64 },
+}
+
+fn wait_for_named_agent(
+    lookup_target: &str,
+    expected_name: &str,
+    timeout: Option<Duration>,
+    mode: AgentWaitMode<'_>,
+) -> std::io::Result<Result<serde_json::Value, serde_json::Value>> {
+    let started_at = Instant::now();
+    let deadline = timeout.and_then(|timeout| started_at.checked_add(timeout));
+    let mut first_poll = true;
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if matches!(mode, AgentWaitMode::Start { .. }) {
+                // Let the server reconcile its matching startup deadline before
+                // returning so the pending name is immediately reusable.
+                let _ = resolve_agent_target_unchecked(lookup_target, "cli:agent:start:timeout");
+            }
+            return Ok(Err(agent_wait_timeout(mode)));
+        }
+        let poll_id = match mode {
+            AgentWaitMode::Start { .. } => "cli:agent:start",
+            AgentWaitMode::Current => "cli:agent:wait",
+            AgentWaitMode::AfterPrompt { .. } => "cli:agent:prompt",
+        };
+        let response = if first_poll {
+            first_poll = false;
+            resolve_agent_target(lookup_target, poll_id)?
+        } else {
+            resolve_agent_target_unchecked(lookup_target, poll_id)?
+        };
+        if response.get("error").is_some() {
+            if matches!(mode, AgentWaitMode::Start { .. }) {
+                return Ok(Err(cli_agent_error(
+                    "cli:agent:start",
+                    "agent_start_failed",
+                    "agent target disappeared before becoming interactive",
+                )));
+            }
+            return Ok(Err(response));
+        }
+        let agent = &response["result"]["agent"];
+        let status = agent["agent_status"].as_str().unwrap_or("unknown");
+        let completed = matches!(status, "idle" | "done" | "blocked");
+        if !matches!(mode, AgentWaitMode::Start { .. })
+            && agent["name"].as_str() != Some(expected_name)
+        {
+            return Ok(Err(agent_name_lost_error(poll_id, expected_name)));
+        }
+        let outcome = match mode {
+            AgentWaitMode::Start { expected_kind } => {
+                if let Some(actual) = agent["agent"].as_str() {
+                    if actual != expected_kind {
+                        Some(Err(cli_agent_error(
+                            "cli:agent:start",
+                            "agent_kind_mismatch",
+                            format!("expected {expected_kind}, detected {actual}"),
+                        )))
+                    } else if agent["name"].as_str() != Some(expected_name) {
+                        Some(Err(agent_name_lost_error("cli:agent:start", expected_name)))
+                    } else if completed && agent["interactive_ready"].as_bool().unwrap_or(false) {
+                        Some(Ok(agent.clone()))
+                    } else if !agent["launch_pending"].as_bool().unwrap_or(false) {
+                        Some(Err(cli_agent_error(
+                            "cli:agent:start",
+                            "agent_start_failed",
+                            "agent process exited before becoming interactive",
+                        )))
+                    } else {
+                        None
+                    }
+                } else if !agent["launch_pending"].as_bool().unwrap_or(false) {
+                    Some(Err(cli_agent_error(
+                        "cli:agent:start",
+                        "agent_start_failed",
+                        "agent process exited before becoming interactive",
+                    )))
+                } else {
+                    None
+                }
+            }
+            AgentWaitMode::Current => {
+                if completed {
+                    Some(Ok(agent.clone()))
+                } else if status == "unknown" {
+                    Some(Err(cli_agent_error(
+                        "cli:agent:wait",
+                        "agent_not_running",
+                        "agent is no longer running",
+                    )))
+                } else {
+                    None
+                }
+            }
+            AgentWaitMode::AfterPrompt {
+                baseline_state_change_seq,
+            } => {
+                let sequence = agent["state_change_seq"].as_u64().unwrap_or(0);
+                if sequence > baseline_state_change_seq && completed {
+                    Some(Ok(agent.clone()))
+                } else if status == "unknown" {
+                    Some(Err(cli_agent_error(
+                        "cli:agent:prompt",
+                        "agent_not_running",
+                        "agent exited while waiting for the prompt",
+                    )))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(outcome) = outcome {
+            return Ok(outcome);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn agent_name_lost_error(request_id: &str, expected_name: &str) -> serde_json::Value {
+    cli_agent_error(
+        request_id,
+        "agent_name_not_found",
+        format!("named agent {expected_name} no longer owns the target terminal"),
     )
 }
 
+fn print_agent_transport_error(
+    err: std::io::Error,
+    request_id: &str,
+    code: &str,
+) -> std::io::Result<i32> {
+    if super::protocol_mismatch_was_reported(&err) {
+        return Ok(1);
+    }
+    super::print_response(&cli_agent_error(request_id, code, err.to_string()))
+}
+
+fn agent_wait_timeout(mode: AgentWaitMode<'_>) -> serde_json::Value {
+    let (id, message) = match mode {
+        AgentWaitMode::Start { .. } => ("cli:agent:start", "timed out waiting for agent startup"),
+        AgentWaitMode::Current => ("cli:agent:wait", "timed out waiting for agent completion"),
+        AgentWaitMode::AfterPrompt { .. } => {
+            ("cli:agent:prompt", "timed out waiting for prompted work")
+        }
+    };
+    cli_agent_error(id, "timeout", message)
+}
+
+fn cli_agent_error(id: &str, code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "error": { "code": code, "message": message.into() }
+    })
+}
+
 fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde_json::Value> {
-    super::send_request(&Request {
+    super::send_request(&agent_get_request(target, request_id))
+}
+
+fn resolve_agent_target_unchecked(
+    target: &str,
+    request_id: &str,
+) -> std::io::Result<serde_json::Value> {
+    super::send_request_unchecked(&agent_get_request(target, request_id))
+}
+
+fn agent_get_request(target: &str, request_id: &str) -> Request {
+    Request {
         id: request_id.into(),
         method: Method::AgentGet(AgentTarget {
             target: target.to_owned(),
         }),
-    })
+    }
 }
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
@@ -560,6 +719,84 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
             name,
         }),
     })?)
+}
+
+fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!("usage: herdr agent prompt <name> <text> [--wait] [--timeout MS]");
+        return Ok(2);
+    };
+    let Some(text) = args.get(1) else {
+        eprintln!("agent prompt requires text");
+        return Ok(2);
+    };
+    let mut wait = false;
+    let mut timeout_ms = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wait" => {
+                wait = true;
+                index += 1;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
+                index += 2;
+            }
+            option => {
+                eprintln!("unknown option: {option}");
+                return Ok(2);
+            }
+        }
+    }
+    let mut response = super::send_request(&Request {
+        id: "cli:agent:prompt".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: target.clone(),
+            text: text.clone(),
+        }),
+    })?;
+    if response.get("error").is_some() || !wait {
+        return super::print_response(&response);
+    }
+    let baseline_state_change_seq = response["result"]["baseline_state_change_seq"]
+        .as_u64()
+        .unwrap_or(0);
+    let Some(terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
+        return super::print_response(&cli_agent_error(
+            "cli:agent:prompt",
+            "agent_prompt_failed",
+            "agent prompt response did not include terminal_id",
+        ));
+    };
+    let waited = match wait_for_named_agent(
+        terminal_id,
+        target,
+        timeout_ms.map(Duration::from_millis),
+        AgentWaitMode::AfterPrompt {
+            baseline_state_change_seq,
+        },
+    ) {
+        Ok(waited) => waited,
+        Err(err) => {
+            return print_agent_transport_error(
+                err,
+                "cli:agent:prompt",
+                "agent_prompt_transport_failed",
+            )
+        }
+    };
+    match waited {
+        Ok(agent) => {
+            response["result"]["agent"] = agent;
+            super::print_response(&response)
+        }
+        Err(error) => super::print_response(&error),
+    }
 }
 
 fn agent_send(args: &[String]) -> std::io::Result<i32> {
@@ -640,42 +877,20 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_wait_status_satisfied(desired: AgentStatus, current: &str) -> bool {
-    match desired {
-        AgentStatus::Idle => matches!(current, "idle" | "done"),
-        AgentStatus::Working => current == "working",
-        AgentStatus::Blocked => current == "blocked",
-        AgentStatus::Unknown => current == "unknown",
-        AgentStatus::Done => false,
-    }
-}
-
-fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
-    match value {
-        "idle" => Ok(AgentStatus::Idle),
-        "working" => Ok(AgentStatus::Working),
-        "blocked" => Ok(AgentStatus::Blocked),
-        "unknown" => Ok(AgentStatus::Unknown),
-        "done" => Err(std::io::Error::other(
-            "done is a UI attention state; use idle for CLI agent completion waits",
-        )),
-        _ => Err(std::io::Error::other(format!(
-            "invalid agent status: {value} (expected idle, working, blocked, or unknown)"
-        ))),
-    }
-}
-
 fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send <target> <text>");
+    eprintln!("  herdr agent prompt <name> <text> [--wait] [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
-    eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+    eprintln!("  herdr agent wait <name> [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
-    eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>");
+    eprintln!(
+        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+    );
     eprintln!("  herdr agent explain <target> [--json]");
     eprintln!("  herdr agent explain --file PATH --agent LABEL [--json]");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");

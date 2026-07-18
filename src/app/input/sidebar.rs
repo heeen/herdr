@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
 
-use crate::app::state::{AppState, Mode, ViewLayout};
+use crate::app::state::{AppState, ViewLayout};
 
 use super::ScrollbarClickTarget;
 
@@ -331,24 +331,6 @@ impl AppState {
         (idx < self.workspaces.len()).then_some(idx)
     }
 
-    fn collapsed_detail_workspace_idx(&self) -> Option<usize> {
-        if matches!(
-            self.mode,
-            Mode::Navigate
-                | Mode::RenameWorkspace
-                | Mode::Resize
-                | Mode::ConfirmClose
-                | Mode::ContextMenu
-                | Mode::Settings
-                | Mode::GlobalMenu
-                | Mode::KeybindHelp
-        ) {
-            Some(self.selected)
-        } else {
-            self.active
-        }
-    }
-
     pub(super) fn collapsed_agent_detail_target_at(
         &self,
         row: u16,
@@ -371,12 +353,10 @@ impl AppState {
             return None;
         }
 
-        let ws_idx = self.collapsed_detail_workspace_idx()?;
-        let ws = self.workspaces.get(ws_idx)?;
         let detail_idx = (row - detail_content_area.y) as usize;
-        let details = ws.pane_details(&self.terminals);
+        let details = crate::ui::agent_panel_entries(self);
         let detail = details.get(detail_idx)?;
-        Some((ws_idx, detail.tab_idx, detail.pane_id))
+        Some((detail.ws_idx, detail.tab_idx, detail.pane_id))
     }
 
     pub(super) fn workspace_drop_index_at_row(&self, row: u16) -> Option<usize> {
@@ -599,7 +579,8 @@ mod tests {
         app::state::{
             AgentPanelScope, AgentPanelSort, AppState, DragTarget, Mode, SidebarAgentItem,
         },
-        detect::Agent,
+        config::SidebarCollapsedModeConfig,
+        detect::{Agent, AgentState},
         workspace::Workspace,
     };
 
@@ -617,6 +598,106 @@ mod tests {
         app.view.workspace_card_areas = cards;
         app.view.divider_rows = divider_rows;
         app
+    }
+
+    #[test]
+    fn dragging_workspace_reorders_without_changing_identity() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![
+            Workspace::test_new("a"),
+            Workspace::test_new("b"),
+            Workspace::test_new("c"),
+        ];
+        let active_id = app.state.workspaces[1].id.clone();
+        let selected_id = app.state.workspaces[2].id.clone();
+        app.state.active = Some(1);
+        app.state.selected = 2;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let source_row = app.state.view.workspace_card_areas[1].rect.y;
+        let target_row = crate::ui::workspace_drop_indicator_row(
+            &app.state.view.workspace_card_areas,
+            app.state.workspace_list_rect(),
+            0,
+        )
+        .unwrap();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            source_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            2,
+            target_row,
+        ));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::WorkspaceReorder {
+                source_ws_idx: 1,
+                insert_idx: Some(0),
+            })
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, target_row));
+
+        let names: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.display_name())
+            .collect();
+        assert_eq!(names, vec!["b", "a", "c"]);
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.selected, 2);
+        assert_eq!(app.state.workspaces[0].id, active_id);
+        assert_eq!(app.state.workspaces[2].id, selected_id);
+        let snapshot = capture_snapshot(&app.state);
+        let captured_names: Vec<_> = snapshot
+            .workspaces
+            .iter()
+            .map(|ws| ws.custom_name.clone().unwrap())
+            .collect();
+        assert_eq!(captured_names, vec!["b", "a", "c"]);
+    }
+    #[test]
+    fn top_drop_slot_is_distinct_from_gap_below_first_workspace() {
+        let mut app = app_for_mouse_test();
+        let first_repo = temp_git_repo("main");
+        let second_repo = temp_git_repo("main");
+
+        let mut first = Workspace::test_new("a");
+        let first_root = first.tabs[0].root_pane;
+        first.identity_cwd = first_repo.clone();
+        first.refresh_git_ahead_behind();
+
+        let mut second = Workspace::test_new("b");
+        let second_root = second.tabs[0].root_pane;
+        second.identity_cwd = second_repo.clone();
+        second.refresh_git_ahead_behind();
+
+        app.state.workspaces = vec![first, second];
+        app.state.ensure_test_terminals();
+        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_root]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&first_terminal_id).unwrap().cwd = first_repo.clone();
+        let second_terminal_id = app.state.workspaces[1].tabs[0].panes[&second_root]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&second_terminal_id)
+            .unwrap()
+            .cwd = second_repo.clone();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        assert_eq!(app.state.workspace_drop_index_at_row(0), Some(0));
+        assert_eq!(app.state.workspace_drop_index_at_row(1), Some(0));
+        assert_eq!(app.state.workspace_drop_index_at_row(2), Some(0));
+        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(1));
+
+        let _ = fs::remove_dir_all(first_repo);
+        let _ = fs::remove_dir_all(second_repo);
     }
 
     #[test]
@@ -1202,6 +1283,51 @@ mod tests {
     }
 
     #[test]
+    fn clicking_collapsed_priority_agent_row_switches_to_matching_workspace() {
+        let mut app = app_for_mouse_test();
+        let first = Workspace::test_new("one");
+        let first_pane = first.tabs[0].root_pane;
+        let second = Workspace::test_new("two");
+        let second_pane = second.tabs[0].root_pane;
+
+        app.state.workspaces = vec![first, second];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.sidebar_collapsed = true;
+        app.state.agent_panel_sort = AgentPanelSort::Priority;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
+        app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+
+        let set_state = |app: &mut crate::app::App, ws_idx: usize, pane_id, state| {
+            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = state;
+        };
+        set_state(&mut app, 0, first_pane, AgentState::Working);
+        set_state(&mut app, 1, second_pane, AgentState::Blocked);
+
+        let (_, _, detail_area) =
+            crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            detail_area.x,
+            detail_area.y,
+        ));
+
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(
+            app.state.workspaces[1].tabs[0].layout.focused(),
+            second_pane
+        );
+    }
+
+    #[test]
     fn clicking_collapsed_sidebar_toggle_expands_sidebar() {
         let mut app = app_for_mouse_test();
         app.state.sidebar_collapsed = true;
@@ -1216,6 +1342,19 @@ mod tests {
         ));
 
         assert!(!app.state.sidebar_collapsed);
+    }
+
+    #[test]
+    fn hidden_collapsed_sidebar_has_no_mouse_expand_hotspot() {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_collapsed = true;
+        app.state.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 0, 20);
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 20);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 19));
+
+        assert!(app.state.sidebar_collapsed);
     }
 
     #[test]
@@ -1364,66 +1503,6 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, list.x + 1, list.y + 1));
 
         assert_eq!(app.state.selected, 2);
-    }
-
-    #[test]
-    fn dragging_workspace_reorders_without_changing_identity() {
-        let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![
-            Workspace::test_new("a"),
-            Workspace::test_new("b"),
-            Workspace::test_new("c"),
-        ];
-        let active_id = app.state.workspaces[1].id.clone();
-        let selected_id = app.state.workspaces[2].id.clone();
-        app.state.active = Some(1);
-        app.state.selected = 2;
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
-        let source_row = app.state.view.workspace_card_areas[1].rect.y;
-        let target_row = crate::ui::workspace_drop_indicator_row(
-            &app.state.view.workspace_card_areas,
-            app.state.workspace_list_rect(),
-            0,
-        )
-        .unwrap();
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            2,
-            source_row,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            2,
-            target_row,
-        ));
-        assert!(matches!(
-            app.state.drag.as_ref().map(|drag| &drag.target),
-            Some(DragTarget::WorkspaceReorder {
-                source_ws_idx: 1,
-                insert_idx: Some(0),
-            })
-        ));
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, target_row));
-
-        let names: Vec<_> = app
-            .state
-            .workspaces
-            .iter()
-            .map(|ws| ws.display_name())
-            .collect();
-        assert_eq!(names, vec!["b", "a", "c"]);
-        assert_eq!(app.state.active, Some(0));
-        assert_eq!(app.state.selected, 2);
-        assert_eq!(app.state.workspaces[0].id, active_id);
-        assert_eq!(app.state.workspaces[2].id, selected_id);
-        let snapshot = capture_snapshot(&app.state);
-        let captured_names: Vec<_> = snapshot
-            .workspaces
-            .iter()
-            .map(|ws| ws.custom_name.clone().unwrap())
-            .collect();
-        assert_eq!(captured_names, vec!["b", "a", "c"]);
     }
 
     #[test]
@@ -1577,47 +1656,6 @@ mod tests {
             is_linked_worktree: name != "main",
         });
         ws
-    }
-
-    #[test]
-    fn top_drop_slot_is_distinct_from_gap_below_first_workspace() {
-        let mut app = app_for_mouse_test();
-        let first_repo = temp_git_repo("main");
-        let second_repo = temp_git_repo("main");
-
-        let mut first = Workspace::test_new("a");
-        let first_root = first.tabs[0].root_pane;
-        first.identity_cwd = first_repo.clone();
-        first.refresh_git_ahead_behind();
-
-        let mut second = Workspace::test_new("b");
-        let second_root = second.tabs[0].root_pane;
-        second.identity_cwd = second_repo.clone();
-        second.refresh_git_ahead_behind();
-
-        app.state.workspaces = vec![first, second];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_root]
-            .attached_terminal_id
-            .clone();
-        app.state.terminals.get_mut(&first_terminal_id).unwrap().cwd = first_repo.clone();
-        let second_terminal_id = app.state.workspaces[1].tabs[0].panes[&second_root]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&second_terminal_id)
-            .unwrap()
-            .cwd = second_repo.clone();
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
-
-        assert_eq!(app.state.workspace_drop_index_at_row(0), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(1), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(2), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(1));
-
-        let _ = fs::remove_dir_all(first_repo);
-        let _ = fs::remove_dir_all(second_repo);
     }
 
     #[test]
