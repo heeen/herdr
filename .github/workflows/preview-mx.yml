@@ -142,6 +142,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Deploy key with write access to 2lab-ai/homebrew-tap (repo-scoped; NOT a personal
+      # token). Present -> the step below pushes the rendered preview formula immediately
+      # after publishing. Absent -> the step no-ops and the tap's 6h cron catches up.
+      TAP_PUSH_KEY: ${{ secrets.TAP_PUSH_KEY }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -214,6 +219,52 @@ jobs:
             fat/herdr-linux-aarch64
             fat/herdr-macos-x86_64
             fat/herdr-macos-aarch64
+
+
+      - name: Bump Homebrew tap to this preview
+        # Event-driven tap update: render Formula/herdr-mx-preview.rb from the fat
+        # bundles just published (same sha256s brew will download) and push it to the
+        # tap over the deploy key, so `brew upgrade herdr-mx-preview` sees this build
+        # immediately instead of waiting on the tap's 6h cron (which stays as backstop
+        # and no-ops on "already at TAG").
+        if: ${{ env.TAP_PUSH_KEY != '' }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.preflight.outputs.tag }}"
+          BUILD_ID="${{ needs.preflight.outputs.build_id }}"
+          VERSION="$(echo "$BUILD_ID" | awk -F- '{print $1"."$2"."$3"."$4}')"
+
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          eval "$(ssh-agent -s)" >/dev/null
+          ssh-add - <<< "$TAP_PUSH_KEY"
+
+          git clone --depth 1 git@github.com:2lab-ai/homebrew-tap.git tap-bump
+
+          declare -A SHAS
+          for name in herdr-macos-aarch64 herdr-macos-x86_64 herdr-linux-aarch64 herdr-linux-x86_64; do
+            SHAS[$name]=$(sha256sum "fat/$name" | cut -d' ' -f1)
+          done
+          sed -e "s/@VERSION@/$VERSION/g" \
+              -e "s/@TAG@/$TAG/g" \
+              -e "s/@SHA_MACOS_AARCH64@/${SHAS[herdr-macos-aarch64]}/" \
+              -e "s/@SHA_MACOS_X86_64@/${SHAS[herdr-macos-x86_64]}/" \
+              -e "s/@SHA_LINUX_AARCH64@/${SHAS[herdr-linux-aarch64]}/" \
+              -e "s/@SHA_LINUX_X86_64@/${SHAS[herdr-linux-x86_64]}/" \
+              tap-bump/Formula/herdr-mx-preview.rb.tmpl > tap-bump/Formula/herdr-mx-preview.rb
+          ruby -c tap-bump/Formula/herdr-mx-preview.rb
+
+          cd tap-bump
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/herdr-mx-preview.rb
+          git diff --cached --quiet && { echo "tap already current"; exit 0; }
+          git commit -m "herdr-mx-preview $TAG"
+          # Commit before pulling (an unstaged render breaks --rebase), then rebase over
+          # anything the cron/other repos pushed meanwhile.
+          git pull --rebase
+          git push
+          echo "tap bumped to $TAG"
 
       - name: Prune old mx previews (keep 3)
         env:
