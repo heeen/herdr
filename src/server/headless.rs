@@ -489,7 +489,10 @@ impl HeadlessServer {
     pub async fn run(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
-        // Register SIGINT handler for graceful shutdown.
+        // Register a graceful-shutdown handler for SIGINT and SIGTERM (SIGHUP
+        // on unix, CTRL_CLOSE_EVENT on Windows via the ctrlc "termination"
+        // feature), so an OS reboot/shutdown still flushes session state
+        // instead of the process being killed before it can save.
         let should_quit = self.should_quit.clone();
         let quit_notify = self.server_event_tx.clone();
         ctrlc_handler(should_quit, quit_notify);
@@ -4270,8 +4273,10 @@ impl Drop for HeadlessServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Installs a Ctrl+C handler that sets the should_quit flag and wakes up
-/// the event loop by sending a QuitSignal on the server event channel.
+/// Installs a shutdown-signal handler (SIGINT, plus SIGTERM/SIGHUP on unix
+/// and CTRL_CLOSE_EVENT on Windows via the "termination" feature) that sets
+/// the should_quit flag and wakes up the event loop by sending a QuitSignal
+/// on the server event channel.
 fn ctrlc_handler(should_quit: Arc<AtomicBool>, server_event_tx: mpsc::Sender<ServerEvent>) {
     let _ = ctrlc::set_handler(move || {
         should_quit.store(true, Ordering::Release);
