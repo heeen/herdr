@@ -945,6 +945,43 @@ pub(super) fn apply_context_menu_action(
                 pane_id,
                 ..
             },
+            Some("Copy"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
+            state.copy_selection(terminal_runtimes, crate::events::ClipboardTarget::Clipboard);
+            state.mode = Mode::Terminal;
+        }
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
+            Some("Paste"),
+        ) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            state.focus_pane_in_workspace(ws_idx, pane_id);
+            if let (Some(text), Some(rt)) = (
+                crate::platform::read_clipboard_text(),
+                state.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id),
+            ) {
+                let _ = rt.try_send_paste(text);
+            }
+            state.mode = Mode::Terminal;
+        }
+        (
+            ContextMenuKind::Pane {
+                ws_idx,
+                tab_idx,
+                pane_id,
+                ..
+            },
             Some("Close pane"),
         ) => {
             state.selected = ws_idx;
@@ -1341,6 +1378,38 @@ impl App {
             ) => {
                 self.focus_pane_internal_via_api(ws_idx, pane_id);
                 self.zoom_focused_pane_via_api();
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                },
+                Some("Copy"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                self.state.copy_selection(
+                    &self.terminal_runtimes,
+                    crate::events::ClipboardTarget::Clipboard,
+                );
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                },
+                Some("Paste"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                if let (Some(text), Some(rt)) = (
+                    crate::platform::read_clipboard_text(),
+                    self.state.runtime_for_pane_in_workspace(
+                        &self.terminal_runtimes,
+                        ws_idx,
+                        pane_id,
+                    ),
+                ) {
+                    let _ = rt.try_send_paste(text);
+                }
                 self.state.mode = Mode::Terminal;
             }
             (
@@ -2223,6 +2292,87 @@ mod tests {
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
         assert_eq!(state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn pane_context_menu_offers_copy_and_paste() {
+        let state = state_with_workspaces(&["main"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert!(menu.items().contains(&"Copy"));
+        assert!(menu.items().contains(&"Paste"));
+    }
+
+    #[test]
+    fn context_menu_copy_without_selection_is_a_safe_no_op() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.mode = Mode::ContextMenu;
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy")
+            .expect("copy item");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        assert_eq!(state.mode, Mode::Terminal);
+        assert!(state.request_clipboard_write.is_none());
+        assert!(state.request_primary_write.is_none());
+    }
+
+    #[test]
+    fn api_context_menu_copy_without_selection_is_a_safe_no_op() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.mode = Mode::ContextMenu;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy")
+            .expect("copy item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.request_clipboard_write.is_none());
+        assert!(app.state.request_primary_write.is_none());
     }
 
     #[test]
