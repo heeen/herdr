@@ -1285,6 +1285,8 @@ impl ContextMenuState {
                 "Split right",
                 "Split down",
                 "Zoom",
+                "Copy",
+                "Paste",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
@@ -1297,6 +1299,8 @@ impl ContextMenuState {
                 "Split right",
                 "Split down",
                 "Zoom",
+                "Copy",
+                "Paste",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
@@ -1309,6 +1313,8 @@ impl ContextMenuState {
                 "Split right",
                 "Split down",
                 "Zoom",
+                "Copy",
+                "Paste",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
@@ -1320,6 +1326,8 @@ impl ContextMenuState {
                 "Split right",
                 "Split down",
                 "Zoom",
+                "Copy",
+                "Paste",
                 "Close pane",
             ],
         }
