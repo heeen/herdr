@@ -511,6 +511,16 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
+/// macOS has no PRIMARY selection concept.
+pub fn write_primary_selection(_bytes: &[u8]) -> bool {
+    false
+}
+
+/// macOS has no PRIMARY selection concept.
+pub fn read_primary_selection_text() -> Option<String> {
+    None
+}
+
 pub fn open_url(url: &str) -> std::io::Result<()> {
     Command::new("open")
         .arg(url)

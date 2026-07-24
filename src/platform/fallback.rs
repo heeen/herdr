@@ -95,6 +95,16 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 /// Unsupported platform stub.
+pub fn write_primary_selection(_bytes: &[u8]) -> bool {
+    false
+}
+
+/// Unsupported platform stub.
+pub fn read_primary_selection_text() -> Option<String> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn open_url(_url: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

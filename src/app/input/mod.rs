@@ -407,6 +407,19 @@ impl App {
 
         self.dispatch_pending_clipboard_write();
 
+        if let Some(content) = self.state.request_primary_write.take() {
+            if self
+                .event_tx
+                .try_send(crate::events::AppEvent::ClipboardWrite {
+                    content,
+                    target: crate::events::ClipboardTarget::Primary,
+                })
+                .is_err()
+            {
+                tracing::warn!("failed to queue primary selection write event");
+            }
+        }
+
         // Sync autoscroll deadline with state (mouse handler may have
         // set or cleared selection_autoscroll during handle_mouse).
         if self.state.selection_autoscroll.is_none() {
@@ -624,9 +637,8 @@ impl App {
             click.col,
         );
         if selected {
-            self.selection_highlight_clear_deadline = self
-                .state
-                .copy_on_select
+            self.selection_highlight_clear_deadline = (self.state.copy_on_select
+                != crate::config::CopyOnSelectConfig::Off)
                 .then(|| std::time::Instant::now() + super::PANE_COPY_HIGHLIGHT_DURATION);
         }
         selected

@@ -2195,7 +2195,16 @@ impl AppState {
             return false;
         }
 
-        let text = if self.copy_on_select {
+        let copy_target = match self.copy_on_select {
+            crate::config::CopyOnSelectConfig::Off => None,
+            crate::config::CopyOnSelectConfig::Clipboard => {
+                Some(crate::events::ClipboardTarget::Clipboard)
+            }
+            crate::config::CopyOnSelectConfig::Primary => {
+                Some(crate::events::ClipboardTarget::Primary)
+            }
+        };
+        let text = if copy_target.is_some() {
             let Some(text) = rt
                 .extract_selection(&selection)
                 .filter(|text| !text.is_empty())
@@ -2210,9 +2219,17 @@ impl AppState {
 
         self.selection = Some(selection);
         self.selection_autoscroll = None;
-        if let Some(text) = text {
-            self.request_clipboard_write = Some(text.into_bytes());
-            info!("copied double-clicked token to clipboard");
+        if let (Some(text), Some(target)) = (text, copy_target) {
+            match target {
+                crate::events::ClipboardTarget::Clipboard => {
+                    self.request_clipboard_write = Some(text.into_bytes());
+                    info!("copied double-clicked token to clipboard");
+                }
+                crate::events::ClipboardTarget::Primary => {
+                    self.request_primary_write = Some(text.into_bytes());
+                    info!("copied double-clicked token to primary selection");
+                }
+            }
         }
         true
     }
@@ -2263,7 +2280,11 @@ impl AppState {
         url_at_column(line, logical_cell.logical_col).map(str::to_owned)
     }
 
-    pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {
+    pub fn copy_selection(
+        &mut self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        target: crate::events::ClipboardTarget,
+    ) {
         let mut sel = match self.selection.take() {
             Some(sel) => sel,
             None => return,
@@ -2282,8 +2303,16 @@ impl AppState {
             .and_then(|rt| rt.extract_selection(&sel));
         if let Some(text) = text {
             if !text.is_empty() {
-                self.request_clipboard_write = Some(text.into_bytes());
-                info!("copied selection to clipboard");
+                match target {
+                    crate::events::ClipboardTarget::Clipboard => {
+                        self.request_clipboard_write = Some(text.into_bytes());
+                        info!("copied selection to clipboard");
+                    }
+                    crate::events::ClipboardTarget::Primary => {
+                        self.request_primary_write = Some(text.into_bytes());
+                        info!("copied selection to primary selection");
+                    }
+                }
             }
         }
 

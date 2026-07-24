@@ -2035,11 +2035,14 @@ impl HeadlessServer {
     /// Returns true if the event changed visual state (requiring a re-render).
     fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
         match &ev {
-            AppEvent::ClipboardWrite { content } => {
+            AppEvent::ClipboardWrite { content, target } => {
                 // Clipboard writes are client-local side effects. Forward them only to
                 // the foreground client instead of broadcasting to every attached client.
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
-                if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+                if self.send_to_foreground_client(ServerMessage::Clipboard {
+                    data,
+                    target: *target,
+                }) {
                     self.app.show_clipboard_feedback();
                 }
                 true
@@ -9044,6 +9047,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
             content: b"test".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert!(changed);
@@ -9061,7 +9065,10 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("foreground clipboard message"),
         ) {
-            ServerMessage::Clipboard { data } => assert_eq!(data, "dGVzdA=="),
+            ServerMessage::Clipboard { data, target } => {
+                assert_eq!(data, "dGVzdA==");
+                assert_eq!(target, crate::events::ClipboardTarget::Clipboard);
+            }
             other => panic!("expected clipboard message, got {other:?}"),
         }
         assert!(
@@ -9079,6 +9086,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
             content: b"test".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert!(changed);
@@ -9110,6 +9118,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
             content: b"test".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert!(changed);

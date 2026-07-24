@@ -98,11 +98,18 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
-        if let AppEvent::ClipboardWrite { content } = ev {
+        if let AppEvent::ClipboardWrite { content, target } = ev {
             #[cfg(not(test))]
-            crate::selection::write_osc52_bytes(&content);
+            match target {
+                crate::events::ClipboardTarget::Clipboard => {
+                    crate::selection::write_osc52_bytes(&content)
+                }
+                crate::events::ClipboardTarget::Primary => {
+                    crate::selection::write_primary_selection_bytes(&content)
+                }
+            }
             #[cfg(test)]
-            let _ = content;
+            let _ = (content, target);
             self.show_clipboard_feedback();
             return;
         }

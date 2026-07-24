@@ -363,6 +363,24 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+pub fn write_primary_selection(bytes: &[u8]) -> bool {
+    for command in primary_selection_commands() {
+        if run_clipboard_command(&command, bytes) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn read_primary_selection_text() -> Option<String> {
+    for command in read_primary_selection_text_commands() {
+        if let Some(text) = read_clipboard_text_with_command(&command) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 pub fn open_url(url: &str) -> std::io::Result<()> {
     Command::new("xdg-open")
         .arg(url)
@@ -539,6 +557,58 @@ fn clipboard_commands() -> Vec<ClipboardCommand> {
         commands.push(ClipboardCommand {
             program: "xsel",
             args: &["--clipboard", "--input"],
+        });
+    }
+
+    commands
+}
+
+fn primary_selection_commands() -> Vec<ClipboardCommand> {
+    let mut commands = Vec::new();
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "wl-copy",
+            args: &["--primary", "--type", "text/plain;charset=utf-8"],
+        });
+    }
+
+    if std::env::var_os("DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "xclip",
+            args: &["-selection", "primary", "-in"],
+        });
+        commands.push(ClipboardCommand {
+            program: "xsel",
+            args: &["--primary", "--input"],
+        });
+    }
+
+    commands
+}
+
+fn read_primary_selection_text_commands() -> Vec<ClipboardCommand> {
+    let mut commands = Vec::new();
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "wl-paste",
+            args: &["--primary", "--type", "text/plain;charset=utf-8"],
+        });
+        commands.push(ClipboardCommand {
+            program: "wl-paste",
+            args: &["--primary", "--type", "text/plain"],
+        });
+    }
+
+    if std::env::var_os("DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "xclip",
+            args: &["-selection", "primary", "-out"],
+        });
+        commands.push(ClipboardCommand {
+            program: "xsel",
+            args: &["--primary", "--output"],
         });
     }
 
@@ -843,6 +913,42 @@ mod tests {
         assert_eq!(commands[1].program, "wl-paste");
         assert_eq!(commands[2].program, "xclip");
         assert_eq!(commands[3].program, "xsel");
+    }
+
+    #[test]
+    fn primary_selection_commands_target_primary_not_clipboard() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let commands = primary_selection_commands();
+        assert_eq!(commands[0].program, "wl-copy");
+        assert!(commands[0].args.contains(&"--primary"));
+        assert_eq!(commands[1].program, "xclip");
+        assert!(commands[1].args.contains(&"primary"));
+        assert_eq!(commands[2].program, "xsel");
+        assert!(commands[2].args.contains(&"--primary"));
+    }
+
+    #[test]
+    fn read_primary_selection_text_commands_target_primary_not_clipboard() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let commands = read_primary_selection_text_commands();
+        assert_eq!(commands[0].program, "wl-paste");
+        assert!(commands[0].args.contains(&"--primary"));
+        assert_eq!(commands[1].program, "wl-paste");
+        assert!(commands[1].args.contains(&"--primary"));
+        assert_eq!(commands[2].program, "xclip");
+        assert!(commands[2].args.contains(&"primary"));
+        assert_eq!(commands[3].program, "xsel");
+        assert!(commands[3].args.contains(&"--primary"));
     }
 
     #[test]

@@ -115,6 +115,16 @@ pub enum HostCursorModeConfig {
     Drawn,
 }
 
+/// Whether and where mouse-copy writes selected text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CopyOnSelectConfig {
+    Off,
+    #[default]
+    Clipboard,
+    Primary,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SidebarCollapsedModeConfig {
@@ -788,8 +798,8 @@ pub struct UiConfig {
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
-    /// Copy text selected with the mouse. Default: true.
-    pub copy_on_select: bool,
+    /// Whether and where mouse-copy writes selected text: off, clipboard, or primary. Default: clipboard.
+    pub copy_on_select: CopyOnSelectConfig,
     /// Host cursor policy. Default: auto.
     pub host_cursor: HostCursorModeConfig,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
@@ -1002,7 +1012,7 @@ impl Default for UiConfig {
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
-            copy_on_select: true,
+            copy_on_select: CopyOnSelectConfig::Clipboard,
             host_cursor: HostCursorModeConfig::Auto,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
@@ -1441,16 +1451,26 @@ mouse_capture = false
     }
 
     #[test]
-    fn copy_on_select_default_on_and_parse() {
+    fn copy_on_select_default_clipboard_and_parse() {
         let default_config = Config::default();
-        assert!(default_config.ui.copy_on_select);
+        assert_eq!(
+            default_config.ui.copy_on_select,
+            CopyOnSelectConfig::Clipboard
+        );
 
         let toml = r#"
 [ui]
-copy_on_select = false
+copy_on_select = "off"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.copy_on_select);
+        assert_eq!(config.ui.copy_on_select, CopyOnSelectConfig::Off);
+
+        let toml = r#"
+[ui]
+copy_on_select = "primary"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.copy_on_select, CopyOnSelectConfig::Primary);
     }
 
     #[test]

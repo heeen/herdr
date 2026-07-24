@@ -810,9 +810,17 @@ impl AppState {
                     if was_click {
                         self.selection = None;
                     } else if was_finalized {
-                        // Double-click already finalized this word selection.
-                    } else if self.copy_on_select {
-                        self.copy_selection(terminal_runtimes);
+                        // Double-click copy already finalized this selection.
+                    } else if let Some(target) = match self.copy_on_select {
+                        crate::config::CopyOnSelectConfig::Off => None,
+                        crate::config::CopyOnSelectConfig::Clipboard => {
+                            Some(crate::events::ClipboardTarget::Clipboard)
+                        }
+                        crate::config::CopyOnSelectConfig::Primary => {
+                            Some(crate::events::ClipboardTarget::Primary)
+                        }
+                    } {
+                        self.copy_selection(terminal_runtimes, target);
                     } else if let Some(selection) = self.selection.as_mut() {
                         selection.finish();
                     }
@@ -904,11 +912,27 @@ impl AppState {
                 }
             }
 
-            MouseEventKind::Up(MouseButton::Middle) | MouseEventKind::Drag(MouseButton::Middle)
-                if !in_sidebar =>
-            {
+            MouseEventKind::Drag(MouseButton::Middle) if !in_sidebar => {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
                     let _ = self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
+                }
+            }
+
+            MouseEventKind::Up(MouseButton::Middle) if !in_sidebar => {
+                if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
+                    if !self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
+                        if let (Some(ws_idx), Some(text)) =
+                            (self.active, crate::platform::read_primary_selection_text())
+                        {
+                            if let Some(rt) = self.runtime_for_pane_in_workspace(
+                                terminal_runtimes,
+                                ws_idx,
+                                info.id,
+                            ) {
+                                let _ = rt.try_send_paste(text);
+                            }
+                        }
+                    }
                 }
             }
 

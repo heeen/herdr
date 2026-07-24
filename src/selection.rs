@@ -263,10 +263,10 @@ fn clamp_to_pane(screen_col: u16, screen_row: u16, pane_inner: Rect) -> (u16, u1
     (clamped_row - pane_inner.y, clamped_col - pane_inner.x)
 }
 
-fn osc52_sequence(bytes: &[u8]) -> String {
+fn osc52_sequence(bytes: &[u8], selector: char) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!("\x1b]52;c;{encoded}\x07")
+    format!("\x1b]52;{selector};{encoded}\x07")
 }
 
 fn contains_wsl_marker(value: &str) -> bool {
@@ -328,7 +328,20 @@ pub fn write_osc52_bytes(bytes: &[u8]) {
         return;
     }
 
-    let sequence = osc52_sequence(bytes);
+    let sequence = osc52_sequence(bytes, 'c');
+    let _ = std::io::stdout().write_all(sequence.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+/// Write PRIMARY-selection bytes via native platform tools or OSC 52.
+///
+/// OSC 52 format: `ESC ] 52 ; p ; <base64> BEL`
+pub fn write_primary_selection_bytes(bytes: &[u8]) {
+    if !should_prefer_osc52() && crate::platform::write_primary_selection(bytes) {
+        return;
+    }
+
+    let sequence = osc52_sequence(bytes, 'p');
     let _ = std::io::stdout().write_all(sequence.as_bytes());
     let _ = std::io::stdout().flush();
 }
@@ -347,7 +360,12 @@ mod tests {
 
     #[test]
     fn osc52_sequence_uses_bel_terminator() {
-        assert_eq!(osc52_sequence(b"hello"), "\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(osc52_sequence(b"hello", 'c'), "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_sequence_accepts_primary_selector() {
+        assert_eq!(osc52_sequence(b"hello", 'p'), "\x1b]52;p;aGVsbG8=\x07");
     }
 
     #[test]
