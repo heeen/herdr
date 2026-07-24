@@ -4,6 +4,11 @@ use std::{
     os::fd::RawFd,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use super::{
@@ -12,6 +17,38 @@ use super::{
 };
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+/// Worst-case time to wait for a clipboard helper (wl-copy/wl-paste/xclip/xsel)
+/// before force-killing it. These tools can block indefinitely waiting for a
+/// selection offer or clipboard owner that never arrives (e.g. no compositor
+/// clipboard manager running), which would otherwise hang the caller forever.
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Force-kills the watched process after `CLIPBOARD_COMMAND_TIMEOUT` unless
+/// disarmed first (on drop, once the caller has finished with the child).
+struct ClipboardWatchdog {
+    done: Arc<AtomicBool>,
+}
+
+impl ClipboardWatchdog {
+    fn arm(pid: u32) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(CLIPBOARD_COMMAND_TIMEOUT);
+            if !watchdog_done.load(Ordering::Acquire) {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for ClipboardWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcGroupMember {
@@ -511,6 +548,7 @@ fn read_clipboard_image_with_spawned_command_max(
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let _watchdog = ClipboardWatchdog::arm(child.id());
     let stdout = child.stdout.take()?;
 
     let read = match read_limited_reader(stdout, max_bytes) {
@@ -653,6 +691,7 @@ fn read_clipboard_text_with_command(command: &ClipboardCommand) -> Option<String
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let _watchdog = ClipboardWatchdog::arm(child.id());
 
     let stdout = child.stdout.take()?;
     let read = match read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES) {
@@ -972,6 +1011,21 @@ mod tests {
         };
 
         assert_eq!(read_clipboard_text_with_command(&command), None);
+    }
+
+    #[test]
+    fn read_clipboard_text_with_command_times_out_on_a_hanging_process() {
+        let command = ClipboardCommand {
+            program: "sleep",
+            args: &["30"],
+        };
+
+        let start = std::time::Instant::now();
+        assert_eq!(read_clipboard_text_with_command(&command), None);
+        assert!(
+            start.elapsed() < CLIPBOARD_COMMAND_TIMEOUT + Duration::from_secs(1),
+            "watchdog should have killed the hanging process well before the full sleep"
+        );
     }
 
     #[test]
