@@ -17,7 +17,10 @@ impl App {
         };
         if self
             .event_tx
-            .try_send(crate::events::AppEvent::ClipboardWrite { content })
+            .try_send(crate::events::AppEvent::ClipboardWrite {
+                content,
+                target: crate::events::ClipboardTarget::Clipboard,
+            })
             .is_err()
         {
             tracing::warn!("failed to queue clipboard write event");
@@ -30,7 +33,7 @@ impl App {
         source_id: InputSourceId,
         key: TerminalKey,
     ) -> bool {
-        if self.state.copy_on_select
+        if self.state.copy_on_select != crate::config::CopyOnSelectConfig::Off
             || !is_retained_selection_copy_key(key)
             || !self
                 .state
@@ -41,7 +44,10 @@ impl App {
             return false;
         }
 
-        self.state.copy_selection(&self.terminal_runtimes);
+        self.state.copy_selection(
+            &self.terminal_runtimes,
+            crate::events::ClipboardTarget::Clipboard,
+        );
         if !self.dispatch_pending_clipboard_write() {
             return false;
         }
@@ -111,7 +117,7 @@ mod tests {
 
     fn clipboard_write_content(app: &mut App) -> Vec<u8> {
         match app.event_rx.try_recv().expect("clipboard write event") {
-            AppEvent::ClipboardWrite { content } => content,
+            AppEvent::ClipboardWrite { content, .. } => content,
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -127,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn copy_on_select_disabled_ctrl_c_copies_and_clears_retained_selection() {
         let (mut app, info, mut input_rx) = app_with_screen_bytes_and_input(b"alpha beta");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         drag_select_range(&mut app, &info, 0, 4);
         assert_visible_selection(&app);
         assert!(app.event_rx.try_recv().is_err());
@@ -145,7 +151,10 @@ mod tests {
         assert!(app.state.selection.is_none());
         assert!(input_rx.try_recv().is_err());
 
-        app.handle_internal_event(AppEvent::ClipboardWrite { content });
+        app.handle_internal_event(AppEvent::ClipboardWrite {
+            content,
+            target: crate::events::ClipboardTarget::Clipboard,
+        });
         assert_eq!(
             app.state
                 .copy_feedback
@@ -186,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn copy_on_select_disabled_cmd_c_copies_retained_selection() {
         let (mut app, info, mut input_rx) = app_with_screen_bytes_and_input(b"alpha beta");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         drag_select_range(&mut app, &info, 0, 4);
 
         app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Char('c'), KeyModifiers::SUPER));
@@ -210,7 +219,7 @@ mod tests {
         );
         assert!(selection.finish());
         app.state.selection = Some(selection);
-        app.state.copy_on_select = true;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Clipboard;
 
         app.handle_terminal_key_headless(TerminalKey::new(
             KeyCode::Char('c'),
@@ -228,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn retained_selection_copy_shortcut_forwards_when_selection_text_is_empty() {
         let (mut app, info, mut input_rx) = app_with_screen_bytes_and_input(b"");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         drag_select_range(&mut app, &info, 0, 4);
         assert_visible_selection(&app);
 
@@ -248,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn retained_selection_copy_shortcut_requires_exact_modifiers() {
         let (mut app, info, mut input_rx) = app_with_screen_bytes_and_input(b"alpha beta");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         drag_select_range(&mut app, &info, 0, 4);
 
         app.handle_terminal_key_headless(TerminalKey::new(

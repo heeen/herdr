@@ -654,10 +654,12 @@ pub enum ServerMessage {
         body: Option<String>,
     },
 
-    /// OSC 52 clipboard data forwarded from a PTY through the server.
+    /// OSC 52 clipboard/primary-selection data forwarded from a PTY through the server.
     Clipboard {
         /// Base64-encoded clipboard data.
         data: String,
+        /// Which selection this write targets.
+        target: crate::events::ClipboardTarget,
     },
 
     /// Set the foreground client's outer terminal window title.
@@ -1372,13 +1374,19 @@ mod tests {
 
     #[test]
     fn server_clipboard_roundtrip() {
-        let msg = ServerMessage::Clipboard {
-            data: "dGVzdA==".to_owned(), // base64 "test"
-        };
-        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-        let (decoded, _): (ServerMessage, _) =
-            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-        assert_eq!(msg, decoded);
+        for target in [
+            crate::events::ClipboardTarget::Clipboard,
+            crate::events::ClipboardTarget::Primary,
+        ] {
+            let msg = ServerMessage::Clipboard {
+                data: "dGVzdA==".to_owned(), // base64 "test"
+                target,
+            };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]

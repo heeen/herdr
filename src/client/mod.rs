@@ -1569,8 +1569,8 @@ async fn run_client_loop(
                 } => {
                     handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                 }
-                ServerMessage::Clipboard { data } => {
-                    forward_clipboard(&data);
+                ServerMessage::Clipboard { data, target } => {
+                    forward_clipboard(&data, target);
                     let _ = io::stdout().flush();
                 }
                 ServerMessage::WindowTitle { title } => {
@@ -1961,14 +1961,19 @@ fn decode_clipboard_payload(data: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(data).ok()
 }
 
-/// Forwards a clipboard write from the server to the local client clipboard.
-fn forward_clipboard(data: &str) {
+/// Forwards a clipboard/primary-selection write from the server to the local client.
+fn forward_clipboard(data: &str, target: crate::events::ClipboardTarget) {
     let Some(bytes) = decode_clipboard_payload(data) else {
         warn!("received invalid clipboard payload from server");
         return;
     };
 
-    crate::selection::write_osc52_bytes(&bytes);
+    match target {
+        crate::events::ClipboardTarget::Clipboard => crate::selection::write_osc52_bytes(&bytes),
+        crate::events::ClipboardTarget::Primary => {
+            crate::selection::write_primary_selection_bytes(&bytes)
+        }
+    }
 }
 
 fn window_title_osc(title: Option<&str>) -> Vec<u8> {
@@ -2986,7 +2991,7 @@ mod tests {
         unsafe {
             std::env::set_var("SSH_CONNECTION", "1 2 3 4");
         }
-        forward_clipboard("dGVzdA==");
+        forward_clipboard("dGVzdA==", crate::events::ClipboardTarget::Clipboard);
         unsafe {
             std::env::remove_var("SSH_CONNECTION");
         }

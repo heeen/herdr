@@ -554,6 +554,7 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_primary_write: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
@@ -2199,6 +2200,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert!(app.state.toast.is_none());
@@ -2214,6 +2216,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert!(app.state.copy_feedback.is_none());
@@ -2234,6 +2237,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
             content: b"copied".to_vec(),
+            target: crate::events::ClipboardTarget::Clipboard,
         });
 
         assert_eq!(app.state.toast, original_toast);
@@ -2725,7 +2729,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = \"off\"\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2772,7 +2776,10 @@ mod tests {
         );
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
         assert!(!app.state.redraw_on_focus_gained);
-        assert!(!app.state.copy_on_select);
+        assert_eq!(
+            app.state.copy_on_select,
+            crate::config::CopyOnSelectConfig::Off
+        );
         assert!(app.state.prompt_new_workspace_name);
         assert!(app.state.selection.is_some());
         assert!(app.state.selection_autoscroll.is_some());

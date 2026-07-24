@@ -1448,6 +1448,9 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
+    /// Set when UI interaction requested a PRIMARY-selection write; drained
+    /// the same way as `request_clipboard_write`.
+    pub request_primary_write: Option<Vec<u8>>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
@@ -1513,7 +1516,7 @@ pub struct AppState {
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
-    pub copy_on_select: bool,
+    pub copy_on_select: crate::config::CopyOnSelectConfig,
     pub right_click_passthrough_modifiers: Option<KeyModifiers>,
     pub right_click_passthrough: Option<RightClickPassthroughGesture>,
     pub redraw_on_focus_gained: bool,
@@ -1818,6 +1821,7 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_primary_write: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
@@ -1889,7 +1893,7 @@ impl AppState {
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
-            copy_on_select: true,
+            copy_on_select: crate::config::CopyOnSelectConfig::default(),
             right_click_passthrough_modifiers: None,
             right_click_passthrough: None,
             redraw_on_focus_gained: true,

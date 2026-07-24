@@ -23,6 +23,18 @@ impl App {
         self.state
             .handle_copy_mode_key(&self.terminal_runtimes, key);
         self.dispatch_pending_clipboard_write();
+        if let Some(content) = self.state.request_primary_write.take() {
+            if self
+                .event_tx
+                .try_send(crate::events::AppEvent::ClipboardWrite {
+                    content,
+                    target: crate::events::ClipboardTarget::Primary,
+                })
+                .is_err()
+            {
+                tracing::warn!("failed to queue primary selection write event");
+            }
+        }
     }
 }
 
@@ -383,7 +395,7 @@ impl AppState {
             .as_ref()
             .map(|copy_mode| (copy_mode.pane_id, copy_mode.entry_offset_from_bottom));
         if copy {
-            self.copy_selection(terminal_runtimes);
+            self.copy_selection(terminal_runtimes, crate::events::ClipboardTarget::Clipboard);
         } else {
             self.clear_selection();
         }
@@ -1111,7 +1123,8 @@ mod tests {
 
     fn copy_mode_clipboard_text(app: &mut App) -> String {
         match app.event_rx.try_recv().expect("clipboard event") {
-            AppEvent::ClipboardWrite { content } => {
+            AppEvent::ClipboardWrite { content, target } => {
+                assert_eq!(target, crate::events::ClipboardTarget::Clipboard);
                 String::from_utf8(content).expect("utf8 clipboard")
             }
             other => panic!("unexpected event: {other:?}"),
@@ -2017,7 +2030,10 @@ mod tests {
         app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()));
 
         match app.event_rx.try_recv().expect("clipboard event") {
-            AppEvent::ClipboardWrite { content } => assert_eq!(content, b"alp"),
+            AppEvent::ClipboardWrite { content, target } => {
+                assert_eq!(content, b"alp");
+                assert_eq!(target, crate::events::ClipboardTarget::Clipboard);
+            }
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(app.state.mode, Mode::Terminal);

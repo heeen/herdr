@@ -595,9 +595,14 @@
         },
         {
           "key": "ui.copy_on_select",
-          "type": "boolean",
-          "default": "true",
-          "description": "Automatically copy text selected by mouse drag or double-click. When disabled, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection."
+          "type": "enum",
+          "default": "clipboard",
+          "description": "Whether and where mouse-copy writes selected text: off, clipboard, or primary. When off, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection.",
+          "values": [
+            "off",
+            "clipboard",
+            "primary"
+          ]
         },
         {
           "key": "ui.host_cursor",

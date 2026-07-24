@@ -5,9 +5,19 @@
 
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
+
+/// Which selection a clipboard write targets. Shared between `AppEvent` and
+/// the wire protocol's `ServerMessage::Clipboard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardTarget {
+    Clipboard,
+    Primary,
+}
 
 #[derive(Debug)]
 pub struct ApiWorktreeAddRequest {
@@ -124,9 +134,13 @@ pub enum AppEvent {
         updated: Vec<crate::detect::manifest_update::ManifestUpdateCommit>,
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
-    /// A pane child emitted a valid OSC 52 clipboard write. The main loop
-    /// re-emits it through herdr's own clipboard writer.
-    ClipboardWrite { content: Vec<u8> },
+    /// A pane child emitted a valid OSC 52 clipboard write, or herdr's own
+    /// mouse-copy queued one. The main loop re-emits it through herdr's own
+    /// clipboard/primary-selection writer.
+    ClipboardWrite {
+        content: Vec<u8>,
+        target: ClipboardTarget,
+    },
     /// Prefix-mode ASCII input-source request, emitted on entering/leaving the ASCII input
     /// realm. The foreground process applies the host-local TIS switch (`active = true`) /
     /// restore (`active = false`): the client in server mode (via server forwarding), the

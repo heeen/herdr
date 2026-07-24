@@ -492,7 +492,10 @@ mod tests {
 
     fn clipboard_write_content(app: &mut App) -> Vec<u8> {
         match app.event_rx.try_recv().expect("clipboard write event") {
-            AppEvent::ClipboardWrite { content } => content,
+            AppEvent::ClipboardWrite { content, target } => {
+                assert_eq!(target, crate::events::ClipboardTarget::Clipboard);
+                content
+            }
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -696,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn copy_on_select_disabled_keeps_drag_selection_without_copying() {
         let (mut app, info) = app_with_screen_bytes(b"alpha beta");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         let row = info.inner_rect.y;
         let start_col = info.inner_rect.x;
         let end_col = info.inner_rect.x + 4;
@@ -738,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn copy_on_select_disabled_retains_double_clicked_word_until_shortcut() {
         let (mut app, info) = app_with_screen_bytes(b"alpha beta");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
         let col = info.inner_rect.x + 2;
         let row = info.inner_rect.y;
 
@@ -768,7 +771,7 @@ mod tests {
         let stale_deadline = app
             .selection_highlight_clear_deadline
             .expect("double-click highlight deadline");
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
 
         let start_col = info.inner_rect.x + 6;
         let end_col = info.inner_rect.x + 9;
@@ -1159,7 +1162,7 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.view.pane_infos = pane_infos;
-        app.state.copy_on_select = false;
+        app.state.copy_on_select = crate::config::CopyOnSelectConfig::Off;
 
         let col = info.inner_rect.x + 2;
         let row = info.inner_rect.y + 3;
