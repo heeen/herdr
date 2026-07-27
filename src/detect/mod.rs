@@ -65,7 +65,6 @@ pub enum Agent {
 }
 
 impl Agent {
-    #[cfg(test)]
     pub const ALL: [Self; 21] = [
         Self::Pi,
         Self::Claude,
