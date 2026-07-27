@@ -1016,9 +1016,6 @@ mouse_captur = true
 [ui.toast]
 enabled = true
 delivry = "system"
-
-[ui.sidebar.agents.rows_by_agent]
-claude = [["terminal_title"]]
 "##,
         )
         .unwrap();
