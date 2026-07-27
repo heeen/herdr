@@ -2,7 +2,7 @@
 
 herdr-mx = upstream [herdr](https://github.com/ogulcancelik/herdr) + the changes on this page. nothing else.
 
-currently tracking: **upstream v0.7.4** (released 2026-07-15). policy: every upstream release is merged within days, mx releases are tagged `v<upstream>-mx.<n>`, and anything on this page is offered upstream when it fits — when a feature lands upstream it leaves this page. when *everything* lands upstream, herdr-mx retires.
+currently tracking: **upstream v0.7.5** (released 2026-07-21). note: `docs/next/CHANGELOG.md` version sections are upstream's release notes preserved verbatim (they may mention upstream features this fork rejects — e.g. sidebar token styling); THIS page is the SSOT for what herdr-mx actually ships. policy: every upstream release is merged within days, mx releases are tagged `v<upstream>-mx.<n>`, and anything on this page is offered upstream when it fits — when a feature lands upstream it leaves this page. when *everything* lands upstream, herdr-mx retires.
 
 ## the big one: multi-remote client
 

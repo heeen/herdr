@@ -49,6 +49,7 @@ enum ManagedAgentPhase {
     Pending {
         ready_after: Option<Instant>,
         deadline: Instant,
+        observed_expected: bool,
     },
     Active,
 }
@@ -56,7 +57,6 @@ enum ManagedAgentPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedAgent {
     kind: Agent,
-    observed_expected: bool,
     phase: ManagedAgentPhase,
 }
 
@@ -82,6 +82,13 @@ pub(crate) struct TerminalTitleChange {
 pub struct TerminalStateMutation {
     pub effective_state_change: Option<EffectiveStateChange>,
     pub session_ref_changed: bool,
+    pub agent_released: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentNameOwner {
+    agent_label: String,
+    session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +116,7 @@ pub struct TerminalState {
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
+    agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
@@ -142,6 +150,7 @@ impl TerminalState {
             terminal_title: None,
             manual_label: None,
             agent_name: None,
+            agent_name_owner: None,
             managed_agent: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
@@ -269,6 +278,9 @@ impl TerminalState {
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
+        let agent_released = process_exited
+            && self.hook_authority_not_newer_than(now)
+            && (previous_agent_label.is_some() || self.agent_name.is_some());
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
             if self
                 .hook_authority
@@ -288,6 +300,7 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                agent_released: false,
             };
         }
         if !process_exited && self.detected_state_observed_before_release_suppression(agent, now) {
@@ -301,9 +314,14 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                agent_released: false,
             };
         }
         self.detected_agent = agent;
+        if let Some(agent) = agent {
+            let agent_label = crate::detect::agent_label(agent);
+            self.reconcile_agent_name_owner(agent_label, None);
+        }
         if !process_exited {
             self.clear_full_lifecycle_hook_suppression_for_detected_agent(
                 previous_detected_agent,
@@ -375,6 +393,9 @@ impl TerminalState {
             self.hook_authority = None;
             self.persisted_agent_session = durable_session;
         }
+        if agent_released {
+            self.clear_agent_name();
+        }
         TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -385,6 +406,7 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
+            agent_released,
         }
     }
 
@@ -505,6 +527,7 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
                 FullLifecycleHookSuppressionReason::HookClear,
@@ -541,6 +564,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            agent_released: false,
         })
     }
 
@@ -1090,6 +1114,7 @@ impl TerminalState {
             );
             self.hook_authority = None;
         }
+        self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -1105,6 +1130,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            agent_released: false,
         })
     }
 
@@ -1230,6 +1256,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session.is_some(),
+            agent_released: false,
         })
     }
 
@@ -1287,6 +1314,7 @@ impl TerminalState {
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
         self.hook_authority = None;
+        self.clear_agent_name();
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
         }
@@ -1300,6 +1328,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            agent_released: true,
         })
     }
 
@@ -1337,6 +1366,23 @@ impl TerminalState {
         })
     }
 
+    pub(crate) fn unchanged_effective_state_change_at(&self, now: Instant) -> EffectiveStateChange {
+        let agent_label = self.effective_agent_label().map(str::to_string);
+        let known_agent = self.effective_known_agent();
+        let state = self.state;
+        let presentation = self.effective_presentation_for_state_at(state, now);
+        EffectiveStateChange {
+            previous_agent_label: agent_label.clone(),
+            previous_known_agent: known_agent,
+            previous_state: state,
+            previous_presentation: presentation.clone(),
+            agent_label,
+            known_agent,
+            state,
+            presentation,
+        }
+    }
+
     pub fn full_lifecycle_hook_authority_active(&self) -> bool {
         self.live_full_lifecycle_hook_authority()
     }
@@ -1370,8 +1416,30 @@ impl TerminalState {
     }
 
     pub fn set_agent_name(&mut self, name: String) {
-        let name = name.trim().to_string();
         self.agent_name = (!name.is_empty()).then_some(name);
+        self.agent_name_owner = self.agent_name.as_ref().and_then(|_| {
+            self.hook_authority
+                .as_ref()
+                .map(|authority| AgentNameOwner {
+                    agent_label: authority.agent_label.clone(),
+                    session_ref: authority.session_ref.clone(),
+                })
+                .or_else(|| {
+                    self.persisted_agent_session
+                        .as_ref()
+                        .map(|session| AgentNameOwner {
+                            agent_label: session.agent.clone(),
+                            session_ref: Some(session.session_ref.clone()),
+                        })
+                })
+                .or_else(|| {
+                    self.effective_agent_label()
+                        .map(|agent_label| AgentNameOwner {
+                            agent_label: agent_label.to_string(),
+                            session_ref: None,
+                        })
+                })
+        });
     }
 
     pub fn begin_managed_agent(
@@ -1383,12 +1451,16 @@ impl TerminalState {
         timeout: Duration,
     ) {
         self.set_agent_name(name);
+        self.agent_name_owner = Some(AgentNameOwner {
+            agent_label: crate::detect::agent_label(kind).to_string(),
+            session_ref: None,
+        });
         self.managed_agent = Some(ManagedAgent {
             kind,
-            observed_expected: false,
             phase: ManagedAgentPhase::Pending {
                 ready_after: Some(now.checked_add(settle_delay).unwrap_or(now)),
                 deadline: now.checked_add(timeout).unwrap_or(now),
+                observed_expected: false,
             },
         });
     }
@@ -1399,11 +1471,8 @@ impl TerminalState {
     }
 
     pub fn managed_agent_interactive_ready(&self) -> bool {
-        self.managed_agent.is_some_and(|managed| {
-            matches!(managed.phase, ManagedAgentPhase::Active)
-                && self.effective_known_agent() == Some(managed.kind)
-                && matches!(self.state, AgentState::Idle | AgentState::Blocked)
-        })
+        self.managed_agent
+            .is_some_and(|managed| matches!(managed.phase, ManagedAgentPhase::Active))
     }
 
     pub fn managed_agent_kind(&self) -> Option<Agent> {
@@ -1414,6 +1483,7 @@ impl TerminalState {
         let ManagedAgentPhase::Pending {
             ready_after,
             deadline,
+            ..
         } = self.managed_agent?.phase
         else {
             return None;
@@ -1426,25 +1496,29 @@ impl TerminalState {
             return false;
         };
         let known_agent = self.effective_known_agent();
-        let observed_expected = managed.observed_expected || known_agent == Some(managed.kind);
+        let observed_expected = match managed.phase {
+            ManagedAgentPhase::Pending {
+                observed_expected, ..
+            } => observed_expected || known_agent == Some(managed.kind),
+            ManagedAgentPhase::Active => false,
+        };
         let clear = process_exited
             || known_agent.is_some_and(|agent| agent != managed.kind)
             || matches!(managed.phase, ManagedAgentPhase::Pending { .. })
                 && observed_expected
                 && known_agent.is_none();
         if clear {
-            self.managed_agent = None;
-            self.agent_name = None;
+            self.clear_agent_name();
             return true;
         }
         if let ManagedAgentPhase::Pending {
             ready_after,
             deadline,
+            observed_expected: previous_observed_expected,
         } = managed.phase
         {
             if now >= deadline {
-                self.managed_agent = None;
-                self.agent_name = None;
+                self.clear_agent_name();
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
@@ -1453,7 +1527,6 @@ impl TerminalState {
                 {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
-                        observed_expected: true,
                         phase: ManagedAgentPhase::Active,
                     });
                     return true;
@@ -1461,19 +1534,23 @@ impl TerminalState {
                 if ready_after.is_some() {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
-                        observed_expected,
                         phase: ManagedAgentPhase::Pending {
                             ready_after: None,
                             deadline,
+                            observed_expected,
                         },
                     });
                     return true;
                 }
             }
-            if observed_expected != managed.observed_expected {
+            if observed_expected != previous_observed_expected {
                 self.managed_agent = Some(ManagedAgent {
-                    observed_expected,
-                    ..managed
+                    kind: managed.kind,
+                    phase: ManagedAgentPhase::Pending {
+                        ready_after,
+                        deadline,
+                        observed_expected,
+                    },
                 });
                 return true;
             }
@@ -1483,15 +1560,19 @@ impl TerminalState {
 
     pub fn restore_managed_agent(&mut self, name: String, kind: Agent) {
         self.set_agent_name(name);
+        self.agent_name_owner = Some(AgentNameOwner {
+            agent_label: crate::detect::agent_label(kind).to_string(),
+            session_ref: None,
+        });
         self.managed_agent = Some(ManagedAgent {
             kind,
-            observed_expected: true,
             phase: ManagedAgentPhase::Active,
         });
     }
 
     pub fn clear_agent_name(&mut self) {
         self.agent_name = None;
+        self.agent_name_owner = None;
         self.managed_agent = None;
     }
 
@@ -1526,6 +1607,44 @@ impl TerminalState {
         // live hook authority or a currently-detected agent; both are cleared when
         // the agent goes away, so they are safe live signals.
         self.agent_name.is_some() || self.effective_agent_label().is_some()
+    }
+
+    fn reconcile_agent_name_owner(
+        &mut self,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+    ) {
+        if self.agent_name.is_none() {
+            return;
+        }
+        if self.managed_agent.is_some_and(|managed| {
+            crate::detect::parse_agent_label(agent_label) == Some(managed.kind)
+        }) {
+            return;
+        }
+        match self.agent_name_owner.as_mut() {
+            Some(owner)
+                if owner.agent_label != agent_label
+                    || owner
+                        .session_ref
+                        .as_ref()
+                        .zip(session_ref)
+                        .is_some_and(|(current, incoming)| current != incoming) =>
+            {
+                self.agent_name = None;
+                self.agent_name_owner = None;
+            }
+            Some(owner) if owner.session_ref.is_none() && session_ref.is_some() => {
+                owner.session_ref = session_ref.cloned();
+            }
+            None => {
+                self.agent_name_owner = Some(AgentNameOwner {
+                    agent_label: agent_label.to_string(),
+                    session_ref: session_ref.cloned(),
+                })
+            }
+            _ => {}
+        }
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
@@ -1664,7 +1783,11 @@ mod tests {
         assert!(terminal.managed_agent_interactive_ready());
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
 
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(terminal.managed_agent_interactive_ready());
+
         terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(terminal.managed_agent_interactive_ready());
         assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(102), true));
@@ -4434,6 +4557,70 @@ mod tests {
     }
 
     #[test]
+    fn pi_session_replacement_clears_the_previous_sessions_alias() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_agent_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("pi-old"),
+                Some(20),
+            )
+            .expect("initial session should be accepted");
+        terminal.set_agent_name("reviewer".into());
+
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("pi-new"),
+                Some(21),
+                Some("new".into()),
+            )
+            .expect("new should replace the session");
+
+        assert!(terminal.agent_name.is_none());
+    }
+
+    #[test]
+    fn managed_agent_name_survives_native_session_replacement() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+
+        for (sequence, session) in [(20, "opencode-old"), (21, "opencode-new")] {
+            terminal
+                .set_agent_session_ref_for_session_start(
+                    "herdr:opencode".into(),
+                    "opencode".into(),
+                    crate::agent_resume::AgentSessionRef::id(session),
+                    Some(sequence),
+                    Some("new".into()),
+                )
+                .expect("managed session should be accepted");
+        }
+
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(terminal.managed_agent_interactive_ready());
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("opencode-new")
+        );
+    }
+
+    #[test]
     fn opencode_session_ref_without_start_source_does_not_replace_existing() {
         let mut terminal = test_terminal();
         terminal
@@ -4866,6 +5053,118 @@ mod tests {
 
         assert!(mutation.session_ref_changed);
         assert!(terminal.hook_authority.is_none());
+    }
+
+    #[test]
+    fn agent_alias_survives_detection_uncertainty_but_not_replacement_or_release() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        terminal.set_agent_name("reviewer".into());
+
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert!(terminal.agent_name.is_none());
+
+        terminal.set_agent_name("replacement".into());
+        terminal
+            .release_agent_with_mutation("herdr:codex", "codex", None)
+            .expect("detected agent release should be accepted");
+        assert!(terminal.agent_name.is_none());
+    }
+
+    #[test]
+    fn agent_replacement_clears_alias_owned_by_hook_identity() {
+        let mut terminal = test_terminal();
+        terminal.set_hook_authority(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(20),
+        );
+        terminal.set_agent_name("reviewer".into());
+
+        terminal.set_detected_state(Some(Agent::Grok), AgentState::Idle);
+
+        assert!(terminal.agent_name.is_none());
+        assert_eq!(terminal.effective_known_agent(), Some(Agent::Grok));
+    }
+
+    #[test]
+    fn accepted_hook_replacement_clears_the_previous_agents_alias() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_hook_authority_at(
+                "custom:agent".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                None,
+                Some(20),
+                Instant::now(),
+            )
+            .expect("initial hook should be accepted");
+        terminal.set_agent_name("reviewer".into());
+
+        terminal
+            .set_hook_authority_at(
+                "custom:agent".into(),
+                "claude".into(),
+                AgentState::Idle,
+                None,
+                None,
+                Some(21),
+                Instant::now(),
+            )
+            .expect("replacement hook should be accepted");
+
+        assert!(terminal.agent_name.is_none());
+        assert_eq!(terminal.effective_known_agent(), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn accepted_same_kind_hook_owner_replacement_clears_the_alias() {
+        let mut terminal = test_terminal();
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                crate::agent_resume::AgentSessionRef::path(test_session_path("first.jsonl")),
+                Some(20),
+                Instant::now(),
+            )
+            .expect("initial hook should be accepted");
+        terminal.set_agent_name("reviewer".into());
+        terminal
+            .clear_hook_authority_with_mutation(Some("herdr:pi"), Some(21))
+            .expect("hook clear should be accepted");
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                crate::agent_resume::AgentSessionRef::path(test_session_path("second.jsonl")),
+                Some(22),
+                Instant::now(),
+            )
+            .expect("replacement hook should be accepted");
+
+        assert!(terminal.agent_name.is_none());
+        assert_eq!(terminal.effective_known_agent(), Some(Agent::Pi));
+    }
+
+    #[test]
+    fn launch_command_alone_does_not_make_a_terminal_an_agent() {
+        let terminal = test_terminal().with_launch_argv(vec!["just".into(), "dev".into()]);
+
+        assert!(!terminal.is_agent_terminal());
     }
 
     #[test]

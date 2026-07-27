@@ -91,13 +91,13 @@ pub(crate) use self::{
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_entry_row_count,
         agent_panel_scope_toggle_rect, agent_panel_scroll_for_target, agent_panel_scroll_metrics,
-        agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
-        collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
+        agent_panel_scrollbar_rect, agent_panel_toggle_rect, all_agent_panel_entries,
+        collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
         compute_workspace_list_areas_full, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
         normalized_workspace_scroll, sidebar_section_divider_rect, workspace_drop_indicator_row,
         workspace_list_entries, workspace_list_entries_expanded, workspace_list_rect,
         workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        HostBannerArea, WorkspaceListEntry,
+        AgentPanelEntry, HostBannerArea, WorkspaceListEntry,
     },
 };
 // Test-only geometry oracles: after the #53 view-geometry refactor the production render/hit-test
@@ -566,7 +566,9 @@ fn render_content_and_overlays(
         Mode::Prefix => render_prefix_overlay(app, frame, terminal_area),
         Mode::Copy => render_copy_mode_overlay(app, frame, terminal_area),
         Mode::Resize => render_resize_overlay(app, frame, terminal_area),
-        Mode::ConfirmClose => render_confirm_close_overlay(app, frame, terminal_area),
+        Mode::ConfirmClose => {
+            render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
+        }
         Mode::ContextMenu => {
             render_context_menu(app, frame);
         }
