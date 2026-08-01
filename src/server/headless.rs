@@ -3475,11 +3475,23 @@ impl HeadlessServer {
         }
 
         let mut targets = Vec::new();
-        for (client_id, (cols, rows), _, _, mode, _) in
+        for (client_id, (cols, rows), _, _, mode, surface_mode) in
             render_targets(&self.clients, self.foreground_client_id)
         {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
+            }
+            // This optimization repaints the SERVER's sidebar region onto the client's last frame,
+            // and computes a full-app view to do it. A composited client renders its own sidebar
+            // and only receives content, so stamping one in would paint a second sidebar (or, on a
+            // narrow host, a second mobile header) into its content area. Fall back to a normal
+            // render, which honours the surface mode.
+            if matches!(
+                surface_mode,
+                crate::protocol::ClientSurfaceMode::EmbeddedContent
+            ) {
+                crate::render_prof::event("retained_animation_fallback.embedded_content_client");
+                return false;
             }
             let Some(client) = self.clients.get(&client_id) else {
                 return false;
@@ -5044,6 +5056,35 @@ mod tests {
                 idx / usize::from(actual.width),
             );
         }
+    }
+
+    /// The retained-animation optimization repaints the SERVER's sidebar onto a client's last
+    /// frame from a full-app view. A composited client draws its own sidebar and receives content
+    /// only, so applying it would paint a second sidebar (or, on a narrow host, a second mobile
+    /// header) into its content. It must fall back to a normal, surface-mode-aware render.
+    #[tokio::test]
+    async fn retained_animation_skips_composited_clients() {
+        let (mut server, _rx, _pane) = retained_test_server(b"hello");
+        set_first_test_pane_working(&mut server);
+        server.render_and_stream();
+
+        // A FullApp client can use the optimization.
+        assert!(
+            server.render_retained_animation_update_and_stream(),
+            "a full-app client should take the retained-animation path"
+        );
+
+        // Flip the same client to the composited surface: it must now bail to a full render.
+        server
+            .clients
+            .get_mut(&1)
+            .expect("test client")
+            .surface_mode = crate::protocol::ClientSurfaceMode::EmbeddedContent;
+
+        assert!(
+            !server.render_retained_animation_update_and_stream(),
+            "a composited client must NOT get the server sidebar stamped onto its content frame"
+        );
     }
 
     #[tokio::test]
