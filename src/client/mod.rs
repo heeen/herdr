@@ -138,7 +138,7 @@ struct ClientState {
     /// Last semantic frame received from each connected server stream.
     frame_cache: HashMap<supervisor::ServerId, protocol::FrameData>,
     /// #45: cached sidebar shell — the expensive `from_model` + full ratatui sidebar render. Rebuilt
-    /// only when the sidebar model/view/size changes: every `request_full_redraw` drops it, the
+    /// only when the sidebar model/view/size changes: every `request_recompose` drops it, the
     /// model/timer/animation paths (`render_cached_composited_frame`) rebuild it, and a host resize
     /// is caught by `ComposedShell::matches_dims`. A pure content-output frame reuses it and only
     /// re-lays the content region, removing the per-content-frame full-sidebar rebuild that throttled
@@ -220,6 +220,9 @@ struct ClientState {
     /// #48: when the last composited frame was flushed. Anchors the hover-render frame-budget clamp
     /// in `next_select_deadline` so deferred hover repaints are capped at ~60fps.
     last_composited_render_at: Instant,
+    /// The server whose frame the last composed output came from. A switch replaces the whole
+    /// content region at once, which the cell diff must not be trusted to express incrementally.
+    last_composed_server: Option<supervisor::ServerId>,
     /// item 6 (Area 6): last time each connected secondary's summary refresh was STARTED. Drives
     /// the adaptive cadence in `due_secondary_summary_refreshes` (400ms active / 2s background)
     /// and is recorded on start and on completion so a slow SSH fetch does not stack.
@@ -434,7 +437,7 @@ enum ClientInputDispatch {
     /// cells, NOT a model/view mutation. Distinguished from [`Redraw`] so the main loop takes the
     /// lightweight `request_hover_redraw` path (rebuild the shell so the new highlight is painted by
     /// the one render source of truth, but PRESERVE the blit-encoder diff baseline so only the ~2
-    /// changed rows are written — never a full-screen repaint) instead of the `request_full_redraw`
+    /// changed rows are written — never a full-screen repaint) instead of the `request_recompose`
     /// sledgehammer a genuine model change needs.
     HoverRedraw,
     Consumed,
@@ -1940,6 +1943,9 @@ fn translate_content_mouse_input(
 }
 
 impl ClientState {
+    /// A genuine full repaint of the host terminal: rewrite every cell, but keep the encoder's
+    /// `last_frame` so no clear is emitted (that is what preserves Kitty graphics across a
+    /// repaint). For resize / focus-gain / graphics-reset — NOT for routine model updates.
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
         // #45: the sidebar model/view changed too, so drop the cached shell —
@@ -1951,9 +1957,30 @@ impl ClientState {
         }
     }
 
-    fn request_full_redraw(&mut self) {
-        self.blit_encoder = render_ansi::BlitEncoder::new();
-        self.request_repaint();
+    /// The sidebar model changed, so the cached shell must be rebuilt — but the host terminal
+    /// does NOT need repainting. Deliberately preserves the blit diff baseline: the encoder then
+    /// writes only the cells that actually differ, so a poll that changed nothing costs no bytes.
+    ///
+    /// Resetting the encoder here (as this used to) made every 2s supervisor refresh emit a
+    /// screen clear plus a full redraw — visible flicker and a full screen of ANSI per poll on a
+    /// slow link, even with nothing on screen changing.
+    /// Note which server the frame about to be composed came from. Switching servers swaps the
+    /// entire content region in one step, so arm a full rewrite rather than trusting a cell diff
+    /// against the previous server's screen. `request_repaint` keeps `last_frame`, so this rewrites
+    /// WITHOUT emitting a clear — no flash, unlike resetting the encoder.
+    fn note_composed_server(&mut self, server_id: &supervisor::ServerId) {
+        if self.last_composed_server.as_ref() != Some(server_id) {
+            self.last_composed_server = Some(server_id.clone());
+            self.repaint_pending = true;
+        }
+    }
+
+    fn request_recompose(&mut self) {
+        self.shell_cache = None;
+        #[cfg(windows)]
+        {
+            self.pending_cursor_reveal = None;
+        }
     }
 
     /// #56: the lightweight redraw for a HOVER / open-menu-selection change (a presentation-only
@@ -4395,7 +4422,7 @@ fn handle_server_write_failure(
         let _ = model.set_connection_state(&server_id, supervisor::ConnectionState::Disconnected);
     }
     schedule_secondary_retry(state, server_id, 0, now);
-    state.request_full_redraw();
+    state.request_recompose();
     Ok(())
 }
 
@@ -4474,7 +4501,7 @@ fn retry_due_secondary_connections(
             model.clear_update_outcome(&server_id);
         }
         state.update_outcome_expiry.remove(&server_id);
-        state.request_full_redraw();
+        state.request_recompose();
     }
 }
 
@@ -4583,11 +4610,13 @@ fn recompose_composited_frame(state: &mut ClientState, rebuild: bool) {
             return;
         };
         let active_server_id = model.active_server_id().clone();
-        state
+        let frame = state
             .frame_cache
             .get(&active_server_id)
             .cloned()
-            .unwrap_or_else(|| protocol::FrameData::blank(state.host_size.0, state.host_size.1))
+            .unwrap_or_else(|| protocol::FrameData::blank(state.host_size.0, state.host_size.1));
+        state.note_composed_server(&active_server_id);
+        frame
     };
 
     let compose_started = Instant::now();
@@ -4649,10 +4678,16 @@ fn render_incoming_server_frame(
         else {
             return;
         };
+        // Same contract as `note_composed_server`, inlined so the field borrows stay disjoint from
+        // the `comp`/`model` borrows held across this block.
+        if state.last_composed_server.as_ref() != Some(&active_server_id) {
+            state.last_composed_server = Some(active_server_id.clone());
+            state.repaint_pending = true;
+        }
         // #45: a pure content-output frame — the sidebar model is unchanged since the last compose,
         // so reuse the cached shell (rebuild = false) and only re-lay the content region. A host
         // resize (dims mismatch) or any model change (which dropped the cache via
-        // `request_full_redraw`) transparently forces a rebuild. This is the hot path that
+        // `request_recompose`) transparently forces a rebuild. This is the hot path that
         // previously rebuilt the entire sidebar (`from_model` + full sidebar render) on EVERY
         // content frame and throttled attach to <1fps as agent TUIs flooded content frames (#45).
         let compose_started = Instant::now();
@@ -4931,6 +4966,7 @@ async fn run_client_loop(
         pending_full_render: false,
         last_composited_render_at: Instant::now(),
         last_summary_refresh: HashMap::new(),
+        last_composed_server: None,
         #[cfg(unix)]
         remote_image_paste_key: None,
         repaint_pending: false,
@@ -5149,7 +5185,7 @@ async fn run_client_loop(
                                         Instant::now(),
                                     )?;
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5172,7 +5208,7 @@ async fn run_client_loop(
                                         "failed to start client sidebar request"
                                     );
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5183,7 +5219,7 @@ async fn run_client_loop(
                                     &event_tx,
                                     &mut state.pending_add_remote,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5200,7 +5236,7 @@ async fn run_client_loop(
                                     &state.ssh_bridges,
                                     &event_tx,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5218,7 +5254,7 @@ async fn run_client_loop(
                                     &state.ssh_bridges,
                                     &event_tx,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5230,7 +5266,7 @@ async fn run_client_loop(
                                     &state.ssh_bridges,
                                     &event_tx,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5251,7 +5287,7 @@ async fn run_client_loop(
                                         supervisor::ConnectionState::Disconnected,
                                     );
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5274,7 +5310,7 @@ async fn run_client_loop(
                                 }
                                 state.update_outcome_expiry.remove(&server_id);
                                 schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5284,7 +5320,7 @@ async fn run_client_loop(
                             // worker off the UI loop (the pending guard collapses double-clicks).
                             ClientInputDispatch::UpdateRemote { server_id } => {
                                 spawn_remote_update_for(&mut state, &server_id, &event_tx);
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5301,7 +5337,7 @@ async fn run_client_loop(
                                     workspace_id,
                                     &event_tx,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5311,7 +5347,7 @@ async fn run_client_loop(
                                 if let Some(compositor) = &mut state.compositor {
                                     compositor.toggle_collapsed_space_key(group_key);
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5338,7 +5374,7 @@ async fn run_client_loop(
                                         Instant::now(),
                                     )?;
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5350,7 +5386,7 @@ async fn run_client_loop(
                                 return Ok(());
                             }
                             ClientInputDispatch::Redraw => {
-                                state.request_full_redraw();
+                                state.request_recompose();
                                 render_cached_composited_frame(&mut state);
                                 continue;
                             }
@@ -5527,7 +5563,7 @@ async fn run_client_loop(
                                     let rtt =
                                         sent_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
                                     model.record_server_ping(&server_id, rtt);
-                                    state.request_full_redraw();
+                                    state.request_recompose();
                                 }
                             }
                         }
@@ -5607,7 +5643,7 @@ async fn run_client_loop(
                                     &server_id,
                                     supervisor::ConnectionState::Disconnected,
                                 );
-                                state.request_full_redraw();
+                                state.request_recompose();
                             }
                             schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                             render_cached_composited_frame(&mut state);
@@ -5707,7 +5743,7 @@ async fn run_client_loop(
                         );
                     }
                     state.last_summary_refresh.insert(server_id.clone(), now);
-                    state.request_full_redraw();
+                    state.request_recompose();
                 }
                 schedule_missing_secondary_stream_retries(
                     &mut state,
@@ -5747,7 +5783,7 @@ async fn run_client_loop(
                 }
                 if let Some(model) = &mut state.supervisor_model {
                     model.apply_secondary_summary_results([(server_id.clone(), result)]);
-                    state.request_full_redraw();
+                    state.request_recompose();
                 }
                 schedule_missing_secondary_stream_retries(
                     &mut state,
@@ -5795,7 +5831,7 @@ async fn run_client_loop(
                                     &event_tx,
                                 );
                                 state.last_supervisor_summary_refresh = now;
-                                state.request_full_redraw();
+                                state.request_recompose();
                             }
                             schedule_missing_secondary_stream_retries(
                                 &mut state,
@@ -5832,7 +5868,7 @@ async fn run_client_loop(
                                         &event_tx,
                                     );
                                 }
-                                state.request_full_redraw();
+                                state.request_recompose();
                             }
                             state.last_summary_refresh.insert(server_id.clone(), now);
                         }
@@ -5850,7 +5886,7 @@ async fn run_client_loop(
                         }
                     }
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 request_composited_render(&mut state);
             }
             ClientLoopEvent::SecondaryConnectionAttemptFinished {
@@ -5904,7 +5940,7 @@ async fn run_client_loop(
                                 err = %err,
                                 "failed to attach retried secondary client stream"
                             );
-                            state.request_full_redraw();
+                            state.request_recompose();
                             request_composited_render(&mut state);
                             continue;
                         }
@@ -6033,7 +6069,7 @@ async fn run_client_loop(
                         );
                     }
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 request_composited_render(&mut state);
             }
             ClientLoopEvent::AddRemoteFinished { result, elapsed } => {
@@ -6075,7 +6111,7 @@ async fn run_client_loop(
                         }
                     }
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             // Worktree-menu parity: fill the open "open worktree…" picker (stale/closed pickers
@@ -6088,7 +6124,7 @@ async fn run_client_loop(
                 if let Some(model) = &mut state.supervisor_model {
                     model.fill_worktree_picker(&server_id, &workspace_id, result);
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             // #44: a one-click update reported a provisioning stage — refresh that host's banner
@@ -6102,7 +6138,7 @@ async fn run_client_loop(
                     model.set_update_progress(&server_id, Some(message));
                 }
                 state.update_outcome_expiry.remove(&server_id);
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             // #44: a one-click update finished. Clear the progress line, and on success tear the
@@ -6134,7 +6170,7 @@ async fn run_client_loop(
                 if succeeded {
                     refetch_secondary_runtime_status(&mut state, &server_id, &event_tx);
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::SupervisorRuntimeStatusFetched {
@@ -6151,7 +6187,7 @@ async fn run_client_loop(
                         enriched = model.enrich_update_success_with_version(&server_id, version);
                     }
                     model.set_remote_runtime_info(&server_id, version, protocol);
-                    state.request_full_redraw();
+                    state.request_recompose();
                 }
                 if enriched {
                     // Re-arm the display timer so the enriched "updated to vX.Y.Z" line shows for its
@@ -6191,7 +6227,7 @@ async fn run_client_loop(
                     result,
                     &event_tx,
                 );
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::ServerDisconnected(server_id) => {
@@ -6216,7 +6252,7 @@ async fn run_client_loop(
                         &server_id,
                         supervisor::ConnectionState::Disconnected,
                     );
-                    state.request_full_redraw();
+                    state.request_recompose();
                 }
                 schedule_secondary_retry(&mut state, server_id, 0, Instant::now());
                 render_cached_composited_frame(&mut state);
@@ -6238,7 +6274,7 @@ async fn run_client_loop(
                                 .frame_cache
                                 .retain(|server_id, _| model.contains_server(server_id));
                         }
-                        state.request_full_redraw();
+                        state.request_recompose();
                         render_cached_composited_frame(&mut state);
                     }
                     Err(err) => {
@@ -6264,7 +6300,7 @@ async fn run_client_loop(
                         .frame_cache
                         .retain(|server_id, _| model.contains_server(server_id));
                 }
-                state.request_full_redraw();
+                state.request_recompose();
                 render_cached_composited_frame(&mut state);
             }
             ClientLoopEvent::Timer => {
@@ -6273,7 +6309,7 @@ async fn run_client_loop(
                 // #61: drop any host update-outcome banner line whose display window has elapsed, then
                 // force a rebuild this tick so the cleared sub-line actually leaves the screen.
                 if expire_host_update_outcomes(&mut state, now) {
-                    state.request_full_redraw();
+                    state.request_recompose();
                     state.pending_full_render = true;
                 }
                 // #48/#56: flush a deferred (coalesced) hover / menu-selection repaint. The
@@ -7160,6 +7196,7 @@ mod tests {
             pending_full_render: false,
             last_composited_render_at: Instant::now(),
             last_summary_refresh: HashMap::new(),
+            last_composed_server: None,
         }
     }
 
@@ -7184,11 +7221,11 @@ mod tests {
         );
     }
 
-    /// #45: any model/view change funnels through `request_full_redraw`, which must drop the cached
+    /// #45: any model/view change funnels through `request_recompose`, which must drop the cached
     /// sidebar shell so the next compose rebuilds it. A reused content frame on a stale cache would
     /// otherwise paint an out-of-date sidebar over fresh model state.
     #[test]
-    fn request_full_redraw_drops_cached_shell() {
+    fn request_recompose_drops_cached_shell() {
         let model = supervisor::ClientSupervisorModel::new("local");
         let mut state = test_client_state_with_model(model);
         let compositor = compositor::ClientCompositor::default();
@@ -7199,11 +7236,11 @@ mod tests {
         state.shell_cache = Some(shell);
         assert!(state.shell_cache.is_some());
 
-        state.request_full_redraw();
+        state.request_recompose();
 
         assert!(
             state.shell_cache.is_none(),
-            "request_full_redraw must drop the cached shell so the sidebar can't go stale (#45)"
+            "request_recompose must drop the cached shell so the sidebar can't go stale (#45)"
         );
     }
 
@@ -7251,19 +7288,38 @@ mod tests {
         );
     }
 
-    /// Counterpart locking the contrast: a genuine model change (`request_full_redraw`) DOES reset
-    /// the blit baseline, so the following frame is a full repaint. This is what a hover must NOT do.
+    /// A model change rebuilds the sidebar shell but must PRESERVE the blit diff baseline, so the
+    /// encoder still writes only the cells that differ. Resetting it here made every routine
+    /// supervisor poll emit a clear + full-screen redraw — visible flicker with nothing changing.
     #[test]
-    fn request_full_redraw_resets_blit_baseline() {
+    fn request_recompose_preserves_blit_baseline() {
         let model = supervisor::ClientSupervisorModel::new("local");
         let mut state = test_client_state_with_model(model);
 
-        let next_is_full = next_encode_is_full_after(&mut state, |s| s.request_full_redraw());
+        let next_is_full = next_encode_is_full_after(&mut state, |s| s.request_recompose());
 
         assert!(
-            next_is_full,
-            "request_full_redraw must reset the blit baseline so the next frame is a full repaint"
+            !next_is_full,
+            "request_recompose must preserve the blit baseline so an unchanged poll costs no bytes"
         );
+    }
+
+    /// The counterpart: a genuine `request_repaint` (resize / focus-gain) arms the full-surface
+    /// rewrite that `flush_composited_frame` passes to the encoder, and drops the shell too.
+    #[test]
+    fn request_repaint_arms_a_full_surface_rewrite() {
+        let model = supervisor::ClientSupervisorModel::new("local");
+        let mut state = test_client_state_with_model(model);
+        state.shell_cache = None;
+        assert!(!state.repaint_pending);
+
+        state.request_repaint();
+
+        assert!(
+            state.repaint_pending,
+            "request_repaint must arm a full repaint"
+        );
+        assert!(state.shell_cache.is_none());
     }
 
     struct EnvVarsRemovedGuard {
