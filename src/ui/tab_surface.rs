@@ -304,7 +304,9 @@ mod tests {
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
         assert_eq!(
             frame_digest(&frame),
-            "ce383feeaac30922502b7c4f8af53b5ca30e816ec4503ca6d015738b584da487"
+            // Re-recorded for the herdr-mx sidebar renderer after the upstream v0.7.4 merge
+            // (upstream's hash characterizes their sidebar; the layout was hand-verified).
+            "9e157f411d3334ce365650e6a465aa3b68efe5a2761c7b8035e4d9d843ce15c8"
         );
     }
 

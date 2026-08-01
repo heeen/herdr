@@ -16,6 +16,9 @@ use super::{
     LimitedRead, Signal,
 };
 
+// Upstream host-cursor/WSL heuristics; consumers live in the upstream client loop, which this
+// fork replaced with the multi-remote client. Kept for the drawn-cursor port (upstream-merge follow-up).
+#[allow(dead_code)]
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
 /// Worst-case time to wait for a clipboard helper (wl-copy/wl-paste/xclip/xsel)
@@ -58,10 +61,14 @@ struct ProcGroupMember {
 
 pub fn raise_server_nofile_limit() {}
 
+// Upstream host-cursor/WSL heuristics; consumers live in the upstream client loop, which this
+// fork replaced with the multi-remote client. Kept for the drawn-cursor port (upstream-merge follow-up).
+#[allow(dead_code)]
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     running_inside_wsl()
 }
 
+#[allow(dead_code)]
 fn running_inside_wsl() -> bool {
     proc_file_indicates_wsl("/proc/sys/kernel/osrelease")
         || proc_file_indicates_wsl("/proc/version")
@@ -71,12 +78,14 @@ fn running_inside_wsl() -> bool {
         || std::path::Path::new("/run/WSL").exists()
 }
 
+#[allow(dead_code)]
 fn proc_file_indicates_wsl(path: &str) -> bool {
     std::fs::read_to_string(path)
         .map(|text| text_indicates_wsl(&text))
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn text_indicates_wsl(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("microsoft") || text.contains("wsl")
@@ -456,6 +465,13 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
         }
     }
 
+    None
+}
+
+/// #59: Linux counterpart to the macOS sandboxed-image detector. No-op for now — the macshot-style
+/// sandboxed-container clipboard is a macOS (TCC) phenomenon; Linux clipboards expose image data
+/// directly via `read_clipboard_image`.
+pub fn clipboard_image_file_if_unreadable() -> Option<String> {
     None
 }
 

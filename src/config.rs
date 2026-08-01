@@ -2,16 +2,15 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 mod io;
 mod keybinds;
-mod model;
-mod sidebar;
+pub(crate) mod model;
 mod sound;
 mod theme;
 
 pub use self::{
     io::{
         config_diagnostic_summary, config_dir, config_path, load_live_config,
-        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
-        upsert_section_value,
+        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_body,
+        upsert_section_bool, upsert_section_value,
     },
     keybinds::{
         format_key_combo, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
@@ -19,14 +18,13 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, CopyOnSelectConfig, HostCursorModeConfig, NewTerminalCwdConfig,
-        ShellModeConfig, SidebarCollapsedModeConfig, ToastClipboardPosition, ToastConfig,
-        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
-    },
-    sidebar::{
-        AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
-        SpaceSidebarToken, SpacesSidebarConfig,
+        validated_sidebar_bounds, AgentPanelScopeConfig, AgentPanelSortConfig, Config,
+        ConfigReloadReport, ConfigReloadStatus, CopyOnSelectConfig, HostBannerAnimation,
+        HostBannerGlyph, HostBannerGradient, HostCursorModeConfig, NewTerminalCwdConfig,
+        ShellModeConfig, SidebarAgentField, SidebarAgentsConfig, SidebarCollapsedModeConfig,
+        SidebarColorPreset, SidebarHostConfig, SidebarItem, SidebarSpaceField, SidebarSpacesConfig,
+        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
+        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

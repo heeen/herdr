@@ -517,6 +517,9 @@ pub(crate) fn events_require_host_surface_redraw(
             .any(|event| matches!(event, RawInputEvent::OuterFocusGained))
 }
 
+// #73: the v0.7.1 merge dropped this gate's caller from the client loop (58b9fec:1114). Allow
+// dead_code until re-ported; remove the allow with #73.
+#[allow(dead_code)]
 #[cfg(any(not(windows), test))]
 pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent]) -> bool {
     events

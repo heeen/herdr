@@ -686,34 +686,76 @@
           ]
         },
         {
-          "key": "ui.sidebar.agents.row_gap",
-          "type": "integer",
-          "default": "0",
-          "description": "Blank terminal rows between expanded Agent sidebar entries. Set to 1 to restore the previous spacing."
+          "key": "ui.sidebar.spaces.lines",
+          "type": "list of field lines",
+          "default": "[[{ field = \"status\" }, { field = \"name\" }], [{ field = \"branch\" }, { field = \"branch_status\" }]]",
+          "description": "Expanded Space sidebar layout, as lines of { field, show, color, order } tables. Fields are \"status\", \"name\", \"branch\", and \"branch_status\"."
         },
         {
-          "key": "ui.sidebar.agents.rows",
-          "type": "list of token rows",
-          "default": "[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]",
-          "description": "Default expanded Agent sidebar layout. Entries may be token strings or inline { token, fg, bold, dim } style tables. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
+          "key": "ui.sidebar.agents.lines",
+          "type": "list of field lines",
+          "default": "[[{ field = \"agent_status\" }, { field = \"pane_name\" }, { field = \"tab_name\" }, { field = \"space_name\" }], [{ field = \"status\" }, { field = \"time\" }, { field = \"custom_status\" }, { field = \"right_alignment\" }, { field = \"agent_name\" }]]",
+          "description": "Expanded Agent sidebar layout, as lines of { field, show, color, order } tables."
         },
         {
-          "key": "ui.sidebar.agents.rows_by_agent",
-          "type": "table of token rows",
-          "default": "{}",
-          "description": "Complete Agent-row overrides keyed by strict canonical agent id. Agents without an override use ui.sidebar.agents.rows."
+          "key": "ui.sidebar.host.gradient",
+          "type": "enum",
+          "default": "\"rainbow\"",
+          "description": "Color gradient for the remote-host banner drawn above each server group in the client-rendered sidebar.",
+          "values": [
+            "rainbow",
+            "accent",
+            "cool",
+            "warm",
+            "muted"
+          ]
         },
         {
-          "key": "ui.sidebar.spaces.row_gap",
-          "type": "integer",
-          "default": "0",
-          "description": "Blank terminal rows between expanded Space sidebar entries. Set to 1 to restore the previous spacing. Consecutive indented worktree children remain packed as one group."
+          "key": "ui.sidebar.host.animation",
+          "type": "enum",
+          "default": "\"animated\"",
+          "description": "Whether the remote-host banner gradient animates or stays static.",
+          "values": [
+            "animated",
+            "static"
+          ]
         },
         {
-          "key": "ui.sidebar.spaces.rows",
-          "type": "list of token rows",
-          "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",
-          "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim } style tables. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
+          "key": "ui.sidebar.host.speed",
+          "type": "enum",
+          "default": "\"calm\"",
+          "description": "Animation speed of the remote-host banner gradient.",
+          "values": [
+            "calm",
+            "normal",
+            "lively"
+          ]
+        },
+        {
+          "key": "ui.sidebar.host.glyph",
+          "type": "enum",
+          "default": "\"left\"",
+          "description": "Whether the remote-host banner shows a leading glyph.",
+          "values": [
+            "left",
+            "none"
+          ]
+        },
+        {
+          "key": "ui.sidebar.host.show_count",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show the workspace count next to each remote-host banner."
+        },
+        {
+          "key": "ui.agent_panel_scope",
+          "type": "enum",
+          "default": "\"all\"",
+          "description": "Which agents the agent sidebar lists: only the current space, or all spaces.",
+          "values": [
+            "current",
+            "all"
+          ]
         },
         {
           "key": "ui.accent",

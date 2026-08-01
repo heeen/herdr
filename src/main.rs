@@ -58,6 +58,7 @@ mod agent_resume;
 mod api;
 mod app;
 mod build_info;
+mod bundle;
 #[cfg(not(windows))]
 mod checksum;
 mod cli;
@@ -87,6 +88,7 @@ mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod remote_registry;
 mod render_prof;
 mod selection;
 mod server;
@@ -98,6 +100,7 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod version;
 mod workspace;
 mod worktree;
 
@@ -317,30 +320,40 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
 
-# Expanded agent rows. Built-ins are state_icon, state_text, workspace, tab, pane, agent,
-# terminal_title, and terminal_title_stripped.
-# Custom values reported through pane metadata use a $name token.
-# A token occurrence may be styled with { token = "workspace", fg = "#89b4fa", bold = true, dim = false }.
-# Omitted style fields preserve the contextual default.
-# [ui.sidebar.agents]
-# Blank rows between agent entries. Set to 1 to restore the previous spacing.
-# row_gap = 0
-# rows = [["state_icon", "workspace", "tab"], ["agent"]]
-# Optional canonical agent IDs replace the default rows for matching agents.
-# [ui.sidebar.agents.rows_by_agent]
-# claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
-
-# Expanded space rows. Built-ins are state_icon, state_text, workspace, branch, and git_status.
-# Custom values reported through workspace metadata use a $name token, for example $jj_status.
-# Inline token styles accept strict #RGB/#RRGGBB foregrounds plus bold and dim booleans.
-# [ui.sidebar.spaces]
-# Blank rows between space entries. Set to 1 to restore the previous spacing.
-# row_gap = 0
-# rows = [["state_icon", "workspace"], ["branch", "git_status"]]
-
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
 # accent = "cyan"
+
+[ui.sidebar.spaces]
+# Optional per-item color presets: default, muted, accent, cool, warm.
+# lines = [
+#   [
+#     { field = "status", show = true },
+#     { field = "name", show = true },
+#   ],
+#   [
+#     { field = "branch", show = true },
+#     { field = "branch_status", show = true },
+#   ],
+# ]
+
+[ui.sidebar.agents]
+# Optional per-item color presets: default, muted, accent, cool, warm.
+# lines = [
+#   [
+#     { field = "agent_status", show = true },
+#     { field = "pane_name", show = true },
+#     { field = "tab_name", show = true },
+#     { field = "space_name", show = true },
+#   ],
+#   [
+#     { field = "status", show = true },
+#     { field = "time", show = true },
+#     { field = "custom_status", show = true },
+#     { field = "right_alignment", show = true },
+#     { field = "agent_name", show = true },
+#   ],
+# ]
 
 # Background notification popup delivery
 [ui.toast]
@@ -393,6 +406,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Experimental local Kitty graphics rendering for attached clients.
 # Requires a Kitty graphics-compatible outer terminal.
 # kitty_graphics = false
+# agent_panel_details was superseded by [ui.sidebar.agents] and is ignored if present.
 # Save recent pane screen history across full server restarts.
 pane_history = false
 # While prefix mode is active, temporarily switch the host input source to
@@ -499,6 +513,9 @@ fn main() -> io::Result<()> {
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
         return remote::run_remote_client_bridge();
     }
+    if args.get(1).map(|s| s.as_str()) == Some("remote-api-bridge") {
+        return remote::run_remote_api_bridge();
+    }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
@@ -546,6 +563,7 @@ fn main() -> io::Result<()> {
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
         println!("       herdr update [--handoff]");
+        println!("       herdr bundle list [path] [--json]");
         println!("       herdr channel set <stable|preview>");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
@@ -623,6 +641,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr integration <subcommand>",
                 "Manage built-in agent integrations",
+            ),
+            (
+                "herdr bundle <subcommand>",
+                "Inspect/build multi-platform binaries (cross-OS remote seeding)",
             ),
         ] {
             println!("  {command:<32} {description}");
@@ -887,5 +909,55 @@ mod tests {
         assert!(NESTED_HERDR_MESSAGES
             .iter()
             .all(|message| !message.starts_with("herdr:")));
+    }
+
+    /// Every commented `# ...` line inside DEFAULT_CONFIG that parses as a TOML
+    /// statement standalone should remain valid when uncommented.
+    ///
+    /// We strip the `# ` prefix only from lines that parse as a single
+    /// valid TOML statement in isolation (assignment or section header).
+    /// Prose comments and inline-example text like `# Accepts: hex
+    /// (#rrggbb)` or `# type = "shell" runs detached in the background.`
+    /// are left as comments.
+    #[test]
+    fn default_config_template_is_valid_toml_when_uncommented() {
+        fn looks_like_toml_statement(after_strip: &str) -> bool {
+            let trimmed = after_strip.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                return toml::from_str::<toml::Value>(trimmed).is_ok();
+            }
+            toml::from_str::<toml::Value>(&format!("{trimmed}\n")).is_ok()
+        }
+
+        let mut uncommented = String::with_capacity(DEFAULT_CONFIG.len());
+        for line in DEFAULT_CONFIG.lines() {
+            let trimmed = line.trim_start();
+            let stripped = trimmed
+                .strip_prefix("# ")
+                .or_else(|| trimmed.strip_prefix("#"));
+            match stripped {
+                Some(rest) if looks_like_toml_statement(rest) => uncommented.push_str(rest),
+                _ => uncommented.push_str(line),
+            }
+            uncommented.push('\n');
+        }
+
+        let parsed: config::Config = toml::from_str(&uncommented).unwrap_or_else(|err| {
+            panic!("uncommented DEFAULT_CONFIG must parse: {err}\n\n{uncommented}")
+        });
+        // Sound examples reference user-supplied files that aren't expected to
+        // exist on the test machine.
+        let schema_diagnostics: Vec<String> = parsed
+            .collect_diagnostics()
+            .into_iter()
+            .filter(|d| !d.contains("missing sound file:"))
+            .collect();
+        assert!(
+            schema_diagnostics.is_empty(),
+            "uncommented DEFAULT_CONFIG must produce no schema diagnostics, got {schema_diagnostics:?}",
+        );
     }
 }

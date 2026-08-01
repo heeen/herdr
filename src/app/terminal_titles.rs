@@ -1,21 +1,6 @@
 use super::App;
 
 impl App {
-    pub(crate) fn terminal_title_sidebar_configured(&self) -> bool {
-        let config = &self.state.sidebar_agents;
-        std::iter::once(&config.rows)
-            .chain(config.rows_by_agent.values())
-            .flatten()
-            .flatten()
-            .any(|token| {
-                matches!(
-                    token.parts().0,
-                    crate::config::AgentSidebarToken::TerminalTitle
-                        | crate::config::AgentSidebarToken::TerminalTitleStripped
-                )
-            })
-    }
-
     pub(crate) fn sync_terminal_titles(&mut self) -> bool {
         let mut observations = Vec::new();
         for (ws_idx, workspace) in self.state.workspaces.iter().enumerate() {
@@ -120,22 +105,6 @@ mod tests {
         assert_eq!(pane.terminal_title_stripped, None);
         assert_eq!(pane.revision, 3);
         assert_eq!(pane_updated_events(&event_hub), 3);
-    }
-
-    #[test]
-    fn override_only_terminal_title_token_requests_sidebar_redraws() {
-        let event_hub = crate::api::EventHub::default();
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
-        app.state.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
-        app.state.sidebar_agents.rows_by_agent.insert(
-            "claude".into(),
-            vec![vec![
-                crate::config::AgentSidebarToken::TerminalTitleStripped,
-            ]],
-        );
-
-        assert!(app.terminal_title_sidebar_configured());
     }
 
     fn pane_updated_events(event_hub: &crate::api::EventHub) -> usize {

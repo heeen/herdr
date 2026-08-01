@@ -572,7 +572,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         Subscription::PaneAgentStatusChanged {
             pane_id,
             agent_status: Some(AgentStatus::Done),
-        } if pane_id == "p_1_1"
+        } if pane_id.as_deref() == Some("p_1_1")
     ));
     assert!(matches!(
         &params.subscriptions[2],
@@ -701,6 +701,8 @@ fn worktree_request_and_response_round_trip() {
         result: ResponseResult::WorktreeCreated {
             workspace: WorkspaceInfo {
                 workspace_id: "w_1".into(),
+                branch: None,
+                git: None,
                 number: 2,
                 label: "herdr".into(),
                 focused: true,
@@ -787,6 +789,8 @@ fn worktree_lifecycle_events_round_trip() {
 
     let workspace = WorkspaceInfo {
         workspace_id: "w_2".into(),
+        branch: None,
+        git: None,
         number: 2,
         label: "herdr".into(),
         focused: true,

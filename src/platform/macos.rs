@@ -15,6 +15,9 @@ use super::{
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
+// Upstream host-cursor heuristics; consumers live in the upstream client loop, which this fork
+// replaced with the multi-remote client. Kept for the drawn-cursor port (upstream-merge follow-up).
+#[allow(dead_code)]
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
 }
@@ -570,6 +573,47 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
         bytes,
         extension: "png",
     })
+}
+
+/// #59: if the clipboard holds a file URL to an IMAGE that this process cannot read, return its path.
+///
+/// Screenshot tools like macshot copy a file URL pointing INTO their own sandboxed container
+/// (`~/Library/Containers/<bundle>/Data/…`), which macOS TCC blocks every other process from reading.
+/// herdr's image bridge gets no image *data* (`read_clipboard_image` returns `None`) and would
+/// silently paste the dead path — so the caller uses this to warn instead. Returns `None` when the
+/// clipboard has no file URL, the file isn't an image, or the file IS readable (the normal path-paste
+/// handles those).
+pub fn clipboard_image_file_if_unreadable() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("POSIX path of (the clipboard as «class furl»)")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None; // no file URL on the clipboard
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let is_image = std::path::Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "tiff" | "tif" | "heic" | "bmp"
+            )
+        });
+    if !is_image {
+        return None;
+    }
+    // Readable → the normal path-paste handles it; only an UNREADABLE (sandboxed) file warrants a warning.
+    if std::fs::File::open(&path).is_ok() {
+        return None;
+    }
+    Some(path)
 }
 
 fn unique_timestamp_nanos() -> u128 {

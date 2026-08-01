@@ -62,7 +62,7 @@ use crate::server::notifications::{
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
 };
-use crate::server::terminal_attach::paste_payload_for_runtime;
+use crate::server::terminal_attach::clipboard_image_paste_payload;
 
 mod pane_graphics;
 
@@ -528,12 +528,9 @@ impl HeadlessServer {
                 needs_render = true;
                 crate::render_prof::event("render.request.pty_dirty");
             }
-            let terminal_title_changed = self.app.sync_terminal_titles();
-            if terminal_title_changed && self.app.terminal_title_sidebar_configured() {
-                needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.terminal_title");
-            }
+            // mx: the segments sidebar renders no terminal-title tokens, so a title change
+            // never needs a redraw here; sync still records titles + emits pane_updated events.
+            let _ = self.app.sync_terminal_titles();
 
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
@@ -1140,9 +1137,14 @@ impl HeadlessServer {
             &self.app.terminal_runtimes,
             self.app.state.active,
             self.app.state.selected,
+            self.app.state.agent_panel_scope,
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            self.app.state.remote_registry.clone(),
+            // #37: carry the cumulative pane-id alias map across the live handoff so an agent's
+            // spawn-time HERDR_PANE_ID keeps resolving (otherwise pane.report_agent fails post-handoff).
+            &self.app.state.pane_id_aliases,
         );
 
         let mut handoff_entries = Vec::new();
@@ -1634,7 +1636,10 @@ impl HeadlessServer {
         }) = self.clients.get(&client_id)
         {
             if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                let payload = paste_payload_for_runtime(runtime, &path);
+                // #59: send the staged image path UN-bracketed so the agent's path→image auto-attach
+                // fires. Bracketing it (as a normal text paste would) made Claude Code treat it as
+                // literal text and print the path instead of attaching the image.
+                let payload = clipboard_image_paste_payload(&path);
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
                     warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
                 }
@@ -2695,6 +2700,7 @@ impl HeadlessServer {
                 cell_height_px,
                 keybindings,
                 writer,
+                surface_mode,
                 render_encoding,
                 direct_attach_requested,
             } => {
@@ -2718,28 +2724,28 @@ impl HeadlessServer {
                     rows,
                     cell_width_px,
                     cell_height_px,
+                    ?surface_mode,
                     ?render_encoding,
                     "client connected"
                 );
                 let last_activity = self.allocate_activity_stamp();
-                self.clients.insert(
-                    client_id,
-                    ClientConnection::new_with_mode(
-                        ClientConnectionMode::App,
-                        keybindings,
-                        (cols, rows),
-                        crate::kitty_graphics::HostCellSize {
-                            width_px: cell_width_px,
-                            height_px: cell_height_px,
-                        },
-                        crate::terminal_theme::TerminalTheme::default(),
-                        None,
-                        last_activity,
-                        render_encoding,
-                        direct_attach_requested,
-                        Some(writer),
-                    ),
+                let mut connection = ClientConnection::new_with_mode(
+                    ClientConnectionMode::App,
+                    keybindings,
+                    (cols, rows),
+                    crate::kitty_graphics::HostCellSize {
+                        width_px: cell_width_px,
+                        height_px: cell_height_px,
+                    },
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    last_activity,
+                    render_encoding,
+                    direct_attach_requested,
+                    Some(writer),
                 );
+                connection.surface_mode = surface_mode;
+                self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
                 }
@@ -2949,6 +2955,31 @@ impl HeadlessServer {
                 info!(client_id, "client detached");
                 self.send_terminal_stream_detach_shutdown(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
+                true
+            }
+            ServerEvent::ClientOpenSettings { client_id } => {
+                self.promote_client_to_foreground(client_id);
+                self.app.open_settings();
+                true
+            }
+            ServerEvent::ClientOpenKeybindHelp { client_id } => {
+                self.promote_client_to_foreground(client_id);
+                self.app.open_keybind_help();
+                true
+            }
+            ServerEvent::ClientPing { client_id, nonce } => {
+                // issue #13: echo the latency probe so the client measures real round-trip time
+                // over the persistent stream. No re-render needed.
+                self.send_to_client(client_id, ServerMessage::Pong { nonce });
+                false
+            }
+            ServerEvent::ClientRequestFullFrame { client_id } => {
+                // v14: the client's delta baseline desynced (a dropped/failed frame). Reset this
+                // client's render baseline so the next render is a full `Frame`, recovering without
+                // ever applying a delta onto a stale baseline. Re-render to push it promptly.
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.request_full_redraw();
+                }
                 true
             }
             ServerEvent::ClientDisconnected { client_id } => {
@@ -3444,7 +3475,7 @@ impl HeadlessServer {
         }
 
         let mut targets = Vec::new();
-        for (client_id, (cols, rows), _, _, mode) in
+        for (client_id, (cols, rows), _, _, mode, _) in
             render_targets(&self.clients, self.foreground_client_id)
         {
             if !matches!(mode, ClientConnectionMode::App) {
@@ -3521,7 +3552,7 @@ impl HeadlessServer {
         }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
-        let [(client_id, (cols, rows), cell_size, _is_foreground, mode)] =
+        let [(client_id, (cols, rows), cell_size, _is_foreground, mode, _surface_mode)] =
             render_targets.as_slice()
         else {
             retained_fallback!("multiple_or_no_target");
@@ -3738,7 +3769,9 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
-        for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, is_foreground, mode, surface_mode) in
+            render_targets
+        {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
@@ -3750,14 +3783,26 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_virtual_with_runtime_registry(
-                            &mut self.app.state,
-                            &self.app.terminal_runtimes,
-                            area,
-                            is_foreground,
-                            render_cell_size,
-                        );
+                    let (buffer, cursor) = match surface_mode {
+                        crate::protocol::ClientSurfaceMode::FullApp => {
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                render_cell_size,
+                            )
+                        }
+                        crate::protocol::ClientSurfaceMode::EmbeddedContent => {
+                            crate::server::render_stream::render_embedded_content_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                render_cell_size,
+                            )
+                        }
+                    };
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -4690,9 +4735,24 @@ mod tests {
     }
 
     fn read_server_frame(bytes: Vec<u8>) -> FrameData {
-        match read_server_message(bytes) {
+        // issue #13: frames may arrive deflate-wrapped; inflate before matching.
+        match crate::protocol::decompress_server_message(read_server_message(bytes)) {
             ServerMessage::Frame(frame) => frame,
             other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    /// Resolve the next server message to a full frame, reconstructing a #13 semantic `FrameDelta`
+    /// against the prior full `baseline` (the same way the client applies deltas). Lets a test that
+    /// reads a post-baseline render assert on full frame content regardless of whether the encoder
+    /// sent a full frame or a delta.
+    fn read_server_frame_after(baseline: &FrameData, bytes: Vec<u8>) -> FrameData {
+        match crate::protocol::decompress_server_message(read_server_message(bytes)) {
+            ServerMessage::Frame(frame) => frame,
+            ServerMessage::FrameDelta(delta) => baseline
+                .with_delta(&delta)
+                .expect("frame delta should reconstruct against the prior full frame"),
+            other => panic!("expected frame or frame delta, got {other:?}"),
         }
     }
 
@@ -4725,9 +4785,6 @@ mod tests {
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
-        server.app.state.sidebar_agents.rows = vec![vec![
-            crate::config::AgentSidebarToken::TerminalTitleStripped,
-        ]];
         let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
             .attached_terminal_id
@@ -4750,19 +4807,8 @@ mod tests {
         assert_eq!(first.terminal_title.as_deref(), Some("⠋ task"));
         assert_eq!(first.terminal_title_stripped.as_deref(), Some("task"));
         assert_eq!(pane_updated_events(&event_hub), 1);
-        let (buffer, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
-            &mut server.app.state,
-            &server.app.terminal_runtimes,
-            Rect::new(0, 0, 100, 30),
-            true,
-            crate::kitty_graphics::HostCellSize::default(),
-        );
-        let rendered = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("task"), "rendered frame: {rendered:?}");
+        // mx: the segments sidebar renders no terminal-title tokens, so there is no
+        // sidebar-render assertion here — the API surface above is the contract.
 
         server
             .app
@@ -5031,20 +5077,30 @@ mod tests {
             test_server_with_mobile_client();
         let (mut full_server, full_desktop_rx, full_mobile_rx) = test_server_with_mobile_client();
 
+        // Keep the baselines: with #13 semantic delta streaming the follow-up render may arrive as
+        // a `FrameDelta`, which only reconstructs against the prior full frame.
         retained_server.render_and_stream();
-        let _ = retained_desktop_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("retained desktop baseline");
-        let _ = retained_mobile_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("retained mobile baseline");
+        let retained_desktop_baseline = read_server_frame(
+            retained_desktop_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained desktop baseline"),
+        );
+        let retained_mobile_baseline = read_server_frame(
+            retained_mobile_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained mobile baseline"),
+        );
         full_server.render_and_stream();
-        let _ = full_desktop_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("full desktop baseline");
-        let _ = full_mobile_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("full mobile baseline");
+        let full_desktop_baseline = read_server_frame(
+            full_desktop_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full desktop baseline"),
+        );
+        let full_mobile_baseline = read_server_frame(
+            full_mobile_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full mobile baseline"),
+        );
 
         retained_server.app.state.spinner_tick = app::HEADLESS_ANIMATION_TICK_STEP;
         full_server.app.state.spinner_tick = app::HEADLESS_ANIMATION_TICK_STEP;
@@ -5052,22 +5108,26 @@ mod tests {
         assert!(retained_server.render_retained_animation_update_and_stream());
         full_server.render_and_stream();
 
-        let retained_desktop = read_server_frame(
+        let retained_desktop = read_server_frame_after(
+            &retained_desktop_baseline,
             retained_desktop_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained desktop animation"),
         );
-        let retained_mobile = read_server_frame(
+        let retained_mobile = read_server_frame_after(
+            &retained_mobile_baseline,
             retained_mobile_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained mobile animation"),
         );
-        let full_desktop = read_server_frame(
+        let full_desktop = read_server_frame_after(
+            &full_desktop_baseline,
             full_desktop_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full desktop animation"),
         );
-        let full_mobile = read_server_frame(
+        let full_mobile = read_server_frame_after(
+            &full_mobile_baseline,
             full_mobile_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full mobile animation"),
@@ -5103,6 +5163,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
@@ -5127,6 +5188,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
@@ -5144,6 +5206,30 @@ new_tab = "prefix+t"
             .bindings
             .iter()
             .any(|binding| binding.label == "prefix+c"));
+    }
+
+    #[test]
+    fn connected_app_client_tracks_surface_mode() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::EmbeddedContent,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            writer,
+        }));
+
+        assert_eq!(
+            server.clients[&1].surface_mode,
+            crate::protocol::ClientSurfaceMode::EmbeddedContent
+        );
     }
 
     #[test]
@@ -5167,6 +5253,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
@@ -5180,6 +5267,7 @@ new_tab = "prefix+t"
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
@@ -5223,6 +5311,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
@@ -5298,6 +5387,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
@@ -5318,6 +5408,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
@@ -5352,6 +5443,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
@@ -5417,6 +5509,7 @@ next_tab = ""
             rows: 30,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
@@ -5719,6 +5812,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
@@ -5753,6 +5847,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
@@ -5786,6 +5881,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
@@ -5886,6 +5982,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
@@ -6437,6 +6534,26 @@ next_tab = ""
             crate::server::render_stream::render_virtual(&mut state, area, true);
         assert_eq!(buffer.area.width, 80);
         assert_eq!(buffer.area.height, 24);
+    }
+
+    #[test]
+    fn embedded_virtual_render_omits_sidebar_and_uses_full_width_content() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let (buffer, _cursor) =
+            crate::server::render_stream::render_embedded_content_virtual(&mut state, area, true);
+
+        assert_eq!(buffer.area.width, 80);
+        assert_eq!(buffer.area.height, 24);
+        assert_eq!(state.view.sidebar_rect, Rect::default());
+        assert!(state.view.workspace_card_areas.is_empty());
+        assert_eq!(state.view.tab_bar_rect, Rect::new(0, 0, 80, 1));
+        assert_eq!(state.view.terminal_area, Rect::new(0, 1, 80, 23));
     }
 
     #[test]
@@ -7759,6 +7876,39 @@ next_tab = ""
         );
     }
 
+    #[test]
+    fn render_and_stream_uses_embedded_app_surface_mode() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        let mut connection = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        connection.surface_mode = crate::protocol::ClientSurfaceMode::EmbeddedContent;
+        server.clients.insert(1, connection);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv().expect("embedded frame"));
+
+        assert_eq!((frame.width, frame.height), (80, 24));
+        assert_eq!(server.app.state.view.sidebar_rect, Rect::default());
+        assert_eq!(server.app.state.view.tab_bar_rect, Rect::new(0, 0, 80, 1));
+        assert_eq!(server.app.state.view.terminal_area, Rect::new(0, 1, 80, 23));
+    }
+
     #[tokio::test]
     async fn resize_shared_runtime_resizes_background_tabs() {
         let mut server = test_headless_server();
@@ -7868,6 +8018,7 @@ next_tab = ""
             rows: 24,
             cell_width_px: 0,
             cell_height_px: 0,
+            surface_mode: crate::protocol::ClientSurfaceMode::FullApp,
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
@@ -8116,8 +8267,10 @@ next_tab = ""
             DeferredRender::None
         );
         assert!(matches!(
-            read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::Frame(_)
+            crate::protocol::decompress_server_message(read_server_message(
+                client_rx.recv_timeout(Duration::from_millis(100)).unwrap()
+            )),
+            ServerMessage::Frame(_) | ServerMessage::FrameDelta(_)
         ));
     }
 
@@ -8359,7 +8512,8 @@ next_tab = ""
         runtime.test_process_pty_bytes(b"\rZ");
 
         assert!(server.render_retained_pty_update_and_stream());
-        let patched = read_server_frame(
+        let patched = read_server_frame_after(
+            &first,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame"),
@@ -8391,7 +8545,9 @@ next_tab = ""
 
         assert!(!server.render_retained_pty_update_and_stream());
         server.render_and_stream();
-        let updated = read_server_frame(
+        // issue #13: the fallback full render still delta-encodes against the baseline.
+        let updated = read_server_frame_after(
+            &initial,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full popup fallback frame"),
@@ -8674,13 +8830,17 @@ next_tab = ""
         let (mut full_server, full_rx, full_pane_id) = retained_test_server(initial);
 
         retained_server.render_and_stream();
-        let _ = retained_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial retained baseline");
+        let retained_baseline = read_server_frame(
+            retained_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial retained baseline"),
+        );
         full_server.render_and_stream();
-        let _ = full_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial full baseline");
+        let full_baseline = read_server_frame(
+            full_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial full baseline"),
+        );
 
         retained_server
             .app
@@ -8702,12 +8862,14 @@ next_tab = ""
         assert!(retained_server.render_retained_pty_update_and_stream());
         full_server.render_and_stream();
 
-        let retained_frame = read_server_frame(
+        let retained_frame = read_server_frame_after(
+            &retained_baseline,
             retained_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame"),
         );
-        let full_frame = read_server_frame(
+        let full_frame = read_server_frame_after(
+            &full_baseline,
             full_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full frame"),
@@ -8723,13 +8885,17 @@ next_tab = ""
         let (mut full_server, full_rx, full_pane_id) = retained_test_server(initial);
 
         retained_server.render_and_stream();
-        let _ = retained_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial retained baseline");
+        let retained_baseline = read_server_frame(
+            retained_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial retained baseline"),
+        );
         full_server.render_and_stream();
-        let _ = full_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial full baseline");
+        let full_baseline = read_server_frame(
+            full_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial full baseline"),
+        );
 
         retained_server
             .app
@@ -8751,12 +8917,14 @@ next_tab = ""
         assert!(retained_server.render_retained_pty_update_and_stream());
         full_server.render_and_stream();
 
-        let retained_frame = read_server_frame(
+        let retained_frame = read_server_frame_after(
+            &retained_baseline,
             retained_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained cursor frame"),
         );
-        let full_frame = read_server_frame(
+        let full_frame = read_server_frame_after(
+            &full_baseline,
             full_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full cursor frame"),
@@ -8768,9 +8936,11 @@ next_tab = ""
     async fn retained_pty_update_declines_unsafe_mode_without_consuming_dirty_rows() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         server.render_and_stream();
-        let _ = client_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial frame");
+        let baseline = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
 
         let runtime = server
             .app
@@ -8785,7 +8955,8 @@ next_tab = ""
 
         server.app.state.mode = crate::app::Mode::Terminal;
         assert!(server.render_retained_pty_update_and_stream());
-        let patched = read_server_frame(
+        let patched = read_server_frame_after(
+            &baseline,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame after safe mode"),
@@ -8830,7 +9001,7 @@ next_tab = ""
         frame.cells[hyperlink_idx].hyperlink = Some(0);
         let prepared = client
             .render_state
-            .prepare_frame(frame)
+            .prepare_frame(frame.clone())
             .expect("hyperlink frame differs");
         client.render_state.commit_sent_frame(prepared);
 
@@ -8845,7 +9016,8 @@ next_tab = ""
         assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
         server.render_and_stream();
-        let full = read_server_frame(
+        let full = read_server_frame_after(
+            &frame,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full frame after hyperlink overwrite"),
@@ -8860,9 +9032,11 @@ next_tab = ""
     async fn retained_pty_update_allows_dirty_row_that_creates_plain_url() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"plain");
         server.render_and_stream();
-        let _ = client_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial frame");
+        let initial = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
 
         let runtime = server
             .app
@@ -8872,7 +9046,9 @@ next_tab = ""
         runtime.test_process_pty_bytes(b"\rhttps://example.com/new");
 
         assert!(server.render_retained_pty_update_and_stream());
-        let patched = read_server_frame(
+        // issue #13: the retained path streams a semantic FrameDelta; reconstruct it.
+        let patched = read_server_frame_after(
+            &initial,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame after plain URL"),
@@ -8893,9 +9069,11 @@ next_tab = ""
         };
 
         server.render_and_stream();
-        let _ = client_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial frame");
+        let baseline = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
 
         let runtime = server
             .app
@@ -8905,7 +9083,8 @@ next_tab = ""
         runtime.test_process_pty_bytes(b"\rZ");
 
         assert!(server.render_retained_pty_update_and_stream());
-        let retained = read_server_frame(
+        let retained = read_server_frame_after(
+            &baseline,
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame with kitty enabled"),

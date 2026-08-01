@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
-    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientLaunchMode, ClientMessage, ClientSurfaceMode, RenderEncoding, ServerMessage,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -288,6 +288,7 @@ pub(crate) enum ServerEvent {
         rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
+        surface_mode: ClientSurfaceMode,
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
@@ -346,6 +347,14 @@ pub(crate) enum ServerEvent {
     },
     /// A client detached gracefully.
     ClientDetach { client_id: u64 },
+    /// A client requested the server-rendered settings UI.
+    ClientOpenSettings { client_id: u64 },
+    /// A client requested the server-rendered keybind help UI.
+    ClientOpenKeybindHelp { client_id: u64 },
+    /// A latency probe from a client; the server echoes `nonce` back in a `Pong` (issue #13).
+    ClientPing { client_id: u64, nonce: u64 },
+    /// A client whose frame baseline desynced asks for a full re-baseline frame (v14).
+    ClientRequestFullFrame { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
@@ -463,6 +472,25 @@ pub(crate) fn handle_client_handshake(
             warn!(client_id, claimed, max, "oversized handshake from client");
             return Ok(());
         }
+        Err(protocol::FramingError::Bincode(err)) => {
+            // SW3: bytes arrived but couldn't be DECODED — almost always protocol-version skew (e.g.
+            // an older client whose Hello layout predates a field added here). Bincode is positional,
+            // so the version field can't be read in isolation; instead reply with a version-mismatch
+            // Welcome (the Welcome shape is the stable handshake contract: variant 0, version +
+            // encoding + error) so the old client exits with a clear reason rather than an abrupt,
+            // undiagnosable close. A timeout / I/O error (no Hello sent) falls through to a silent
+            // close below — it's not a version problem.
+            debug!(client_id, err = %err, "failed to decode client hello; replying with version-mismatch Welcome");
+            let welcome = ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: Some(format!(
+                    "incompatible client protocol (server speaks v{PROTOCOL_VERSION}); update herdr"
+                )),
+            };
+            let _ = protocol::write_message(&mut stream, &welcome);
+            return Ok(());
+        }
         Err(err) => {
             debug!(client_id, err = %err, "failed to read client hello");
             return Ok(());
@@ -475,6 +503,7 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        surface_mode,
         keybindings,
         direct_attach_requested,
     ) = match hello {
@@ -485,6 +514,7 @@ pub(crate) fn handle_client_handshake(
             cell_width_px,
             cell_height_px,
             requested_encoding,
+            surface_mode,
             keybindings,
             launch_mode,
         } => {
@@ -524,6 +554,7 @@ pub(crate) fn handle_client_handshake(
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
+                surface_mode,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
             )
@@ -577,6 +608,7 @@ pub(crate) fn handle_client_handshake(
         rows: client_rows,
         cell_width_px,
         cell_height_px,
+        surface_mode,
         render_encoding,
         keybindings,
         direct_attach_requested,
@@ -786,6 +818,10 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::OpenSettings => ServerEvent::ClientOpenSettings { client_id },
+            ClientMessage::OpenKeybindHelp => ServerEvent::ClientOpenKeybindHelp { client_id },
+            ClientMessage::Ping { nonce } => ServerEvent::ClientPing { client_id, nonce },
+            ClientMessage::RequestFullFrame => ServerEvent::ClientRequestFullFrame { client_id },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -1120,6 +1156,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             },
@@ -1151,6 +1188,7 @@ new_tab = "ctrl+notakey"
                 rows,
                 cell_width_px,
                 cell_height_px,
+                surface_mode,
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
@@ -1159,6 +1197,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(client_id, 42);
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
+                assert_eq!(surface_mode, ClientSurfaceMode::FullApp);
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
@@ -1195,6 +1234,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
             },

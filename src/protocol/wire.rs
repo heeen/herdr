@@ -13,7 +13,14 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// v14 (mx): `FrameDelta` carries `base_checksum` and clients may send `RequestFullFrame`
+/// (delta-desync recovery). v18: upstream v0.7.4 merge — unions upstream's v17 additions
+/// (terminal observe/control streams, `PrefixInputSource`) after the mx variants; bumped past
+/// both lines (mx 14, upstream 17) so neither side's peers can false-match.
+/// v19: mx merged with upstream v0.7.5+ — both lines independently shipped a v18 with different
+/// variant sets (upstream added `KittyKeyboardReportAll`, mx added `FrameDelta`/`Pong`/
+/// `Compressed`), so this union must sit above both to stay unambiguous.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -23,6 +30,13 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 /// Normal traffic keeps `MAX_FRAME_SIZE`; this larger cap is only for explicit
 /// image payloads that are naturally much larger after base64 encoding.
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
+/// Hard ceiling on the inflated size of a `ServerMessage::Compressed` payload. The wire frame is
+/// already bounded (`MAX_FRAME_SIZE`/`MAX_GRAPHICS_FRAME_SIZE`), but deflate can amplify ~1000×, so
+/// a bounded compressed frame could otherwise inflate to multiple GB and OOM the client. This cap
+/// sits well above any legitimate frame (a full graphics frame is ≤ ~32 MB raw; a full text frame a
+/// few MB) while turning a decompression bomb into a dropped message.
+pub const MAX_DECOMPRESSED_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -41,6 +55,15 @@ pub enum RenderEncoding {
     SemanticFrame,
     /// Send already-diffed terminal ANSI byte streams.
     TerminalAnsi,
+}
+
+/// App surface requested by an attached app client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientSurfaceMode {
+    /// Existing behavior: the server renders the full Herdr UI.
+    FullApp,
+    /// The server renders only active workspace content for a client-owned shell.
+    EmbeddedContent,
 }
 
 /// Keybinding profile requested by an attached app client.
@@ -330,6 +353,8 @@ pub enum ClientMessage {
         cell_height_px: u32,
         /// Render encoding requested by the client.
         requested_encoding: RenderEncoding,
+        /// Surface mode requested by the client.
+        surface_mode: ClientSurfaceMode,
         /// Keybinding profile requested by the client.
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
@@ -390,9 +415,34 @@ pub enum ClientMessage {
     },
 
     /// Structured input events from platform clients that do not expose Unix-style raw bytes.
+    /// Tag 7: kept immediately after `AttachScroll` so the protocol-13 wire-tag ordering
+    /// (`client_message_wire_tags_preserve_protocol_13_order`) is preserved; the multi-remote
+    /// variants below are appended after it.
     InputEvents { events: Vec<ClientInputEvent> },
 
-    /// Switch this connection into read-only terminal observe mode.
+    /// Open the server-rendered settings UI for this client.
+    OpenSettings,
+
+    /// Open the server-rendered keybind help UI for this client.
+    OpenKeybindHelp,
+
+    /// Latency probe over the persistent client stream (issue #13). The server echoes `nonce` in a
+    /// `ServerMessage::Pong`, so the client measures true round-trip time without the per-request
+    /// bridge-connection + remote-process-spawn overhead. Appended last to keep wire tags stable.
+    Ping {
+        /// Opaque token echoed back in the matching Pong.
+        nonce: u64,
+    },
+
+    /// Request a full re-baseline frame (v14). Sent when the client detects its cached frame
+    /// baseline no longer matches the server's (a `FrameDelta` whose `base_checksum` mismatches, or
+    /// a compressed frame that failed to inflate). The server resets the per-client render baseline
+    /// so its next render is a full `Frame`, recovering from a desync without showing wrong cells.
+    /// Appended last to keep the existing bincode wire tags stable.
+    RequestFullFrame,
+
+    /// Switch this connection into read-only terminal observe mode. Appended after the mx
+    /// variants so their bincode wire tags stay stable across the upstream v0.7.4 merge.
     ObserveTerminal {
         /// Pane, terminal, or agent target to observe.
         target: String,
@@ -478,6 +528,30 @@ pub struct CursorState {
     pub shape: CursorShapeParam,
 }
 
+/// A delta against the client's last full frame for a semantic-frame client (issue #13): only the
+/// changed cells travel the wire, cutting remote bandwidth by 1–2 orders of magnitude for typical
+/// edits so a low-ping ssh link is no longer full-frame-bandwidth-bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameDelta {
+    /// Frame width in columns (must match the baseline being updated).
+    pub width: u16,
+    /// Frame height in rows.
+    pub height: u16,
+    /// Changed cells as `(row-major index, new cell)`.
+    pub cells: Vec<(u32, CellData)>,
+    /// Cursor state for this frame.
+    pub cursor: Option<CursorState>,
+    /// OSC 8 hyperlink URIs referenced by the (full reconstructed) frame.
+    pub hyperlinks: Vec<String>,
+    /// Kitty graphics bytes to apply after the text frame.
+    pub graphics: Vec<u8>,
+    /// [`frame_checksum`] of the baseline frame this delta was computed against (the server's
+    /// `last_frame`). The client refuses to apply the delta onto a baseline whose checksum differs,
+    /// so a dropped/failed prior frame can no longer silently desync the reconstructed display.
+    /// Appended last so older decoders that ignore trailing bytes stay tolerant.
+    pub base_checksum: u64,
+}
+
 /// A rendered frame to be displayed by the client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameData {
@@ -556,6 +630,87 @@ impl FrameData {
         }
     }
 
+    /// Compute a delta from `prev` to `self` for semantic-frame streaming (issue #13): the changed
+    /// cells (row-major index + new value) plus the cursor/hyperlinks/graphics. Returns `None` when
+    /// the dimensions differ (the caller must send a full frame to re-baseline).
+    pub fn delta_from(&self, prev: &FrameData) -> Option<FrameDelta> {
+        if self.width != prev.width
+            || self.height != prev.height
+            || self.cells.len() != prev.cells.len()
+        {
+            return None;
+        }
+        let cells: Vec<(u32, CellData)> = self
+            .cells
+            .iter()
+            .zip(prev.cells.iter())
+            .enumerate()
+            .filter(|(_, (new, old))| new != old)
+            .map(|(index, (new, _))| (index as u32, new.clone()))
+            .collect();
+        Some(FrameDelta {
+            width: self.width,
+            height: self.height,
+            cells,
+            cursor: self.cursor.clone(),
+            hyperlinks: self.hyperlinks.clone(),
+            graphics: self.graphics.clone(),
+            base_checksum: frame_checksum(prev),
+        })
+    }
+
+    /// Reconstruct the full frame produced by applying `delta` on top of `self` (the previous full
+    /// frame). Returns `None` if the baseline doesn't match the delta's dimensions or an index is
+    /// out of range, signaling the client to wait for a full re-baseline frame.
+    pub fn with_delta(&self, delta: &FrameDelta) -> Option<FrameData> {
+        let expected = (delta.width as usize) * (delta.height as usize);
+        if self.width != delta.width || self.height != delta.height || self.cells.len() != expected
+        {
+            return None;
+        }
+        let mut cells = self.cells.clone();
+        for (index, cell) in &delta.cells {
+            let i = *index as usize;
+            if i >= cells.len() {
+                return None;
+            }
+            cells[i] = cell.clone();
+        }
+        Some(FrameData {
+            cells,
+            width: delta.width,
+            height: delta.height,
+            cursor: delta.cursor.clone(),
+            hyperlinks: delta.hyperlinks.clone(),
+            graphics: delta.graphics.clone(),
+        })
+    }
+
+    /// A blank frame of `width`×`height` reset/space cells. Used as an instant placeholder when
+    /// switching to a server whose content has not been received yet, so the UI repaints the new
+    /// shell immediately instead of holding the previous server's screen (issue #13).
+    pub fn blank(width: u16, height: u16) -> Self {
+        let count = (width as usize) * (height as usize);
+        FrameData {
+            cells: vec![
+                CellData {
+                    symbol: " ".to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                count
+            ],
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
@@ -629,9 +784,6 @@ pub enum ServerMessage {
     /// A rendered frame to be displayed by a semantic-frame client.
     Frame(FrameData),
 
-    /// Terminal bytes to write directly for a terminal-ANSI client.
-    Terminal(TerminalFrame),
-
     /// Client-local Kitty graphics bytes to write directly to the host terminal.
     Graphics {
         /// Raw Kitty graphics protocol bytes.
@@ -677,7 +829,27 @@ pub enum ServerMessage {
         enabled: bool,
     },
 
-    /// Whether the focused terminal requests Kitty report-all keyboard input.
+    /// A delta against the client's last full frame for a semantic-frame client (issue #13). The
+    /// client reconstructs the full frame from its cached baseline; servers send a full `Frame`
+    /// first and whenever a delta would not be smaller / dimensions change. Placed last so the
+    /// existing variant indices (and their bincode wire tags) stay stable.
+    FrameDelta(FrameDelta),
+
+    /// Reply to `ClientMessage::Ping`, echoing its `nonce` so the client can compute round-trip
+    /// latency over the persistent stream (issue #13).
+    Pong {
+        /// The nonce from the matching Ping.
+        nonce: u64,
+    },
+
+    /// A deflate-compressed inner `ServerMessage` (issue #13). Wraps the verbose semantic
+    /// Frame/FrameDelta payloads (a full screen is ~hundreds of KB of per-cell data that
+    /// compresses ~10-30x) so remote bandwidth — and the host-banner download readout — reflect
+    /// reality. The client inflates and dispatches the inner message.
+    Compressed(Vec<u8>),
+
+    /// Whether the focused terminal requests Kitty report-all keyboard input. Appended after the
+    /// mx variants so their bincode wire tags stay stable across the upstream v0.7.5+ merge.
     KittyKeyboardReportAll {
         /// True only while the focused pane requests `REPORT_ALL_KEYS_AS_ESCAPE_CODES`.
         enabled: bool,
@@ -685,11 +857,17 @@ pub enum ServerMessage {
 
     /// Apply the prefix-mode ASCII input-source change on the foreground client.
     /// `active = true` → switch to an ASCII-capable source (saving the current one);
-    /// `active = false` → restore the saved source.
+    /// `active = false` → restore the saved source. Appended after the mx variants so their
+    /// bincode wire tags stay stable across the upstream v0.7.4 merge.
     PrefixInputSource {
         /// Whether the ASCII input source should be active.
         active: bool,
     },
+
+    /// Terminal bytes to write directly for a terminal-ANSI client. Upstream declares this right
+    /// after `Frame`; herdr-mx appends it here so the mx wire tags (Compressed = 11 etc.) stay
+    /// stable across the upstream v0.7.4 merge — version parity gates mixed-version peers anyway.
+    Terminal(TerminalFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +880,9 @@ pub enum ServerMessage {
 /// - Named colors (Reset, Black, …, White) → `0x00_00_00_XX` where XX is 0..=16
 /// - Indexed palette → `0x01_00_00_XX` where XX is the palette index
 /// - RGB → `0x02_RR_GG_BB` with components in the lower 3 bytes
+///
+/// `pub(crate)` so the client compositor can pack theme colors when painting the per-frame hover
+/// overlay (#56) into the SAME packed encoding `CellData` already carries.
 pub(crate) fn color_to_u32(color: ratatui::style::Color) -> u32 {
     match color {
         ratatui::style::Color::Reset => 0x00_00_00_00,
@@ -844,6 +1025,79 @@ impl From<io::Error> for FramingError {
 ///
 /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
 /// (would be truncated by the length prefix cast).
+/// Server-message payloads larger than this are worth deflating (issue #13); tiny deltas don't
+/// benefit and the wrapper would only add overhead.
+pub const FRAME_COMPRESSION_THRESHOLD: usize = 256;
+
+/// Deterministic content checksum of a frame's cells + dimensions, computed identically on the
+/// server and client. A [`FrameDelta`] carries the checksum of the baseline it was built against;
+/// the client only applies the delta when its cached baseline hashes to the same value, so a
+/// dropped/failed prior frame can no longer silently reconstruct wrong cells. FNV-1a (64-bit) over
+/// width, height and each cell — graphics/cursor are excluded (they self-heal and would make a
+/// large graphics frame expensive to hash). Not cryptographic; only guards against accidental
+/// baseline drift.
+pub fn frame_checksum(frame: &FrameData) -> u64 {
+    fn fold(hash: &mut u64, bytes: &[u8]) {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            *hash ^= *byte as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fold(&mut hash, &frame.width.to_le_bytes());
+    fold(&mut hash, &frame.height.to_le_bytes());
+    for cell in &frame.cells {
+        fold(&mut hash, cell.symbol.as_bytes());
+        fold(&mut hash, &[0]); // symbol terminator so "ab"+"c" != "a"+"bc"
+        fold(&mut hash, &cell.fg.to_le_bytes());
+        fold(&mut hash, &cell.bg.to_le_bytes());
+        fold(&mut hash, &cell.modifier.to_le_bytes());
+        fold(&mut hash, &[cell.skip as u8]);
+        match cell.hyperlink {
+            Some(idx) => {
+                fold(&mut hash, &[1]);
+                fold(&mut hash, &idx.to_le_bytes());
+            }
+            None => fold(&mut hash, &[0]),
+        }
+    }
+    hash
+}
+
+/// Wrap a server message in `ServerMessage::Compressed` when its serialized form exceeds
+/// [`FRAME_COMPRESSION_THRESHOLD`]; otherwise return it unchanged. Deflate level 1 stays cheap on
+/// the render path while cutting verbose full frames ~10-30x. Returns the original on any encode
+/// hiccup (never blocks a frame).
+pub fn compress_server_message(message: ServerMessage) -> ServerMessage {
+    let Ok(raw) = bincode::serde::encode_to_vec(&message, bincode::config::standard()) else {
+        return message;
+    };
+    if raw.len() <= FRAME_COMPRESSION_THRESHOLD {
+        return message;
+    }
+    ServerMessage::Compressed(miniz_oxide::deflate::compress_to_vec(&raw, 1))
+}
+
+/// Inflate a `ServerMessage::Compressed` into its inner message; other messages pass through. On
+/// inflate/parse failure the (still-`Compressed`) message is returned so the caller can detect it.
+pub fn decompress_server_message(message: ServerMessage) -> ServerMessage {
+    let ServerMessage::Compressed(bytes) = &message else {
+        return message;
+    };
+    // Bound the inflated output: deflate can amplify a small (but wire-capped) compressed frame into
+    // gigabytes, so an attacker/buggy server could OOM the client. Past the cap, drop the message.
+    let Ok(raw) =
+        miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, MAX_DECOMPRESSED_MESSAGE_SIZE)
+    else {
+        return message;
+    };
+    match bincode::serde::decode_from_slice::<ServerMessage, _>(&raw, bincode::config::standard()) {
+        Ok((inner, _)) => inner,
+        Err(_) => message,
+    }
+}
+
 pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
     let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .map_err(|e| FramingError::Bincode(e.to_string()))?;
@@ -966,6 +1220,88 @@ mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
 
+    fn frame_of(symbols: &[&str]) -> FrameData {
+        FrameData {
+            cells: symbols
+                .iter()
+                .map(|s| CellData {
+                    symbol: (*s).to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                })
+                .collect(),
+            width: symbols.len() as u16,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frame_delta_round_trips_to_the_new_frame() {
+        let prev = frame_of(&["a", "b", "c", "d"]);
+        let next = frame_of(&["a", "X", "c", "Y"]);
+        let delta = next.delta_from(&prev).expect("same dims yield a delta");
+        // Only the two changed cells travel.
+        assert_eq!(delta.cells.len(), 2);
+        assert_eq!(delta.cells[0].0, 1);
+        assert_eq!(delta.cells[1].0, 3);
+        // Applying the delta to the baseline reconstructs the new frame exactly.
+        assert_eq!(prev.with_delta(&delta), Some(next));
+    }
+
+    #[test]
+    fn frame_delta_is_none_on_dimension_change() {
+        let prev = frame_of(&["a", "b"]);
+        let next = frame_of(&["a", "b", "c"]);
+        assert!(next.delta_from(&prev).is_none());
+    }
+
+    #[test]
+    fn frame_delta_apply_rejects_mismatched_baseline() {
+        let next = frame_of(&["a", "X"]);
+        let delta = next.delta_from(&frame_of(&["a", "b"])).unwrap();
+        // A baseline of the wrong size can't be updated by this delta.
+        assert!(frame_of(&["a", "b", "c"]).with_delta(&delta).is_none());
+    }
+
+    #[test]
+    fn frame_checksum_is_stable_and_content_sensitive() {
+        // Deterministic for identical frames, different when any cell content changes.
+        assert_eq!(
+            frame_checksum(&frame_of(&["a", "b", "c"])),
+            frame_checksum(&frame_of(&["a", "b", "c"]))
+        );
+        assert_ne!(
+            frame_checksum(&frame_of(&["a", "b", "c"])),
+            frame_checksum(&frame_of(&["a", "X", "c"]))
+        );
+        // Same cells, different dimensions also diverge.
+        assert_ne!(
+            frame_checksum(&frame_of(&["a", "b"])),
+            frame_checksum(&frame_of(&["a", "b", "c"]))
+        );
+    }
+
+    #[test]
+    fn frame_delta_carries_its_baseline_checksum() {
+        // P2: the delta pins the checksum of the baseline it was built against, so the client can
+        // detect a desynced baseline (a dropped/failed prior frame) and refuse to apply onto it.
+        let prev = frame_of(&["a", "b", "c", "d"]);
+        let next = frame_of(&["a", "X", "c", "Y"]);
+        let delta = next.delta_from(&prev).expect("same dims yield a delta");
+        assert_eq!(delta.base_checksum, frame_checksum(&prev));
+        // A different (desynced) baseline of the same size has a different checksum, so the client's
+        // `frame_checksum(baseline) == delta.base_checksum` guard rejects it.
+        let desynced = frame_of(&["z", "z", "z", "z"]);
+        assert_eq!(desynced.width, prev.width);
+        assert_ne!(frame_checksum(&desynced), delta.base_checksum);
+    }
+
     // ---- Round-trip: ClientMessage ----
 
     #[test]
@@ -977,12 +1313,34 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_hello_embedded_content_surface_mode_roundtrip() {
+        let msg = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::EmbeddedContent,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+        };
+
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
         assert_eq!(msg, decoded);
     }
 
@@ -1014,6 +1372,7 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             }),
@@ -1056,18 +1415,24 @@ mod tests {
             6
         );
         assert_eq!(tag(&ClientMessage::InputEvents { events: Vec::new() }), 7);
+        // herdr-mx wire layout: the mx variants (OpenSettings..RequestFullFrame, tags 8-11)
+        // keep their tags; upstream's terminal session stream variants are appended after them.
+        assert_eq!(tag(&ClientMessage::OpenSettings), 8);
+        assert_eq!(tag(&ClientMessage::OpenKeybindHelp), 9);
+        assert_eq!(tag(&ClientMessage::Ping { nonce: 1 }), 10);
+        assert_eq!(tag(&ClientMessage::RequestFullFrame), 11);
         assert_eq!(
             tag(&ClientMessage::ObserveTerminal {
                 target: "w1:p1".to_owned(),
             }),
-            8
+            12
         );
         assert_eq!(
             tag(&ClientMessage::ControlTerminal {
                 target: "w1:p1".to_owned(),
                 takeover: false,
             }),
-            9
+            13
         );
     }
 
@@ -1475,6 +1840,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
@@ -1549,6 +1915,7 @@ mod tests {
                     cell_width_px: 8,
                     cell_height_px: 16,
                     requested_encoding: RenderEncoding::SemanticFrame,
+                    surface_mode: ClientSurfaceMode::FullApp,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                 },
@@ -1985,6 +2352,7 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
             requested_encoding: RenderEncoding::SemanticFrame,
+            surface_mode: ClientSurfaceMode::FullApp,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
         };
@@ -2021,6 +2389,7 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
+                surface_mode: ClientSurfaceMode::FullApp,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
             },
@@ -2038,6 +2407,8 @@ mod tests {
                 cell_height_px: 16,
             },
             ClientMessage::Detach,
+            ClientMessage::OpenSettings,
+            ClientMessage::OpenKeybindHelp,
         ];
 
         // Set non-blocking so we can write and read in the same test.
