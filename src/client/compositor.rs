@@ -253,8 +253,38 @@ pub(crate) struct ClientCompositor {
     // the title row and the button release; carries the press origin + the menu's offset at press, so
     // each motion sets the new offset = start_offset + (mouse - start). Cleared on release/close.
     menu_drag: Option<ClientMenuDrag>,
+    // The mobile switcher panel: the client-owned counterpart of the server's `Mode::Navigate`
+    // mobile branch. On a host too narrow for a sidebar the header's "switch" button is the ONLY
+    // way to reach spaces/agents, so the client renders the real switcher (`render_mobile_panel`)
+    // rather than the desktop launcher popup. Open-state and scroll are pure client view state —
+    // the server owns neither, exactly like `sidebar_collapsed` / `agent_panel_scroll`.
+    mobile_switcher_open: bool,
+    mobile_switcher_scroll: usize,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
+}
+
+/// A resolved click inside the open mobile switcher. Every variant that acts on a remote already
+/// carries the host it belongs to, so the caller never has to re-resolve a row index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MobileSwitcherHit {
+    Close,
+    FocusWorkspace {
+        server_id: ServerId,
+        workspace_id: String,
+    },
+    FocusAgent {
+        server_id: ServerId,
+        agent_id: String,
+    },
+    NewWorkspace,
+    NewTab {
+        server_id: ServerId,
+        workspace_id: String,
+    },
+    /// Index into the global launcher rows — the SAME order `client_global_menu_items` renders, so
+    /// the row activates the launcher action sitting at that position.
+    Menu(usize),
 }
 
 /// #47: the in-progress state of dragging the open client menu's top border to reposition it.
@@ -490,6 +520,9 @@ struct ClientSidebarSnapshot {
     // read one rect (mirrors how `ViewState` caches `workspace_card_areas`). `None` when no overlay
     // is open or it does not fit. Selection-independent, so it stays valid across #56 HoverRedraws.
     overlay_popup: Option<Rect>,
+    // Whether the mobile switcher panel is open. Carried on the snapshot (not read from the model)
+    // because it is client-local view state, exactly like `sidebar_collapsed`.
+    mobile_switcher_open: bool,
 }
 
 impl ClientCompositor {
@@ -521,6 +554,8 @@ impl ClientCompositor {
             prefix_pending_bytes: None,
             collapsed_space_keys: std::collections::HashSet::new(),
             menu_drag: None,
+            mobile_switcher_open: false,
+            mobile_switcher_scroll: 0,
             working_since: HashMap::new(),
         }
     }
@@ -1442,6 +1477,14 @@ impl ClientCompositor {
                 excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
             }
         }
+        // The switcher only exists on a mobile-width host; `render_client_shell` gates on the same
+        // pair, so what we protect below is exactly what gets painted.
+        let switcher_visible =
+            snapshot.app.view.layout == ViewLayout::Mobile && snapshot.mobile_switcher_open;
+        if switcher_visible {
+            // It covers the whole host, so the content copy must not write over any of it.
+            excluded_rects.push(Rect::new(0, 0, host_width, host_height));
+        }
         let frame = render_client_shell(&snapshot, host_width, host_height);
 
         // item 1/3: the add-remote / new-workspace-picker / manage modals are rendered as ratatui
@@ -1460,7 +1503,9 @@ impl ClientCompositor {
             || model.confirm_close_workspace().is_some()
             || model.new_worktree_form().is_some()
             || model.confirm_delete_worktree().is_some()
-            || model.worktree_picker().is_some();
+            || model.worktree_picker().is_some()
+            // The switcher covers the host, so the live content cursor must be hidden behind it.
+            || switcher_visible;
 
         ComposedShell {
             frame,
@@ -1561,6 +1606,188 @@ impl ClientCompositor {
             crate::ui::mobile_header_hit_areas_for_rect(Rect::new(0, 0, host_width, header_height))
                 .menu;
         (menu.width > 0 && menu.height > 0).then_some(menu)
+    }
+
+    /// Whether the mobile switcher panel is open. It covers the whole host, so every render and
+    /// input path treats it as modal.
+    pub(crate) fn mobile_switcher_open(&self) -> bool {
+        self.mobile_switcher_open
+    }
+
+    /// Open the switcher from the header's "switch" button. Always starts at the top: the panel
+    /// leads with agents, and reopening it scrolled to wherever the last visit ended would hide the
+    /// rows the button exists to reach.
+    pub(crate) fn open_mobile_switcher(&mut self) {
+        self.mobile_switcher_open = true;
+        self.mobile_switcher_scroll = 0;
+    }
+
+    pub(crate) fn close_mobile_switcher(&mut self) {
+        self.mobile_switcher_open = false;
+        self.mobile_switcher_scroll = 0;
+    }
+
+    /// Wheel-scroll the open switcher. Returns `Some(moved)` when the event was a wheel notch the
+    /// switcher owns, `None` when it was not a wheel event at all. The clamp comes from the SAME
+    /// synthetic `AppState` the panel renders from, so the last notch lands exactly on the last row
+    /// instead of scrolling into empty space, and a no-op notch reports `false` so it does not force
+    /// a recompose. Entries are two rows tall, hence the same `×2` step the server path uses.
+    pub(crate) fn handle_mobile_switcher_scroll(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        mouse: &crossterm::event::MouseEvent,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<bool> {
+        use crossterm::event::MouseEventKind;
+
+        let delta: i16 = match mouse.kind {
+            MouseEventKind::ScrollUp => -2,
+            MouseEventKind::ScrollDown => 2,
+            _ => return None,
+        };
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            self.effective_sidebar_width(host_width),
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let max_scroll = crate::ui::mobile_switcher_max_scroll(&snapshot.app);
+        let next = if delta.is_negative() {
+            self.mobile_switcher_scroll
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.mobile_switcher_scroll.saturating_add(delta as usize)
+        }
+        .min(max_scroll);
+        let moved = next != self.mobile_switcher_scroll;
+        self.mobile_switcher_scroll = next;
+        Some(moved)
+    }
+
+    /// The open switcher's close-button rect. Production hit-tests it through
+    /// `mobile_switcher_hit_test`; this exists so the dispatch tests can press the button where it
+    /// is actually painted instead of hardcoding a corner.
+    #[cfg(test)]
+    pub(crate) fn mobile_switcher_close_rect(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<Rect> {
+        if !self.mobile_switcher_open || !self.is_mobile(host_width) {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            self.effective_sidebar_width(host_width),
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        Some(crate::ui::mobile_switcher_areas(&snapshot.app).close)
+    }
+
+    /// Resolve a click inside the open mobile switcher to the action it selects, with every row
+    /// already mapped back to its owning host. Returns `None` when the switcher is not showing or
+    /// the click landed on no row (the panel is modal, so the caller still swallows those).
+    ///
+    /// Rows are hit-tested through the SHARED `mobile_switcher_target_at` against the same
+    /// synthetic `AppState` the panel was rendered from, so render == hit-test by construction.
+    /// Only the final host resolution is client-specific: the server's switcher targets a single
+    /// session and can act on bare indices, while the client's aggregated view must first ask which
+    /// remote the row came from.
+    pub(crate) fn mobile_switcher_hit_test(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        x: u16,
+        y: u16,
+        host_width: u16,
+        host_height: u16,
+    ) -> Option<MobileSwitcherHit> {
+        if !self.mobile_switcher_open || !self.is_mobile(host_width) {
+            return None;
+        }
+        let snapshot = ClientSidebarSnapshot::from_model(
+            model,
+            self,
+            self.effective_sidebar_width(host_width),
+            host_width,
+            host_height,
+            Instant::now(),
+        );
+        let app = &snapshot.app;
+        if rect_contains(crate::ui::mobile_switcher_areas(app).close, x, y) {
+            return Some(MobileSwitcherHit::Close);
+        }
+
+        // The active workspace backs the tab rows; `Tab`/`NewTab` are meaningless without it.
+        let active_route = || {
+            let idx = app.active?;
+            let route = snapshot.workspace_routes.get(idx)?;
+            Some((idx, route))
+        };
+        // `agent_routes` is built in the same order `agent_panel_entries` yields rows under the same
+        // scope, so an entry's position in that list is its route index — the identity
+        // `hit_test_agent_panel` already relies on.
+        let agent_hit = |position: usize| {
+            let route = snapshot.agent_routes.get(position)?;
+            Some(MobileSwitcherHit::FocusAgent {
+                server_id: route.server_id.clone(),
+                agent_id: route.agent_id.clone(),
+            })
+        };
+
+        match crate::ui::mobile_switcher_target_at(app, x, y)? {
+            crate::ui::MobileSwitcherTarget::NewWorkspace => Some(MobileSwitcherHit::NewWorkspace),
+            crate::ui::MobileSwitcherTarget::Workspace(ws_idx) => {
+                let route = snapshot.workspace_routes.get(ws_idx)?;
+                // A disabled row (a host that is still connecting, or a space the remote cannot
+                // serve) is painted dim and must not steal focus, matching the sidebar.
+                if route.disabled {
+                    return None;
+                }
+                Some(MobileSwitcherHit::FocusWorkspace {
+                    server_id: route.server_id.clone(),
+                    workspace_id: route.workspace_id.clone()?,
+                })
+            }
+            crate::ui::MobileSwitcherTarget::Agent {
+                ws_idx,
+                tab_idx,
+                pane_id,
+            } => agent_hit(
+                crate::ui::agent_panel_entries(app)
+                    .iter()
+                    .position(|entry| {
+                        entry.ws_idx == ws_idx
+                            && entry.tab_idx == tab_idx
+                            && entry.pane_id == pane_id
+                    })?,
+            ),
+            // The client has no tab-focus route of its own, and does not need one: focusing a tab's
+            // first agent is what actually switches the remote to that tab, through the proven
+            // agent-focus path.
+            crate::ui::MobileSwitcherTarget::Tab(tab_idx) => {
+                let (active_idx, _) = active_route()?;
+                agent_hit(
+                    crate::ui::agent_panel_entries(app)
+                        .iter()
+                        .position(|entry| entry.ws_idx == active_idx && entry.tab_idx == tab_idx)?,
+                )
+            }
+            crate::ui::MobileSwitcherTarget::NewTab => {
+                let (_, route) = active_route()?;
+                Some(MobileSwitcherHit::NewTab {
+                    server_id: route.server_id.clone(),
+                    workspace_id: route.workspace_id.clone()?,
+                })
+            }
+            crate::ui::MobileSwitcherTarget::Menu(index) => Some(MobileSwitcherHit::Menu(index)),
+        }
     }
 
     /// Top-left cell of the content region in host coordinates: `(sidebar_width, header_height)`.
@@ -2049,6 +2276,10 @@ impl ClientSidebarSnapshot {
                 host_width,
                 host_height.saturating_sub(header_height),
             );
+            // The switcher panel spans `mobile_screen_rect` (the union of the header and terminal
+            // areas set above), so its scroll must be mirrored in BEFORE the shared renderer and
+            // `mobile_switcher_target_at` read it — both derive their row geometry from this field.
+            app.mobile_switcher_scroll = compositor.mobile_switcher_scroll;
         } else {
             app.view.layout = ViewLayout::Desktop;
             app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
@@ -2419,6 +2650,10 @@ impl ClientSidebarSnapshot {
             host_banner_server_ids,
             agent_routes,
             collapsed_detail_agent_routes,
+            // Only meaningful on a mobile-width host; a desktop host never renders the panel, so the
+            // flag staying set across a resize back to mobile is intentional (the panel reopens
+            // where the user left it, like every other overlay).
+            mobile_switcher_open: compositor.mobile_switcher_open,
             // item 1: clone the overlay state out of the model into ui-owned carriers (pure read).
             // The closure maps these into ui view structs before rendering.
             add_remote_form: model.add_remote_form().cloned(),
@@ -2493,6 +2728,17 @@ fn render_client_shell(
                     frame,
                     snapshot.app.view.mobile_header_rect,
                 );
+                // The switcher is the mobile stand-in for the whole sidebar, so it covers the host
+                // (header included) exactly as the server's `Mode::Navigate` mobile branch does.
+                // `build_shell_inner` protects the same rect from the content copy.
+                if snapshot.mobile_switcher_open {
+                    crate::ui::render_mobile_panel(
+                        &snapshot.app,
+                        &terminal_runtimes,
+                        frame,
+                        frame.area(),
+                    );
+                }
             } else if snapshot.app.sidebar_collapsed {
                 crate::ui::render_sidebar_collapsed(
                     &snapshot.app,
@@ -5599,6 +5845,206 @@ mod tests {
             composed.cursor.map(|c| (c.x, c.y)),
             Some((0, MOBILE_HEADER_HEIGHT)),
             "the cursor must be offset by the header too"
+        );
+    }
+
+    /// A mixed fleet whose FOCUSED space lives on the remote and owns the only agent, so the
+    /// switcher's agent row and its two space rows resolve to different hosts — the thing the
+    /// client has to get right and the single-session server path never has to.
+    fn mobile_switcher_model() -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: false,
+        });
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: false,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "remote-api".into(),
+                        label: "api".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![AgentSummary {
+                        agent_id: "remote-agent".into(),
+                        workspace_id: "remote-api".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: true,
+                        pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
+                    }],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
+    }
+
+    /// Every acting row of the switcher must resolve to the host that owns it. The rows are found
+    /// by asking the SHARED hit-test what it painted rather than by hardcoding coordinates, so this
+    /// keeps testing the mapping (not the layout) if the panel is ever re-laid out.
+    #[test]
+    fn mobile_switcher_resolves_rows_to_their_owning_host() {
+        let (model, remote_id) = mobile_switcher_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let host = (50u16, 24u16);
+        compositor.open_mobile_switcher();
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            0,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let viewport = crate::ui::mobile_switcher_areas(&snapshot.app).viewport;
+        let col = viewport.x + 2;
+
+        let mut agent_hit = None;
+        let mut workspace_hits: Vec<MobileSwitcherHit> = Vec::new();
+        for row in viewport.y..viewport.y.saturating_add(viewport.height) {
+            let resolved = || compositor.mobile_switcher_hit_test(&model, col, row, host.0, host.1);
+            match crate::ui::mobile_switcher_target_at(&snapshot.app, col, row) {
+                Some(crate::ui::MobileSwitcherTarget::Agent { .. }) if agent_hit.is_none() => {
+                    agent_hit = resolved();
+                }
+                Some(crate::ui::MobileSwitcherTarget::Workspace(_)) => {
+                    if let Some(hit) = resolved() {
+                        if !workspace_hits.contains(&hit) {
+                            workspace_hits.push(hit);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            agent_hit,
+            Some(MobileSwitcherHit::FocusAgent {
+                server_id: remote_id.clone(),
+                agent_id: "remote-agent".into(),
+            }),
+            "the agent row must focus the agent on the remote that owns it"
+        );
+        assert!(
+            workspace_hits.contains(&MobileSwitcherHit::FocusWorkspace {
+                server_id: ServerId::main(),
+                workspace_id: "main-herdr".into(),
+            }),
+            "the local space row must route to the main server, got {workspace_hits:?}"
+        );
+        assert!(
+            workspace_hits.contains(&MobileSwitcherHit::FocusWorkspace {
+                server_id: remote_id,
+                workspace_id: "remote-api".into(),
+            }),
+            "the remote space row must route to the remote, got {workspace_hits:?}"
+        );
+    }
+
+    /// The close button is the only way out of a panel that fills the host, so it must hit.
+    #[test]
+    fn mobile_switcher_close_button_is_hittable() {
+        let (model, _remote_id) = mobile_switcher_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let host = (50u16, 24u16);
+        compositor.open_mobile_switcher();
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            0,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let close = crate::ui::mobile_switcher_areas(&snapshot.app).close;
+
+        assert_eq!(
+            compositor.mobile_switcher_hit_test(&model, close.x, close.y, host.0, host.1),
+            Some(MobileSwitcherHit::Close)
+        );
+    }
+
+    /// A closed switcher — and a desktop-width host, which has a sidebar instead — must never
+    /// swallow a click through the switcher hit-test.
+    #[test]
+    fn mobile_switcher_hit_test_is_inert_when_not_showing() {
+        let (model, _remote_id) = mobile_switcher_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+
+        assert_eq!(
+            compositor.mobile_switcher_hit_test(&model, 2, 5, 50, 24),
+            None
+        );
+        compositor.open_mobile_switcher();
+        assert_eq!(
+            compositor.mobile_switcher_hit_test(&model, 2, 5, 120, 24),
+            None,
+            "a desktop-width host renders a sidebar, never the switcher"
+        );
+    }
+
+    /// The open panel covers the host: it must render, count as modal (so the live content cursor
+    /// is hidden behind it) and be protected from the content copy — otherwise the pane underneath
+    /// would be painted straight over it, which is exactly the double-render class of bug.
+    #[test]
+    fn open_mobile_switcher_covers_the_host_and_survives_the_content_copy() {
+        let (model, _remote_id) = mobile_switcher_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let host = (50u16, 24u16);
+
+        let closed = compositor.build_shell(&model, host.0, host.1, Instant::now());
+        assert!(!closed.modal_open);
+
+        compositor.open_mobile_switcher();
+        let open = compositor.build_shell(&model, host.0, host.1, Instant::now());
+        assert!(open.modal_open, "the switcher must hide the content cursor");
+        assert!(
+            open.excluded_rects
+                .contains(&Rect::new(0, 0, host.0, host.1)),
+            "the whole host must be protected from the content copy"
+        );
+        assert_ne!(
+            open.frame.cells, closed.frame.cells,
+            "opening the switcher must actually change what is painted"
+        );
+
+        let (content_w, content_h) = compositor.content_size(host.0, host.1);
+        let mut content = FrameData::blank(content_w, content_h);
+        for cell in &mut content.cells {
+            cell.symbol = "Z".into();
+        }
+        let composed = overlay_content_onto_shell(&open, &content);
+        assert_eq!(
+            composed.cells, open.frame.cells,
+            "no content cell may reach the screen while the panel is up"
         );
     }
 

@@ -1258,6 +1258,13 @@ fn dispatch_composited_mouse_input(
         return dispatch_open_client_menu_mouse(compositor, model, host_size, mouse);
     }
 
+    // The mobile switcher covers the whole host, so — like the menus above — it owns every event
+    // while it is open, ahead of the sidebar handlers (which on a mobile host would be hit-testing
+    // a sidebar that is not even rendered).
+    if compositor.mobile_switcher_open() {
+        return dispatch_mobile_switcher_mouse(compositor, model, host_size, mouse);
+    }
+
     // item 7 (Area 4): handle motion BEFORE resize/scroll/hit_test. The `hit_test` dispatch below
     // early-returns `Consumed` for any non-`Down(Left)` kind, so without this top-of-fn arm a
     // `Moved` over a sidebar row would never reach `hover_test`. Intercept only when over the
@@ -1506,9 +1513,10 @@ fn dispatch_composited_mouse_input(
     // click in the (mini..expanded) column gap and offset every forwarded content click while the
     // sidebar was collapsed or mid-slide.
     let origin = compositor.content_origin(host_size.0, host_size.1);
-    // Mobile: the sidebar is replaced by a header on top, so its switch button is the workspace
-    // switcher. Route it to the SAME launcher menu the sidebar's "menu" button opens — that menu
-    // already lists every space/agent across servers, which is exactly what the switcher is for.
+    // Mobile: the sidebar is replaced by a header on top, whose "switch" button opens the switcher
+    // panel — the mobile stand-in for the sidebar itself (spaces, agents, tabs), NOT the launcher
+    // popup the sidebar's "menu" button opens. The launcher is still reachable from the switcher's
+    // own menu section, exactly as on the server-rendered mobile layout.
     if mouse.row < origin.1 {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && compositor
@@ -1520,7 +1528,7 @@ fn dispatch_composited_mouse_input(
                         && mouse.row < menu.y.saturating_add(menu.height)
                 })
         {
-            model.open_client_global_menu(mouse.column, mouse.row);
+            compositor.open_mobile_switcher();
             return ClientInputDispatch::Redraw;
         }
         return ClientInputDispatch::Consumed;
@@ -1530,6 +1538,130 @@ fn dispatch_composited_mouse_input(
     }
 
     translate_content_mouse_input(data, mouse, origin)
+}
+
+/// Mouse handling for the open mobile switcher. The panel is modal and full-screen, so every event
+/// is consumed here and nothing leaks to the pane beneath it.
+///
+/// Selecting a row closes the panel first — the user asked to switch, so leaving the switcher up
+/// over the destination they just picked would hide the very thing they navigated to. That mirrors
+/// the server path, which drops back to `Mode::Terminal` on each acting target.
+fn dispatch_mobile_switcher_mouse(
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    host_size: (u16, u16),
+    mouse: &MouseEvent,
+) -> ClientInputDispatch {
+    if let Some(moved) =
+        compositor.handle_mobile_switcher_scroll(model, mouse, host_size.0, host_size.1)
+    {
+        return if moved {
+            ClientInputDispatch::Redraw
+        } else {
+            ClientInputDispatch::Consumed
+        };
+    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return ClientInputDispatch::Consumed;
+    }
+
+    let Some(hit) = compositor.mobile_switcher_hit_test(
+        model,
+        mouse.column,
+        mouse.row,
+        host_size.0,
+        host_size.1,
+    ) else {
+        // A press on no row keeps the panel up. The switcher fills the host, so an "outside click"
+        // to dismiss does not exist here — the close button is the way out.
+        return ClientInputDispatch::Consumed;
+    };
+
+    match hit {
+        compositor::MobileSwitcherHit::Close => {
+            compositor.close_mobile_switcher();
+            ClientInputDispatch::Redraw
+        }
+        compositor::MobileSwitcherHit::FocusWorkspace {
+            server_id,
+            workspace_id,
+        } => {
+            compositor.close_mobile_switcher();
+            let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+            model
+                .focus_workspace_route(&server_id, &workspace_id)
+                .api_request("client:workspace-focus")
+                .map(|request| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    refresh,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Redraw)
+        }
+        compositor::MobileSwitcherHit::FocusAgent {
+            server_id,
+            agent_id,
+        } => {
+            compositor.close_mobile_switcher();
+            let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+            model
+                .focus_agent_route(&server_id, &agent_id)
+                .api_request("client:agent-focus")
+                .map(|request| ClientInputDispatch::ApiRequest {
+                    server_id,
+                    refresh,
+                    request: Box::new(request),
+                })
+                .unwrap_or(ClientInputDispatch::Redraw)
+        }
+        compositor::MobileSwitcherHit::NewWorkspace => {
+            compositor.close_mobile_switcher();
+            match model.open_new_workspace_picker() {
+                route @ supervisor::NewWorkspaceRoute::CreateOn(_) => route
+                    .api_request("client:workspace-create")
+                    .map(|(server_id, request)| ClientInputDispatch::ApiRequest {
+                        server_id,
+                        refresh: ClientApiRefreshPolicy::Immediate,
+                        request: Box::new(request),
+                    })
+                    .unwrap_or(ClientInputDispatch::Redraw),
+                supervisor::NewWorkspaceRoute::PickDestination(_)
+                | supervisor::NewWorkspaceRoute::Unavailable { .. } => ClientInputDispatch::Redraw,
+            }
+        }
+        compositor::MobileSwitcherHit::NewTab {
+            server_id,
+            workspace_id,
+        } => {
+            compositor.close_mobile_switcher();
+            ClientInputDispatch::ApiRequest {
+                server_id,
+                // A new tab changes what the remote is showing, so reconcile it immediately rather
+                // than waiting for the next poll.
+                refresh: ClientApiRefreshPolicy::Immediate,
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:tab-create".into(),
+                    method: crate::api::schema::Method::TabCreate(
+                        crate::api::schema::TabCreateParams {
+                            workspace_id: Some(workspace_id),
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                            env: Default::default(),
+                        },
+                    ),
+                }),
+            }
+        }
+        // Route the menu section through the SAME launcher rows the sidebar's "menu" button opens,
+        // so both surfaces run one action table (`global_launcher_rows`) and cannot drift.
+        compositor::MobileSwitcherHit::Menu(index) => {
+            compositor.close_mobile_switcher();
+            model.open_client_global_menu(0, 0);
+            let outcome = model.select_client_menu_item(index);
+            dispatch_for_client_menu_outcome(model, outcome)
+        }
+    }
 }
 
 /// #46/#47: mouse handling for the one OPEN client menu (launcher / workspace / host). Called from
@@ -8326,6 +8458,77 @@ mod tests {
             ClientInputDispatch::Forward(bytes) => assert_eq!(bytes, expected),
             other => panic!("expanded content click must forward, got {other:?}"),
         }
+    }
+
+    /// On a mobile-width host the header's "switch" button is the only route to spaces and agents,
+    /// so it must open the real switcher panel — not the desktop launcher popup, which lists
+    /// settings/detach/add-remote and reaches neither.
+    #[test]
+    fn mobile_switch_button_opens_the_switcher_not_the_launcher() {
+        let (mut model, _remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::with_mobile_threshold(26, 64);
+        let host = (50u16, 24u16);
+        let button = compositor
+            .mobile_menu_rect(host.0, host.1)
+            .expect("a mobile-width host paints a switch button");
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch =
+            dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &click);
+
+        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        assert!(compositor.mobile_switcher_open());
+        assert!(
+            model.client_menu().is_none(),
+            "the launcher popup must not be what the switch button opens"
+        );
+    }
+
+    /// The open panel is modal: a press on the pane beneath it must never leak through as content
+    /// input, and the close button must be the way back out.
+    #[test]
+    fn open_mobile_switcher_swallows_content_clicks_until_closed() {
+        let (mut model, _remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::with_mobile_threshold(26, 64);
+        let host = (50u16, 24u16);
+        compositor.open_mobile_switcher();
+
+        let press = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &press(4, 15),
+        );
+        assert!(
+            matches!(dispatch, ClientInputDispatch::Consumed),
+            "a press under the panel must not reach the pane, got {dispatch:?}"
+        );
+        assert!(compositor.mobile_switcher_open());
+
+        let close = compositor
+            .mobile_switcher_close_rect(&model, host.0, host.1)
+            .expect("an open switcher paints a close button");
+        let dispatch = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &press(close.x, close.y),
+        );
+        assert!(matches!(dispatch, ClientInputDispatch::Redraw));
+        assert!(!compositor.mobile_switcher_open());
     }
 
     #[test]
