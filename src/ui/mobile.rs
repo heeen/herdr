@@ -51,6 +51,12 @@ pub(crate) fn is_mobile_width(area: Rect, threshold: u16) -> bool {
 }
 
 pub(crate) fn compute_mobile_header_hit_areas(_app: &AppState, area: Rect) -> MobileHeaderHitAreas {
+    mobile_header_hit_areas_for_rect(area)
+}
+
+/// The header geometry on its own. The client compositor renders the mobile header without a
+/// server `AppState`, so it hit-tests through this same helper — render == hit-test either way.
+pub(crate) fn mobile_header_hit_areas_for_rect(area: Rect) -> MobileHeaderHitAreas {
     if area.width == 0 || area.height == 0 {
         return MobileHeaderHitAreas::default();
     }

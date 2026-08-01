@@ -18,6 +18,9 @@ use crate::terminal::{TerminalId, TerminalRuntimeRegistry, TerminalState};
 
 pub(crate) const DEFAULT_SIDEBAR_WIDTH: u16 = 26;
 
+/// Rows the mobile header occupies, matching the server's `compute_mobile_view`.
+pub(crate) const MOBILE_HEADER_HEIGHT: u16 = 2;
+
 /// #26: double-click window for the width-divider reset, matching the monolithic host's
 /// `DOUBLE_CLICK_WINDOW` (`src/app/input/mouse.rs`).
 const DIVIDER_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
@@ -183,6 +186,10 @@ pub(crate) enum SidebarResizeOutcome {
 
 pub(crate) struct ClientCompositor {
     sidebar_width: u16,
+    /// `ui.mobile_width_threshold`: at or below this host width there is no room for a sidebar, so
+    /// the client switches to the mobile layout (no sidebar column, a 2-row header on top) exactly
+    /// as the server-rendered full-app path does.
+    mobile_width_threshold: u16,
     workspace_scroll: usize,
     agent_panel_scroll: usize,
     resizing_sidebar: bool,
@@ -279,6 +286,9 @@ pub(crate) struct ComposedShell {
     modal_open: bool,
     /// Sidebar width this shell was laid out at (the content region starts at this column).
     sidebar_width: u16,
+    /// Row the content region starts at. 0 on a desktop-width host; the mobile header height when
+    /// the sidebar has been replaced by a header on top.
+    content_y: u16,
     /// Content region width (`host_width - sidebar_width`).
     content_width: u16,
     /// Host dimensions this shell was built for; a mismatch (a resize) forces a rebuild before reuse.
@@ -484,8 +494,13 @@ struct ClientSidebarSnapshot {
 
 impl ClientCompositor {
     pub(crate) fn new(sidebar_width: u16) -> Self {
+        Self::with_mobile_threshold(sidebar_width, crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD)
+    }
+
+    pub(crate) fn with_mobile_threshold(sidebar_width: u16, mobile_width_threshold: u16) -> Self {
         Self {
             sidebar_width,
+            mobile_width_threshold,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             resizing_sidebar: false,
@@ -1452,6 +1467,7 @@ impl ClientCompositor {
             excluded_rects,
             modal_open,
             sidebar_width,
+            content_y: self.header_height(host_width, host_height),
             content_width,
             host_width,
             host_height,
@@ -1508,7 +1524,9 @@ impl ClientCompositor {
             host_width
                 .saturating_sub(self.effective_sidebar_width(host_width))
                 .max(1),
-            host_height,
+            host_height
+                .saturating_sub(self.header_height(host_width, host_height))
+                .max(1),
         )
     }
 
@@ -1516,8 +1534,52 @@ impl ClientCompositor {
     // SAME collapse-aware origin render/hit-test/content_size use; they previously used the
     // resting `sidebar_width()`, so a collapsed client forwarded content clicks offset by
     // (expanded − mini) columns and swallowed clicks in the gap as sidebar clicks.
+    /// Whether the host terminal is too narrow for a sidebar, mirroring the server's
+    /// `ui::is_mobile_width` gate so both paths flip at exactly the same width.
+    pub(crate) fn is_mobile(&self, host_width: u16) -> bool {
+        crate::ui::is_mobile_width(Rect::new(0, 0, host_width, 1), self.mobile_width_threshold)
+    }
+
+    /// Rows reserved at the TOP for the mobile header (the sidebar's replacement). Zero on a
+    /// desktop-width host. Matches the server's `area.height.min(2)`.
+    pub(crate) fn header_height(&self, host_width: u16, host_height: u16) -> u16 {
+        if self.is_mobile(host_width) {
+            host_height.min(MOBILE_HEADER_HEIGHT)
+        } else {
+            0
+        }
+    }
+
+    /// The mobile header's switch-button rect, or `None` on a desktop-width host. Derived from the
+    /// same helper the renderer uses, so the affordance is hittable exactly where it is painted.
+    pub(crate) fn mobile_menu_rect(&self, host_width: u16, host_height: u16) -> Option<Rect> {
+        let header_height = self.header_height(host_width, host_height);
+        if header_height == 0 {
+            return None;
+        }
+        let menu =
+            crate::ui::mobile_header_hit_areas_for_rect(Rect::new(0, 0, host_width, header_height))
+                .menu;
+        (menu.width > 0 && menu.height > 0).then_some(menu)
+    }
+
+    /// Top-left cell of the content region in host coordinates: `(sidebar_width, header_height)`.
+    /// Desktop reserves columns on the left, mobile reserves rows on top; every hit-test and
+    /// content-forwarding site subtracts THIS so render and input stay in lockstep either way.
+    pub(crate) fn content_origin(&self, host_width: u16, host_height: u16) -> (u16, u16) {
+        (
+            self.effective_sidebar_width(host_width),
+            self.header_height(host_width, host_height),
+        )
+    }
+
     pub(crate) fn effective_sidebar_width(&self, host_width: u16) -> u16 {
         if host_width <= 1 {
+            return 0;
+        }
+        // Mobile: no sidebar column at all. Returning 0 here is what lets every existing
+        // x-offset/hit-test site stay correct without a second code path.
+        if self.is_mobile(host_width) {
             return 0;
         }
         // #9: interpolate between the full width and the mini width across `collapse_progress`, so
@@ -1971,14 +2033,32 @@ impl ClientSidebarSnapshot {
         // chevron glyph renders the matching state. Client-owned (the aggregated view's collapse is a
         // per-client display concern), unlike the server's persisted set.
         app.collapsed_space_keys = compositor.collapsed_space_keys.clone();
-        app.view.layout = ViewLayout::Desktop;
-        app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
-        app.view.terminal_area = Rect::new(
-            sidebar_width,
-            0,
-            host_width.saturating_sub(sidebar_width),
-            host_height,
-        );
+        // Mobile: no sidebar column — a 2-row header on top and the content below it, matching
+        // the server's `compute_mobile_view` so the shared renderers lay out identically.
+        let header_height = compositor.header_height(host_width, host_height);
+        if header_height > 0 {
+            let header_rect = Rect::new(0, 0, host_width, header_height);
+            app.view.layout = ViewLayout::Mobile;
+            app.view.sidebar_rect = Rect::default();
+            app.view.mobile_header_rect = header_rect;
+            app.view.mobile_menu_hit_area =
+                crate::ui::compute_mobile_header_hit_areas(&app, header_rect).menu;
+            app.view.terminal_area = Rect::new(
+                0,
+                header_height,
+                host_width,
+                host_height.saturating_sub(header_height),
+            );
+        } else {
+            app.view.layout = ViewLayout::Desktop;
+            app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, host_height);
+            app.view.terminal_area = Rect::new(
+                sidebar_width,
+                0,
+                host_width.saturating_sub(sidebar_width),
+                host_height,
+            );
+        }
         // #47: the global launcher uses the unified `ClientMenu` STATE (one keyboard/hover/dismiss/
         // modal path), but KEEPS its original visual surface — the server's `Mode::GlobalMenu` +
         // `render_global_launcher_menu` dropdown (no modal header, button-anchored, badge dots) — so
@@ -2404,7 +2484,16 @@ fn render_client_shell(
             // clicks selected nothing) and the expand affordance was the clipped "‹‹ collapse"
             // label instead of the original "»" glyph. Rendering through `render_sidebar_collapsed`
             // fixes both: render == hit-test, and the "»" expand icon matches the server original.
-            if snapshot.app.sidebar_collapsed {
+            if snapshot.app.view.layout == ViewLayout::Mobile {
+                // Too narrow for a sidebar: draw the same 2-row header the server-rendered
+                // full-app mobile layout uses, from the same synthetic AppState.
+                crate::ui::render_mobile_header(
+                    &snapshot.app,
+                    &terminal_runtimes,
+                    frame,
+                    snapshot.app.view.mobile_header_rect,
+                );
+            } else if snapshot.app.sidebar_collapsed {
                 crate::ui::render_sidebar_collapsed(
                     &snapshot.app,
                     frame,
@@ -3612,6 +3701,7 @@ pub(crate) fn overlay_content_onto_shell(
         active_frame,
         &mut frame,
         shell.sidebar_width,
+        shell.content_y,
         shell.content_width,
         &shell.excluded_rects,
     );
@@ -3621,6 +3711,7 @@ pub(crate) fn overlay_content_onto_shell(
         frame.cursor = offset_cursor(
             active_frame.cursor.as_ref(),
             shell.sidebar_width,
+            shell.content_y,
             shell.content_width,
         );
     }
@@ -3635,22 +3726,28 @@ fn copy_active_content_excluding(
     active_frame: &FrameData,
     target: &mut FrameData,
     target_x: u16,
+    target_y: u16,
     target_width: u16,
     excluded_rects: &[Rect],
 ) {
     let copy_width = target_width.min(active_frame.width);
-    let copy_height = target.height.min(active_frame.height);
+    let copy_height = target
+        .height
+        .saturating_sub(target_y)
+        .min(active_frame.height);
     for row in 0..copy_height {
         for col in 0..copy_width {
             let source_idx = (row as usize) * (active_frame.width as usize) + (col as usize);
             let target_col = target_x + col;
+            let target_row = target_y + row;
             if excluded_rects
                 .iter()
-                .any(|rect| rect_contains(*rect, target_col, row))
+                .any(|rect| rect_contains(*rect, target_col, target_row))
             {
                 continue;
             }
-            let target_idx = (row as usize) * (target.width as usize) + (target_col as usize);
+            let target_idx =
+                (target_row as usize) * (target.width as usize) + (target_col as usize);
             if let (Some(source), Some(target_cell)) = (
                 active_frame.cells.get(source_idx),
                 target.cells.get_mut(target_idx),
@@ -3664,6 +3761,7 @@ fn copy_active_content_excluding(
 fn offset_cursor(
     cursor: Option<&CursorState>,
     sidebar_width: u16,
+    content_y: u16,
     content_width: u16,
 ) -> Option<CursorState> {
     let cursor = cursor?;
@@ -3672,7 +3770,7 @@ fn offset_cursor(
     }
     Some(CursorState {
         x: sidebar_width + cursor.x,
-        y: cursor.y,
+        y: content_y + cursor.y,
         visible: cursor.visible,
         shape: cursor.shape,
     })
@@ -3824,12 +3922,12 @@ mod tests {
         let composed = ClientCompositor::new(26).compose_frame(
             &model,
             &content,
-            60,
+            100,
             28,
             std::time::Instant::now(),
         );
 
-        assert_eq!(composed.width, 60);
+        assert_eq!(composed.width, 100);
         assert_eq!(composed.height, 28);
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
@@ -3903,7 +4001,7 @@ mod tests {
         let composed = ClientCompositor::new(26).compose_frame(
             &model,
             &content,
-            60,
+            100,
             16,
             std::time::Instant::now(),
         );
@@ -3922,19 +4020,47 @@ mod tests {
         let compositor = ClientCompositor::new(12);
 
         assert_eq!(compositor.content_size(80, 24), (68, 24));
-        assert_eq!(compositor.content_size(8, 24), (1, 24));
+        // A host narrower than the sidebar is now the MOBILE layout: no sidebar column at all, so
+        // content keeps the full width and gives up the header rows instead.
+        assert_eq!(
+            compositor.content_size(8, 24),
+            (8, 24 - MOBILE_HEADER_HEIGHT)
+        );
+
+        // With mobile disabled (threshold 0) the old degenerate path still guarantees a column.
+        let never_mobile = ClientCompositor::with_mobile_threshold(12, 0);
+        assert_eq!(never_mobile.content_size(8, 24), (1, 24));
     }
 
     #[test]
     fn compose_frame_reserves_content_column_when_host_is_narrower_than_sidebar() {
         let model = ClientSupervisorModel::new("local");
-        let compositor = ClientCompositor::new(12);
+        // Mobile disabled, so this still covers the degenerate "sidebar wider than the host" path.
+        let compositor = ClientCompositor::with_mobile_threshold(12, 0);
         let content = frame(1, 1, &["x"]);
 
         let composed = compositor.compose_frame(&model, &content, 8, 3, std::time::Instant::now());
 
         assert_eq!(composed.width, 8);
         assert_eq!(composed.cells[7].symbol, "x");
+    }
+
+    /// The same tiny host WITH mobile enabled: no sidebar, content starts below the header.
+    #[test]
+    fn compose_frame_on_a_tiny_host_uses_the_mobile_layout() {
+        let model = ClientSupervisorModel::new("local");
+        let compositor = ClientCompositor::new(12);
+        let (w, h) = compositor.content_size(8, 4);
+        let content = frame(w, h, &["x"]);
+
+        let composed = compositor.compose_frame(&model, &content, 8, 4, std::time::Instant::now());
+
+        assert_eq!(composed.width, 8);
+        assert_eq!(
+            composed.cells[(MOBILE_HEADER_HEIGHT as usize) * 8].symbol,
+            "x",
+            "content starts on the first row below the mobile header"
+        );
     }
 
     #[test]
@@ -4003,7 +4129,7 @@ mod tests {
         // Derive row geometry from the same snapshot render uses (render == hit_test): the main
         // card, the divider, item 2's host banner, and the remote card all come from one pass.
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         let main_card = snapshot
             .app
             .view
@@ -4033,11 +4159,11 @@ mod tests {
             .y;
 
         assert_eq!(
-            compositor.hit_test(&model, 23, 0, 60, 28),
+            compositor.hit_test(&model, 23, 0, 100, 28),
             Some(SidebarHitTarget::Filter)
         );
         assert_eq!(
-            compositor.hit_test(&model, 1, main_card.rect.y, 60, 28),
+            compositor.hit_test(&model, 1, main_card.rect.y, 100, 28),
             Some(SidebarHitTarget::Workspace {
                 server_id: ServerId::main(),
                 workspace_id: "main-herdr".into(),
@@ -4046,11 +4172,11 @@ mod tests {
         // item 4: the local→remote divider row resolves to no workspace. item 2 (C3): the host
         // banner row (below the divider, above the remote card) also resolves to no workspace.
         assert!(!matches!(
-            compositor.hit_test(&model, 1, divider_y, 60, 28),
+            compositor.hit_test(&model, 1, divider_y, 100, 28),
             Some(SidebarHitTarget::Workspace { .. })
         ));
         assert!(!matches!(
-            compositor.hit_test(&model, 1, local_banner_y, 60, 28),
+            compositor.hit_test(&model, 1, local_banner_y, 100, 28),
             Some(SidebarHitTarget::Workspace { .. })
         ));
         // #19 (host half): the Local banner sits ABOVE the local card (it is the host drag handle).
@@ -4067,7 +4193,7 @@ mod tests {
             "remote banner sits between the local block and the remote card"
         );
         assert_eq!(
-            compositor.hit_test(&model, 1, remote_card.rect.y, 60, 28),
+            compositor.hit_test(&model, 1, remote_card.rect.y, 100, 28),
             Some(SidebarHitTarget::Workspace {
                 server_id: remote_id.clone(),
                 workspace_id: "remote-api".into(),
@@ -4076,7 +4202,7 @@ mod tests {
         // The agent row + affordances still resolve to their targets at their geometry.
         let new_rect = snapshot.app.sidebar_new_button_rect();
         assert_eq!(
-            compositor.hit_test(&model, new_rect.x, new_rect.y, 60, 28),
+            compositor.hit_test(&model, new_rect.x, new_rect.y, 100, 28),
             Some(SidebarHitTarget::New)
         );
         let menu_rect = snapshot.app.global_launcher_rect();
@@ -4085,13 +4211,13 @@ mod tests {
                 &model,
                 menu_rect.x + menu_rect.width - 1,
                 menu_rect.y,
-                60,
+                100,
                 28
             ),
             Some(SidebarHitTarget::Menu)
         );
         assert_eq!(
-            compositor.hit_test(&model, 27, main_card.rect.y, 60, 28),
+            compositor.hit_test(&model, 27, main_card.rect.y, 100, 28),
             None
         );
     }
@@ -4140,7 +4266,7 @@ mod tests {
         for y in 0..16 {
             assert!(
                 !matches!(
-                    compositor.hit_test(&model, 1, y, 60, 16),
+                    compositor.hit_test(&model, 1, y, 100, 16),
                     Some(SidebarHitTarget::Workspace { .. })
                 ),
                 "row {y} unexpectedly hit-tested to a workspace",
@@ -4215,11 +4341,11 @@ mod tests {
         );
 
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         let rect = agent_panel_toggle_hit_rect(&snapshot.app);
         assert!(rect.width > 0, "the scope toggle should be drawn");
         assert_eq!(
-            compositor.hit_test(&model, rect.x, rect.y, 60, 28),
+            compositor.hit_test(&model, rect.x, rect.y, 100, 28),
             Some(SidebarHitTarget::AgentScopeToggle)
         );
 
@@ -4241,13 +4367,13 @@ mod tests {
 
         // AllWorkspaces: both agents have routes.
         let all =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         assert_eq!(all.agent_routes.len(), 2);
 
         // CurrentWorkspace: only the active workspace's (ws-1) agent route remains.
         compositor.toggle_agent_panel_scope();
         let current =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         assert_eq!(current.agent_routes.len(), 1);
         assert_eq!(current.agent_routes[0].agent_id, "agent-1");
     }
@@ -4326,7 +4452,7 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_agent_panel_scope(); // -> CurrentWorkspace
         let current =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         // The local workspace (row 0, the agent-focused one) wins, so its agent renders.
         assert_eq!(current.app.active, Some(0));
         assert_eq!(current.agent_routes.len(), 1);
@@ -4343,7 +4469,7 @@ mod tests {
         assert!(compositor.section_split.is_none());
 
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         let divider = crate::ui::sidebar_section_divider_rect(
             snapshot.app.view.sidebar_rect,
             snapshot.app.sidebar_section_split,
@@ -4361,7 +4487,7 @@ mod tests {
             compositor.handle_sidebar_section_divider_mouse(
                 &model,
                 &ev(MouseEventKind::Down(MouseButton::Left), divider.y),
-                60,
+                100,
                 28,
             ),
             Some(true)
@@ -4371,7 +4497,7 @@ mod tests {
             compositor.handle_sidebar_section_divider_mouse(
                 &model,
                 &ev(MouseEventKind::Drag(MouseButton::Left), divider.y + 2),
-                60,
+                100,
                 28,
             ),
             Some(true)
@@ -4387,7 +4513,7 @@ mod tests {
             compositor.handle_sidebar_section_divider_mouse(
                 &model,
                 &ev(MouseEventKind::Up(MouseButton::Left), divider.y + 2),
-                60,
+                100,
                 28,
             ),
             Some(true)
@@ -4396,7 +4522,7 @@ mod tests {
             compositor.handle_sidebar_section_divider_mouse(
                 &model,
                 &ev(MouseEventKind::Drag(MouseButton::Left), divider.y + 4),
-                60,
+                100,
                 28,
             ),
             None
@@ -4571,7 +4697,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         let model = single_server_two_ws_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
 
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
@@ -4666,7 +4792,7 @@ mod tests {
             .unwrap();
 
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -4798,7 +4924,7 @@ mod tests {
             .unwrap();
 
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -4877,7 +5003,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         let model = single_server_two_ws_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -5001,7 +5127,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         let (model, _x, _y) = three_host_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
 
         // Banner rects in render order: [local, x, y].
         let snapshot = ClientSidebarSnapshot::from_model(
@@ -5072,7 +5198,7 @@ mod tests {
         assert_eq!(model.active_server_id(), &remote_y);
 
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -5140,7 +5266,7 @@ mod tests {
     fn host_drop_indicator_never_inside_a_space_block() {
         let (model, _x, _y) = three_host_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -5188,7 +5314,7 @@ mod tests {
     fn space_press_is_workspace_and_banner_press_is_host() {
         let (model, remote_x, _y) = three_host_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -5220,7 +5346,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         let model = single_server_two_ws_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
 
         compositor.begin_workspace_press(ServerId::main(), "ws-2".into(), 1, 5);
         let up = crossterm::event::MouseEvent {
@@ -5263,7 +5389,7 @@ mod tests {
             )
             .unwrap();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 16u16);
+        let host = (100u16, 16u16);
 
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
@@ -5343,6 +5469,139 @@ mod tests {
     }
 
     // item 4: a [Main, Secondary] model with workspaces on both sides.
+    // ----- mobile layout (narrow host) ---------------------------------------------------
+
+    /// Below `ui.mobile_width_threshold` there is no room for a 26-col sidebar, so the compositor
+    /// drops the sidebar entirely and reserves two header ROWS on top instead — mirroring the
+    /// server-rendered full-app mobile layout.
+    #[test]
+    fn narrow_host_drops_the_sidebar_for_a_header() {
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+
+        assert!(compositor.is_mobile(50));
+        assert_eq!(compositor.effective_sidebar_width(50), 0);
+        assert_eq!(compositor.header_height(50, 24), MOBILE_HEADER_HEIGHT);
+        assert_eq!(compositor.content_origin(50, 24), (0, MOBILE_HEADER_HEIGHT));
+        // Content keeps the full width and gives up the header rows.
+        assert_eq!(
+            compositor.content_size(50, 24),
+            (50, 24 - MOBILE_HEADER_HEIGHT)
+        );
+    }
+
+    /// A desktop-width host is untouched: sidebar columns, no header rows.
+    #[test]
+    fn wide_host_keeps_the_sidebar_and_reserves_no_header() {
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+
+        assert!(!compositor.is_mobile(120));
+        assert_eq!(
+            compositor.effective_sidebar_width(120),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+        assert_eq!(compositor.header_height(120, 24), 0);
+        assert_eq!(
+            compositor.content_origin(120, 24),
+            (DEFAULT_SIDEBAR_WIDTH, 0)
+        );
+        assert_eq!(
+            compositor.content_size(120, 24),
+            (120 - DEFAULT_SIDEBAR_WIDTH, 24)
+        );
+    }
+
+    /// The threshold is the configured one, not a hardcoded 64.
+    #[test]
+    fn mobile_threshold_follows_config() {
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 100);
+
+        assert!(compositor.is_mobile(90), "90 <= configured threshold 100");
+        assert!(!compositor.is_mobile(101));
+    }
+
+    /// The synthetic AppState the shell renders from must carry the mobile layout, an empty
+    /// sidebar rect, a 2-row header and a content area pushed below it — so the shared renderer
+    /// and every hit-test derived from the snapshot agree.
+    #[test]
+    fn from_model_lays_out_the_mobile_view_on_a_narrow_host() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 0, 50, 20, Instant::now());
+
+        assert_eq!(snapshot.app.view.layout, ViewLayout::Mobile);
+        assert_eq!(snapshot.app.view.sidebar_rect, Rect::default());
+        assert_eq!(
+            snapshot.app.view.mobile_header_rect,
+            Rect::new(0, 0, 50, MOBILE_HEADER_HEIGHT)
+        );
+        assert_eq!(
+            snapshot.app.view.terminal_area,
+            Rect::new(0, MOBILE_HEADER_HEIGHT, 50, 20 - MOBILE_HEADER_HEIGHT)
+        );
+        // The switch button is hittable where it is painted.
+        let menu = snapshot.app.view.mobile_menu_hit_area;
+        assert!(menu.width > 0 && menu.height > 0);
+        assert_eq!(
+            Some(menu),
+            compositor.mobile_menu_rect(50, 20),
+            "hit-test rect must match the one laid out for the renderer"
+        );
+    }
+
+    /// A wide host still gets the desktop view out of `from_model`.
+    #[test]
+    fn from_model_keeps_the_desktop_view_on_a_wide_host() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            DEFAULT_SIDEBAR_WIDTH,
+            120,
+            20,
+            Instant::now(),
+        );
+
+        assert_eq!(snapshot.app.view.layout, ViewLayout::Desktop);
+        assert_eq!(
+            snapshot.app.view.sidebar_rect,
+            Rect::new(0, 0, DEFAULT_SIDEBAR_WIDTH, 20)
+        );
+        assert_eq!(compositor.mobile_menu_rect(120, 20), None);
+    }
+
+    /// The composited frame must place live content BELOW the header on a narrow host (and the
+    /// cursor with it), instead of at row 0 where it would overwrite the header.
+    #[test]
+    fn composited_content_sits_below_the_mobile_header() {
+        let (model, _remote_id) = mixed_supervisor_model();
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let (content_w, content_h) = compositor.content_size(50, 20);
+        let mut content = FrameData::blank(content_w, content_h);
+        content.cells[0].symbol = "Z".into();
+        content.cursor = Some(CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+            shape: 0,
+        });
+
+        let shell = compositor.build_shell(&model, 50, 20, Instant::now());
+        let composed = overlay_content_onto_shell(&shell, &content);
+
+        let top_left_of_content = (MOBILE_HEADER_HEIGHT as usize) * (50_usize);
+        assert_eq!(
+            composed.cells[top_left_of_content].symbol, "Z",
+            "content must start on the first row below the header"
+        );
+        assert_eq!(
+            composed.cursor.map(|c| (c.x, c.y)),
+            Some((0, MOBILE_HEADER_HEIGHT)),
+            "the cursor must be offset by the header too"
+        );
+    }
+
     fn mixed_supervisor_model() -> (ClientSupervisorModel, ServerId) {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
@@ -5394,7 +5653,7 @@ mod tests {
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
 
         // Index-aligned with app.workspaces, and matches each row's is_remote.
         assert_eq!(
@@ -5413,7 +5672,7 @@ mod tests {
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         // A mixed model yields exactly one divider row. #19 (host half): in multi-host mode
         // BOTH hosts emit a banner (Local + the one visible Secondary), so two host-banner
         // areas come out of the same compute pass.
@@ -5431,7 +5690,7 @@ mod tests {
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
 
         assert!(snapshot.app.host_banner_active);
         assert_eq!(snapshot.app.host_banners.len(), 2);
@@ -5459,7 +5718,7 @@ mod tests {
         // Sanity: the model really does emit the non-selectable rows.
         let compositor = ClientCompositor::new(26);
         let pre =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         assert_eq!(pre.app.view.divider_rows.len(), 1);
         // #19 (host half): multi-host mode banners both hosts (Local + remote).
         assert_eq!(pre.app.view.host_banner_areas.len(), 2);
@@ -5476,7 +5735,7 @@ mod tests {
         model.focus_workspace_route(&remote_id, "remote-api");
 
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         // active/selected point at the optimistic remote row's flat index, NOT shifted by the
         // divider/banner rows that sit above it in the rendered list.
         assert_eq!(snapshot.app.active, Some(remote_idx));
@@ -5559,7 +5818,7 @@ mod tests {
 
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
 
         // active/selected point at the agent's workspace row, and that workspace has a focused
         // pane (the agent) — so the composited agents panel renders that group as focused.
@@ -5624,7 +5883,7 @@ mod tests {
 
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
 
         // Resolve entries by agent label so the assertions don't depend on row ordering.
         let entries = crate::ui::agent_panel_entries(&snapshot.app);
@@ -5702,7 +5961,7 @@ mod tests {
 
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
 
         let entries = crate::ui::agent_panel_entries(&snapshot.app);
         let entry_a = entries
@@ -5737,9 +5996,9 @@ mod tests {
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         let banner_y = snapshot.app.view.host_banner_areas[0].rect.y;
-        let hit = compositor.hit_test(&model, 1, banner_y, 60, 16);
+        let hit = compositor.hit_test(&model, 1, banner_y, 100, 16);
         assert!(
             !matches!(hit, Some(SidebarHitTarget::Workspace { .. })),
             "banner row {banner_y} hit-tested to a workspace: {hit:?}"
@@ -5758,7 +6017,7 @@ mod tests {
         // geometry the renderer uses.
         let (mut model, remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -5818,7 +6077,7 @@ mod tests {
             .unwrap();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         assert!(snapshot.app.view.divider_rows.is_empty());
     }
 
@@ -5828,11 +6087,11 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         // Derive the divider y from the same snapshot geometry render uses (render == hit_test).
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         let divider_y = snapshot.app.view.divider_rows[0];
 
         // The divider row resolves to no Workspace target.
-        let divider_hit = compositor.hit_test(&model, 1, divider_y, 60, 16);
+        let divider_hit = compositor.hit_test(&model, 1, divider_y, 100, 16);
         assert!(
             !matches!(divider_hit, Some(SidebarHitTarget::Workspace { .. })),
             "divider row {divider_y} hit-tested to a workspace: {divider_hit:?}"
@@ -5841,7 +6100,7 @@ mod tests {
         for card in &snapshot.app.view.workspace_card_areas {
             assert_ne!(card.rect.y, divider_y, "a card overlaps the divider row");
             assert!(matches!(
-                compositor.hit_test(&model, 1, card.rect.y, 60, 16),
+                compositor.hit_test(&model, 1, card.rect.y, 100, 16),
                 Some(SidebarHitTarget::Workspace { .. })
             ));
         }
@@ -5854,7 +6113,7 @@ mod tests {
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         let divider_y = snapshot.app.view.divider_rows[0];
         assert!(snapshot
             .app
@@ -5928,7 +6187,7 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
         let composed =
-            compositor.compose_frame(&model, &content, 60, 20, std::time::Instant::now());
+            compositor.compose_frame(&model, &content, 100, 20, std::time::Instant::now());
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
             .collect();
@@ -5947,9 +6206,11 @@ mod tests {
 
         // the popup is footer-anchored (opens upward from the sidebar footer), NOT centered: its
         // top border sits below the host top, and it never reaches the bottom rows.
-        let popup =
-            crate::ui::new_workspace_picker_popup_rect(anchor_area(&model, &compositor, 60, 20), 2)
-                .expect("popup fits");
+        let popup = crate::ui::new_workspace_picker_popup_rect(
+            anchor_area(&model, &compositor, 100, 20),
+            2,
+        )
+        .expect("popup fits");
         assert!(popup.y > 0, "popup is not flush to host top");
         assert!(rows[popup.y as usize].contains("┌"), "top border row");
         // rows below the popup show server content / blanks, not the picker.
@@ -5965,7 +6226,7 @@ mod tests {
 
         // derive the FOOTER-ANCHORED row coordinates from the SAME shared geometry + anchor_area
         // the renderer/hit-test use.
-        let anchor = anchor_area(&model, &compositor, 60, 20);
+        let anchor = anchor_area(&model, &compositor, 100, 20);
         let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row0 = crate::ui::new_workspace_picker_row_rect(inner, 0);
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
@@ -5975,13 +6236,13 @@ mod tests {
         assert!(row0.y > 0);
 
         assert_eq!(
-            compositor.hit_test(&model, row0.x, row0.y, 60, 20),
+            compositor.hit_test(&model, row0.x, row0.y, 100, 20),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: ServerId::main(),
             })
         );
         assert_eq!(
-            compositor.hit_test(&model, row1.x, row1.y, 60, 20),
+            compositor.hit_test(&model, row1.x, row1.y, 100, 20),
             Some(SidebarHitTarget::NewWorkspaceDestination {
                 server_id: remote_id,
             })
@@ -6005,16 +6266,16 @@ mod tests {
         let (model, _) = two_destination_picker_model();
         let compositor = ClientCompositor::new(26);
 
-        let anchor = anchor_area(&model, &compositor, 60, 20);
+        let anchor = anchor_area(&model, &compositor, 100, 20);
         let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let (confirm, cancel) = crate::ui::new_workspace_picker_button_rects(inner);
 
         assert_eq!(
-            compositor.hit_test(&model, confirm.x, confirm.y, 60, 20),
+            compositor.hit_test(&model, confirm.x, confirm.y, 100, 20),
             Some(SidebarHitTarget::NewWorkspacePickerConfirm)
         );
         assert_eq!(
-            compositor.hit_test(&model, cancel.x, cancel.y, 60, 20),
+            compositor.hit_test(&model, cancel.x, cancel.y, 100, 20),
             Some(SidebarHitTarget::NewWorkspacePickerCancel)
         );
     }
@@ -6027,7 +6288,7 @@ mod tests {
         let compositor = ClientCompositor::new(26);
         let content = frame(8, 3, &["content", "frame"]);
         let composed =
-            compositor.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+            compositor.compose_frame(&model, &content, 100, 16, std::time::Instant::now());
 
         let rows: Vec<_> = (0..composed.height)
             .map(|row| row_text(&composed, row))
@@ -6042,11 +6303,11 @@ mod tests {
         // row sits one cell inside the menu's top-left border (rect.y + 1). It resolves to the unified
         // `ClientMenuRow { index }` target.
         assert_eq!(
-            compositor.hit_test(&model, 21, 1, 60, 16),
+            compositor.hit_test(&model, 21, 1, 100, 16),
             Some(SidebarHitTarget::ClientMenuRow { index: 0 })
         );
         assert_eq!(
-            compositor.hit_test(&model, 21, 5, 60, 16),
+            compositor.hit_test(&model, 21, 5, 100, 16),
             Some(SidebarHitTarget::ClientMenuRow { index: 4 })
         );
     }
@@ -6064,7 +6325,7 @@ mod tests {
         model.open_client_global_menu(0, 0);
         let now = std::time::Instant::now();
         // One cached hover-less shell; the selection is painted by the overlay each frame (#56).
-        let shell = compositor.build_shell(&model, 60, 16, now);
+        let shell = compositor.build_shell(&model, 100, 16, now);
         let compose_with_selection = |selected: usize| {
             let mut frame = overlay_content_onto_shell(&shell, &content);
             apply_hover_overlay(&mut frame, &shell, None, Some(selected));
@@ -6079,7 +6340,7 @@ mod tests {
             &model,
             &compositor,
             26,
-            60,
+            100,
             16,
             std::time::Instant::now(),
         );
@@ -6370,7 +6631,7 @@ mod tests {
             &model,
             &compositor,
             26,
-            60,
+            100,
             16,
             std::time::Instant::now(),
         );
@@ -6384,12 +6645,13 @@ mod tests {
         let content = frame(8, 3, &["content", "frame"]);
 
         let at_zero = ClientCompositor::new(26);
-        let frame_zero = at_zero.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+        let frame_zero =
+            at_zero.compose_frame(&model, &content, 100, 16, std::time::Instant::now());
 
         let mut at_eight = ClientCompositor::new(26);
         at_eight.advance_animation_tick(8);
         let frame_eight =
-            at_eight.compose_frame(&model, &content, 60, 16, std::time::Instant::now());
+            at_eight.compose_frame(&model, &content, 100, 16, std::time::Instant::now());
 
         let symbols_zero: Vec<_> = frame_zero.cells.iter().map(|c| c.symbol.clone()).collect();
         let symbols_eight: Vec<_> = frame_eight.cells.iter().map(|c| c.symbol.clone()).collect();
@@ -6472,7 +6734,7 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.seed_working_since((remote_id.clone(), "remote-agent".to_string()), t0);
 
-        let snapshot = ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, t0);
+        let snapshot = ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, t0);
 
         // Exactly one terminal (the working remote agent) was built.
         let terminal = snapshot
@@ -6714,7 +6976,7 @@ mod tests {
         let mut compositor = ClientCompositor::new(26);
         compositor.set_hover(Some(SidebarHoverTarget::Workspace { ws_idx: 1 }));
         let snapshot =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 16, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 16, Instant::now());
         assert_eq!(
             snapshot.app.sidebar_hover,
             Some(SidebarHoverTarget::Workspace { ws_idx: 1 })
@@ -6727,7 +6989,7 @@ mod tests {
         // then assert `hover_test` over the same (x,y) resolves the matching Workspace ws_idx.
         let (model, remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -6763,7 +7025,7 @@ mod tests {
         // and the item-4 divider row never resolve to a Workspace/Agent hover target.
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -6838,7 +7100,7 @@ mod tests {
         // sweep the sidebar column: no row resolves to a Workspace hover (disabled rows rejected).
         for y in 0..16u16 {
             assert!(!matches!(
-                compositor.hover_test(&model, 1, y, 60, 16),
+                compositor.hover_test(&model, 1, y, 100, 16),
                 Some(SidebarHoverTarget::Workspace { .. })
             ));
         }
@@ -6851,7 +7113,7 @@ mod tests {
         // even though the placeholder pane_id is freshly alloc'd each recompose.
         let (model, _remote_id) = mixed_supervisor_model_with_agent();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 20u16);
+        let host = (100u16, 20u16);
 
         // find the agent row by sweeping (the click path resolves the agent there).
         let agent_row = (0..host.1)
@@ -6907,7 +7169,7 @@ mod tests {
         // where mouse_capture can be false — see the input/mouse tests).
         let (model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 16u16);
+        let host = (100u16, 16u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -6968,7 +7230,7 @@ mod tests {
         // `ClientMenuRow` target; a position off the popup resolves to None (the menu is modal).
         let (mut model, _remote_id) = mixed_supervisor_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 16u16);
+        let host = (100u16, 16u16);
 
         model.open_client_global_menu(0, 0);
         let snapshot = ClientSidebarSnapshot::from_model(
@@ -7002,7 +7264,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (mut model, remote_id) = mixed_supervisor_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 16u16);
+        let host = (100u16, 16u16);
         // a cursor-anchored host context menu, anchored well inside the screen so it can move freely.
         model.open_host_context_menu(remote_id, "x".into(), 10, 4);
 
@@ -7179,7 +7441,7 @@ mod tests {
     }
 
     fn model_hover_anywhere(model: &ClientSupervisorModel, y: u16) -> Option<SidebarHoverTarget> {
-        ClientCompositor::new(26).hover_test(model, 1, y, 60, 16)
+        ClientCompositor::new(26).hover_test(model, 1, y, 100, 16)
     }
 
     #[test]
@@ -7196,7 +7458,7 @@ mod tests {
         // NewWorkspaceDestination { row }.
         let (model, _remote_id) = two_destination_picker_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 20u16);
+        let host = (100u16, 20u16);
         let anchor = anchor_area(&model, &compositor, host.0, host.1);
         let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
@@ -7296,7 +7558,7 @@ mod tests {
             .unwrap();
         let compositor = ClientCompositor::new(26);
         let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         let labels: Vec<_> = snap
             .app
             .workspaces
@@ -7355,7 +7617,7 @@ mod tests {
             .unwrap();
         let compositor = ClientCompositor::new(26);
         let snap =
-            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 60, 28, Instant::now());
+            ClientSidebarSnapshot::from_model(&model, &compositor, 26, 100, 28, Instant::now());
         let ws = snap
             .app
             .workspaces
@@ -7424,7 +7686,7 @@ mod tests {
     fn collapsed_flag_gates_snapshot() {
         let (model, _local, _agent) = collapsed_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snap = |c: &ClientCompositor| {
             ClientSidebarSnapshot::from_model(&model, c, 26, host.0, host.1, Instant::now())
         };
@@ -7483,7 +7745,7 @@ mod tests {
     fn expanded_toggle_rect_hits_toggle_target() {
         let (model, _local, _agent) = collapsed_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snap = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7514,7 +7776,7 @@ mod tests {
         let (model, _local, _agent) = collapsed_model();
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snap = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7555,7 +7817,7 @@ mod tests {
     fn collapsed_mini_toggle_row_is_hittable_full_width() {
         let (model, _local, _agent) = collapsed_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
 
         compositor.toggle_sidebar_collapsed();
         while compositor.sidebar_width_animating() {
@@ -7598,7 +7860,7 @@ mod tests {
         let (mut model, local, _agent) = collapsed_model();
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snap = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7635,7 +7897,7 @@ mod tests {
         let (mut model, local, agent) = collapsed_model();
         let mut compositor = ClientCompositor::new(26);
         compositor.toggle_sidebar_collapsed();
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snap = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7724,7 +7986,7 @@ mod tests {
     fn worktree_parent_chevron_hit_test_resolves_and_toggles_group() {
         let model = worktree_grouped_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7777,7 +8039,7 @@ mod tests {
     fn worktree_parent_body_click_focuses_without_toggling() {
         let model = worktree_grouped_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,
@@ -7806,7 +8068,7 @@ mod tests {
     fn standalone_workspace_has_no_chevron_hit() {
         let model = single_server_two_ws_model();
         let compositor = ClientCompositor::new(26);
-        let host = (60u16, 28u16);
+        let host = (100u16, 28u16);
         let snapshot = ClientSidebarSnapshot::from_model(
             &model,
             &compositor,

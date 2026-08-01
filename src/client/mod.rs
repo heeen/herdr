@@ -692,19 +692,19 @@ fn dispatch_composited_input(
         // #71: subtract the collapse-aware origin (mini width while collapsed / mid-slide), the
         // SAME value render + hit_test + content_size read — the resting `sidebar_width()` here
         // forwarded collapsed-mode content clicks offset by (expanded − mini) columns.
-        let sidebar_width = compositor.effective_sidebar_width(host_size.0);
+        let origin = compositor.content_origin(host_size.0, host_size.1);
         let mut forwarded = Vec::new();
         for event in &events {
             let crate::raw_input::RawInputEvent::Mouse(mouse) = event else {
                 continue;
             };
-            // Drop coalesced sidebar-area events rather than forward them with a bogus column;
-            // precise per-event sidebar handling would need byte spans the parser doesn't expose.
-            if mouse.column < sidebar_width {
+            // Drop coalesced chrome events rather than forward them with a bogus position;
+            // precise per-event handling would need byte spans the parser doesn't expose.
+            if mouse.column < origin.0 || mouse.row < origin.1 {
                 continue;
             }
             if let ClientInputDispatch::Forward(bytes) =
-                translate_content_mouse_input(Vec::new(), mouse, sidebar_width)
+                translate_content_mouse_input(Vec::new(), mouse, origin)
             {
                 forwarded.extend_from_slice(&bytes);
             }
@@ -1267,8 +1267,9 @@ fn dispatch_composited_mouse_input(
     if matches!(mouse.kind, MouseEventKind::Moved) {
         // #71: gate hover interception on the collapse-aware width so content motion in the
         // mini↔expanded gap still forwards to the pane instead of being eaten as sidebar hover.
-        let sidebar_width = compositor.effective_sidebar_width(host_size.0);
-        if mouse.column < sidebar_width
+        let origin = compositor.content_origin(host_size.0, host_size.1);
+        if mouse.column < origin.0
+            || mouse.row < origin.1
             || compositor.hover().is_some()
             || compositor.has_pending_hover()
         {
@@ -1504,12 +1505,31 @@ fn dispatch_composited_mouse_input(
     // #71: consume/translate against the collapse-aware origin — the resting width consumed every
     // click in the (mini..expanded) column gap and offset every forwarded content click while the
     // sidebar was collapsed or mid-slide.
-    let sidebar_width = compositor.effective_sidebar_width(host_size.0);
-    if mouse.column < sidebar_width {
+    let origin = compositor.content_origin(host_size.0, host_size.1);
+    // Mobile: the sidebar is replaced by a header on top, so its switch button is the workspace
+    // switcher. Route it to the SAME launcher menu the sidebar's "menu" button opens — that menu
+    // already lists every space/agent across servers, which is exactly what the switcher is for.
+    if mouse.row < origin.1 {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && compositor
+                .mobile_menu_rect(host_size.0, host_size.1)
+                .is_some_and(|menu| {
+                    mouse.column >= menu.x
+                        && mouse.column < menu.x.saturating_add(menu.width)
+                        && mouse.row >= menu.y
+                        && mouse.row < menu.y.saturating_add(menu.height)
+                })
+        {
+            model.open_client_global_menu(mouse.column, mouse.row);
+            return ClientInputDispatch::Redraw;
+        }
+        return ClientInputDispatch::Consumed;
+    }
+    if mouse.column < origin.0 {
         return ClientInputDispatch::Consumed;
     }
 
-    translate_content_mouse_input(data, mouse, sidebar_width)
+    translate_content_mouse_input(data, mouse, origin)
 }
 
 /// #46/#47: mouse handling for the one OPEN client menu (launcher / workspace / host). Called from
@@ -1901,9 +1921,12 @@ fn dispatch_for_worktree_picker_outcome(
 fn translate_content_mouse_input(
     original: Vec<u8>,
     mouse: &MouseEvent,
-    sidebar_width: u16,
+    content_origin: (u16, u16),
 ) -> ClientInputDispatch {
-    let Some(column) = mouse.column.checked_sub(sidebar_width) else {
+    let (Some(column), Some(row)) = (
+        mouse.column.checked_sub(content_origin.0),
+        mouse.row.checked_sub(content_origin.1),
+    ) else {
         return ClientInputDispatch::Consumed;
     };
 
@@ -1914,7 +1937,7 @@ fn translate_content_mouse_input(
         | MouseEventKind::ScrollRight => crate::input::encode_mouse_scroll(
             mouse.kind,
             column,
-            mouse.row,
+            row,
             mouse.modifiers,
             crate::input::MouseProtocolEncoding::Sgr,
         ),
@@ -1922,7 +1945,7 @@ fn translate_content_mouse_input(
             crate::input::encode_mouse_button(
                 mouse.kind,
                 column,
-                mouse.row,
+                row,
                 mouse.modifiers,
                 crate::input::MouseProtocolEncoding::Sgr,
             )
@@ -1933,7 +1956,7 @@ fn translate_content_mouse_input(
         MouseEventKind::Moved => crate::input::encode_mouse_button(
             mouse.kind,
             column,
-            mouse.row,
+            row,
             mouse.modifiers,
             crate::input::MouseProtocolEncoding::Sgr,
         ),
@@ -2034,10 +2057,16 @@ fn client_render_plan(
     supervisor_model: Option<&supervisor::ClientSupervisorModel>,
     requested_encoding: RenderEncoding,
     host_size: (u16, u16),
+    mobile_width_threshold: u16,
 ) -> ClientRenderPlan {
     let use_client_compositor = supervisor_model.is_some();
     if use_client_compositor {
-        let compositor = compositor::ClientCompositor::default();
+        // The threshold matters here: on a narrow host the compositor reserves header ROWS
+        // instead of sidebar COLUMNS, so the size we negotiate with the server differs.
+        let compositor = compositor::ClientCompositor::with_mobile_threshold(
+            compositor::DEFAULT_SIDEBAR_WIDTH,
+            mobile_width_threshold,
+        );
         return ClientRenderPlan {
             surface_mode: ClientSurfaceMode::EmbeddedContent,
             requested_encoding: RenderEncoding::SemanticFrame,
@@ -2645,8 +2674,12 @@ fn run_client_with_mode(
         );
     }
 
-    let render_plan =
-        client_render_plan(supervisor_model.as_ref(), requested_encoding, (cols, rows));
+    let render_plan = client_render_plan(
+        supervisor_model.as_ref(),
+        requested_encoding,
+        (cols, rows),
+        loaded_config.config.ui.mobile_width_threshold,
+    );
 
     // Try to connect to the server.
     let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
@@ -2747,9 +2780,12 @@ fn run_client_with_mode(
     });
 
     let result = rt.block_on(async {
-        let client_compositor = render_plan
-            .use_client_compositor
-            .then(compositor::ClientCompositor::default);
+        let client_compositor = render_plan.use_client_compositor.then(|| {
+            compositor::ClientCompositor::with_mobile_threshold(
+                compositor::DEFAULT_SIDEBAR_WIDTH,
+                loaded_config.config.ui.mobile_width_threshold,
+            )
+        });
         run_client_loop(
             stream,
             should_quit,
@@ -8002,7 +8038,12 @@ mod tests {
     fn client_render_plan_uses_embedded_content_when_supervisor_is_available() {
         let model = supervisor::ClientSupervisorModel::new("local");
 
-        let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
+        let plan = client_render_plan(
+            Some(&model),
+            RenderEncoding::TerminalAnsi,
+            (80, 24),
+            crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
+        );
 
         assert_eq!(plan.surface_mode, ClientSurfaceMode::EmbeddedContent);
         assert_eq!(plan.requested_encoding, RenderEncoding::SemanticFrame);
@@ -8015,7 +8056,12 @@ mod tests {
 
     #[test]
     fn client_render_plan_uses_full_app_when_supervisor_is_unavailable() {
-        let plan = client_render_plan(None, RenderEncoding::TerminalAnsi, (80, 24));
+        let plan = client_render_plan(
+            None,
+            RenderEncoding::TerminalAnsi,
+            (80, 24),
+            crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
+        );
 
         assert_eq!(plan.surface_mode, ClientSurfaceMode::FullApp);
         assert_eq!(plan.requested_encoding, RenderEncoding::TerminalAnsi);
@@ -8038,7 +8084,12 @@ mod tests {
             auto_update: false,
         });
 
-        let plan = client_render_plan(Some(&model), RenderEncoding::TerminalAnsi, (80, 24));
+        let plan = client_render_plan(
+            Some(&model),
+            RenderEncoding::TerminalAnsi,
+            (80, 24),
+            crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
+        );
 
         assert_eq!(plan.surface_mode, ClientSurfaceMode::EmbeddedContent);
         assert_eq!(plan.requested_encoding, RenderEncoding::SemanticFrame);
@@ -8119,7 +8170,7 @@ mod tests {
     fn workspace_card_right_click_opens_context_menu() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8159,7 +8210,7 @@ mod tests {
         // the content area even leaked through to the pane beneath.
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8215,7 +8266,7 @@ mod tests {
     fn collapsed_content_click_forwards_with_mini_origin() {
         let (mut model, _remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         compositor.toggle_sidebar_collapsed();
         while compositor.sidebar_width_animating() {
             compositor.step_sidebar_width_animation();
@@ -8283,7 +8334,7 @@ mod tests {
         // knew about the open menu, so hovering the menu used to highlight NOTHING on it.
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8338,7 +8389,7 @@ mod tests {
     fn context_menu_rename_then_submit_yields_workspace_rename_request() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8395,7 +8446,7 @@ mod tests {
     fn context_menu_close_confirm_yields_workspace_close_request() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8450,7 +8501,7 @@ mod tests {
     fn context_menu_close_cancel_dismisses_without_request() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = (0..host.1)
             .find(|row| {
                 matches!(
@@ -8505,7 +8556,7 @@ mod tests {
     fn host_menu_add_space_yields_workspace_create_on_that_host() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = host_banner_row(&compositor, &model, &remote_id, host);
 
         // Right-click the banner opens the host menu anchored at that row.
@@ -8548,7 +8599,7 @@ mod tests {
     fn host_menu_toggle_yields_set_remote_enabled() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = host_banner_row(&compositor, &model, &remote_id, host);
         dispatch_composited_mouse_input(
             Vec::new(),
@@ -8578,7 +8629,7 @@ mod tests {
     fn host_menu_disconnect_yields_disconnect_dispatch_not_disable() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = host_banner_row(&compositor, &model, &remote_id, host);
         dispatch_composited_mouse_input(
             Vec::new(),
@@ -8974,7 +9025,7 @@ mod tests {
             b"\x1b[<0;24;1M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
@@ -8990,7 +9041,7 @@ mod tests {
         let mut compositor = compositor::ClientCompositor::new(26);
         // item 2 (C3): the host banner adds a row above the remote group, so render at a taller
         // sidebar and scan the full height for the remote workspace row (render == hit_test).
-        let host_size = (60, 24);
+        let host_size = (100, 24);
         let row = (0..host_size.1)
             .find(|row| {
                 matches!(
@@ -9032,7 +9083,7 @@ mod tests {
     fn composited_input_scrolls_workspace_list_before_clicking_remote_workspace() {
         let (mut model, remote_id) = mixed_remote_model_with_many_workspaces(8, 2);
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host_size = (60, 12);
+        let host_size = (100, 12);
 
         assert!(
             (0..host_size.1).all(|row| {
@@ -9109,7 +9160,7 @@ mod tests {
             b"\x1b[<0;2;12M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -9162,7 +9213,7 @@ mod tests {
         compositor: &mut compositor::ClientCompositor,
         model: &mut supervisor::ClientSupervisorModel,
     ) -> ClientInputDispatch {
-        dispatch_composited_input(c.to_string().into_bytes(), compositor, model, (60, 16))
+        dispatch_composited_input(c.to_string().into_bytes(), compositor, model, (100, 16))
     }
 
     // A next-workspace key (bound direct to `alt+n`) routed through `dispatch_composited_input`
@@ -9175,8 +9226,12 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert_eq!(model.active_server_id(), &supervisor::ServerId::main());
 
-            let dispatch =
-                dispatch_composited_input(b"\x1bn".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1bn".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
 
             assert_eq!(
                 dispatch,
@@ -9205,8 +9260,12 @@ mod tests {
             let (mut model, remote_id) = mixed_remote_model();
             let mut compositor = compositor::ClientCompositor::new(26);
 
-            let dispatch =
-                dispatch_composited_input(b"\x1bp".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1bp".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
 
             assert_eq!(
                 dispatch,
@@ -9297,8 +9356,12 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.new_workspace_picker().is_none());
 
-            let dispatch =
-                dispatch_composited_input(b"\x1bm".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1bm".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             assert!(model.new_workspace_picker().is_some());
@@ -9313,8 +9376,12 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.rename_workspace_form().is_none());
 
-            let dispatch =
-                dispatch_composited_input(b"\x1br".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1br".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             let form = model
@@ -9333,8 +9400,12 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(model.confirm_close_workspace().is_none());
 
-            let dispatch =
-                dispatch_composited_input(b"\x1bd".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1bd".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
 
             assert_eq!(dispatch, ClientInputDispatch::Redraw);
             let confirm = model
@@ -9355,8 +9426,12 @@ mod tests {
             let mut compositor = compositor::ClientCompositor::new(26);
             assert!(!compositor.sidebar_collapsed_for_test());
 
-            let dispatch =
-                dispatch_composited_input(b"\x1bb".to_vec(), &mut compositor, &mut model, (60, 16));
+            let dispatch = dispatch_composited_input(
+                b"\x1bb".to_vec(),
+                &mut compositor,
+                &mut model,
+                (100, 16),
+            );
             assert_eq!(dispatch, ClientInputDispatch::Consumed);
             assert!(compositor.sidebar_collapsed_for_test());
         });
@@ -9378,7 +9453,7 @@ mod tests {
 
                 // ctrl+b (0x02) arms prefix mode: swallowed (Redraw), nothing forwarded yet.
                 assert_eq!(
-                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (100, 16)),
                     ClientInputDispatch::Redraw
                 );
                 assert!(compositor.prefix_armed());
@@ -9395,7 +9470,7 @@ mod tests {
 
                 // ctrl+b then b again expands — flips back the other direction.
                 assert_eq!(
-                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (100, 16)),
                     ClientInputDispatch::Redraw
                 );
                 assert_eq!(
@@ -9448,7 +9523,7 @@ mod tests {
 
                 // Press the prefix key (ctrl+b == 0x02): arms prefix mode, swallowed (Redraw).
                 assert_eq!(
-                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16),),
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (100, 16),),
                     ClientInputDispatch::Redraw
                 );
                 assert!(compositor.prefix_armed());
@@ -9487,7 +9562,7 @@ mod tests {
 
             // ctrl+b (0x02) arms prefix mode and is swallowed (not forwarded yet).
             assert_eq!(
-                dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (100, 16)),
                 ClientInputDispatch::Redraw
             );
             assert!(compositor.prefix_armed());
@@ -9511,7 +9586,7 @@ mod tests {
                 let (mut model, _remote_id) = mixed_remote_model();
                 let mut compositor = compositor::ClientCompositor::new(26);
                 assert_eq!(
-                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (60, 16)),
+                    dispatch_composited_input(vec![0x02], &mut compositor, &mut model, (100, 16)),
                     ClientInputDispatch::Redraw
                 );
                 assert_eq!(
@@ -9811,7 +9886,7 @@ mod tests {
             b"\x1b[<0;28;3M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -9848,7 +9923,7 @@ mod tests {
     fn composited_moved_records_pending_hover_and_resolves_once_per_frame() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = remote_workspace_row(&compositor, &model, &remote_id, host);
 
         // #48: a motion over the row RECORDS a pending hover and asks for a (deferred) HoverRedraw —
@@ -9898,7 +9973,7 @@ mod tests {
     fn composited_moved_off_sidebar_clears_hover_once() {
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
         let row = remote_workspace_row(&compositor, &model, &remote_id, host);
 
         // establish a sidebar hover (record on motion, resolve at the per-frame flush).
@@ -9936,7 +10011,7 @@ mod tests {
         // never ApiRequest/ServerControl/AddRemote/SetRemoteEnabled/DeleteRemote.
         let (mut model, remote_id) = mixed_remote_model();
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 24u16);
+        let host = (100u16, 24u16);
 
         let no_traffic = |dispatch: &ClientInputDispatch| {
             !matches!(
@@ -9985,7 +10060,7 @@ mod tests {
             b"\x1b[<0;2;8M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -10017,7 +10092,7 @@ mod tests {
             b"\x1b[<0;2;8M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
@@ -10043,7 +10118,7 @@ mod tests {
         // item 1: click the FOOTER-ANCHORED remote destination row (index 1), using the same
         // shared geometry + anchor_area the renderer/hit-test use (the popup floats over the live
         // content at the sidebar footer, not centered).
-        let anchor = compositor.overlay_anchor_area(&model, 60, 20);
+        let anchor = compositor.overlay_anchor_area(&model, 100, 20);
         let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
         assert!(row1.y > 0);
@@ -10052,7 +10127,7 @@ mod tests {
             sgr_left_down(row1.x, row1.y),
             &mut compositor,
             &mut model,
-            (60, 20),
+            (100, 20),
         );
 
         assert_eq!(
@@ -10085,13 +10160,13 @@ mod tests {
 
         // ↓ moves the highlight onto the remote (index 1).
         let nav =
-            dispatch_composited_input(b"\x1b[B".to_vec(), &mut compositor, &mut model, (60, 16));
+            dispatch_composited_input(b"\x1b[B".to_vec(), &mut compositor, &mut model, (100, 16));
         assert_eq!(nav, ClientInputDispatch::Redraw);
         assert_eq!(model.new_workspace_picker().map(|p| p.selected), Some(1));
 
         // Enter confirms the highlighted destination → create on the remote.
         let confirm =
-            dispatch_composited_input(b"\r".to_vec(), &mut compositor, &mut model, (60, 16));
+            dispatch_composited_input(b"\r".to_vec(), &mut compositor, &mut model, (100, 16));
         assert_eq!(
             confirm,
             ClientInputDispatch::ApiRequest {
@@ -10121,7 +10196,7 @@ mod tests {
         let mut compositor = compositor::ClientCompositor::new(26);
 
         let dispatch =
-            dispatch_composited_input(b"\x1b".to_vec(), &mut compositor, &mut model, (60, 16));
+            dispatch_composited_input(b"\x1b".to_vec(), &mut compositor, &mut model, (100, 16));
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
         assert_eq!(model.new_workspace_picker(), None);
@@ -10136,7 +10211,7 @@ mod tests {
             b"\x1b[<0;24;8M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(dispatch, ClientInputDispatch::Redraw);
@@ -10154,7 +10229,7 @@ mod tests {
         model.open_client_global_menu(0, 0);
         assert_eq!(model.client_menu().map(|m| m.selected), Some(0));
         let mut compositor = compositor::ClientCompositor::new(26);
-        let host = (60u16, 16u16);
+        let host = (100u16, 16u16);
 
         // motion onto menu row index 1 moves the highlight 0 → 1 and repaints (launcher keeps its
         // original `global_menu_rect` dropdown geometry, so row i sits at y = rect.y + 1 + i).
@@ -10194,7 +10269,7 @@ mod tests {
             b"\x1b[<0;22;2M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -10210,7 +10285,7 @@ mod tests {
             b"\x1b[<0;22;3M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -10226,7 +10301,7 @@ mod tests {
             b"\x1b[<0;22;4M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(
@@ -10248,7 +10323,7 @@ mod tests {
             b"\x1b[<0;22;5M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(detach, ClientInputDispatch::DetachAll);
@@ -10270,7 +10345,7 @@ mod tests {
             b"\x1b[<0;22;2M".to_vec(),
             &mut compositor,
             &mut model,
-            (60, 16),
+            (100, 16),
         );
 
         assert_eq!(

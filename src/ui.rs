@@ -33,9 +33,14 @@ use self::menus::{
     render_resize_overlay,
 };
 use self::mobile::{
-    compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
-    mobile_toast_banner_rect, render_mobile_header, render_mobile_panel,
+    mobile_switcher_max_scroll_for_height, mobile_toast_banner_rect, render_mobile_panel,
     render_mobile_toast_banner,
+};
+// The client compositor lays out and renders the mobile header itself when the host is too narrow
+// for a sidebar, so these are shared with the client rather than private to the server renderer.
+pub(crate) use self::mobile::{
+    compute_mobile_header_hit_areas, is_mobile_width, mobile_header_hit_areas_for_rect,
+    render_mobile_header,
 };
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
