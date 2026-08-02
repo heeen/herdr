@@ -1133,31 +1133,43 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     insert_host_banners(app, entries)
 }
 
-/// item 2 (C3): insert one `HostBanner { banner_idx }` immediately before each remote host
-/// group's first workspace, in `visible_servers()` order (the order `app.host_banners` and
-/// `app.host_banner_rows` are built in). `host_banner_rows[i]` is the `ws_idx` of the i-th
-/// banner's host group's first workspace; the banner sits BELOW item 4's divider (which was
-/// already inserted) and ABOVE that host's indented `Workspace` rows. Empty in monolithic
-/// mode (no banners). `banner_idx` indexes `app.host_banners`.
+/// item 2 (C3): insert one `HostBanner { banner_idx }` at the head of each run of rows belonging
+/// to the same host. The banner sits BELOW item 4's divider (already inserted) and ABOVE that
+/// host's rows. Empty in monolithic mode (no banners). `banner_idx` indexes `app.host_banners`.
+///
+/// Placement is by IDENTITY — the host each row reports — not by position. It used to match a
+/// recorded "first workspace index" per host, which quietly required every host's rows to stay
+/// contiguous and in stream order; reordering the list moved a banner onto the wrong row. Reading
+/// the run boundary instead means the banners follow whatever order the rows end up in.
 fn insert_host_banners(
     app: &AppState,
     entries: Vec<WorkspaceListEntry>,
 ) -> Vec<WorkspaceListEntry> {
-    if app.host_banner_rows.is_empty() {
+    if app.host_banner_host_idx.is_empty() {
         return entries;
     }
 
-    let mut result = Vec::with_capacity(entries.len() + app.host_banner_rows.len());
+    let mut result = Vec::with_capacity(entries.len() + app.host_banner_host_idx.len());
+    // `None` until the first row, so the very first host run also gets its banner.
+    let mut current_host: Option<usize> = None;
     for entry in entries {
         if let WorkspaceListEntry::Workspace {
             ws_idx,
             indented: false,
         } = entry
         {
-            // A banner precedes the un-indented first row of its host group. Each host's first
-            // workspace is recorded once in `host_banner_rows`; emit its banner here.
-            if let Some(banner_idx) = app.host_banner_rows.iter().position(|row| *row == ws_idx) {
-                result.push(WorkspaceListEntry::HostBanner { banner_idx });
+            // Children of a worktree group are indented and belong to the same host as their
+            // parent, so only un-indented rows can open a new run.
+            let host = app.client_workspace_host.get(ws_idx).copied();
+            if host != current_host {
+                current_host = host;
+                if let Some(banner_idx) = host.and_then(|host| {
+                    app.host_banner_host_idx
+                        .iter()
+                        .position(|banner| *banner == host)
+                }) {
+                    result.push(WorkspaceListEntry::HostBanner { banner_idx });
+                }
             }
         }
         result.push(entry);
@@ -5324,16 +5336,37 @@ lines = [
 
     use crate::app::state::{HostBannerSpec, HostBannerState};
 
-    /// Build an app like `divider_app` but with `host_banners`/`host_banner_rows`/
-    /// `host_banner_active` populated, mirroring what `from_model` does on the client path.
-    /// `banner_rows` are the `ws_idx`s the banners precede; `states` the per-banner state.
+    /// Build an app like `divider_app` but with `host_banners`/`client_workspace_host`/
+    /// `host_banner_host_idx`/`host_banner_active` populated, mirroring what `from_model` does on
+    /// the client path. `banner_rows` are the `ws_idx`s the banners precede — the tests still
+    /// express layout that way, so this derives the per-row host identity the renderer now reads:
+    /// each listed row opens a new host run, and any rows before the first one are the unbannered
+    /// local host.
     fn host_banner_app(
         remote: &[bool],
         banner_rows: &[usize],
         states: &[HostBannerState],
     ) -> AppState {
         let mut app = divider_app(remote);
-        app.host_banner_rows = banner_rows.to_vec();
+        let mut host_of_row = Vec::with_capacity(remote.len());
+        let mut banner_host = Vec::new();
+        let mut host = 0usize;
+        let mut started = false;
+        for ws_idx in 0..remote.len() {
+            if banner_host.len() < banner_rows.len() && banner_rows[banner_host.len()] == ws_idx {
+                if started {
+                    host += 1;
+                }
+                started = true;
+                banner_host.push(host);
+            } else {
+                started = true;
+            }
+            host_of_row.push(host);
+        }
+        app.client_workspace_host = host_of_row;
+        app.host_styles = vec![crate::app::state::HostStyle::default(); host + 1];
+        app.host_banner_host_idx = banner_host;
         app.host_banners = banner_rows
             .iter()
             .zip(states.iter())
@@ -5631,12 +5664,66 @@ lines = [
         );
     }
 
+    /// Banners must follow their host's rows wherever those rows end up. The old placement matched
+    /// a recorded "first workspace index", so reversing the rows within a host silently left the
+    /// banner on the wrong one; matching the host identity per row is what fixes it. This is the
+    /// regression guard for the sorting and ungrouping work that reorders these lists.
+    #[test]
+    fn host_banners_follow_their_rows_after_a_reorder() {
+        let mut app = host_banner_app(
+            &[false, false, true, true],
+            &[0, 2],
+            &[HostBannerState::Connected, HostBannerState::Connected],
+        );
+
+        let banner_positions = |app: &AppState| -> Vec<(usize, usize)> {
+            let entries = workspace_list_entries(app);
+            let mut seen = Vec::new();
+            let mut pending: Option<usize> = None;
+            for entry in entries {
+                match entry {
+                    WorkspaceListEntry::HostBanner { banner_idx } => pending = Some(banner_idx),
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                        if let Some(banner_idx) = pending.take() {
+                            seen.push((banner_idx, ws_idx));
+                        }
+                    }
+                    WorkspaceListEntry::Divider { .. } => {}
+                }
+            }
+            seen
+        };
+
+        // Storage order: host 0 owns rows 0-1, host 1 owns rows 2-3.
+        assert_eq!(banner_positions(&app), vec![(0, 0), (1, 2)]);
+
+        // Reverse each host's rows in place. The runs stay contiguous, but each host's FIRST row
+        // is now a different workspace — the case the old positional matching got wrong.
+        app.workspaces.swap(0, 1);
+        app.workspaces.swap(2, 3);
+        app.client_workspace_host = vec![0, 0, 1, 1];
+        assert_eq!(
+            banner_positions(&app),
+            vec![(0, 0), (1, 2)],
+            "each banner must still head its own host's run"
+        );
+
+        // Interleaving the hosts entirely — what an ungrouped global sort produces — must still
+        // put a banner at the head of every run rather than dropping or misplacing them.
+        app.client_workspace_host = vec![0, 1, 0, 1];
+        assert_eq!(
+            banner_positions(&app),
+            vec![(0, 0), (1, 1), (0, 2), (1, 3)],
+            "every host change opens a new run, so every run is labelled"
+        );
+    }
+
     #[test]
     fn remote_spaces_sit_under_banner_local_has_none() {
         // The single remote host group (ws 1 & 2) is introduced by exactly one banner above its
         // first row; the local space (ws 0) is the first entry with no banner above it.
-        let mut app = host_banner_app(&[false, true, true], &[1], &[HostBannerState::Connected]);
-        app.host_banner_rows = vec![1]; // one host group starting at ws 1
+        // one host group starting at ws 1; the helper derives the per-row host identity from it
+        let app = host_banner_app(&[false, true, true], &[1], &[HostBannerState::Connected]);
         let entries = workspace_list_entries(&app);
 
         // Local space is the first entry; nothing precedes it.

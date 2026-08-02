@@ -3012,13 +3012,6 @@ impl ClientSupervisorModel {
         }
     }
 
-    /// item 2 (C3): one banner spec per visible host, in `visible_servers()` order. Each tuple
-    /// is `(insertion_index, spec)` where `insertion_index` is the position in the flat
-    /// `workspace_rows()` stream at which the banner precedes that host's first row.
-    ///
-    /// #19 (host half): the Local/Main host also gets a banner — but ONLY in multi-host mode
-    /// (≥2 visible hosts, i.e. at least one remote), so its banner is the draggable handle for
-    /// reordering hosts. The single-local case stays banner-free (unchanged single-host UX).
     /// The un-parsed style inputs for every VISIBLE host, in `visible_servers()` order — the same
     /// order `host_styles` and the banners use. Raw strings, because the model has no palette to
     /// resolve them against; `from_model` is the one place holding both the palette and the
@@ -3035,16 +3028,22 @@ impl ClientSupervisorModel {
             .collect()
     }
 
+    /// item 2 (C3): one banner spec per visible host, in `visible_servers()` order. Each tuple is
+    /// `(host_idx, spec)` — the host's POSITION among the visible servers, matching the `host_idx`
+    /// stamped on every row. It used to be a row offset into the flat `workspace_rows()` stream,
+    /// which silently assumed each host's rows stayed contiguous and in stream order; sorting and
+    /// ungrouping break that, so banners are now placed by identity instead of by position.
+    ///
+    /// #19 (host half): the Local/Main host also gets a banner — but ONLY in multi-host mode
+    /// (≥2 visible hosts, i.e. at least one remote), so its banner is the draggable handle for
+    /// reordering hosts. The single-local case stays banner-free (unchanged single-host UX).
     pub(crate) fn host_banner_specs(&self) -> Vec<(usize, crate::app::state::HostBannerSpec)> {
-        let all_filter = self.filter == ServerFilter::All;
         let visible = self.visible_servers();
         // #19: in multi-host mode every host (Local included) gets a banner; otherwise only
         // remotes do (and a lone local yields none, preserving the single-host UX).
         let banner_local = visible.len() >= 2;
         let mut specs = Vec::new();
-        let mut row_offset = 0usize;
-        for server in visible {
-            let rows = workspace_rows_for_server(server, all_filter);
+        for (host_idx, server) in visible.into_iter().enumerate() {
             if server.role == ServerRole::Secondary || banner_local {
                 let space_count = server
                     .summaries
@@ -3053,7 +3052,7 @@ impl ClientSupervisorModel {
                     .filter(|workspace| !workspace.workspace_id.is_empty())
                     .count();
                 specs.push((
-                    row_offset,
+                    host_idx,
                     crate::app::state::HostBannerSpec {
                         display_name: server.display_name.clone(),
                         connection_state: host_banner_state(server),
@@ -3069,7 +3068,6 @@ impl ClientSupervisorModel {
                     },
                 ));
             }
-            row_offset += rows.len();
         }
         specs
     }
@@ -5934,23 +5932,31 @@ mod tests {
         assert_eq!(specs[2].1.display_name, "prod");
         assert_eq!(specs[2].1.space_count, 1);
 
-        // The insertion index precedes that host's first row in the flat workspace_rows() stream.
+        // The tuple's first element is the host's position among the VISIBLE servers — the same
+        // `host_idx` every one of that host's rows carries. Assert the identity holds for EVERY
+        // row rather than just the first: that is precisely what makes banner placement survive
+        // any reordering of the list, which a row-offset could not.
         let rows = model.workspace_rows();
-        assert_eq!(
-            rows[specs[0].0].server_id,
-            ServerId::main(),
-            "local banner index precedes the local row"
-        );
-        assert_eq!(
-            rows[specs[1].0].server_id,
-            ServerId::secondary("dev"),
-            "dev banner index precedes dev's first row"
-        );
-        assert_eq!(
-            rows[specs[2].0].server_id,
-            ServerId::secondary("prod"),
-            "prod banner index precedes prod's first row"
-        );
+        for (host_idx, spec) in &specs {
+            let expected = match spec.display_name.as_str() {
+                "local" => ServerId::main(),
+                name => ServerId::secondary(name),
+            };
+            let matching: Vec<_> = rows
+                .iter()
+                .filter(|row| row.host_idx == *host_idx)
+                .collect();
+            assert!(
+                !matching.is_empty(),
+                "host {host_idx} ({}) has no rows",
+                spec.display_name
+            );
+            assert!(
+                matching.iter().all(|row| row.server_id == expected),
+                "every row stamped host {host_idx} must belong to {}",
+                spec.display_name
+            );
+        }
     }
 
     #[test]

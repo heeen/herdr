@@ -2629,11 +2629,10 @@ impl ClientSidebarSnapshot {
             .collect();
 
         let host_banner_specs = model.host_banner_specs();
-        // The insertion index from `host_banner_specs` is a position in the flat
-        // `workspace_rows()` stream, which is 1:1 with `app.workspaces` (each row pushed in
-        // order above) — so it is a valid `ws_idx`. `host_banner_rows[i]` is the workspace the
-        // i-th banner is emitted immediately before; `host_banners[i]` is its spec.
-        app.host_banner_rows = host_banner_specs.iter().map(|(idx, _)| *idx).collect();
+        // `host_banner_specs` yields `(host_idx, spec)` in `visible_servers()` order — the SAME
+        // space `client_workspace_host` and `host_styles` use, so a banner is matched to its rows
+        // by identity rather than by where those rows happen to sit.
+        app.host_banner_host_idx = host_banner_specs.iter().map(|(idx, _)| *idx).collect();
         app.host_banners = host_banner_specs
             .into_iter()
             .map(|(_, spec)| spec)
@@ -2641,7 +2640,7 @@ impl ClientSidebarSnapshot {
         app.host_banner_active = model.host_banner_active();
         // C1: normalize the workspace scroll AFTER the host-banner rows are populated above.
         // `normalized_workspace_scroll` counts entries via `workspace_list_entries`, which only
-        // emits the HostBanner rows once `host_banner_rows` is set — running it earlier clamped the
+        // emits the HostBanner rows once `host_banner_host_idx` is set — running it earlier clamped the
         // scroll to the banner-less row count (N-1) while the geometry/scrollbar below count N+B,
         // so a multi-host list scrolled to its bottom could not hold its last rows in view.
         app.workspace_scroll = crate::ui::normalized_workspace_scroll(

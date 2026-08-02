@@ -2274,11 +2274,11 @@ pub struct AppState {
     pub local_host_style: HostStyle,
     /// item 2: one per HostBanner entry; empty in monolithic.
     pub host_banners: Vec<HostBannerSpec>,
-    /// item 2: index-aligned with `host_banners`; each value is the `ws_idx` of the remote
-    /// host group's first workspace, i.e. the workspace the banner is emitted immediately
-    /// before. Empty in monolithic. Derived once in `from_model` from `host_banner_specs()`,
-    /// so render geometry stays a pure read.
-    pub(crate) host_banner_rows: Vec<usize>,
+    /// item 2: index-aligned with `host_banners`; each value is the HOST that banner belongs to,
+    /// as an index into `host_styles` — the same space `client_workspace_host` uses. Empty in
+    /// monolithic. Banners are placed by matching this identity against each row's host, so they
+    /// stay correct however the rows are ordered.
+    pub(crate) host_banner_host_idx: Vec<usize>,
     /// items 2/4: divider labeled↔plain coordination flag; false in monolithic.
     pub(crate) host_banner_active: bool,
     /// item 2: host banner config.
@@ -2673,7 +2673,7 @@ impl AppState {
             host_styles: Vec::new(),
             local_host_style: HostStyle::default(),
             host_banners: Vec::new(),
-            host_banner_rows: Vec::new(),
+            host_banner_host_idx: Vec::new(),
             host_banner_active: false,
             sidebar_host: crate::config::model::SidebarHostConfig::default(),
             sidebar_hover: None,

@@ -692,7 +692,7 @@ impl App {
             host_styles: Vec::new(),
             local_host_style: crate::app::state::HostStyle::default(),
             host_banners: Vec::new(),
-            host_banner_rows: Vec::new(),
+            host_banner_host_idx: Vec::new(),
             host_banner_active: false,
             sidebar_host: config.ui.sidebar.host.clone(),
             sidebar_hover: None,
