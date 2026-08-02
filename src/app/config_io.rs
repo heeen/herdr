@@ -222,6 +222,31 @@ impl App {
             self.apply_config_from_disk(false);
         }
     }
+
+    /// Persist the spaces sort. Mirrors `save_agent_panel_sort` — write the `[ui]` key, then let
+    /// the normal reload path apply it, so an unwritable config rolls back instead of leaving the
+    /// in-memory state ahead of what is on disk.
+    pub(super) fn save_space_sort(&mut self, sort: crate::app::state::SpaceSort) {
+        use crate::app::state::SpaceSort;
+        use crate::config::SpaceSortConfig;
+        let value = match sort {
+            SpaceSort::Manual => SpaceSortConfig::Manual,
+            SpaceSort::Alphabetical => SpaceSortConfig::Alphabetical,
+            SpaceSort::Status => SpaceSortConfig::Status,
+            SpaceSort::Recent => SpaceSortConfig::Recent,
+        }
+        .as_str();
+        if self.update_config_file("space sort", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "space_sort",
+                &format!("\"{value}\""),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
 }
 
 /// Read an existing config file for an in-place update.

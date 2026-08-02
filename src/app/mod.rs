@@ -246,6 +246,17 @@ fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginR
         .collect()
 }
 
+fn space_sort_from_config(value: crate::config::SpaceSortConfig) -> crate::app::state::SpaceSort {
+    use crate::app::state::SpaceSort;
+    use crate::config::SpaceSortConfig;
+    match value {
+        SpaceSortConfig::Manual => SpaceSort::Manual,
+        SpaceSortConfig::Alphabetical => SpaceSort::Alphabetical,
+        SpaceSortConfig::Status => SpaceSort::Status,
+        SpaceSortConfig::Recent => SpaceSort::Recent,
+    }
+}
+
 fn agent_panel_sort_from_config(
     sort: crate::config::AgentPanelSortConfig,
 ) -> state::AgentPanelSort {
@@ -651,6 +662,8 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
+            space_sort: space_sort_from_config(config.ui.space_sort),
+            group_spaces_by_host: config.ui.group_spaces_by_host,
             agent_view_override: None,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
@@ -689,6 +702,7 @@ impl App {
             spinner_tick: 0,
             client_workspace_remote: Vec::new(),
             client_workspace_host: Vec::new(),
+            client_workspace_last_focused_ms: Vec::new(),
             host_styles: Vec::new(),
             local_host_style: crate::app::state::HostStyle::default(),
             host_banners: Vec::new(),

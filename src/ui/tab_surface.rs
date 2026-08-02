@@ -306,7 +306,10 @@ mod tests {
             frame_digest(&frame),
             // Re-recorded for the herdr-mx sidebar renderer after the upstream v0.7.4 merge
             // (upstream's hash characterizes their sidebar; the layout was hand-verified).
-            "9e157f411d3334ce365650e6a465aa3b68efe5a2761c7b8035e4d9d843ce15c8"
+            // Re-recorded again for the spaces sort toggle: the header row now carries a
+            // right-aligned mode label ("manual" by default), mirroring the agents panel's
+            // toggle. Verified by dumping the frame — that label is the only cell change.
+            "7fb7995bded360e95eacadc15a06eabf25edef86e78aa2b7844e207c0504a0bf"
         );
     }
 

@@ -106,6 +106,30 @@ impl AgentPanelSortConfig {
     }
 }
 
+/// How the spaces list is ordered. `Manual` is the hand-arranged storage order (drag-to-reorder);
+/// the other three sort it, within each host group when grouped and across the whole fleet when
+/// not. Unknown values fall back to `Manual`, matching how every other sidebar enum degrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceSortConfig {
+    #[default]
+    Manual,
+    Alphabetical,
+    Status,
+    Recent,
+}
+
+impl SpaceSortConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Alphabetical => "alphabetical",
+            Self::Status => "status",
+            Self::Recent => "recent",
+        }
+    }
+}
+
 /// herdr-mx: agent panel scope filter config ("current" | "all"). Default "all".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -842,6 +866,11 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
+    /// Order of the spaces list: "manual" (hand-arranged), "alphabetical", "status" or "recent".
+    pub space_sort: SpaceSortConfig,
+    /// Group spaces under their host. Turning this off yields one flat list, where each row's host
+    /// is shown by its colour and bullet instead of by a banner above a block.
+    pub group_spaces_by_host: bool,
     /// herdr-mx: agent sidebar scope. Saved values are "current" or "all". Default: "all".
     pub agent_panel_scope: AgentPanelScopeConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1535,6 +1564,8 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
+            space_sort: SpaceSortConfig::Manual,
+            group_spaces_by_host: true,
             agent_panel_scope: AgentPanelScopeConfig::All,
             accent: "cyan".into(),
             toast: ToastConfig::default(),

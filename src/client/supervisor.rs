@@ -109,6 +109,10 @@ pub(crate) struct WorkspaceSummary {
     // grouping — `worktree_key` stays the only grouping signal.
     pub(crate) git_repo_key: Option<String>,
     pub(crate) git_is_linked: bool,
+    /// Unix epoch millis of the remote's last focus of this space, mirrored from the wire
+    /// `WorkspaceInfo.last_focused_at_ms`. Comparable across hosts, which is what lets the
+    /// "recent" sort order a whole fleet rather than one server at a time.
+    pub(crate) last_focused_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,6 +614,9 @@ pub(crate) struct WorkspaceSidebarRow {
     /// `workspace_rows`, so it covers the placeholder rows a disconnected or empty remote emits —
     /// those are real rows and must carry their host like any other.
     pub(crate) host_idx: usize,
+    /// Unix epoch millis of this space's last focus, for the "recent" sort. `None` on placeholder
+    /// rows and on spaces never focused in a recorded session; both sort last.
+    pub(crate) last_focused_at_ms: Option<u64>,
 }
 
 /// One host's style as stored, before any palette resolution. The local host has no registry entry,
@@ -3327,6 +3334,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             worktree_is_linked: false,
             // Stamped by `workspace_rows` once the host's position is known.
             host_idx: 0,
+            last_focused_at_ms: None,
         }];
     }
 
@@ -3343,6 +3351,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             worktree_is_linked: false,
             // Stamped by `workspace_rows` once the host's position is known.
             host_idx: 0,
+            last_focused_at_ms: None,
         }];
     }
 
@@ -3363,6 +3372,7 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             worktree_is_linked: workspace.worktree_is_linked,
             // Stamped by `workspace_rows` once the host's position is known.
             host_idx: 0,
+            last_focused_at_ms: workspace.last_focused_at_ms,
         })
         .collect()
 }
@@ -3721,6 +3731,7 @@ impl ServerSummary {
                     label: workspace.label,
                     branch: workspace.branch,
                     focused: workspace.focused,
+                    last_focused_at_ms: workspace.last_focused_at_ms,
                     // #22: carry the wire worktree group key + linked flag so the client's shared
                     // sidebar grouping renderer can collapse/expand worktree groups.
                     worktree_key: workspace.worktree.as_ref().map(|w| w.repo_key.clone()),
@@ -3995,6 +4006,7 @@ mod tests {
             active_tab_id: "tab-1".into(),
             agent_status: crate::api::schema::AgentStatus::Idle,
             tokens: std::collections::HashMap::new(),
+            last_focused_at_ms: None,
             worktree: None,
             git: None,
         }
@@ -4187,6 +4199,7 @@ mod tests {
                 worktree_key: None,
                 worktree_is_linked: false,
                 host_idx: 0,
+                last_focused_at_ms: None,
             }]
         );
         // the client-owned global menu still offers add remote / manage remotes.
@@ -4285,6 +4298,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 0,
+                    last_focused_at_ms: None,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-ssh"),
@@ -4297,6 +4311,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 1,
+                    last_focused_at_ms: None,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -4309,6 +4324,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 2,
+                    last_focused_at_ms: None,
                 },
             ]
         );
@@ -4453,6 +4469,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 0,
+                    last_focused_at_ms: None,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id,
@@ -4465,6 +4482,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 1,
+                    last_focused_at_ms: None,
                 },
             ]
         );
@@ -4524,6 +4542,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 1,
+                    last_focused_at_ms: None,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -4536,6 +4555,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 2,
+                    last_focused_at_ms: None,
                 },
             ]
         );
@@ -4950,6 +4970,7 @@ mod tests {
                     worktree_key: None,
                     worktree_is_linked: false,
                     host_idx: 0,
+                    last_focused_at_ms: None,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id.clone(),
@@ -4966,6 +4987,7 @@ mod tests {
                     // second VISIBLE host. Under the single-server filter below it is visible host
                     // 0 — the index is a position in `visible_servers()`, not a global server id.
                     host_idx: 1,
+                    last_focused_at_ms: None,
                 },
             ]
         );
@@ -4984,6 +5006,7 @@ mod tests {
                 worktree_key: None,
                 worktree_is_linked: false,
                 host_idx: 0,
+                last_focused_at_ms: None,
             }]
         );
     }
@@ -5010,6 +5033,7 @@ mod tests {
                 worktree_key: None,
                 worktree_is_linked: false,
                 host_idx: 1,
+                last_focused_at_ms: None,
             }]
         );
 
@@ -5030,6 +5054,7 @@ mod tests {
                 // index is a position in `visible_servers()`, which is what `host_styles` is
                 // built from — the two move together under a filter.
                 host_idx: 0,
+                last_focused_at_ms: None,
             }]
         );
     }
@@ -5056,6 +5081,7 @@ mod tests {
                 worktree_key: None,
                 worktree_is_linked: false,
                 host_idx: 1,
+                last_focused_at_ms: None,
             }]
         );
     }
@@ -6178,6 +6204,7 @@ mod tests {
                             worktree_is_linked: false,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                         WorkspaceSummary {
                             workspace_id: "ws-b".into(),
@@ -6188,6 +6215,7 @@ mod tests {
                             worktree_is_linked: false,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                     ],
                     agents: Vec::new(),
@@ -6238,6 +6266,7 @@ mod tests {
                             worktree_is_linked: false,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                         WorkspaceSummary {
                             workspace_id: "wt-child".into(),
@@ -6248,6 +6277,7 @@ mod tests {
                             worktree_is_linked: true,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                     ],
                     agents: Vec::new(),
@@ -6276,6 +6306,7 @@ mod tests {
             worktree_is_linked: is_linked,
             git_repo_key: None,
             git_is_linked: false,
+            last_focused_at_ms: None,
         }
     }
 

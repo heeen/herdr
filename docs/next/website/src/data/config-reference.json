@@ -686,6 +686,24 @@
           ]
         },
         {
+          "key": "ui.space_sort",
+          "type": "enum",
+          "default": "\"manual\"",
+          "description": "Order of the spaces list. \"manual\" keeps the hand-arranged order and is the only mode in which drag-to-reorder is offered; the others sort within each host group, or across the whole fleet when ui.group_spaces_by_host is off.",
+          "values": [
+            "manual",
+            "alphabetical",
+            "status",
+            "recent"
+          ]
+        },
+        {
+          "key": "ui.group_spaces_by_host",
+          "type": "boolean",
+          "default": "true",
+          "description": "Group spaces under their host. Turn off for one flat list, where each row's host is shown by its colour and bullet instead of by a banner above a block."
+        },
+        {
           "key": "ui.sidebar.spaces.lines",
           "type": "list of field lines",
           "default": "[[{ field = \"status\" }, { field = \"name\" }], [{ field = \"branch\" }, { field = \"branch_status\" }]]",

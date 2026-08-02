@@ -63,6 +63,11 @@ pub struct WorkspaceInfo {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,
+    /// Unix epoch millis of this space's last focus, for clients that sort by recency. Absent when
+    /// never focused in a recorded session. Additive and `serde(default)`, so an older client
+    /// ignores it and an older server simply omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focused_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
     /// herdr-mx: present when the workspace's checkout is a git repo even WITHOUT worktree-space

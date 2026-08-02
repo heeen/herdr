@@ -23,7 +23,7 @@ pub use self::{
         HostBannerGlyph, HostBannerGradient, HostCursorModeConfig, NewTerminalCwdConfig,
         ShellModeConfig, SidebarAgentField, SidebarAgentsConfig, SidebarCollapsedModeConfig,
         SidebarColorPreset, SidebarHostConfig, SidebarItem, SidebarSpaceField, SidebarSpacesConfig,
-        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
+        SpaceSortConfig, ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sound::SoundConfig,

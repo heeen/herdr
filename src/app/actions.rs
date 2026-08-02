@@ -1108,11 +1108,25 @@ impl AppState {
             .is_some_and(|tab_idx| tab_idx == self.workspaces[ws_idx].active_tab)
     }
 
+    /// Stamp a space as just focused, for the "recent" sort. The ONE write site — every focus
+    /// path funnels through `switch_workspace` / `switch_workspace_tab`, so recording it here
+    /// cannot drift from what the user actually visited.
+    pub(crate) fn mark_workspace_focused(&mut self, idx: usize) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .ok();
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            ws.last_focused_at_ms = now;
+        }
+    }
+
     pub fn switch_workspace(&mut self, idx: usize) {
         if idx < self.workspaces.len() {
             let previous_focus = self.current_pane_focus_target();
             self.active = Some(idx);
             self.selected = idx;
+            self.mark_workspace_focused(idx);
             let workspace_id = self.workspaces[idx].id.clone();
             crate::logging::workspace_focused(&workspace_id);
             self.mark_session_dirty();
@@ -1147,6 +1161,7 @@ impl AppState {
         let workspace_changed = self.active != Some(ws_idx);
         self.active = Some(ws_idx);
         self.selected = ws_idx;
+        self.mark_workspace_focused(ws_idx);
         let workspace_id = self.workspaces[ws_idx].id.clone();
         if workspace_changed {
             crate::logging::workspace_focused(&workspace_id);
@@ -4355,6 +4370,40 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    /// Focusing a space stamps its last-focus time, and focusing another one leaves the first
+    /// stamp alone — that difference is the whole basis of the "recent" sort.
+    #[test]
+    fn switching_workspaces_stamps_the_last_focus_time() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        assert!(state
+            .workspaces
+            .iter()
+            .all(|ws| ws.last_focused_at_ms.is_none()));
+
+        state.switch_workspace(0);
+        let first = state.workspaces[0]
+            .last_focused_at_ms
+            .expect("focusing a space stamps it");
+        assert!(state.workspaces[1].last_focused_at_ms.is_none());
+
+        state.switch_workspace(1);
+        assert!(state.workspaces[1].last_focused_at_ms.is_some());
+        assert_eq!(
+            state.workspaces[0].last_focused_at_ms,
+            Some(first),
+            "the space we left keeps its own stamp"
+        );
+    }
+
+    /// The tab-level focus path sets `active` too, so it must stamp as well — otherwise clicking
+    /// straight onto a tab of another space would leave that space looking stale.
+    #[test]
+    fn switching_to_a_tab_of_another_workspace_stamps_it() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        assert!(state.switch_workspace_tab(1, 0));
+        assert!(state.workspaces[1].last_focused_at_ms.is_some());
     }
 
     #[test]

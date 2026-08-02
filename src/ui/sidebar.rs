@@ -101,6 +101,28 @@ fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
     }
 }
 
+/// The label shown on the spaces header's sort toggle.
+pub(crate) fn space_sort_label(sort: crate::app::state::SpaceSort) -> &'static str {
+    use crate::app::state::SpaceSort;
+    match sort {
+        SpaceSort::Manual => "manual",
+        SpaceSort::Alphabetical => "a-z",
+        SpaceSort::Status => "status",
+        SpaceSort::Recent => "recent",
+    }
+}
+
+/// The clickable rect of the spaces sort toggle — right-aligned on the header row, mirroring the
+/// agents panel's toggle so both sections carry the same affordance in the same place.
+pub(crate) fn space_sort_toggle_rect(area: Rect, sort: crate::app::state::SpaceSort) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::default();
+    }
+    let label = space_sort_label(sort);
+    let width = (UnicodeWidthStr::width(label) as u16).min(area.width);
+    Rect::new(area.x + area.width.saturating_sub(width), area.y, width, 1)
+}
+
 pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
     agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
 }
@@ -910,6 +932,20 @@ pub(crate) fn row_host_style(app: &AppState, ws_idx: usize) -> crate::app::state
         .unwrap_or(app.local_host_style)
 }
 
+/// When a space was last focused, in unix epoch millis. Prefers the client's mirrored value (which
+/// spans the fleet) and falls back to the local `Workspace`, so one accessor serves both paths.
+///
+/// `None` means never focused. Note that `None < Some` under `Option`'s ordering, so a
+/// `Reverse(workspace_recency(..))` key sorts unfocused spaces LAST — which is what we want, and
+/// reads backwards enough to be worth a test of its own.
+pub(crate) fn workspace_recency(app: &AppState, ws_idx: usize) -> Option<u64> {
+    app.client_workspace_last_focused_ms
+        .get(ws_idx)
+        .copied()
+        .flatten()
+        .or_else(|| app.workspaces.get(ws_idx)?.last_focused_at_ms)
+}
+
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
@@ -1031,6 +1067,80 @@ pub(crate) fn workspace_list_entries_expanded_with_hosts(
     workspace_list_entries_inner(app, true)
 }
 
+/// The order spaces are laid out in, as indices into `app.workspaces`. This is the ONE place the
+/// spaces list is ordered: the entry list built from it feeds render geometry, hit-testing, drop
+/// slots, scroll extent, keyboard navigation and the mobile switcher alike, so every one of them
+/// follows without sorting again (and without being able to disagree).
+///
+/// When grouped, each host's run is sorted within itself so hosts stay contiguous and their
+/// banners keep meaning. Ungrouped, the whole list sorts as one. `sort_by_key` is stable, so equal
+/// keys keep storage order — the hand-arranged order survives as the tiebreak for free.
+fn ordered_workspace_indices(app: &AppState) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..app.workspaces.len()).collect();
+    if app.space_sort == crate::app::state::SpaceSort::Manual {
+        return order;
+    }
+
+    if app.group_spaces_by_host && !app.client_workspace_host.is_empty() {
+        // Sort inside each contiguous run of one host, leaving the runs where they are.
+        let mut start = 0usize;
+        while start < order.len() {
+            let host = app.client_workspace_host.get(order[start]).copied();
+            let mut end = start + 1;
+            while end < order.len() && app.client_workspace_host.get(order[end]).copied() == host {
+                end += 1;
+            }
+            order[start..end].sort_by_key(|ws_idx| space_sort_key(app, *ws_idx));
+            start = end;
+        }
+    } else {
+        order.sort_by_key(|ws_idx| space_sort_key(app, *ws_idx));
+    }
+    order
+}
+
+/// The sort key for one space. `Reverse` on status and recency puts the most urgent / most recent
+/// first; `None` recency therefore lands last, which is what we want for a never-focused space.
+fn space_sort_key(app: &AppState, ws_idx: usize) -> SpaceSortKey {
+    use crate::app::state::SpaceSort;
+    let Some(ws) = app.workspaces.get(ws_idx) else {
+        return SpaceSortKey::default();
+    };
+    match app.space_sort {
+        SpaceSort::Manual => SpaceSortKey::default(),
+        // Not `display_name_from`: that needs a `TerminalRuntimeRegistry` this path never receives.
+        // The cached label is what the client's placeholder spaces carry, so both paths agree.
+        SpaceSort::Alphabetical => SpaceSortKey {
+            label: ws
+                .custom_name
+                .as_deref()
+                .unwrap_or(&ws.cached_auto_label)
+                .to_lowercase(),
+            ..SpaceSortKey::default()
+        },
+        SpaceSort::Status => {
+            let (state, seen) = ws.aggregate_state(&app.terminals);
+            SpaceSortKey {
+                attention: std::cmp::Reverse(workspace_attention_priority(state, seen)),
+                ..SpaceSortKey::default()
+            }
+        }
+        SpaceSort::Recent => SpaceSortKey {
+            recency: std::cmp::Reverse(workspace_recency(app, ws_idx)),
+            ..SpaceSortKey::default()
+        },
+    }
+}
+
+/// One key type for every sort mode, so the comparison stays a single stable `sort_by_key` rather
+/// than a match that returns differently-typed closures.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct SpaceSortKey {
+    attention: std::cmp::Reverse<u8>,
+    recency: std::cmp::Reverse<Option<u64>>,
+    label: String,
+}
+
 fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
     let mut members_by_key = HashMap::<String, Vec<usize>>::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
@@ -1069,7 +1179,10 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
 
     let mut emitted_groups = std::collections::HashSet::<String>::new();
     let mut entries = Vec::new();
-    for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+    for ws_idx in ordered_workspace_indices(app) {
+        let Some(ws) = app.workspaces.get(ws_idx) else {
+            continue;
+        };
         let Some(space) = ws
             .worktree_space()
             .filter(|space| grouped_keys.contains(&space.key))
@@ -1117,12 +1230,19 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
                 });
             }
         } else {
-            for member_idx in members {
-                if *member_idx == parent_idx {
-                    continue;
-                }
+            // Children order by the SAME key as their parents, so a sort reaches inside a worktree
+            // group instead of stopping at its head.
+            let mut children: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|member_idx| *member_idx != parent_idx)
+                .collect();
+            if app.space_sort != crate::app::state::SpaceSort::Manual {
+                children.sort_by_key(|member_idx| space_sort_key(app, *member_idx));
+            }
+            for member_idx in children {
                 entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: *member_idx,
+                    ws_idx: member_idx,
                     indented: true,
                 });
             }
@@ -1677,7 +1797,9 @@ pub(crate) fn workspace_drop_slots(
     cards: &[crate::app::state::WorkspaceCardArea],
     area: Rect,
 ) -> Vec<(crate::app::state::WorkspaceDropTarget, u16)> {
-    if area.height == 0 || cards.is_empty() {
+    // No slots means no drop indicator on either path — the monolithic renderer and the client's
+    // drag preview both derive theirs from this list, so gating here covers both at once.
+    if area.height == 0 || cards.is_empty() || !app.space_reorder_enabled() {
         return Vec::new();
     }
     let list_bottom = area.y + area.height.saturating_sub(1);
@@ -1872,6 +1994,18 @@ fn render_workspace_list(
             )])),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        // The sort toggle is drawn from the SAME rect the hit-test reads, so it is clickable
+        // exactly where it is painted.
+        let toggle = space_sort_toggle_rect(area, app.space_sort);
+        if toggle.width > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    space_sort_label(app.space_sort),
+                    Style::default().fg(p.overlay0),
+                ))),
+                toggle,
+            );
+        }
     }
 
     let metrics = workspace_list_scroll_metrics(app, area);
@@ -2999,6 +3133,45 @@ mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// The client's mirrored value wins where present, and the local `Workspace` covers the
+    /// monolithic path — one accessor, both paths.
+    #[test]
+    fn workspace_recency_prefers_the_mirrored_value_and_falls_back_locally() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.push(Workspace::test_new("a"));
+        app.workspaces.push(Workspace::test_new("b"));
+        app.workspaces[0].last_focused_at_ms = Some(100);
+
+        assert_eq!(workspace_recency(&app, 0), Some(100), "monolithic fallback");
+        assert_eq!(workspace_recency(&app, 1), None, "never focused");
+        assert_eq!(workspace_recency(&app, 9), None, "out of range");
+
+        app.client_workspace_last_focused_ms = vec![Some(500), None];
+        assert_eq!(
+            workspace_recency(&app, 0),
+            Some(500),
+            "the fleet-wide value wins over the local one"
+        );
+        assert_eq!(
+            workspace_recency(&app, 1),
+            None,
+            "a mirrored None stays None rather than falling back"
+        );
+    }
+
+    /// `None < Some`, so reversing puts never-focused spaces last. This is the ordering that reads
+    /// backwards and is easy to "fix" into a regression.
+    #[test]
+    fn reversed_recency_sorts_unfocused_spaces_last() {
+        let mut order = vec![None, Some(20u64), None, Some(10u64)];
+        order.sort_by_key(|value| std::cmp::Reverse(*value));
+        assert_eq!(
+            order,
+            vec![Some(20), Some(10), None, None],
+            "most recent first, never-focused last"
+        );
+    }
 
     /// A monolithic session has no per-row host mapping at all, so every row must resolve to the
     /// local style — that fallback is what keeps the single-session look byte-identical.
@@ -5028,6 +5201,112 @@ lines = [
         app.active = None;
         app.mode = Mode::Terminal;
         app
+    }
+
+    /// Build a two-host fleet whose rows are deliberately NOT in label order, so an alphabetical
+    /// sort has to actually move them. Host 0 owns rows 0-1, host 1 owns rows 2-3.
+    fn sort_app() -> AppState {
+        let mut app = divider_app(&[false, false, true, true]);
+        for (idx, name) in ["delta", "alpha", "charlie", "bravo"].iter().enumerate() {
+            app.workspaces[idx].custom_name = Some((*name).to_string());
+        }
+        app.client_workspace_host = vec![0, 0, 1, 1];
+        app.host_styles = vec![crate::app::state::HostStyle::default(); 2];
+        app
+    }
+
+    fn space_order(app: &AppState) -> Vec<usize> {
+        workspace_list_entries(app)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sort × grouping matrix. Grouped keeps each host's rows together and sorts within them;
+    /// ungrouped sorts the whole fleet as one list.
+    #[test]
+    fn space_sort_orders_within_hosts_when_grouped_and_globally_when_not() {
+        use crate::app::state::SpaceSort;
+
+        let mut app = sort_app();
+
+        // Manual is the storage order, untouched, in both grouping modes.
+        assert_eq!(space_order(&app), vec![0, 1, 2, 3]);
+        app.group_spaces_by_host = false;
+        assert_eq!(space_order(&app), vec![0, 1, 2, 3]);
+
+        // Alphabetical, grouped: alpha<delta within host 0, bravo<charlie within host 1, and the
+        // two host runs stay contiguous and in host order.
+        app.group_spaces_by_host = true;
+        app.space_sort = SpaceSort::Alphabetical;
+        assert_eq!(space_order(&app), vec![1, 0, 3, 2]);
+
+        // Alphabetical, ungrouped: one list — alpha, bravo, charlie, delta — interleaving hosts.
+        app.group_spaces_by_host = false;
+        assert_eq!(space_order(&app), vec![1, 3, 2, 0]);
+    }
+
+    /// Recency sorts most-recent first and puts never-focused spaces last — the `Reverse(Option)`
+    /// ordering that reads backwards.
+    #[test]
+    fn recent_sort_puts_never_focused_spaces_last() {
+        use crate::app::state::SpaceSort;
+        let mut app = sort_app();
+        app.group_spaces_by_host = false;
+        app.space_sort = SpaceSort::Recent;
+
+        app.workspaces[0].last_focused_at_ms = Some(10);
+        app.workspaces[2].last_focused_at_ms = Some(30);
+        // rows 1 and 3 were never focused
+
+        let order = space_order(&app);
+        assert_eq!(&order[..2], &[2, 0], "most recently focused first");
+        assert!(
+            order[2..].contains(&1) && order[2..].contains(&3),
+            "never-focused spaces sort last, got {order:?}"
+        );
+    }
+
+    /// Equal keys keep storage order, so the hand-arranged order survives as the tiebreak.
+    #[test]
+    fn space_sort_is_stable_on_equal_keys() {
+        use crate::app::state::SpaceSort;
+        let mut app = sort_app();
+        app.group_spaces_by_host = false;
+        app.space_sort = SpaceSort::Status;
+        // Every space has the same aggregate state here, so nothing should move.
+        assert_eq!(space_order(&app), vec![0, 1, 2, 3]);
+    }
+
+    /// Dragging is only offered in the manual, grouped view — anywhere else a drop would either
+    /// snap back or commit a meaningless index.
+    #[test]
+    fn reordering_is_disabled_whenever_the_list_is_sorted_or_ungrouped() {
+        use crate::app::state::SpaceSort;
+        let mut app = sort_app();
+        assert!(app.space_reorder_enabled(), "manual + grouped allows drag");
+
+        for sort in [
+            SpaceSort::Alphabetical,
+            SpaceSort::Status,
+            SpaceSort::Recent,
+        ] {
+            app.space_sort = sort;
+            assert!(
+                !app.space_reorder_enabled(),
+                "an automatic sort must disable reordering ({sort:?})"
+            );
+        }
+
+        app.space_sort = SpaceSort::Manual;
+        app.group_spaces_by_host = false;
+        assert!(
+            !app.space_reorder_enabled(),
+            "ungrouped interleaves hosts, so the drop index would be wrong"
+        );
     }
 
     fn divider_positions(entries: &[WorkspaceListEntry]) -> Vec<usize> {

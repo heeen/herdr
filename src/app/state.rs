@@ -1187,6 +1187,17 @@ pub enum AgentPanelSort {
     Priority,
 }
 
+/// Runtime counterpart of [`crate::config::SpaceSortConfig`] — how the spaces list is ordered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpaceSort {
+    /// The hand-arranged storage order. The only mode in which drag-to-reorder does anything.
+    #[default]
+    Manual,
+    Alphabetical,
+    Status,
+    Recent,
+}
+
 /// herdr-mx: agent panel scope filter — which workspaces' agents the multi-remote
 /// client panel shows. Orthogonal to upstream's `AgentPanelSort` (ordering).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2211,6 +2222,11 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
+    /// Order of the spaces list. Applied once, where the entry list is built, so render, hit-test,
+    /// scroll extent and keyboard navigation all follow it without each having to sort.
+    pub space_sort: SpaceSort,
+    /// Whether spaces are grouped under their host. Off yields one flat list.
+    pub group_spaces_by_host: bool,
     pub agent_panel_scope: AgentPanelScope,
     /// Transient session-wide projection override for the built-in Agents view.
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
@@ -2267,6 +2283,10 @@ pub struct AppState {
     /// the client's `WorkspaceRoute` (which carries the real `ServerId`) lives on the compositor
     /// snapshot, not here. Banner placement, host-run detection and per-row styling all read it.
     pub(crate) client_workspace_host: Vec<usize>,
+    /// Per-workspace last-focus time (unix epoch millis), index-aligned with `workspaces`; empty
+    /// in monolithic, where the value lives on `Workspace` itself. Mirrored from the remotes so the
+    /// "recent" sort can order spaces across the whole fleet.
+    pub(crate) client_workspace_last_focused_ms: Vec<Option<u64>>,
     /// One entry per VISIBLE host, in the same order banners are emitted; empty in monolithic.
     pub host_styles: Vec<HostStyle>,
     /// The local host's style, resolved from `[ui.sidebar.host]`. Set on BOTH the monolithic and
@@ -2337,6 +2357,36 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Step the spaces sort to the next mode. The scroll offset is an ENTRY index, so it means
+    /// something different the instant the order changes — reset it and re-anchor on the selected
+    /// space, exactly as the agents panel resets its own scroll on a sort flip. `selected`/`active`
+    /// are storage indices and deliberately untouched: sorting moves rows, not the selection.
+    pub(crate) fn cycle_space_sort(&mut self) {
+        self.space_sort = match self.space_sort {
+            SpaceSort::Manual => SpaceSort::Alphabetical,
+            SpaceSort::Alphabetical => SpaceSort::Status,
+            SpaceSort::Status => SpaceSort::Recent,
+            SpaceSort::Recent => SpaceSort::Manual,
+        };
+        self.invalidate_space_order_scroll();
+    }
+
+    fn invalidate_space_order_scroll(&mut self) {
+        self.workspace_scroll = 0;
+        self.mobile_switcher_scroll = 0;
+        self.ensure_workspace_visible(self.selected);
+        self.mark_session_dirty();
+    }
+
+    /// Whether spaces can be hand-reordered right now. Dragging is only meaningful in the manual,
+    /// grouped view: an automatic sort re-derives the row's position from its label/status/recency,
+    /// so a drop would snap straight back while still rewriting the persisted order; and while
+    /// ungrouped, hosts interleave, which makes the render-position → server-local index
+    /// translation the reorder relies on produce a wrong index rather than no index.
+    pub(crate) fn space_reorder_enabled(&self) -> bool {
+        self.space_sort == SpaceSort::Manual && self.group_spaces_by_host
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -2630,6 +2680,8 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
+            space_sort: SpaceSort::Manual,
+            group_spaces_by_host: true,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             agent_view_override: None,
             next_agent_state_change_seq: 0,
@@ -2670,6 +2722,7 @@ impl AppState {
             spinner_tick: 0,
             client_workspace_remote: Vec::new(),
             client_workspace_host: Vec::new(),
+            client_workspace_last_focused_ms: Vec::new(),
             host_styles: Vec::new(),
             local_host_style: HostStyle::default(),
             host_banners: Vec::new(),

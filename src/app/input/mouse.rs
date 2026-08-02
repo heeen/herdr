@@ -589,6 +589,11 @@ impl AppState {
                         return None;
                     }
 
+                    if self.on_space_sort_toggle(mouse.column, mouse.row) {
+                        self.cycle_space_sort();
+                        return None;
+                    }
+
                     if self.on_agent_panel_sort_toggle(mouse.column, mouse.row) {
                         self.agent_panel_sort = match self.agent_panel_sort {
                             AgentPanelSort::Spaces => AgentPanelSort::Priority,

@@ -386,6 +386,11 @@ impl AppState {
         source_ws_idx: usize,
         drop_target: crate::app::state::WorkspaceDropTarget,
     ) -> Option<crate::api::schema::WorkspaceMoveBlockParams> {
+        // A move computed against a sorted or ungrouped view would carry a meaningless storage
+        // index, so refuse rather than commit one.
+        if !self.space_reorder_enabled() {
+            return None;
+        }
         let source = self.workspaces.get(source_ws_idx)?;
         if source
             .worktree_space()
@@ -464,6 +469,22 @@ impl AppState {
             workspace_ids,
             before_workspace_id,
         })
+    }
+
+    /// Whether a click landed on the spaces header's sort toggle. Reads the SAME rect the header
+    /// renders from, so the affordance is hittable exactly where it is painted.
+    pub(super) fn on_space_sort_toggle(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+        let ws_area =
+            crate::ui::workspace_list_rect(self.view.sidebar_rect, self.sidebar_section_split);
+        let rect = crate::ui::space_sort_toggle_rect(ws_area, self.space_sort);
+        rect.width > 0
+            && col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height
     }
 
     pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {

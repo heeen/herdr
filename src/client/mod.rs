@@ -9320,6 +9320,7 @@ mod tests {
                 worktree_is_linked: false,
                 git_repo_key: None,
                 git_is_linked: false,
+                last_focused_at_ms: None,
             })
             .collect();
         model
@@ -9342,6 +9343,7 @@ mod tests {
                 worktree_is_linked: false,
                 git_repo_key: None,
                 git_is_linked: false,
+                last_focused_at_ms: None,
             })
             .collect();
         model

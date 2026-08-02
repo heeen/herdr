@@ -2573,6 +2573,8 @@ impl ClientSidebarSnapshot {
             // Index-aligned with `app.workspaces` exactly like the remote flag above; this is what
             // lets the shared renderer attribute a row to its host without seeing `workspace_routes`.
             app.client_workspace_host.push(row.host_idx);
+            app.client_workspace_last_focused_ms
+                .push(row.last_focused_at_ms);
             // #20: index-aligned with `app.workspaces` so the current-workspace scope can pick its
             // slice below.
             per_ws_agent_routes.push(ws_agent_routes);
@@ -5486,6 +5488,7 @@ mod tests {
                             worktree_is_linked: false,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         }],
                         agents: Vec::new(),
                     },
@@ -5771,6 +5774,7 @@ mod tests {
                 worktree_is_linked: false,
                 git_repo_key: None,
                 git_is_linked: false,
+                last_focused_at_ms: None,
             })
             .collect();
         model
@@ -8818,6 +8822,7 @@ mod tests {
                             worktree_is_linked: false,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                         WorkspaceSummary {
                             workspace_id: "child".into(),
@@ -8828,6 +8833,7 @@ mod tests {
                             worktree_is_linked: true,
                             git_repo_key: None,
                             git_is_linked: false,
+                            last_focused_at_ms: None,
                         },
                     ],
                     agents: Vec::new(),

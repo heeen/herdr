@@ -1115,6 +1115,15 @@
             "label": {
               "type": "string"
             },
+            "last_focused_at_ms": {
+              "description": "Unix epoch millis of this space's last focus, for clients that sort by recency. Absent when\nnever focused in a recorded session. Additive and `serde(default)`, so an older client\nignores it and an older server simply omits it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -10340,6 +10349,15 @@
             },
             "label": {
               "type": "string"
+            },
+            "last_focused_at_ms": {
+              "description": "Unix epoch millis of this space's last focus, for clients that sort by recency. Absent when\nnever focused in a recorded session. Additive and `serde(default)`, so an older client\nignores it and an older server simply omits it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "number": {
               "format": "uint",

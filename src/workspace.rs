@@ -208,6 +208,13 @@ pub struct Workspace {
     pub(crate) next_public_tab_number: usize,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// When this space last received focus, as unix epoch millis. Drives the "recent" space sort.
+    ///
+    /// Wall clock rather than a counter on purpose: the sort runs across a fleet of hosts, so the
+    /// value has to be comparable between machines and survive a restart. (Clock skew between
+    /// hosts is accepted — it only ever reorders equally-stale spaces.) `None` means never focused
+    /// in a recorded session, which sorts last.
+    pub last_focused_at_ms: Option<u64>,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
@@ -332,6 +339,7 @@ impl Workspace {
             next_public_tab_number: tabs.len() + 1,
             tabs,
             active_tab,
+            last_focused_at_ms: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             #[cfg(test)]
@@ -383,6 +391,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            last_focused_at_ms: None,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }
@@ -571,6 +580,7 @@ impl Workspace {
                 next_public_tab_number: 2,
                 tabs: vec![tab],
                 active_tab: 0,
+                last_focused_at_ms: None,
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
             },
@@ -1406,6 +1416,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            last_focused_at_ms: None,
             test_runtimes: HashMap::new(),
         }
     }
