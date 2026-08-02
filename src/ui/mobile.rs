@@ -7,9 +7,9 @@ use ratatui::{
 };
 
 use super::sidebar::{
-    agent_panel_entries, agent_panel_entries_from, grouped_child_display_label,
-    next_entry_is_indented_workspace, workspace_list_entries_expanded, AgentPanelEntry,
-    WorkspaceListEntry,
+    agent_panel_entries, agent_panel_entries_from, grouped_child_display_label, host_banner_glyph,
+    host_banner_suffix, host_health_color, next_entry_is_indented_workspace,
+    workspace_list_entries_expanded_with_hosts, AgentPanelEntry, WorkspaceListEntry,
 };
 use super::status::{agent_icon, state_dot};
 use super::text::{display_width_u16, truncate_end};
@@ -20,6 +20,8 @@ use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const SWITCH_BUTTON_WIDTH: u16 = 10;
+/// Matches the desktop sidebar's divider caption so both surfaces name the boundary identically.
+const LOCAL_REMOTE_DIVIDER_LABEL: &str = " remote ";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MobileHeaderHitAreas {
@@ -111,20 +113,53 @@ fn mobile_agents_block_height(app: &AppState) -> usize {
     }
 }
 
+/// Doc rows one spaces-section entry occupies: a space is a name line plus a detail line, while a
+/// host banner or a local→remote divider is a single rule. Matches the desktop sidebar's heights.
+fn space_entry_height(entry: &WorkspaceListEntry) -> usize {
+    match entry {
+        WorkspaceListEntry::Workspace { .. } => 2,
+        WorkspaceListEntry::Divider { .. } | WorkspaceListEntry::HostBanner { .. } => 1,
+    }
+}
+
+/// The spaces section as `(doc row offset within the section, entry)`. Render, hit-test, scroll
+/// extent and keyboard doc-ranges all walk THIS one layout, so a host banner cannot shift any of
+/// them out of step with the others — the rows are no longer a uniform height, so the arithmetic
+/// each of them used to do independently would no longer agree.
+fn mobile_switcher_space_layout(app: &AppState) -> Vec<(usize, WorkspaceListEntry)> {
+    let mut offset = 0usize;
+    workspace_list_entries_expanded_with_hosts(app)
+        .into_iter()
+        .map(|entry| {
+            let start = offset;
+            offset += space_entry_height(&entry);
+            (start, entry)
+        })
+        .collect()
+}
+
+fn mobile_switcher_spaces_height(app: &AppState) -> usize {
+    mobile_switcher_space_layout(app)
+        .last()
+        .map(|(start, entry)| start + space_entry_height(entry))
+        .unwrap_or(0)
+}
+
 pub(crate) fn mobile_switcher_workspace_doc_range(
     app: &AppState,
     idx: usize,
 ) -> std::ops::Range<usize> {
-    // Spaces render in grouped order, so a workspace's row position is its index
-    // in the entry list, not its raw array index.
-    let pos = workspace_list_entries_expanded(app)
-        .iter()
-        .position(
-            |entry| matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx),
-        )
-        .unwrap_or(idx);
+    // Spaces render in grouped order and are interleaved with host rows, so a workspace's row
+    // position comes from the shared layout, not from its raw array index.
+    let offset = mobile_switcher_space_layout(app)
+        .into_iter()
+        .find_map(|(start, entry)| {
+            matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. } if ws_idx == idx)
+                .then_some(start)
+        })
+        .unwrap_or(idx * 2);
     // spaces sit after the agents block, then a title + "new workspace" row.
-    let start = mobile_agents_block_height(app) + 2 + pos * 2;
+    let start = mobile_agents_block_height(app) + 2 + offset;
     start..start + 2
 }
 
@@ -178,18 +213,20 @@ pub(crate) fn mobile_switcher_target_at(
         return Some(MobileSwitcherTarget::NewWorkspace);
     }
     cursor += 1;
-    // Spaces render in grouped (worktree-tree) order, which differs from raw
-    // array order, so map the clicked row to the entry's real workspace index.
-    let space_entries = workspace_list_entries_expanded(app);
-    let spaces_end = cursor + space_entries.len() * 2;
+    // Spaces render in grouped (worktree-tree) order interleaved with host rows, so resolve the
+    // clicked row through the shared layout. Host banners and dividers are labels, not targets.
+    let spaces_end = cursor + mobile_switcher_spaces_height(app);
     if doc_row >= cursor && doc_row < spaces_end {
-        let entry_idx = (doc_row - cursor) / 2;
-        return space_entries.get(entry_idx).and_then(|entry| match entry {
-            WorkspaceListEntry::Workspace { ws_idx, .. } => {
-                Some(MobileSwitcherTarget::Workspace(*ws_idx))
-            }
-            _ => None,
-        });
+        let row = doc_row - cursor;
+        return mobile_switcher_space_layout(app)
+            .into_iter()
+            .find(|(start, entry)| row >= *start && row < start + space_entry_height(entry))
+            .and_then(|(_, entry)| match entry {
+                WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                    Some(MobileSwitcherTarget::Workspace(ws_idx))
+                }
+                WorkspaceListEntry::Divider { .. } | WorkspaceListEntry::HostBanner { .. } => None,
+            });
     }
     cursor = spaces_end;
 
@@ -468,9 +505,9 @@ fn render_close_button(app: &AppState, frame: &mut Frame, area: Rect) {
 }
 
 fn mobile_switcher_content_height(app: &AppState) -> usize {
-    // Derive spaces height from the same entry list the render/hit-test use so
+    // Derive spaces height from the same layout the render/hit-test use so
     // the three never disagree.
-    let spaces_h = 2 + workspace_list_entries_expanded(app).len() * 2;
+    let spaces_h = 2 + mobile_switcher_spaces_height(app);
     let tabs_h = app
         .active
         .and_then(|idx| app.workspaces.get(idx))
@@ -602,12 +639,53 @@ fn render_mobile_switcher_content(
         p,
     );
     doc_y += 1;
-    let space_entries = workspace_list_entries_expanded(app);
+    let space_entries: Vec<WorkspaceListEntry> = mobile_switcher_space_layout(app)
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect();
     for (entry_idx, entry) in space_entries.iter().enumerate() {
+        // A host banner names the machine whose spaces follow; the divider marks the local→remote
+        // boundary when no banner does. Both are one-line labels, so they advance `doc_y` by one —
+        // the same heights `mobile_switcher_space_layout` hands the hit-test.
+        match entry {
+            WorkspaceListEntry::HostBanner { banner_idx } => {
+                if let Some(banner) = app.host_banners.get(*banner_idx) {
+                    render_switcher_host_banner_at(
+                        frame,
+                        viewport,
+                        content,
+                        doc_y,
+                        app.mobile_switcher_scroll,
+                        banner,
+                        app.sidebar_host.show_count,
+                        p,
+                    );
+                }
+                doc_y += 1;
+                continue;
+            }
+            WorkspaceListEntry::Divider { labeled } => {
+                render_switcher_divider_at(
+                    frame,
+                    viewport,
+                    content,
+                    doc_y,
+                    app.mobile_switcher_scroll,
+                    *labeled,
+                    p,
+                );
+                doc_y += 1;
+                continue;
+            }
+            WorkspaceListEntry::Workspace { .. } => {}
+        }
         let WorkspaceListEntry::Workspace { ws_idx, indented } = entry else {
             continue;
         };
         let Some(ws) = app.workspaces.get(*ws_idx) else {
+            // The layout still reserved this entry's two rows, so skip them rather than sliding
+            // every following row up and desyncing render from hit-test.
+            doc_y += 2;
             continue;
         };
         let active = Some(*ws_idx) == app.active;
@@ -770,6 +848,92 @@ fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
         parts.push(agent_label.to_string());
     }
     format!("  {}", parts.join(" · "))
+}
+
+/// One host banner row: the machine whose spaces follow, with its connection dot. The switcher
+/// aggregates spaces across every connected host, so this is what tells "api on stealth" apart from
+/// a local space of the same name.
+fn render_switcher_host_banner_at(
+    frame: &mut Frame,
+    viewport: Rect,
+    content: Rect,
+    doc_y: usize,
+    scroll: usize,
+    banner: &crate::app::state::HostBannerSpec,
+    app_show_count: bool,
+    p: &Palette,
+) {
+    // Glyph, health color and suffix all come from the sidebar's helpers, so a host reads the same
+    // on both surfaces instead of the switcher inventing a second visual language for it.
+    let bg = p.panel_bg;
+    let health = host_health_color(banner.latency_ms, banner.connection_state, p);
+    let mut spans = vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled(
+            host_banner_glyph(banner.connection_state),
+            Style::default().fg(health).bg(bg),
+        ),
+        Span::styled(" ", Style::default().bg(bg)),
+        Span::styled(
+            truncate_end(
+                &banner.display_name,
+                content.width.saturating_sub(4) as usize,
+            ),
+            Style::default()
+                .fg(p.text)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(suffix) =
+        host_banner_suffix(banner.connection_state, banner.space_count, app_show_count)
+    {
+        spans.push(Span::styled(suffix, Style::default().fg(p.overlay0).bg(bg)));
+    }
+    render_one_line_item(
+        frame,
+        viewport,
+        content,
+        doc_y,
+        scroll,
+        bg,
+        Line::from(spans),
+    );
+}
+
+/// The local→remote boundary rule. `labeled` is set only when no host banner names the remote side
+/// (the desktop sidebar makes the same call), so the two never both caption the same boundary.
+fn render_switcher_divider_at(
+    frame: &mut Frame,
+    viewport: Rect,
+    content: Rect,
+    doc_y: usize,
+    scroll: usize,
+    labeled: bool,
+    p: &Palette,
+) {
+    let style = Style::default().fg(p.surface_dim).bg(p.panel_bg);
+    let width = content.width as usize;
+    let line = if labeled && width > LOCAL_REMOTE_DIVIDER_LABEL.chars().count() {
+        let pad = width - LOCAL_REMOTE_DIVIDER_LABEL.chars().count();
+        let left = pad / 2;
+        format!(
+            "{}{LOCAL_REMOTE_DIVIDER_LABEL}{}",
+            "─".repeat(left),
+            "─".repeat(pad - left)
+        )
+    } else {
+        "─".repeat(width)
+    };
+    render_one_line_item(
+        frame,
+        viewport,
+        content,
+        doc_y,
+        scroll,
+        p.panel_bg,
+        Line::from(Span::styled(line, style)),
+    );
 }
 
 fn render_section_title_at(

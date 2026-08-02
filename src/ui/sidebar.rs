@@ -706,7 +706,7 @@ fn host_banner_spans(
 /// The leading connection-state glyph for a host banner (when `cfg.glyph == Left`).
 /// Returns `(glyph, dim)` where `dim` selects a stable dim/red palette color; `Connected`
 /// uses the gradient first-char color (handled by the caller).
-fn host_banner_glyph(state: crate::app::state::HostBannerState) -> &'static str {
+pub(super) fn host_banner_glyph(state: crate::app::state::HostBannerState) -> &'static str {
     use crate::app::state::HostBannerState;
     match state {
         HostBannerState::Connected => "◆",
@@ -719,7 +719,7 @@ fn host_banner_glyph(state: crate::app::state::HostBannerState) -> &'static str 
 
 /// The dim suffix that follows the host name, keyed off the banner state. `Connected` only
 /// shows `· N spaces` when `show_count` is set; the other states surface the state word.
-fn host_banner_suffix(
+pub(super) fn host_banner_suffix(
     state: crate::app::state::HostBannerState,
     space_count: usize,
     show_count: bool,
@@ -747,7 +747,7 @@ fn format_download_rate(bps: u64) -> String {
 
 /// Color-grade a host by health: green when smooth, yellow when warming, peach when laggy, red
 /// when down/incompatible, dim until the first latency sample (issue #13).
-fn host_health_color(
+pub(super) fn host_health_color(
     latency_ms: Option<u32>,
     state: crate::app::state::HostBannerState,
     p: &Palette,
@@ -1001,13 +1001,23 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
 
 /// Like [`workspace_list_entries`] but always expands worktree groups, ignoring
 /// `collapsed_space_keys`, and emits ONLY `Workspace` entries (no divider/host-banner
-/// rows). The mobile switcher has no collapse affordance, always shows the full
-/// worktree tree, and computes its row math assuming every entry is a workspace row.
+/// rows). Callers that index straight into the result — keyboard navigation and the
+/// workspace actions — want a uniform list of selectable spaces.
 pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
-    workspace_list_entries_inner(app, true)
+    workspace_list_entries_expanded_with_hosts(app)
         .into_iter()
         .filter(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. }))
         .collect()
+}
+
+/// The same always-expanded list, but KEEPING the local→remote divider and host-banner rows.
+/// The mobile switcher renders these: it aggregates spaces from every connected host, so without
+/// them the list is a flat run of names with nothing saying which machine each one lives on.
+/// Both extra kinds are absent in monolithic mode, so a single-session host is unaffected.
+pub(crate) fn workspace_list_entries_expanded_with_hosts(
+    app: &AppState,
+) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, true)
 }
 
 fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {

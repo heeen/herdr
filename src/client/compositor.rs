@@ -6048,6 +6048,74 @@ mod tests {
         );
     }
 
+    /// The switcher aggregates spaces from every host, so it must say which host each one is on —
+    /// and adding those rows must not shift the hit-test off the rows that are painted. Host rows
+    /// are one line while spaces are two, so this pins render, hit-test and the keyboard's
+    /// doc-range against each other rather than trusting the row arithmetic.
+    #[test]
+    fn mobile_switcher_shows_host_rows_without_desyncing_the_hit_test() {
+        let (model, _remote_id) = mobile_switcher_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let host = (50u16, 30u16);
+        compositor.open_mobile_switcher();
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            0,
+            host.0,
+            host.1,
+            Instant::now(),
+        );
+        let app = &snapshot.app;
+        let viewport = crate::ui::mobile_switcher_areas(app).viewport;
+        let col = viewport.x + 2;
+        let shell = compositor.build_shell(&model, host.0, host.1, Instant::now());
+        let row_text = |row: u16| -> String {
+            (0..host.0 as usize)
+                .map(|x| {
+                    shell.frame.cells[row as usize * host.0 as usize + x]
+                        .symbol
+                        .clone()
+                })
+                .collect()
+        };
+
+        // Both hosts are named, and the local→remote boundary is ruled.
+        let all: String = (0..host.1).map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            all.contains("local"),
+            "the local host must be named:\n{all}"
+        );
+        assert!(all.contains('x'), "the remote host must be named:\n{all}");
+
+        // Every space's doc-range must point at the row its own name is painted on, and the
+        // target under that row must be that space.
+        for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+            let doc = crate::ui::mobile_switcher_workspace_doc_range(app, ws_idx);
+            let row = viewport.y + doc.start as u16;
+            let label = ws.display_name_from(&app.terminals, &TerminalRuntimeRegistry::new());
+            assert!(
+                row_text(row).contains(&label),
+                "space {ws_idx} ({label}) is not painted on its own doc row {row}:\n{all}"
+            );
+            assert_eq!(
+                crate::ui::mobile_switcher_target_at(app, col, row),
+                Some(crate::ui::MobileSwitcherTarget::Workspace(ws_idx)),
+                "clicking space {ws_idx}'s painted row must select it"
+            );
+        }
+
+        // A host row is a label, never a target — clicking one must not focus a space.
+        let banner_row = (0..host.1)
+            .find(|row| row_text(*row).contains("local"))
+            .expect("the local host banner is painted");
+        assert_eq!(
+            crate::ui::mobile_switcher_target_at(app, col, banner_row),
+            None,
+            "the host banner row must not resolve to a space"
+        );
+    }
+
     fn mixed_supervisor_model() -> (ClientSupervisorModel, ServerId) {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
