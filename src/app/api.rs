@@ -985,6 +985,9 @@ impl App {
             Method::RemoteSetAutoUpdate(params) => {
                 return self.handle_remote_set_auto_update(request.id, params)
             }
+            Method::RemoteSetStyle(params) => {
+                return self.handle_remote_set_style(request.id, params)
+            }
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }

@@ -367,7 +367,10 @@ pub(crate) struct HoverGeometry {
     affordance_to: u32,
     /// Workspace cards paintable on hover: `(ws_idx, list_bottom-clipped rect)`. Selected / active /
     /// dragged cards are EXCLUDED here (their bg already wins over hover, so hovering them is a no-op).
-    workspace_cards: Vec<(usize, Rect)>,
+    /// `(ws_idx, rect, hover_bg)`. The colour is per-row because a host-tinted row must lift from
+    /// ITS own background — one global hover colour would flatten every host to the same shade the
+    /// moment you pointed at a row.
+    workspace_cards: Vec<(usize, Rect, u32)>,
     /// Agent-panel rows paintable on hover: `(route_idx, full multi-line row rect)`. The active row
     /// is EXCLUDED (its `surface_dim` bg wins over hover).
     agent_rows: Vec<(usize, Rect)>,
@@ -2339,7 +2342,7 @@ impl ClientSidebarSnapshot {
         app.sidebar_host = settings.sidebar_host.clone();
         // The local host's style comes from config, not the registry (it has no registry entry).
         // Set before `host_styles` is built, which falls back to it for the local entry.
-        app.local_host_style = local_host_style_from_config(&app.sidebar_host);
+        app.local_host_style = crate::app::state::HostStyle::from_local_config(&app.sidebar_host);
         app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
         // #25: gate the SHARED renderer onto its collapsed layout BEFORE geometry is computed, so
         // the collapsed sections + toggle rect are what gets laid out and what `hit_test` reads
@@ -2825,27 +2828,11 @@ fn resolve_host_style(
             .fg
             .as_deref()
             .and_then(crate::config::parse_color_checked),
-        bullet: input.bullet.as_deref().and_then(single_char_bullet),
+        bullet: input
+            .bullet
+            .as_deref()
+            .and_then(crate::remote_registry::single_width_bullet),
     }
-}
-
-/// The local host's style, from `[ui.sidebar.host]`. Shared by both paths so a monolithic session
-/// and a remote-less client render identically.
-pub(crate) fn local_host_style_from_config(
-    cfg: &crate::config::model::SidebarHostConfig,
-) -> crate::app::state::HostStyle {
-    let _ = cfg;
-    crate::app::state::HostStyle::default()
-}
-
-/// A bullet must be exactly one character wide — both row layouts budget one column for it.
-fn single_char_bullet(raw: &str) -> Option<char> {
-    let mut chars = raw.chars();
-    let first = chars.next()?;
-    (chars.next().is_none()
-        && !first.is_control()
-        && unicode_width::UnicodeWidthChar::width(first) == Some(1))
-    .then_some(first)
 }
 
 fn render_client_shell(
@@ -3800,7 +3787,9 @@ fn compute_hover_geometry(snapshot: &ClientSidebarSnapshot) -> HoverGeometry {
             }
         }
         if let Some(rect) = clip_rect_to_bottom(card.rect, list_bottom) {
-            geom.workspace_cards.push((i, rect));
+            let host = crate::ui::row_host_style(app, i);
+            let hover = color_to_u32(p.hover_bg_over(host.bg.unwrap_or(p.panel_bg)));
+            geom.workspace_cards.push((i, rect, hover));
         }
     }
 
@@ -3973,8 +3962,10 @@ pub(crate) fn apply_hover_overlay(
     };
     match target {
         SidebarHoverTarget::Workspace { ws_idx } => {
-            if let Some((_, rect)) = geom.workspace_cards.iter().find(|(i, _)| *i == ws_idx) {
-                fill_rect_bg(frame, *rect, geom.hover_bg);
+            if let Some((_, rect, hover_bg)) =
+                geom.workspace_cards.iter().find(|(i, _, _)| *i == ws_idx)
+            {
+                fill_rect_bg(frame, *rect, *hover_bg);
             }
         }
         SidebarHoverTarget::AgentRoute { route_idx } => {
@@ -4271,6 +4262,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -4370,6 +4364,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -4480,6 +4477,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -4631,6 +4631,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -4793,6 +4796,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         // Local server (row 0): workspace focused AND its agent is the focused one.
         model
@@ -5269,6 +5275,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -5458,6 +5467,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let remote_y = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "remote-y".into(),
@@ -5469,6 +5481,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         for (id, ws, label, focused) in [
             (ServerId::main(), "main-herdr", "herdr", true),
@@ -6015,6 +6030,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -6391,6 +6409,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let workspace = |id: &str, label: &str| WorkspaceSummary {
             workspace_id: id.into(),
@@ -6445,6 +6466,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let compositor = ClientCompositor::new(DEFAULT_SIDEBAR_WIDTH);
         let snapshot = ClientSidebarSnapshot::from_model(
@@ -6491,6 +6515,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -6638,6 +6665,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -7013,6 +7043,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -7455,6 +7488,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -7647,6 +7683,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_connection_state(
@@ -7675,6 +7714,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             id: "r2".into(),
@@ -7687,6 +7729,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model.open_remote_manage_overlay();
         model
@@ -7951,6 +7996,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -8358,6 +8406,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -9077,6 +9128,76 @@ mod tests {
     /// agent rows, the filter label, the new/menu buttons, the scope toggle), painting it via the
     /// overlay must be cell-identical to the old shell that baked that hover — and must actually
     /// change something (no vacuous pass). One cached hover-less shell serves them all.
+    /// The Seam-1 equivalence check, but with a host that actually carries a background tint.
+    /// Without a styled host the other equivalence tests exercise only the `host.bg == None` path,
+    /// so the per-row hover colour — the one thing per-host styling changes in the overlay — would
+    /// go uncovered and could drift from the baked render unnoticed.
+    #[test]
+    fn hover_overlay_matches_baked_for_a_host_styled_row() {
+        use crate::app::state::SidebarHoverTarget;
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-styled".into(),
+            name: "styled".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local { session: None },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: false,
+            style_bg: Some("#2a1f3d".into()),
+            style_fg: Some("#cba6f7".into()),
+            style_bullet: Some("◈".into()),
+        });
+        model
+            .set_summary(&ServerId::main(), server_summary_with_agents("main", 2, 1))
+            .unwrap();
+        model
+            .set_summary(&remote_id, server_summary_with_agents("remote", 2, 1))
+            .unwrap();
+
+        let compositor = ClientCompositor::new(28);
+        let now = std::time::Instant::now();
+        let content = frame(20, 10, &["x"]);
+        let shell = compositor.build_shell(&model, 80, 44, now);
+
+        // The styled host must actually be resolved, or this test would pass vacuously too.
+        let snapshot =
+            ClientSidebarSnapshot::from_model(&model, &compositor, 28, 80, 44, Instant::now());
+        assert!(
+            snapshot
+                .app
+                .host_styles
+                .iter()
+                .any(|style| style.bg.is_some()),
+            "the remote's style must reach the render snapshot"
+        );
+
+        assert!(
+            shell
+                .hover
+                .workspace_cards
+                .iter()
+                .any(|(_, _, hover)| *hover != shell.hover.hover_bg),
+            "at least one row must hover to a host-tinted colour, or this test proves nothing"
+        );
+
+        for (ws_idx, _, _) in shell.hover.workspace_cards.clone() {
+            let target = SidebarHoverTarget::Workspace { ws_idx };
+            let mut overlaid = overlay_content_onto_shell(&shell, &content);
+            apply_hover_overlay(&mut overlaid, &shell, Some(target), None);
+
+            let mut hovered_compositor = ClientCompositor::new(28);
+            hovered_compositor.set_hover(Some(target));
+            let baked = hovered_compositor.build_shell_hover_baked(&model, 80, 44, now);
+            let baked = overlay_content_onto_shell(&baked, &content);
+
+            assert_eq!(
+                overlaid.cells, baked.cells,
+                "hover overlay must match the baked render for styled row {ws_idx}"
+            );
+        }
+    }
+
     #[test]
     fn hover_overlay_matches_baked_for_every_sidebar_target() {
         use crate::app::state::SidebarHoverTarget;
@@ -9094,7 +9215,7 @@ mod tests {
                 .hover
                 .workspace_cards
                 .iter()
-                .map(|(i, _)| SidebarHoverTarget::Workspace { ws_idx: *i }),
+                .map(|(i, _, _)| SidebarHoverTarget::Workspace { ws_idx: *i }),
         );
         targets.extend(
             shell
@@ -9377,7 +9498,7 @@ mod tests {
             .workspace_cards
             .iter()
             .take(2)
-            .map(|(i, _)| SidebarHoverTarget::Workspace { ws_idx: *i })
+            .map(|(i, _, _)| SidebarHoverTarget::Workspace { ws_idx: *i })
             .collect();
         assert_eq!(
             targets.len(),

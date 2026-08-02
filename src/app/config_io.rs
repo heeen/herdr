@@ -271,14 +271,27 @@ fn space_sidebar_config_body(preferences: &SidebarSpacePreferences) -> String {
 /// writer — the host group is not item-based). Mirrors the enum `as_str()` mapping so the
 /// round-trip re-parses to the same `SidebarHostConfig`.
 fn host_sidebar_config_body(preferences: &crate::config::SidebarHostConfig) -> String {
-    format!(
+    let mut body = format!(
         "gradient = \"{}\"\nanimation = \"{}\"\nspeed = \"{}\"\nglyph = \"{}\"\nshow_count = {}\n",
         preferences.gradient.as_str(),
         preferences.animation.as_str(),
         preferences.speed.as_str(),
         preferences.glyph.as_str(),
         preferences.show_count,
-    )
+    );
+    // The local-host style keys are OMITTED when unset rather than written as "". This body
+    // replaces the whole section, so writing an empty string would turn "unset" into "set to
+    // nothing" the first time any unrelated host setting was saved from the settings panel.
+    for (key, value) in [
+        ("local_bg", preferences.local_bg.as_deref()),
+        ("local_fg", preferences.local_fg.as_deref()),
+        ("local_bullet", preferences.local_bullet.as_deref()),
+    ] {
+        if let Some(value) = value {
+            body.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+    }
+    body
 }
 
 fn agent_sidebar_config_body(preferences: &SidebarAgentPreferences) -> String {

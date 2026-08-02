@@ -759,6 +759,8 @@ fn render_mobile_switcher_content(
         );
         let (state, seen) = ws.aggregate_state(&app.terminals);
         let (dot, dot_style) = state_dot(state, seen, p);
+        // Same override rule as the sidebar: the host supplies the shape, the state keeps the colour.
+        let dot = super::sidebar::host_bullet_or(super::sidebar::row_host_style(app, *ws_idx), dot);
 
         let mut title_spans = vec![Span::styled("  ", Style::default().bg(bg))];
         // Worktrees of the same space render as branches off their parent, so a

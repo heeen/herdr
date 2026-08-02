@@ -704,7 +704,9 @@ impl App {
             client_workspace_host: Vec::new(),
             client_workspace_last_focused_ms: Vec::new(),
             host_styles: Vec::new(),
-            local_host_style: crate::app::state::HostStyle::default(),
+            local_host_style: crate::app::state::HostStyle::from_local_config(
+                &config.ui.sidebar.host,
+            ),
             host_banners: Vec::new(),
             host_banner_host_idx: Vec::new(),
             host_banner_active: false,
@@ -3526,6 +3528,9 @@ mod tests {
             speed: crate::config::model::HostBannerSpeed::Lively,
             glyph: crate::config::HostBannerGlyph::None,
             show_count: true,
+            local_bg: None,
+            local_fg: None,
+            local_bullet: None,
         };
 
         assert!(app.save_sidebar_host_preferences(preferences.clone()));

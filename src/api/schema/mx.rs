@@ -33,6 +33,19 @@ pub struct RemoteSetAutoUpdateParams {
     pub auto_update: bool,
 }
 
+/// Replace a remote's row styling. All three fields are optional and set together: sending `None`
+/// clears that part of the style, so one call fully describes the desired state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteSetStyleParams {
+    pub remote_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bullet: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RemoteSetEnabledParams {
     pub remote_id: String,

@@ -101,6 +101,27 @@ impl App {
             Err(err) => encode_error(id, err.code(), err.message()),
         }
     }
+
+    /// Set a remote's row styling. Validation lives in the registry setter, so an invalid colour or
+    /// a multi-column bullet is refused here rather than written to disk and discovered at render.
+    pub(super) fn handle_remote_set_style(
+        &mut self,
+        id: String,
+        params: crate::api::schema::RemoteSetStyleParams,
+    ) -> String {
+        match self.state.remote_registry.set_style(
+            &params.remote_id,
+            params.bg,
+            params.fg,
+            params.bullet,
+        ) {
+            Ok(remote) => {
+                self.state.mark_session_dirty();
+                encode_success(id, ResponseResult::RemoteEnabledChanged { remote })
+            }
+            Err(err) => encode_error(id, err.code(), err.message()),
+        }
+    }
 }
 
 fn main_server_remote_targets() -> Vec<crate::remote_registry::RemoteTargetSnapshot> {

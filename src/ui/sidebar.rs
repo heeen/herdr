@@ -946,6 +946,18 @@ pub(crate) fn workspace_recency(app: &AppState, ws_idx: usize) -> Option<u64> {
         .or_else(|| app.workspaces.get(ws_idx)?.last_focused_at_ms)
 }
 
+/// The host's bullet if it set one, else the state dot's own glyph. A helper so the sidebar and
+/// the mobile switcher cannot disagree about the override rule.
+pub(crate) fn host_bullet_or(
+    host: crate::app::state::HostStyle,
+    default: &'static str,
+) -> std::borrow::Cow<'static, str> {
+    match host.bullet {
+        Some(bullet) => std::borrow::Cow::Owned(bullet.to_string()),
+        None => std::borrow::Cow::Borrowed(default),
+    }
+}
+
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
@@ -1269,6 +1281,20 @@ fn insert_host_banners(
         return entries;
     }
 
+    // Ungrouped there are no host runs to head, but the banner row is the ONLY hit target for the
+    // host context menu (enable/disable, reconnect, update, style) and the host drag handle — so
+    // collect them into a strip above the flat list rather than dropping them. Rows are attributed
+    // by their colour and bullet instead, which is the point of ungrouping.
+    if !app.group_spaces_by_host {
+        let mut result = Vec::with_capacity(entries.len() + app.host_banner_host_idx.len());
+        result.extend(
+            (0..app.host_banner_host_idx.len())
+                .map(|banner_idx| WorkspaceListEntry::HostBanner { banner_idx }),
+        );
+        result.extend(entries);
+        return result;
+    }
+
     let mut result = Vec::with_capacity(entries.len() + app.host_banner_host_idx.len());
     // `None` until the first row, so the very first host run also gets its banner.
     let mut current_host: Option<usize> = None;
@@ -1309,6 +1335,11 @@ fn insert_local_remote_divider(
     app: &AppState,
     entries: Vec<WorkspaceListEntry>,
 ) -> Vec<WorkspaceListEntry> {
+    // The divider marks ONE local→remote transition, which only means anything while locals and
+    // remotes stay contiguous. Ungrouped they interleave, so it would land arbitrarily.
+    if !app.group_spaces_by_host {
+        return entries;
+    }
     let is_remote = |entry: &WorkspaceListEntry| match entry {
         WorkspaceListEntry::Workspace { ws_idx, .. } => {
             app.client_workspace_remote.get(*ws_idx).copied()
@@ -2025,20 +2056,25 @@ fn render_workspace_list(
         // bolds (the `name_style` gate below is untouched).
         let hovered = app.sidebar_hover
             == Some(crate::app::state::SidebarHoverTarget::Workspace { ws_idx: i });
-        let highlighted = selected || is_active || is_dragged || hovered;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
 
-        if highlighted {
-            let bg = if selected {
-                p.surface0
-            } else if is_dragged {
-                p.surface1
-            } else if is_active {
-                p.surface_dim
-            } else {
-                // hovered-only (the prior three arms are false) → subtle theme-derived lift.
-                p.hover_bg()
-            };
+        // The host's tint is the resting background. Selected/active/dragged deliberately ignore
+        // it so the selection stays uniformly legible, and hover lifts from the host's own colour
+        // rather than the page background — otherwise pointing at a row would flatten every host
+        // to the same shade, losing the identity exactly when you are looking for it.
+        let host = row_host_style(app, i);
+        let row_bg = if selected {
+            Some(p.surface0)
+        } else if is_dragged {
+            Some(p.surface1)
+        } else if is_active {
+            Some(p.surface_dim)
+        } else if hovered {
+            Some(p.hover_bg_over(host.bg.unwrap_or(p.panel_bg)))
+        } else {
+            host.bg
+        };
+        if let Some(bg) = row_bg {
             let buf = frame.buffer_mut();
             for y in row_y..row_y + row_height {
                 if y >= list_bottom {
@@ -2056,17 +2092,22 @@ fn render_workspace_list(
             Style::default().fg(p.subtext0)
         };
 
+        // The host's bullet replaces the SHAPE only — the colour still encodes agent state, so the
+        // host cue is added rather than traded against the signal the dot already carries.
         let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
         let parent_group = (!card.indented)
             .then(|| workspace_parent_group_state(app, i))
             .flatten();
-        let status_dot = if let Some((key, true)) = parent_group.as_ref() {
+        let (status_glyph, status_style) = if let Some((key, true)) = parent_group.as_ref() {
             let (state, seen) = space_aggregate_state(app, key);
             state_dot(state, seen, p)
         } else {
             (icon, icon_style)
         };
+        // Applied after the group-aggregate choice so a worktree parent's rolled-up dot carries
+        // the host's shape too, rather than only the plain rows doing so.
+        let status_dot = (host_bullet_or(host, status_glyph), status_style);
         let branch_color = if selected || is_active {
             p.mauve
         } else {
@@ -2118,7 +2159,7 @@ fn render_workspace_list(
                             status_dot.1.fg.unwrap_or(p.accent),
                             p,
                         );
-                        content.push(Span::styled(status_dot.0, icon_style));
+                        content.push(Span::styled(status_dot.0.clone(), icon_style));
                         previous_was_status = true;
                     }
                     SidebarSpaceItem::Name => {
@@ -5307,6 +5348,91 @@ lines = [
             !app.space_reorder_enabled(),
             "ungrouped interleaves hosts, so the drop index would be wrong"
         );
+    }
+
+    /// Ungrouped drops the local→remote rule (it marks one transition, which means nothing once
+    /// hosts interleave) and lifts every banner into a strip above the flat list — the banner row
+    /// is the only hit target for the host menu and the host drag handle, so it has to survive.
+    #[test]
+    fn ungrouping_replaces_host_runs_with_a_banner_strip_and_no_divider() {
+        use crate::app::state::SpaceSort;
+        let mut app = sort_app();
+        app.host_banner_host_idx = vec![0, 1];
+        app.host_banners = vec![
+            host_banner_spec("local", HostBannerState::Connected),
+            host_banner_spec("stealth", HostBannerState::Connected),
+        ];
+        app.host_banner_active = true;
+
+        // Grouped: a banner heads each host's run, with the divider between the two groups.
+        let grouped = workspace_list_entries(&app);
+        assert_eq!(
+            divider_positions(&grouped).len(),
+            1,
+            "grouped keeps the local→remote rule"
+        );
+
+        app.group_spaces_by_host = false;
+        app.space_sort = SpaceSort::Alphabetical;
+        let flat = workspace_list_entries(&app);
+
+        assert!(
+            divider_positions(&flat).is_empty(),
+            "no contiguous local/remote boundary exists once hosts interleave"
+        );
+        assert!(
+            matches!(flat[0], WorkspaceListEntry::HostBanner { banner_idx: 0 })
+                && matches!(flat[1], WorkspaceListEntry::HostBanner { banner_idx: 1 }),
+            "both banners lead the list: {flat:?}"
+        );
+        assert!(
+            flat[2..]
+                .iter()
+                .all(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. })),
+            "no banner is interleaved among the rows: {flat:?}"
+        );
+        // ...and the rows below are one globally sorted list, not two host blocks.
+        let order: Vec<usize> = flat[2..]
+            .iter()
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::Workspace { ws_idx, .. } => Some(*ws_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec![1, 3, 2, 0], "alpha, bravo, charlie, delta");
+    }
+
+    fn host_banner_spec(name: &str, state: HostBannerState) -> HostBannerSpec {
+        HostBannerSpec {
+            display_name: name.to_string(),
+            connection_state: state,
+            space_count: 2,
+            latency_ms: None,
+            download_bps: None,
+            progress_lines: Vec::new(),
+            update_outcome: None,
+        }
+    }
+
+    /// The host supplies the bullet's SHAPE while the agent state keeps its colour, so the host cue
+    /// is added to the status signal rather than replacing it.
+    #[test]
+    fn host_bullet_overrides_the_shape_but_not_the_state_colour() {
+        use crate::app::state::HostStyle;
+        let p = crate::app::state::Palette::catppuccin();
+        let (default_glyph, style) = state_dot(AgentState::Blocked, false, &p);
+
+        let unstyled = HostStyle::default();
+        assert_eq!(host_bullet_or(unstyled, default_glyph), default_glyph);
+
+        let styled = HostStyle {
+            bg: None,
+            fg: None,
+            bullet: Some('◈'),
+        };
+        assert_eq!(host_bullet_or(styled, default_glyph), "◈");
+        // The caller keeps `style` untouched — the colour still encodes Blocked.
+        assert_eq!(style.fg, Some(p.red));
     }
 
     fn divider_positions(entries: &[WorkspaceListEntry]) -> Vec<usize> {

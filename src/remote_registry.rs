@@ -27,6 +27,17 @@ pub struct RemoteDefinitionSnapshot {
     // `skip_serializing_if` keeps an off remote serializing byte-identical to today (no on-disk churn).
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_update: bool,
+    /// Per-host row styling, stored as the RAW strings the user supplied so session.json stays
+    /// hand-editable and a style-less remote serializes byte-identical to before. Resolved against
+    /// the palette by the client (the only place that has one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_fg: Option<String>,
+    /// A single character. Validated on write, so a bad value cannot reach the row layouts, which
+    /// budget exactly one column for the bullet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_bullet: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -71,6 +82,7 @@ pub enum RemoteRegistryError {
     DuplicateName,
     DuplicateTarget,
     NotFound,
+    InvalidStyle,
 }
 
 impl RemoteRegistryError {
@@ -81,6 +93,7 @@ impl RemoteRegistryError {
             Self::DuplicateName => "duplicate_remote_name",
             Self::DuplicateTarget => "duplicate_remote_target",
             Self::NotFound => "remote_not_found",
+            Self::InvalidStyle => "invalid_remote_style",
         }
     }
 
@@ -91,6 +104,9 @@ impl RemoteRegistryError {
             Self::DuplicateName => "remote name already exists",
             Self::DuplicateTarget => "remote target already exists",
             Self::NotFound => "remote not found",
+            Self::InvalidStyle => {
+                "remote style must be a known colour and a single-width bullet character"
+            }
         }
     }
 }
@@ -143,6 +159,9 @@ impl RemoteRegistrySnapshot {
             keybindings,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         };
         self.remotes.push(remote.clone());
         Ok(remote)
@@ -211,6 +230,36 @@ impl RemoteRegistrySnapshot {
             .find(|remote| remote.id == remote_id)
             .ok_or(RemoteRegistryError::NotFound)?;
         remote.auto_update = auto_update;
+        Ok(remote.clone())
+    }
+
+    /// Replace a remote's whole style in one call. Validating here — rather than at render — means
+    /// a rejected value never reaches disk, and a value that IS on disk can be trusted.
+    pub fn set_style(
+        &mut self,
+        remote_id: &str,
+        bg: Option<String>,
+        fg: Option<String>,
+        bullet: Option<String>,
+    ) -> Result<RemoteDefinitionSnapshot, RemoteRegistryError> {
+        for colour in [bg.as_deref(), fg.as_deref()].into_iter().flatten() {
+            if crate::config::parse_color_checked(colour).is_none() {
+                return Err(RemoteRegistryError::InvalidStyle);
+            }
+        }
+        if let Some(bullet) = bullet.as_deref() {
+            if single_width_bullet(bullet).is_none() {
+                return Err(RemoteRegistryError::InvalidStyle);
+            }
+        }
+        let remote = self
+            .remotes
+            .iter_mut()
+            .find(|remote| remote.id == remote_id)
+            .ok_or(RemoteRegistryError::NotFound)?;
+        remote.style_bg = bg;
+        remote.style_fg = fg;
+        remote.style_bullet = bullet;
         Ok(remote.clone())
     }
 
@@ -353,6 +402,18 @@ fn ssh_display_name(target: &str) -> String {
         .filter(|part| !part.is_empty())
         .unwrap_or(target);
     host.to_string()
+}
+
+/// A host bullet must be exactly one character occupying one terminal column — both the sidebar
+/// and the mobile switcher budget a single column for it, so a wide or combining glyph would push
+/// their layouts out rather than fail visibly.
+pub fn single_width_bullet(raw: &str) -> Option<char> {
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    (chars.next().is_none()
+        && !first.is_control()
+        && unicode_width::UnicodeWidthChar::width(first) == Some(1))
+    .then_some(first)
 }
 
 #[cfg(test)]

@@ -697,6 +697,9 @@ mod tests {
                     keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                     disabled: false,
                     auto_update: false,
+                    style_bg: None,
+                    style_fg: None,
+                    style_bullet: None,
                 }],
             },
         };

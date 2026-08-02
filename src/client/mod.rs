@@ -7339,6 +7339,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         }
     }
 
@@ -8006,6 +8009,9 @@ mod tests {
                                     crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                                 disabled: false,
                                 auto_update: false,
+                                style_bg: None,
+                                style_fg: None,
+                                style_bullet: None,
                             },
                         },
                     })
@@ -8239,6 +8245,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
 
         let plan = client_render_plan(
@@ -8269,6 +8278,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model
             .set_summary(
@@ -9204,6 +9216,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: true,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         model.set_remote_runtime_info(
             &remote,
@@ -9308,6 +9323,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
 
         let main_workspaces = (0..main_count)
@@ -9646,6 +9664,9 @@ mod tests {
                 keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
                 disabled: false,
                 auto_update: false,
+                style_bg: None,
+                style_fg: None,
+                style_bullet: None,
             };
         let focused_ws = |id: &str| supervisor::WorkspaceSummary {
             workspace_id: id.into(),
@@ -10797,6 +10818,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let api_socket = std::path::PathBuf::from("/tmp/herdr-prod-api.sock");
         let client_socket = std::path::PathBuf::from("/tmp/herdr-prod-client.sock");
@@ -10857,6 +10881,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -10917,6 +10944,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);
@@ -11003,6 +11033,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         });
         let bridge =
             crate::remote::RemoteBridge::from_socket_paths_for_test(client_socket, api_socket);

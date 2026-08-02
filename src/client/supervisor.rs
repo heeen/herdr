@@ -144,6 +144,10 @@ pub(crate) struct ManagedServer {
     /// #61: per-remote auto-update flag, synced from the registry (like `disabled`). When set, the
     /// client auto-pushes its own build onto this remote on a detected protocol mismatch.
     pub(crate) auto_update: bool,
+    /// Raw per-host style from the registry; resolved against the palette by the compositor.
+    pub(crate) style_bg: Option<String>,
+    pub(crate) style_fg: Option<String>,
+    pub(crate) style_bullet: Option<String>,
     /// Recent round-trip samples (ms) for the host banner readout; capped at the last
     /// [`HOST_PING_SAMPLE_WINDOW`] (issue #13). The banner shows their average.
     pub(crate) ping_samples: std::collections::VecDeque<u32>,
@@ -806,6 +810,9 @@ impl ClientSupervisorModel {
                 summaries: ServerSummary::default(),
                 disabled: false,
                 auto_update: false,
+                style_bg: None,
+                style_fg: None,
+                style_bullet: None,
                 ping_samples: std::collections::VecDeque::new(),
                 download_bps: None,
                 remote_version: None,
@@ -978,6 +985,9 @@ impl ClientSupervisorModel {
             // #61: re-apply the auto-update flag on every sync too (like `disabled`), so toggling it
             // server-side reflects on the client by the next registry refresh.
             server.auto_update = definition.auto_update;
+            server.style_bg = definition.style_bg.clone();
+            server.style_fg = definition.style_fg.clone();
+            server.style_bullet = definition.style_bullet.clone();
             next_secondaries.push(server);
         }
 
@@ -3028,9 +3038,9 @@ impl ClientSupervisorModel {
             .into_iter()
             .map(|server| HostStyleInput {
                 is_local: server.role == ServerRole::Main,
-                bg: None,
-                fg: None,
-                bullet: None,
+                bg: server.style_bg.clone(),
+                fg: server.style_fg.clone(),
+                bullet: server.style_bullet.clone(),
             })
             .collect()
     }
@@ -3500,6 +3510,9 @@ fn managed_secondary(
         summaries: ServerSummary::default(),
         disabled: definition.disabled, // item 3 (Area 5): gate input from the registry.
         auto_update: definition.auto_update, // #61: per-remote auto-update flag from the registry.
+        style_bg: definition.style_bg,
+        style_fg: definition.style_fg,
+        style_bullet: definition.style_bullet,
         ping_samples: std::collections::VecDeque::new(),
         download_bps: None,
         remote_version: None,
@@ -3969,6 +3982,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         }
     }
 
@@ -3987,6 +4003,9 @@ mod tests {
             keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Server,
             disabled: false,
             auto_update: false,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
         }
     }
 
@@ -7334,6 +7353,9 @@ mod tests {
     ) -> crate::remote_registry::RemoteDefinitionSnapshot {
         crate::remote_registry::RemoteDefinitionSnapshot {
             auto_update: true,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
             ..ssh_remote(id, name, target)
         }
     }
@@ -7351,6 +7373,9 @@ mod tests {
         // r4: auto-update ON but a LOCAL (non-ssh) target -> excluded (nothing to reinstall over ssh).
         let r4 = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
             auto_update: true,
+            style_bg: None,
+            style_fg: None,
+            style_bullet: None,
             ..local_remote("r4", "delta", Some("delta"))
         });
 

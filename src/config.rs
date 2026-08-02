@@ -71,6 +71,7 @@ impl Config {
             .chain(self.remote_image_paste_key().err())
             .chain(self.ui.sound.diagnostics())
             .chain(self.invalid_sidebar_bounds_diagnostic())
+            .chain(self.ui.sidebar.host.color_diagnostics())
             .collect()
     }
 

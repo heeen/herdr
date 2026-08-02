@@ -172,6 +172,31 @@ pub struct HostStyle {
     pub bullet: Option<char>,
 }
 
+impl HostStyle {
+    /// The local host's style, from `[ui.sidebar.host]`. The local host has no remote-registry
+    /// entry, so config is where its style lives. Shared by both paths, so a monolithic session
+    /// and a remote-less client resolve it identically.
+    ///
+    /// An invalid value degrades to "no override" rather than to a fallback colour: a typo should
+    /// leave the row looking untouched (and produce a config diagnostic), not paint it cyan.
+    pub fn from_local_config(cfg: &crate::config::model::SidebarHostConfig) -> Self {
+        Self {
+            bg: cfg
+                .local_bg
+                .as_deref()
+                .and_then(crate::config::parse_color_checked),
+            fg: cfg
+                .local_fg
+                .as_deref()
+                .and_then(crate::config::parse_color_checked),
+            bullet: cfg
+                .local_bullet
+                .as_deref()
+                .and_then(crate::remote_registry::single_width_bullet),
+        }
+    }
+}
+
 impl Palette {
     pub(crate) fn sidebar_color(&self, preset: SidebarColorPreset, default: Color) -> Color {
         match preset {

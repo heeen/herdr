@@ -3727,6 +3727,36 @@
           ],
           "type": "object"
         },
+        "RemoteSetStyleParams": {
+          "description": "Replace a remote's row styling. All three fields are optional and set together: sending `None`\nclears that part of the style, so one call fully describes the desired state.",
+          "properties": {
+            "bg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bullet": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "remote_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "remote_id"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4728,6 +4758,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/RemoteSetAutoUpdateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.set_style",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteSetStyleParams"
             }
           },
           "required": [
@@ -8865,6 +8911,26 @@
               "type": "string"
             },
             "session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style_bg": {
+              "description": "Per-host row styling, stored as the RAW strings the user supplied so session.json stays\nhand-editable and a style-less remote serializes byte-identical to before. Resolved against\nthe palette by the client (the only place that has one).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style_bullet": {
+              "description": "A single character. Validated on write, so a bad value cannot reach the row layouts, which\nbudget exactly one column for the bullet.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "style_fg": {
               "type": [
                 "string",
                 "null"

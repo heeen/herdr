@@ -906,6 +906,12 @@ pub struct SidebarHostConfig {
     pub speed: HostBannerSpeed,
     pub glyph: HostBannerGlyph,
     pub show_count: bool,
+    /// The LOCAL host's row styling. Remotes carry theirs in the remote registry (per-host, edited
+    /// from the host menu); the local host has no registry entry, so its style lives here.
+    /// Raw strings, validated by `color_diagnostics` and resolved against the palette at render.
+    pub local_bg: Option<String>,
+    pub local_fg: Option<String>,
+    pub local_bullet: Option<String>,
 }
 
 impl Default for SidebarHostConfig {
@@ -916,6 +922,9 @@ impl Default for SidebarHostConfig {
             speed: HostBannerSpeed::Calm,
             glyph: HostBannerGlyph::Left,
             show_count: false,
+            local_bg: None,
+            local_fg: None,
+            local_bullet: None,
         }
     }
 }
@@ -1044,6 +1053,9 @@ struct RawSidebarHostConfig {
     speed: Option<String>,
     glyph: Option<String>,
     show_count: Option<bool>,
+    local_bg: Option<String>,
+    local_fg: Option<String>,
+    local_bullet: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SidebarHostConfig {
@@ -1058,7 +1070,42 @@ impl<'de> Deserialize<'de> for SidebarHostConfig {
             speed: parse_host_speed(raw.speed.as_deref()),
             glyph: parse_host_glyph(raw.glyph.as_deref()),
             show_count: raw.show_count.unwrap_or(false),
+            // Kept as written, including anything invalid: `color_diagnostics` reports it and the
+            // renderer ignores it. Dropping it here would silently erase the user's typo on the
+            // next settings save instead of telling them about it.
+            local_bg: raw.local_bg,
+            local_fg: raw.local_fg,
+            local_bullet: raw.local_bullet,
         })
+    }
+}
+
+impl SidebarHostConfig {
+    /// Diagnostics for the local host's style values. `parse_color` never fails — it falls back to
+    /// cyan — so without this a typo would silently paint the local host bright cyan rather than
+    /// telling the user anything.
+    pub fn color_diagnostics(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (key, value) in [
+            ("local_bg", self.local_bg.as_deref()),
+            ("local_fg", self.local_fg.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if crate::config::parse_color_checked(value).is_none() {
+                    out.push(format!(
+                        "ui.sidebar.host.{key} = {value:?} is not a known color; ignoring it"
+                    ));
+                }
+            }
+        }
+        if let Some(bullet) = self.local_bullet.as_deref() {
+            if crate::remote_registry::single_width_bullet(bullet).is_none() {
+                out.push(format!(
+                    "ui.sidebar.host.local_bullet = {bullet:?} must be a single single-width character; ignoring it"
+                ));
+            }
+        }
+        out
     }
 }
 

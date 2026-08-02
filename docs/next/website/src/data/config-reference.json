@@ -766,6 +766,24 @@
           "description": "Show the workspace count next to each remote-host banner."
         },
         {
+          "key": "ui.sidebar.host.local_bg",
+          "type": "string",
+          "default": "unset",
+          "description": "Background tint for the local host's space rows. Accepts hex (#89b4fa), rgb(r,g,b) or a named color. Remote hosts carry their own style in the remote registry, set from the host menu."
+        },
+        {
+          "key": "ui.sidebar.host.local_fg",
+          "type": "string",
+          "default": "unset",
+          "description": "Text color for the local host's space rows. Same accepted formats as local_bg."
+        },
+        {
+          "key": "ui.sidebar.host.local_bullet",
+          "type": "string",
+          "default": "unset",
+          "description": "Bullet glyph for the local host's space rows. Must be a single character one column wide; the row layouts budget exactly one column for it."
+        },
+        {
           "key": "ui.agent_panel_scope",
           "type": "enum",
           "default": "\"all\"",
