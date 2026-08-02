@@ -647,7 +647,7 @@ fn render_mobile_switcher_content(
             let active = focused_agent.is_some_and(|(ws_idx, tab_idx, pane_id)| {
                 entry.ws_idx == ws_idx && entry.tab_idx == tab_idx && entry.pane_id == pane_id
             });
-            let bg = mobile_item_bg(false, active, p);
+            let bg = mobile_item_bg(false, active, crate::app::state::HostStyle::default(), p);
             let (icon, icon_style) = agent_icon(entry.state, entry.seen, app.spinner_tick, p);
             let title = Line::from(vec![
                 Span::styled("  ", Style::default().bg(bg)),
@@ -751,7 +751,12 @@ fn render_mobile_switcher_content(
         };
         let active = Some(*ws_idx) == app.active;
         let selected = *ws_idx == app.selected;
-        let bg = mobile_item_bg(selected, active, p);
+        let bg = mobile_item_bg(
+            selected,
+            active,
+            super::sidebar::row_host_style(app, *ws_idx),
+            p,
+        );
         let (state, seen) = ws.aggregate_state(&app.terminals);
         let (dot, dot_style) = state_dot(state, seen, p);
 
@@ -837,7 +842,7 @@ fn render_mobile_switcher_content(
         doc_y += 1;
         for (idx, tab) in ws.tabs.iter().enumerate() {
             let active = idx == ws.active_tab;
-            let bg = mobile_item_bg(false, active, p);
+            let bg = mobile_item_bg(false, active, crate::app::state::HostStyle::default(), p);
             let display_name = ws
                 .tab_display_name(idx)
                 .unwrap_or_else(|| (idx + 1).to_string());
@@ -1113,13 +1118,22 @@ fn fill_visible_doc_rect(
     }
 }
 
-fn mobile_item_bg(selected: bool, active: bool, p: &Palette) -> ratatui::style::Color {
+/// A switcher row's background. Selected/active deliberately ignore the host tint so the selection
+/// stays uniformly legible; only a resting row carries its host's colour, which is exactly where
+/// the host cue is needed. `host.bg == None` (every unstyled fleet, and every monolithic session)
+/// yields the previous `panel_bg`.
+fn mobile_item_bg(
+    selected: bool,
+    active: bool,
+    host: crate::app::state::HostStyle,
+    p: &Palette,
+) -> ratatui::style::Color {
     if selected {
         p.surface0
     } else if active {
         p.surface_dim
     } else {
-        p.panel_bg
+        host.bg.unwrap_or(p.panel_bg)
     }
 }
 

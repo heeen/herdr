@@ -606,6 +606,20 @@ pub(crate) struct WorkspaceSidebarRow {
     // worktree parents/children. `None` for placeholder/unavailable rows (they never group).
     pub(crate) worktree_key: Option<String>,
     pub(crate) worktree_is_linked: bool,
+    /// Index of the host this row came from, in `visible_servers()` order. Stamped in
+    /// `workspace_rows`, so it covers the placeholder rows a disconnected or empty remote emits —
+    /// those are real rows and must carry their host like any other.
+    pub(crate) host_idx: usize,
+}
+
+/// One host's style as stored, before any palette resolution. The local host has no registry entry,
+/// so it carries `is_local` and takes its style from `[ui.sidebar.host]` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct HostStyleInput {
+    pub(crate) is_local: bool,
+    pub(crate) bg: Option<String>,
+    pub(crate) fg: Option<String>,
+    pub(crate) bullet: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2959,8 +2973,12 @@ impl ClientSupervisorModel {
         // `from_model`'s `active_idx` (computed from this flat stream) cannot be shifted.
         self.visible_servers()
             .into_iter()
-            .flat_map(|server| {
+            .enumerate()
+            .flat_map(|(host_idx, server)| {
                 let mut rows = workspace_rows_for_server(server, all_filter);
+                for row in &mut rows {
+                    row.host_idx = host_idx;
+                }
                 if let Some(focused_workspace) = self.optimistic_focused_workspace_id(&server.id) {
                     for row in &mut rows {
                         row.focused =
@@ -3001,6 +3019,22 @@ impl ClientSupervisorModel {
     /// #19 (host half): the Local/Main host also gets a banner — but ONLY in multi-host mode
     /// (≥2 visible hosts, i.e. at least one remote), so its banner is the draggable handle for
     /// reordering hosts. The single-local case stays banner-free (unchanged single-host UX).
+    /// The un-parsed style inputs for every VISIBLE host, in `visible_servers()` order — the same
+    /// order `host_styles` and the banners use. Raw strings, because the model has no palette to
+    /// resolve them against; `from_model` is the one place holding both the palette and the
+    /// settings, so it does the parsing.
+    pub(crate) fn host_style_inputs(&self) -> Vec<HostStyleInput> {
+        self.visible_servers()
+            .into_iter()
+            .map(|server| HostStyleInput {
+                is_local: server.role == ServerRole::Main,
+                bg: None,
+                fg: None,
+                bullet: None,
+            })
+            .collect()
+    }
+
     pub(crate) fn host_banner_specs(&self) -> Vec<(usize, crate::app::state::HostBannerSpec)> {
         let all_filter = self.filter == ServerFilter::All;
         let visible = self.visible_servers();
@@ -3293,6 +3327,8 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             is_remote,
             worktree_key: None,
             worktree_is_linked: false,
+            // Stamped by `workspace_rows` once the host's position is known.
+            host_idx: 0,
         }];
     }
 
@@ -3307,6 +3343,8 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             is_remote,
             worktree_key: None,
             worktree_is_linked: false,
+            // Stamped by `workspace_rows` once the host's position is known.
+            host_idx: 0,
         }];
     }
 
@@ -3325,6 +3363,8 @@ fn workspace_rows_for_server(server: &ManagedServer, all_filter: bool) -> Vec<Wo
             // #22: thread the worktree group key + linked flag through to `from_model`.
             worktree_key: workspace.worktree_key.clone(),
             worktree_is_linked: workspace.worktree_is_linked,
+            // Stamped by `workspace_rows` once the host's position is known.
+            host_idx: 0,
         })
         .collect()
 }
@@ -4148,6 +4188,7 @@ mod tests {
                 is_remote: false,
                 worktree_key: None,
                 worktree_is_linked: false,
+                host_idx: 0,
             }]
         );
         // the client-owned global menu still offers add remote / manage remotes.
@@ -4245,6 +4286,7 @@ mod tests {
                     is_remote: false,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 0,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-ssh"),
@@ -4256,6 +4298,7 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 1,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -4267,6 +4310,7 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 2,
                 },
             ]
         );
@@ -4410,6 +4454,7 @@ mod tests {
                     is_remote: false,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 0,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id,
@@ -4421,6 +4466,7 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 1,
                 },
             ]
         );
@@ -4479,6 +4525,7 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 1,
                 },
                 WorkspaceSidebarRow {
                     server_id: ServerId::secondary("remote-dev"),
@@ -4490,6 +4537,7 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 2,
                 },
             ]
         );
@@ -4903,6 +4951,7 @@ mod tests {
                     is_remote: false,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    host_idx: 0,
                 },
                 WorkspaceSidebarRow {
                     server_id: remote_id.clone(),
@@ -4916,6 +4965,9 @@ mod tests {
                     is_remote: true,
                     worktree_key: None,
                     worktree_is_linked: false,
+                    // second VISIBLE host. Under the single-server filter below it is visible host
+                    // 0 — the index is a position in `visible_servers()`, not a global server id.
+                    host_idx: 1,
                 },
             ]
         );
@@ -4933,6 +4985,7 @@ mod tests {
                 is_remote: true,
                 worktree_key: None,
                 worktree_is_linked: false,
+                host_idx: 0,
             }]
         );
     }
@@ -4958,6 +5011,7 @@ mod tests {
                 is_remote: true,
                 worktree_key: None,
                 worktree_is_linked: false,
+                host_idx: 1,
             }]
         );
 
@@ -4974,6 +5028,10 @@ mod tests {
                 is_remote: true,
                 worktree_key: None,
                 worktree_is_linked: false,
+                // The filter hides the local host, so this remote becomes visible host 0. The
+                // index is a position in `visible_servers()`, which is what `host_styles` is
+                // built from — the two move together under a filter.
+                host_idx: 0,
             }]
         );
     }
@@ -4999,6 +5057,7 @@ mod tests {
                 is_remote: true,
                 worktree_key: None,
                 worktree_is_linked: false,
+                host_idx: 1,
             }]
         );
     }

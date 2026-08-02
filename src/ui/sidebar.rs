@@ -899,6 +899,17 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace) -> u16
     workspace_render_lines(app, ws).len() as u16
 }
 
+/// The style of the host a workspace row belongs to. Falls back to the local host's style whenever
+/// there is no per-row host mapping — which covers every monolithic session and a client with no
+/// remotes, so both render exactly as they did before per-host styling existed.
+pub(crate) fn row_host_style(app: &AppState, ws_idx: usize) -> crate::app::state::HostStyle {
+    app.client_workspace_host
+        .get(ws_idx)
+        .and_then(|host| app.host_styles.get(*host))
+        .copied()
+        .unwrap_or(app.local_host_style)
+}
+
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
@@ -2976,6 +2987,46 @@ mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// A monolithic session has no per-row host mapping at all, so every row must resolve to the
+    /// local style — that fallback is what keeps the single-session look byte-identical.
+    #[test]
+    fn row_host_style_falls_back_to_local_without_a_host_mapping() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.local_host_style = crate::app::state::HostStyle {
+            bg: Some(ratatui::style::Color::Rgb(1, 2, 3)),
+            fg: None,
+            bullet: Some('#'),
+        };
+
+        assert!(app.client_workspace_host.is_empty());
+        assert_eq!(row_host_style(&app, 0), app.local_host_style);
+        assert_eq!(
+            row_host_style(&app, 999),
+            app.local_host_style,
+            "an out-of-range row must fall back too, never index out of bounds"
+        );
+    }
+
+    /// With a mapping present, each row takes its own host's style.
+    #[test]
+    fn row_host_style_reads_the_mapped_host() {
+        use ratatui::style::Color;
+        let mut app = crate::app::state::AppState::test_new();
+        let local = crate::app::state::HostStyle::default();
+        let remote = crate::app::state::HostStyle {
+            bg: Some(Color::Rgb(9, 9, 9)),
+            fg: Some(Color::Rgb(8, 8, 8)),
+            bullet: Some('*'),
+        };
+        app.local_host_style = local;
+        app.host_styles = vec![local, remote];
+        app.client_workspace_host = vec![0, 1, 1];
+
+        assert_eq!(row_host_style(&app, 0), local);
+        assert_eq!(row_host_style(&app, 1), remote);
+        assert_eq!(row_host_style(&app, 2), remote);
+    }
 
     #[test]
     fn render_sidebar_toggle_draws_expanded_collapse_icon() {

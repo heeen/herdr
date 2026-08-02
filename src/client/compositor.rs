@@ -2337,6 +2337,9 @@ impl ClientSidebarSnapshot {
         app.sidebar_agent = settings.sidebar_agents.clone();
         // item 2 (C3): host-banner styling rides UiSettingsInfo over the wire.
         app.sidebar_host = settings.sidebar_host.clone();
+        // The local host's style comes from config, not the registry (it has no registry entry).
+        // Set before `host_styles` is built, which falls back to it for the local entry.
+        app.local_host_style = local_host_style_from_config(&app.sidebar_host);
         app.global_menu_extra_labels = vec!["add remote", "manage remotes"];
         // #25: gate the SHARED renderer onto its collapsed layout BEFORE geometry is computed, so
         // the collapsed sections + toggle rect are what gets laid out and what `hit_test` reads
@@ -2567,6 +2570,9 @@ impl ClientSidebarSnapshot {
             // item 4: mirror the per-row local/remote signal into AppState, index-aligned with
             // app.workspaces. Empty in monolithic mode (no rows), so monolithic emits no divider.
             app.client_workspace_remote.push(row.is_remote);
+            // Index-aligned with `app.workspaces` exactly like the remote flag above; this is what
+            // lets the shared renderer attribute a row to its host without seeing `workspace_routes`.
+            app.client_workspace_host.push(row.host_idx);
             // #20: index-aligned with `app.workspaces` so the current-workspace scope can pick its
             // slice below.
             per_ws_agent_routes.push(ws_agent_routes);
@@ -2613,6 +2619,15 @@ impl ClientSidebarSnapshot {
         // visible_servers() order) and the coordination flag BEFORE computing geometry, so that
         // `workspace_list_entries` emits the HostBanner rows and flips the divider to plain. The
         // banner specs ride positionally: `HostBannerArea.banner_idx` indexes `app.host_banners`.
+        // Resolve every visible host's style here: this is the one place holding BOTH the palette
+        // and the model's settings. The local host has no registry entry, so it falls back to the
+        // `[ui.sidebar.host]` defaults that `local_host_style` already carries.
+        app.host_styles = model
+            .host_style_inputs()
+            .into_iter()
+            .map(|input| resolve_host_style(&input, app.local_host_style))
+            .collect();
+
         let host_banner_specs = model.host_banner_specs();
         // The insertion index from `host_banner_specs` is a position in the flat
         // `workspace_rows()` stream, which is 1:1 with `app.workspaces` (each row pushed in
@@ -2788,6 +2803,48 @@ fn client_menu_header_rows(menu: &crate::client::supervisor::ClientMenu) -> u16 
     } else {
         1
     }
+}
+
+/// Resolve one host's stored style strings against the palette. Phase 6 fills the strings in from
+/// the remote registry; until then every remote resolves to "no override", which is exactly the
+/// pre-feature look. The local host inherits the config-derived default.
+fn resolve_host_style(
+    input: &crate::client::supervisor::HostStyleInput,
+    local: crate::app::state::HostStyle,
+) -> crate::app::state::HostStyle {
+    if input.is_local {
+        return local;
+    }
+    crate::app::state::HostStyle {
+        bg: input
+            .bg
+            .as_deref()
+            .and_then(crate::config::parse_color_checked),
+        fg: input
+            .fg
+            .as_deref()
+            .and_then(crate::config::parse_color_checked),
+        bullet: input.bullet.as_deref().and_then(single_char_bullet),
+    }
+}
+
+/// The local host's style, from `[ui.sidebar.host]`. Shared by both paths so a monolithic session
+/// and a remote-less client render identically.
+pub(crate) fn local_host_style_from_config(
+    cfg: &crate::config::model::SidebarHostConfig,
+) -> crate::app::state::HostStyle {
+    let _ = cfg;
+    crate::app::state::HostStyle::default()
+}
+
+/// A bullet must be exactly one character wide — both row layouts budget one column for it.
+fn single_char_bullet(raw: &str) -> Option<char> {
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    (chars.next().is_none()
+        && !first.is_control()
+        && unicode_width::UnicodeWidthChar::width(first) == Some(1))
+    .then_some(first)
 }
 
 fn render_client_shell(
@@ -6368,6 +6425,55 @@ mod tests {
             )
             .unwrap();
         (model, remote_id)
+    }
+
+    /// Every row must carry the host it came from, index-aligned with `app.workspaces` — including
+    /// the placeholder row a remote with no summary contributes, which is a real row and would
+    /// otherwise inherit the previous host's identity (and colour).
+    #[test]
+    fn from_model_maps_every_row_to_its_host_including_placeholders() {
+        let (mut model, _remote_id) = mobile_switcher_model();
+        // A third host that never reported a summary: it contributes exactly one placeholder row.
+        model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-silent".into(),
+            name: "silent".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local { session: None },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: false,
+        });
+        let compositor = ClientCompositor::new(DEFAULT_SIDEBAR_WIDTH);
+        let snapshot = ClientSidebarSnapshot::from_model(
+            &model,
+            &compositor,
+            DEFAULT_SIDEBAR_WIDTH,
+            120,
+            30,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            snapshot.app.client_workspace_host.len(),
+            snapshot.app.workspaces.len(),
+            "the host mapping must cover every row, not just the ones with summaries"
+        );
+        assert_eq!(
+            snapshot.app.client_workspace_host,
+            vec![0, 1, 2],
+            "one row per host, each stamped with its own host index"
+        );
+        assert_eq!(snapshot.app.host_styles.len(), 3);
+        // Not `assert_invariants_for_test`: the synthetic client AppState deliberately allocates
+        // placeholder panes for agent-less workspaces without inserting backing terminals, which
+        // that helper rejects. Assert the alignment this feature depends on directly instead.
+        for (ws_idx, host) in snapshot.app.client_workspace_host.iter().enumerate() {
+            assert!(
+                *host < snapshot.app.host_styles.len(),
+                "row {ws_idx} points at host {host} with only {} styles",
+                snapshot.app.host_styles.len()
+            );
+        }
     }
 
     fn mixed_supervisor_model() -> (ClientSupervisorModel, ServerId) {

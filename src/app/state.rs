@@ -158,6 +158,20 @@ fn blend_color(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
+/// How one host's rows are painted: an optional background tint, text colour and bullet glyph.
+/// Every field is optional and falls back to today's per-state styling, so an unstyled fleet — and
+/// every monolithic session — renders exactly as before.
+///
+/// `bullet` is a `char`, not a `String`, on purpose: both row layouts do width arithmetic that
+/// assumes a one-column dot (the mobile name budget and the desktop prefix spans), so a wide glyph
+/// would silently overflow them. Width is validated where the style is ingested, never at render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostStyle {
+    pub bg: Option<Color>,
+    pub fg: Option<Color>,
+    pub bullet: Option<char>,
+}
+
 impl Palette {
     pub(crate) fn sidebar_color(&self, preset: SidebarColorPreset, default: Color) -> Color {
         match preset {
@@ -174,7 +188,15 @@ impl Palette {
     /// selected(`surface0`)/active(`surface_dim`)/drag(`surface1`). Theme-derived (no per-theme
     /// table); non-`Rgb` palettes fall back to `surface_dim` (never bold). Hover NEVER bolds.
     pub(crate) fn hover_bg(&self) -> Color {
-        blend_color(self.panel_bg, self.surface_dim, 0.5)
+        self.hover_bg_over(self.panel_bg)
+    }
+
+    /// The same faint hover lift, but over an arbitrary base. A host-tinted row must lift from ITS
+    /// own background, not from the page background, or hovering would flatten every host to one
+    /// colour — losing the host identity exactly while the user is pointing at it.
+    /// [`Palette::hover_bg`] is precisely the `base == panel_bg` case.
+    pub(crate) fn hover_bg_over(&self, base: Color) -> Color {
+        blend_color(base, self.surface_dim, 0.5)
     }
 
     /// Catppuccin Mocha — the default.
@@ -2240,6 +2262,16 @@ pub struct AppState {
     pub spinner_tick: u32,
     /// item 4: per-workspace local/remote flag, index-aligned with `workspaces`; empty in monolithic.
     pub(crate) client_workspace_remote: Vec<bool>,
+    /// Per-workspace host index into [`AppState::host_styles`], index-aligned with `workspaces`;
+    /// empty in monolithic. This is the ONLY per-row host identity the shared `ui` layer can see —
+    /// the client's `WorkspaceRoute` (which carries the real `ServerId`) lives on the compositor
+    /// snapshot, not here. Banner placement, host-run detection and per-row styling all read it.
+    pub(crate) client_workspace_host: Vec<usize>,
+    /// One entry per VISIBLE host, in the same order banners are emitted; empty in monolithic.
+    pub host_styles: Vec<HostStyle>,
+    /// The local host's style, resolved from `[ui.sidebar.host]`. Set on BOTH the monolithic and
+    /// client paths, so a fleet with no remotes renders exactly like a single session.
+    pub local_host_style: HostStyle,
     /// item 2: one per HostBanner entry; empty in monolithic.
     pub host_banners: Vec<HostBannerSpec>,
     /// item 2: index-aligned with `host_banners`; each value is the `ws_idx` of the remote
@@ -2637,6 +2669,9 @@ impl AppState {
             keybinds: Keybinds::default(),
             spinner_tick: 0,
             client_workspace_remote: Vec::new(),
+            client_workspace_host: Vec::new(),
+            host_styles: Vec::new(),
+            local_host_style: HostStyle::default(),
             host_banners: Vec::new(),
             host_banner_rows: Vec::new(),
             host_banner_active: false,
@@ -2722,6 +2757,31 @@ impl AppState {
     }
 
     pub fn assert_invariants_for_test(&self) {
+        // The two client-side per-row vectors are either absent (monolithic) or exactly aligned
+        // with `workspaces`. A SHORT vector is the dangerous case, not a long one: `row_host_style`
+        // falls back to the local style for a missing index, so a truncated mapping would silently
+        // paint remote rows in the local host's colour instead of failing loudly.
+        for (name, len) in [
+            (
+                "client_workspace_remote",
+                self.client_workspace_remote.len(),
+            ),
+            ("client_workspace_host", self.client_workspace_host.len()),
+        ] {
+            assert!(
+                len == 0 || len == self.workspaces.len(),
+                "{name} must be empty or aligned with workspaces ({len} vs {})",
+                self.workspaces.len()
+            );
+        }
+        for (ws_idx, host) in self.client_workspace_host.iter().enumerate() {
+            assert!(
+                *host < self.host_styles.len(),
+                "workspace {ws_idx} maps to host {host}, out of {} host styles",
+                self.host_styles.len()
+            );
+        }
+
         if self.workspaces.is_empty() {
             assert!(
                 self.active.is_none(),
