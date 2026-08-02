@@ -126,7 +126,7 @@ pub(crate) use self::{
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
     tab_surface::{tab_surface_cursor, tab_surface_hyperlinks, TabSurfaceView},
     tabs::compute_tab_bar_view,
-    widgets::{centered_popup_rect, modal_stack_areas},
+    widgets::{centered_popup_rect, modal_stack_areas, OverlayAnchor},
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};

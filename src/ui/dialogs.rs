@@ -8,9 +8,8 @@ use ratatui::{
 
 use super::text::{display_width_u16, truncate_end};
 use super::widgets::{
-    action_button_row_rects, bottom_left_popup_rect, centered_popup_rect, panel_contrast_fg,
-    render_action_button, render_modal_header, render_modal_shell, render_panel_shell,
-    ActionButtonSpec,
+    action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
+    render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec, OverlayAnchor,
 };
 use crate::app::state::Palette;
 use crate::app::{state::WorktreeOpenState, AppState, Mode};
@@ -854,8 +853,8 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 /// The outer popup rect for the add-remote overlay — footer-anchored (bottom-left of `area`,
 /// opening upward) so it floats over the live content like the global launcher menu. Used by BOTH
 /// the renderer and the compositor's content-copy exclusion / hit-test.
-pub(crate) fn add_remote_popup_rect(area: Rect) -> Option<Rect> {
-    bottom_left_popup_rect(area, 54, 9)
+pub(crate) fn add_remote_popup_rect(anchor: OverlayAnchor) -> Option<Rect> {
+    anchor.popup_rect(54, 9)
 }
 
 /// Fixed inner rect for the add-remote overlay. Returns `None` when the host is too small to fit
@@ -864,8 +863,8 @@ pub(crate) fn add_remote_popup_rect(area: Rect) -> Option<Rect> {
 /// Test-only oracle: production render/hit-test reads this rect from the view (#53), so the helper
 /// is only referenced by unit tests asserting the two geometries agree.
 #[cfg(test)]
-pub(crate) fn add_remote_inner_rect(area: Rect) -> Option<Rect> {
-    add_remote_popup_rect(area).map(|popup| {
+pub(crate) fn add_remote_inner_rect(anchor: OverlayAnchor) -> Option<Rect> {
+    add_remote_popup_rect(anchor).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -904,8 +903,8 @@ fn picker_popup_height(count: usize) -> u16 {
 /// The outer popup rect for the new-workspace picker — footer-anchored (bottom-left of `area`,
 /// opening upward) so it floats over the live content like the global launcher menu. Used by BOTH
 /// the renderer and the compositor's content-copy exclusion / hit-test.
-pub(crate) fn new_workspace_picker_popup_rect(area: Rect, count: usize) -> Option<Rect> {
-    bottom_left_popup_rect(area, 44, picker_popup_height(count))
+pub(crate) fn new_workspace_picker_popup_rect(anchor: OverlayAnchor, count: usize) -> Option<Rect> {
+    anchor.popup_rect(44, picker_popup_height(count))
 }
 
 /// Shared inner rect for the new-workspace picker overlay. The popup height is derived from the
@@ -914,8 +913,8 @@ pub(crate) fn new_workspace_picker_popup_rect(area: Rect, count: usize) -> Optio
 ///
 /// Test-only oracle (see `add_remote_inner_rect`): production reads this rect from the view (#53).
 #[cfg(test)]
-pub(crate) fn new_workspace_picker_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    new_workspace_picker_popup_rect(area, count).map(|popup| {
+pub(crate) fn new_workspace_picker_inner_rect(anchor: OverlayAnchor, count: usize) -> Option<Rect> {
+    new_workspace_picker_popup_rect(anchor, count).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -1163,8 +1162,8 @@ fn remote_manage_popup_height(count: usize) -> u16 {
 /// (bottom-left of `area`, opening upward) so it floats over the live content like the global
 /// launcher menu. Width 64, height derived from `count`. Used by BOTH the renderer and the
 /// compositor's content-copy exclusion / hit-test.
-pub(crate) fn remote_manage_popup_rect(area: Rect, count: usize) -> Option<Rect> {
-    bottom_left_popup_rect(area, 64, remote_manage_popup_height(count))
+pub(crate) fn remote_manage_popup_rect(anchor: OverlayAnchor, count: usize) -> Option<Rect> {
+    anchor.popup_rect(64, remote_manage_popup_height(count))
 }
 
 /// item 3 (Area 3/5): the SHARED inner rect for the management overlay (render + hit-test). The
@@ -1173,8 +1172,8 @@ pub(crate) fn remote_manage_popup_rect(area: Rect, count: usize) -> Option<Rect>
 ///
 /// Test-only oracle (see `add_remote_inner_rect`): production reads this rect from the view (#53).
 #[cfg(test)]
-pub(crate) fn remote_manage_inner_rect(area: Rect, count: usize) -> Option<Rect> {
-    remote_manage_popup_rect(area, count).map(|popup| {
+pub(crate) fn remote_manage_inner_rect(anchor: OverlayAnchor, count: usize) -> Option<Rect> {
+    remote_manage_popup_rect(anchor, count).map(|popup| {
         Rect::new(
             popup.x + 1,
             popup.y + 1,
@@ -1457,8 +1456,8 @@ pub(crate) fn client_menu_row_rect(inner: Rect, header_rows: u16, row_index: usi
 }
 
 /// The outer popup rect for the rename overlay — footer-anchored, like add-remote.
-pub(crate) fn rename_workspace_popup_rect(area: Rect) -> Option<Rect> {
-    bottom_left_popup_rect(area, 48, 7)
+pub(crate) fn rename_workspace_popup_rect(anchor: OverlayAnchor) -> Option<Rect> {
+    anchor.popup_rect(48, 7)
 }
 
 /// The (save, cancel) button rects inside the rename overlay's inner rect. Mirrors
@@ -1509,8 +1508,8 @@ pub(crate) fn confirm_close_workspace_button_rects(inner: Rect) -> (Rect, Rect) 
 
 /// Worktree-menu parity: the outer popup rect for the new-worktree branch input — footer-anchored,
 /// like the rename overlay it mirrors.
-pub(crate) fn new_worktree_popup_rect(area: Rect) -> Option<Rect> {
-    bottom_left_popup_rect(area, 48, 7)
+pub(crate) fn new_worktree_popup_rect(anchor: OverlayAnchor) -> Option<Rect> {
+    anchor.popup_rect(48, 7)
 }
 
 /// Worktree-menu parity: render the new-worktree branch input. Mirrors
@@ -1640,10 +1639,10 @@ pub(crate) struct WorktreePickerRowView<'a> {
 }
 
 /// Worktree-menu parity: the picker popup rect — footer-anchored like the manage overlay, sized
-/// to the row count (header + rows + status, clamped by `bottom_left_popup_rect`).
-pub(crate) fn worktree_picker_popup_rect(area: Rect, count: usize) -> Option<Rect> {
+/// to the row count (header + rows + status, clamped by the anchor).
+pub(crate) fn worktree_picker_popup_rect(anchor: OverlayAnchor, count: usize) -> Option<Rect> {
     let height = (count.max(1) as u16).saturating_add(4).min(14);
-    bottom_left_popup_rect(area, 64, height)
+    anchor.popup_rect(64, height)
 }
 
 /// Worktree-menu parity: render the "open worktree…" picker — a header, then one row per existing
@@ -1925,7 +1924,7 @@ mod tests {
         add_remote_button_rects, add_remote_inner_rect, client_menu_inner_rect_at,
         client_menu_popup_rect_at, confirm_close_overlay_text, new_workspace_picker_button_rects,
         new_workspace_picker_inner_rect, new_workspace_picker_row_rect,
-        render_new_linked_worktree_overlay,
+        render_new_linked_worktree_overlay, OverlayAnchor,
     };
 
     fn rects_are_disjoint(a: Rect, b: Rect) -> bool {
@@ -1990,8 +1989,8 @@ mod tests {
 
     #[test]
     fn add_remote_button_rects_lays_out_two_centered_buttons() {
-        let area = Rect::new(0, 0, 80, 24);
-        let inner = add_remote_inner_rect(area).expect("modal fits");
+        let anchor = OverlayAnchor::Footer(Rect::new(0, 0, 80, 24));
+        let inner = add_remote_inner_rect(anchor).expect("modal fits");
         let (submit, cancel) = add_remote_button_rects(inner);
 
         assert_eq!(submit.height, 1);
@@ -2005,8 +2004,8 @@ mod tests {
 
     #[test]
     fn new_workspace_picker_button_rects_lays_out_two_centered_buttons() {
-        let area = Rect::new(0, 0, 80, 24);
-        let inner = new_workspace_picker_inner_rect(area, 3).expect("modal fits");
+        let anchor = OverlayAnchor::Footer(Rect::new(0, 0, 80, 24));
+        let inner = new_workspace_picker_inner_rect(anchor, 3).expect("modal fits");
         let (confirm, cancel) = new_workspace_picker_button_rects(inner);
 
         assert_eq!(confirm.height, 1);
@@ -2019,9 +2018,9 @@ mod tests {
 
     #[test]
     fn new_workspace_picker_inner_rect_is_shared_geometry() {
-        let area = Rect::new(0, 0, 80, 24);
+        let anchor = OverlayAnchor::Footer(Rect::new(0, 0, 80, 24));
         let count = 3usize;
-        let inner = new_workspace_picker_inner_rect(area, count).expect("modal fits");
+        let inner = new_workspace_picker_inner_rect(anchor, count).expect("modal fits");
 
         // every destination row resolves inside the inner rect — the same helper render uses.
         for n in 0..count {

@@ -62,6 +62,35 @@ pub(crate) fn bottom_left_popup_rect(area: Rect, popup_w: u16, popup_h: u16) -> 
     Some(Rect::new(popup_x, popup_y, popup_w, popup_h))
 }
 
+/// Where a composited client form (add-remote / picker / manage / rename) places its popup.
+///
+/// The sidebar layouts anchor at the sidebar footer so the form opens upward over the live content
+/// like the launcher menu (#47). The mobile layout has no sidebar to anchor to, so it centers over
+/// the host instead — the same placement `render_settings_overlay` uses, which is this app's look
+/// for a dialog that owns the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlayAnchor {
+    Footer(Rect),
+    Centered(Rect),
+}
+
+impl OverlayAnchor {
+    /// The host area the anchor places within. Sub-popups that are centered in their own right (the
+    /// delete/close confirms) position themselves in it directly.
+    pub(crate) fn area(self) -> Rect {
+        match self {
+            Self::Footer(area) | Self::Centered(area) => area,
+        }
+    }
+
+    pub(crate) fn popup_rect(self, popup_w: u16, popup_h: u16) -> Option<Rect> {
+        match self {
+            Self::Footer(area) => bottom_left_popup_rect(area, popup_w, popup_h),
+            Self::Centered(area) => centered_popup_rect(area, popup_w, popup_h),
+        }
+    }
+}
+
 pub(super) fn render_modal_shell(
     frame: &mut Frame,
     area: Rect,

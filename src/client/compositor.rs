@@ -1480,15 +1480,15 @@ impl ClientCompositor {
         // over the live content like the global launcher menu: they are footer-anchored popups (NOT
         // centered, full-screen-dimmed modals). The content copy must protect EXACTLY the open
         // popup's rect(s) — so the overlay stays visible AND the rest of the content shows around
-        // it. Both render and these exclusion rects derive from the SAME `*_popup_rect(anchor_area)`
+        // it. Both render and these exclusion rects derive from the SAME `*_popup_rect(anchor)`
         // helpers, so what we protect lines up cell-for-cell with what gets drawn. Without an open
         // overlay we fall back to protecting just the open global-menu rect.
         //
         // Derive the anchor from the snapshot already built above instead of calling
-        // `overlay_anchor_area` (which rebuilds the full snapshot a second time per frame just to
+        // `overlay_anchor` (which rebuilds the full snapshot a second time per frame just to
         // read `sidebar_footer_rect().y` — a heavy `from_model` of terminal/route state we already
-        // have). This is exactly what `overlay_anchor_area` returns.
-        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+        // have). This is exactly what the `overlay_anchor` method returns.
+        let anchor = overlay_anchor(&snapshot, host_width, host_height);
         let mut excluded_rects: Vec<Rect> = Vec::new();
         // #47/#53: protect the open overlay's (drag-shifted) popup so it floats over the content
         // cell-for-cell — read the ONE rect the view cached for every overlay's current position (the
@@ -1497,7 +1497,7 @@ impl ClientCompositor {
         // the manage delete-confirm sub-popup stays centered on top of the (possibly dragged) list.
         if let Some((overlay, _)) = snapshot.remote_manage.as_ref() {
             if overlay.confirm_delete.is_some() {
-                excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor_area));
+                excluded_rects.extend(crate::ui::remote_manage_confirm_popup_rect(anchor.area()));
             }
         }
         // The switcher only exists on a mobile-width host; `render_client_shell` gates on the same
@@ -1560,21 +1560,20 @@ impl ClientCompositor {
         overlay_content_onto_shell(&shell, active_frame)
     }
 
-    /// The footer-anchored `anchor_area` the composited client overlays (add-remote /
-    /// new-workspace picker / manage-remotes) are positioned within: it spans the host top down to
-    /// the sidebar footer row, so the popups open upward from the footer like the global launcher
-    /// menu (instead of dead-centered). Render, content-copy exclusion, hit-test and hover-test all
-    /// derive overlay geometry from this SAME rect, so they cannot drift.
+    /// The anchor the composited client overlays (add-remote / new-workspace picker /
+    /// manage-remotes) are positioned within: the sidebar footer row on a sidebar layout, the whole
+    /// host when there is no sidebar to float at. Render, content-copy exclusion, hit-test and
+    /// hover-test all derive overlay geometry from this SAME anchor, so they cannot drift.
     ///
     /// Production code inlines this body (`compose_frame`/`hit_test` build the snapshot once and
     /// reuse it); only tests call the helper standalone, hence `#[cfg(test)]`.
     #[cfg(test)]
-    pub(crate) fn overlay_anchor_area(
+    pub(crate) fn overlay_anchor(
         &self,
         model: &crate::client::supervisor::ClientSupervisorModel,
         host_width: u16,
         host_height: u16,
-    ) -> Rect {
+    ) -> crate::ui::OverlayAnchor {
         let sidebar_width = self.effective_sidebar_width(host_width);
         let snapshot = ClientSidebarSnapshot::from_model(
             model,
@@ -1584,7 +1583,7 @@ impl ClientCompositor {
             host_height,
             Instant::now(),
         );
-        Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y)
+        overlay_anchor(&snapshot, host_width, host_height)
     }
 
     pub(crate) fn content_size(&self, host_width: u16, host_height: u16) -> (u16, u16) {
@@ -1918,7 +1917,14 @@ impl ClientCompositor {
         host_height: u16,
     ) -> Option<SidebarHitTarget> {
         let sidebar_width = self.effective_sidebar_width(host_width);
-        if sidebar_width == 0 || host_height == 0 || y >= host_height {
+        // Mobile has no sidebar column (`effective_sidebar_width` is 0 there), but the composited
+        // overlays still float over the content, so the zero width must not short-circuit their
+        // hit-test — an open form would render yet swallow no click. The `x >= sidebar_width` guard
+        // further down still rejects every SIDEBAR target, which is what the 0 stands for.
+        if host_height == 0
+            || y >= host_height
+            || (sidebar_width == 0 && !self.is_mobile(host_width))
+        {
             return None;
         }
 
@@ -1936,7 +1942,7 @@ impl ClientCompositor {
         // the SAME shared helpers the renderer uses (`new_workspace_picker_inner_rect`/`_row_rect`/
         // `add_remote_inner_rect` + the button-rect helpers) over the SAME `anchor_area`,
         // guaranteeing render == hit_test.
-        let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+        let anchor = overlay_anchor(&snapshot, host_width, host_height);
         // #47: every overlay hit-tests against its (drag-shifted) popup — the SAME rect the renderer
         // draws — so a dragged overlay's targets follow it and render == hit-test. #53: read the one
         // rect the view computed; render and hit-test now consume the SAME field, not two recomputes.
@@ -1951,7 +1957,7 @@ impl ClientCompositor {
             // item 3 (Area 5): the manage overlay intercepts the whole host rect first (so a click on
             // a sidebar workspace row while the overlay is open never resolves to a `Workspace` hit).
             if snapshot.remote_manage.is_some() {
-                return hit_test_remote_manage(&snapshot, popup, anchor_area, x, y);
+                return hit_test_remote_manage(&snapshot, popup, anchor.area(), x, y);
             }
         }
         // #47: the open client menu (launcher / workspace / host) is modal — when open it owns the
@@ -2225,7 +2231,9 @@ impl ClientCompositor {
         host_height: u16,
     ) -> Option<Rect> {
         let sidebar_width = self.effective_sidebar_width(host_width);
-        if sidebar_width == 0 || host_height == 0 {
+        // Mobile reports a zero sidebar width but still floats the overlays over the content, so it
+        // must reach the popup rect (drag-to-move reads it) — same rationale as in `hit_test`.
+        if host_height == 0 || (sidebar_width == 0 && !self.is_mobile(host_width)) {
             return None;
         }
         let snapshot = ClientSidebarSnapshot::from_model(
@@ -2895,11 +2903,12 @@ fn render_client_shell(
             }
             // item 1: render the composited client overlays as footer-anchored popups that float
             // over the live content — the proven `render_global_launcher_menu` compositing path.
-            // `anchor_area` spans the host top down to the sidebar footer row so the popups open
-            // upward from the footer (matching the launcher menu), NOT dead-centered. The
+            // The anchor spans the host top down to the sidebar footer row so the popups open
+            // upward from the footer (matching the launcher menu), NOT dead-centered — except on a
+            // layout with no sidebar, where they center like the settings modal. The
             // compositor maps the ui-owned snapshot carriers into ui view structs here (no
             // supervisor types reach `ui`).
-            let anchor_area = Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y);
+            let anchor = overlay_anchor(snapshot, host_width, host_height);
             // #47/#53: the (drag-shifted) popup rect of whichever overlay is open — render every
             // overlay at THIS rect so a dragged overlay moves and render == hit-test == drag geometry.
             // Read from the view (#53): computed once in `from_model`, never recomputed here.
@@ -2964,7 +2973,7 @@ fn render_client_shell(
                         overlay.confirm_delete.as_deref(),
                         frame,
                         popup,
-                        anchor_area,
+                        anchor.area(),
                     );
                 }
             }
@@ -3375,8 +3384,23 @@ fn context_menu_popup_rect(
 
 /// #47: the footer-anchored area the form overlays (add-remote / picker / manage / rename / confirm)
 /// anchor their popups within. Spans the host top down to the sidebar footer row.
-fn overlay_footer_anchor_area(snapshot: &ClientSidebarSnapshot, host_width: u16) -> Rect {
-    Rect::new(0, 0, host_width, snapshot.app.sidebar_footer_rect().y)
+///
+/// The mobile layout has no sidebar (and neither does a host too small for one), so
+/// `sidebar_footer_rect()` is `Rect::default()` there and its `y` is 0. Anchoring to that produced a
+/// zero-height area, every `*_popup_rect` helper returned `None`, and the overlays rendered nowhere
+/// and hit-tested nothing — a form the user had just opened was simply invisible. With no footer to
+/// float at, center over the whole host instead, the way `render_settings_overlay` places the
+/// settings modal.
+fn overlay_anchor(
+    snapshot: &ClientSidebarSnapshot,
+    host_width: u16,
+    host_height: u16,
+) -> crate::ui::OverlayAnchor {
+    let footer_y = snapshot.app.sidebar_footer_rect().y;
+    if footer_y == 0 {
+        return crate::ui::OverlayAnchor::Centered(Rect::new(0, 0, host_width, host_height));
+    }
+    crate::ui::OverlayAnchor::Footer(Rect::new(0, 0, host_width, footer_y))
 }
 
 /// #47: the CURRENT popup rect of whichever client overlay is open — its default position shifted by
@@ -3399,23 +3423,23 @@ fn open_overlay_popup_rect(
             context_menu_popup_rect(menu, offset, host_width, host_height)
         };
     }
-    let anchor_area = overlay_footer_anchor_area(snapshot, host_width);
+    let anchor = overlay_anchor(snapshot, host_width, host_height);
     let base = if snapshot.add_remote_form.is_some() {
-        crate::ui::add_remote_popup_rect(anchor_area)
+        crate::ui::add_remote_popup_rect(anchor)
     } else if let Some((dests, _)) = snapshot.new_workspace_picker.as_ref() {
-        crate::ui::new_workspace_picker_popup_rect(anchor_area, dests.len())
+        crate::ui::new_workspace_picker_popup_rect(anchor, dests.len())
     } else if let Some((_, rows)) = snapshot.remote_manage.as_ref() {
-        crate::ui::remote_manage_popup_rect(anchor_area, rows.len())
+        crate::ui::remote_manage_popup_rect(anchor, rows.len())
     } else if snapshot.rename_workspace.is_some() {
-        crate::ui::rename_workspace_popup_rect(anchor_area)
+        crate::ui::rename_workspace_popup_rect(anchor)
     } else if snapshot.confirm_close_workspace.is_some() {
-        crate::ui::confirm_close_workspace_popup_rect(anchor_area)
+        crate::ui::confirm_close_workspace_popup_rect(anchor.area())
     } else if snapshot.new_worktree.is_some() {
-        crate::ui::new_worktree_popup_rect(anchor_area)
+        crate::ui::new_worktree_popup_rect(anchor)
     } else if snapshot.confirm_delete_worktree.is_some() {
-        crate::ui::confirm_delete_worktree_popup_rect(anchor_area)
+        crate::ui::confirm_delete_worktree_popup_rect(anchor.area())
     } else if let Some(picker) = snapshot.worktree_picker.as_ref() {
-        crate::ui::worktree_picker_popup_rect(anchor_area, picker.items.len())
+        crate::ui::worktree_picker_popup_rect(anchor, picker.items.len())
     } else {
         None
     }?;
@@ -4237,16 +4261,16 @@ mod tests {
         }
     }
 
-    /// The footer-anchored `anchor_area` the renderer/hit-test derive the composited client
-    /// overlays from: spans the host top down to the sidebar footer row. Tests derive their
-    /// expected popup coordinates from this SAME rect so render geometry == hit-test geometry.
+    /// The anchor the renderer/hit-test derive the composited client overlays from. Tests derive
+    /// their expected popup coordinates from this SAME anchor so render geometry == hit-test
+    /// geometry.
     fn anchor_area(
         model: &ClientSupervisorModel,
         compositor: &ClientCompositor,
         host_w: u16,
         host_h: u16,
-    ) -> Rect {
-        compositor.overlay_anchor_area(model, host_w, host_h)
+    ) -> crate::ui::OverlayAnchor {
+        compositor.overlay_anchor(model, host_w, host_h)
     }
 
     fn row_text(frame: &FrameData, row: u16) -> String {
@@ -7339,6 +7363,46 @@ mod tests {
     }
 
     #[test]
+    fn add_remote_modal_renders_on_a_mobile_width_host() {
+        let mut model = ClientSupervisorModel::new("local");
+        model.open_add_remote_form();
+
+        let compositor = ClientCompositor::new(26);
+        let content = frame(20, 8, &["content", "frame"]);
+        // narrower than `DEFAULT_MOBILE_WIDTH_THRESHOLD` → the mobile layout (no sidebar).
+        let composed =
+            compositor.compose_frame(&model, &content, 40, 24, std::time::Instant::now());
+        let rows: Vec<_> = (0..composed.height)
+            .map(|row| row_text(&composed, row))
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("add remote")),
+            "add-remote overlay invisible on a mobile-width host; rows={rows:?}"
+        );
+        // ...and it is interactive: the mobile layout has no sidebar, but the overlay's buttons
+        // must still hit-test (the zero sidebar width used to short-circuit `hit_test` entirely).
+        let popup = compositor
+            .open_overlay_popup_rect(&model, 40, 24)
+            .expect("popup fits on a mobile-width host");
+        // With no sidebar footer to float at, the form centers like the settings modal instead of
+        // hugging the bottom-left corner the sidebar layouts anchor to.
+        assert!(
+            popup.x > 0 && popup.y > 0,
+            "mobile popup not centered: {popup:?}"
+        );
+        assert_eq!(popup.x, (40 - popup.width) / 2);
+        let (submit, cancel) = crate::ui::add_remote_button_rects(popup_inner(popup));
+        assert_eq!(
+            compositor.hit_test(&model, submit.x, submit.y, 40, 24),
+            Some(SidebarHitTarget::AddRemoteSubmit)
+        );
+        assert_eq!(
+            compositor.hit_test(&model, cancel.x, cancel.y, 40, 24),
+            Some(SidebarHitTarget::AddRemoteCancel)
+        );
+    }
+
+    #[test]
     fn modal_survives_full_screen_content_overwrite() {
         // Regression: a composited overlay must stay visible even when the server content frame
         // fills the ENTIRE content area (a real pane full of text). The content copy protects
@@ -7376,9 +7440,8 @@ mod tests {
         // ...AND the content sentinel must STILL be visible somewhere in the content area OUTSIDE
         // the popup rect — proving the fix protects only the popup, not the whole screen (the old
         // bug blanked everything).
-        let popup =
-            crate::ui::add_remote_popup_rect(compositor.overlay_anchor_area(&model, 80, 24))
-                .expect("popup fits");
+        let popup = crate::ui::add_remote_popup_rect(compositor.overlay_anchor(&model, 80, 24))
+            .expect("popup fits");
         let sidebar_width = 26u16;
         let sentinel_outside_popup = (0..composed.height).any(|row| {
             (sidebar_width..composed.width).any(|col| {
@@ -7837,7 +7900,7 @@ mod tests {
             compositor.hit_test(&model, row0.x, row0.y, 80, 24),
             Some(SidebarHitTarget::RemoteManageRow { .. })
         ));
-        let popup = crate::ui::remote_manage_confirm_popup_rect(anchor).expect("popup fits");
+        let popup = crate::ui::remote_manage_confirm_popup_rect(anchor.area()).expect("popup fits");
         let pinner = Rect::new(
             popup.x + 1,
             popup.y + 1,

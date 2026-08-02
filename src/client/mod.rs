@@ -10559,7 +10559,7 @@ mod tests {
         // item 1: click the FOOTER-ANCHORED remote destination row (index 1), using the same
         // shared geometry + anchor_area the renderer/hit-test use (the popup floats over the live
         // content at the sidebar footer, not centered).
-        let anchor = compositor.overlay_anchor_area(&model, 100, 20);
+        let anchor = compositor.overlay_anchor(&model, 100, 20);
         let inner = crate::ui::new_workspace_picker_inner_rect(anchor, 2).expect("modal fits");
         let row1 = crate::ui::new_workspace_picker_row_rect(inner, 1);
         assert!(row1.y > 0);
