@@ -617,6 +617,8 @@ impl App {
                 terminal_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
+                mobile_back_hit_area: Rect::default(),
+                mobile_back_available: false,
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),

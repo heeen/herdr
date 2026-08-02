@@ -260,8 +260,27 @@ pub(crate) struct ClientCompositor {
     // the server owns neither, exactly like `sidebar_collapsed` / `agent_panel_scroll`.
     mobile_switcher_open: bool,
     mobile_switcher_scroll: usize,
+    // The agent the mobile header's "last" button flips back to. The server keeps its own
+    // `previous_pane_focus`, but that spans ONE session — this client's focus moves across hosts,
+    // so "where I was" is a client-level fact and lives here. Holds the focus that was current just
+    // before the latest focus change, which is what makes the button a two-way toggle.
+    previous_agent_focus: Option<(ServerId, String)>,
     // item 5 freshness, key = (server_id, agent_id):
     working_since: HashMap<(ServerId, String), std::time::Instant>,
+}
+
+/// The `(host, agent)` the fleet currently has focused, across every connected server. The client's
+/// aggregated view can only have one, so the first `focused` agent wins.
+fn focused_agent_route(
+    model: &crate::client::supervisor::ClientSupervisorModel,
+) -> Option<(ServerId, String)> {
+    model.agent_groups().into_iter().find_map(|group| {
+        group
+            .agents
+            .into_iter()
+            .find(|agent| agent.focused)
+            .map(|agent| (group.server_id.clone(), agent.agent_id))
+    })
 }
 
 /// A resolved click inside the open mobile switcher. Every variant that acts on a remote already
@@ -556,6 +575,7 @@ impl ClientCompositor {
             menu_drag: None,
             mobile_switcher_open: false,
             mobile_switcher_scroll: 0,
+            previous_agent_focus: None,
             working_since: HashMap::new(),
         }
     }
@@ -1608,6 +1628,49 @@ impl ClientCompositor {
         (menu.width > 0 && menu.height > 0).then_some(menu)
     }
 
+    /// Record where focus is RIGHT NOW, immediately before moving it somewhere else. Called from
+    /// every focus dispatch, so the "last" button always points at the agent the user just left.
+    /// Re-focusing the agent that is already current is not a move and must not overwrite the
+    /// history, or two taps of "last" would land on the same place instead of flipping back.
+    pub(crate) fn note_focus_leaving(
+        &mut self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+        target: Option<(&ServerId, &str)>,
+    ) {
+        let current = focused_agent_route(model);
+        if current.as_ref().zip(target).is_some_and(
+            |((server, agent), (next_server, next_agent))| {
+                server == next_server && agent == next_agent
+            },
+        ) {
+            return;
+        }
+        if current.is_some() {
+            self.previous_agent_focus = current;
+        }
+    }
+
+    /// The agent the "last" button flips to, or `None` when nothing has been left yet or the
+    /// remembered agent is gone (a closed pane, a disconnected host). Re-resolved against the live
+    /// model on every call, so a stale route reports unavailable instead of focusing nothing.
+    pub(crate) fn mobile_back_route(
+        &self,
+        model: &crate::client::supervisor::ClientSupervisorModel,
+    ) -> Option<(ServerId, String)> {
+        let (server_id, agent_id) = self.previous_agent_focus.as_ref()?;
+        if focused_agent_route(model).as_ref() == Some(&(server_id.clone(), agent_id.clone())) {
+            return None;
+        }
+        model
+            .agent_groups()
+            .iter()
+            .any(|group| {
+                &group.server_id == server_id
+                    && group.agents.iter().any(|agent| &agent.agent_id == agent_id)
+            })
+            .then(|| (server_id.clone(), agent_id.clone()))
+    }
+
     /// Whether the mobile switcher panel is open. It covers the whole host, so every render and
     /// input path treats it as modal.
     pub(crate) fn mobile_switcher_open(&self) -> bool {
@@ -1788,6 +1851,19 @@ impl ClientCompositor {
             }
             crate::ui::MobileSwitcherTarget::Menu(index) => Some(MobileSwitcherHit::Menu(index)),
         }
+    }
+
+    /// The mobile header's "last" button rect, or `None` on a desktop host or a header too narrow
+    /// to carry a second button. Same helper the renderer uses, so it is hittable where painted.
+    pub(crate) fn mobile_back_rect(&self, host_width: u16, host_height: u16) -> Option<Rect> {
+        let header_height = self.header_height(host_width, host_height);
+        if header_height == 0 {
+            return None;
+        }
+        let back =
+            crate::ui::mobile_header_hit_areas_for_rect(Rect::new(0, 0, host_width, header_height))
+                .back;
+        (back.width > 0 && back.height > 0).then_some(back)
     }
 
     /// Top-left cell of the content region in host coordinates: `(sidebar_width, header_height)`.
@@ -2268,8 +2344,12 @@ impl ClientSidebarSnapshot {
             app.view.layout = ViewLayout::Mobile;
             app.view.sidebar_rect = Rect::default();
             app.view.mobile_header_rect = header_rect;
-            app.view.mobile_menu_hit_area =
-                crate::ui::compute_mobile_header_hit_areas(&app, header_rect).menu;
+            let header_hits = crate::ui::compute_mobile_header_hit_areas(&app, header_rect);
+            app.view.mobile_menu_hit_area = header_hits.menu;
+            app.view.mobile_back_hit_area = header_hits.back;
+            // Unlike the monolithic host, "back" here spans hosts, so it is answered from the
+            // client's own focus history rather than the server's per-session one.
+            app.view.mobile_back_available = compositor.mobile_back_route(model).is_some();
             app.view.terminal_area = Rect::new(
                 0,
                 header_height,
@@ -6114,6 +6194,168 @@ mod tests {
             None,
             "the host banner row must not resolve to a space"
         );
+    }
+
+    /// The header must fit "last" beside "switch" without the two overlapping, and must drop it
+    /// rather than squeeze the status row to nothing on a genuinely narrow host.
+    #[test]
+    fn mobile_header_affords_the_back_button_only_when_there_is_room() {
+        let compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+
+        let switch = compositor
+            .mobile_menu_rect(50, 6)
+            .expect("a mobile host paints a switch button");
+        let back = compositor
+            .mobile_back_rect(50, 6)
+            .expect("a 50-column header has room for both buttons");
+        assert_eq!(
+            back.x + back.width,
+            switch.x,
+            "the back button must sit flush against switch, never over it"
+        );
+        assert!(back.x > 0, "the status row must keep some columns");
+
+        assert_eq!(
+            compositor.mobile_back_rect(26, 6),
+            None,
+            "a narrow header drops the shortcut and keeps the switcher"
+        );
+        assert!(
+            compositor.mobile_menu_rect(26, 6).is_some(),
+            "the switcher button is never dropped"
+        );
+        assert_eq!(
+            compositor.mobile_back_rect(120, 6),
+            None,
+            "desktop has none"
+        );
+    }
+
+    /// The point of the button is flipping between two agents, so focusing B after A must make
+    /// "last" point at A — and taking it must then point back at B.
+    #[test]
+    fn mobile_back_route_flips_between_the_last_two_agents() {
+        let (mut model, remote_id) = two_agent_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let local = ServerId::main();
+
+        assert_eq!(
+            compositor.mobile_back_route(&model),
+            None,
+            "nothing has been left yet, so there is nowhere back to"
+        );
+
+        // Focus the local agent, then the remote one: "back" is now the local agent.
+        compositor.note_focus_leaving(&model, Some((&local, "a-local")));
+        model.focus_agent_route(&local, "a-local");
+        compositor.note_focus_leaving(&model, Some((&remote_id, "a-remote")));
+        model.focus_agent_route(&remote_id, "a-remote");
+        assert_eq!(
+            compositor.mobile_back_route(&model),
+            Some((local.clone(), "a-local".to_string())),
+            "back must point at the agent just left, on its own host"
+        );
+
+        // Taking it flips the pair round, so a second tap returns to where we were.
+        compositor.note_focus_leaving(&model, Some((&local, "a-local")));
+        model.focus_agent_route(&local, "a-local");
+        assert_eq!(
+            compositor.mobile_back_route(&model),
+            Some((remote_id, "a-remote".to_string())),
+            "back must now return to the agent we just came from"
+        );
+    }
+
+    /// A remembered agent that no longer exists must report unavailable, so the button dims instead
+    /// of firing a focus at a pane that is gone.
+    #[test]
+    fn mobile_back_route_drops_an_agent_that_disappeared() {
+        let (mut model, remote_id) = two_agent_model();
+        let mut compositor = ClientCompositor::with_mobile_threshold(DEFAULT_SIDEBAR_WIDTH, 64);
+        let local = ServerId::main();
+
+        // Land on the local agent, then move to the remote one, so "back" points at the local one.
+        compositor.note_focus_leaving(&model, Some((&local, "a-local")));
+        model.focus_agent_route(&local, "a-local");
+        compositor.note_focus_leaving(&model, Some((&remote_id, "a-remote")));
+        model.focus_agent_route(&remote_id, "a-remote");
+        assert_eq!(
+            compositor.mobile_back_route(&model),
+            Some((local.clone(), "a-local".to_string()))
+        );
+
+        // The local agent goes away (its pane closed).
+        model
+            .set_summary(
+                &local,
+                ServerSummary {
+                    workspaces: vec![WorkspaceSummary {
+                        workspace_id: "ws-local".into(),
+                        label: "local".into(),
+                        branch: None,
+                        focused: false,
+                        ..Default::default()
+                    }],
+                    agents: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            compositor.mobile_back_route(&model),
+            None,
+            "a closed agent is not somewhere to go back to"
+        );
+    }
+
+    fn two_agent_model() -> (ClientSupervisorModel, ServerId) {
+        let mut model = ClientSupervisorModel::new("local");
+        let remote_id = model.add_secondary(crate::remote_registry::RemoteDefinitionSnapshot {
+            id: "remote-x".into(),
+            name: "x".into(),
+            target: crate::remote_registry::RemoteTargetSnapshot::Local {
+                session: Some("x".into()),
+            },
+            session: None,
+            keybindings: crate::remote_registry::RemoteKeybindingsSnapshot::Local,
+            disabled: false,
+            auto_update: false,
+        });
+        let workspace = |id: &str, label: &str| WorkspaceSummary {
+            workspace_id: id.into(),
+            label: label.into(),
+            branch: None,
+            focused: false,
+            ..Default::default()
+        };
+        let agent = |id: &str, ws: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: ws.into(),
+            label: "claude".into(),
+            status: "idle".into(),
+            focused: false,
+            pane_label: None,
+            tab_id: String::new(),
+            tab_label: None,
+        };
+        model
+            .set_summary(
+                &ServerId::main(),
+                ServerSummary {
+                    workspaces: vec![workspace("ws-local", "local")],
+                    agents: vec![agent("a-local", "ws-local")],
+                },
+            )
+            .unwrap();
+        model
+            .set_summary(
+                &remote_id,
+                ServerSummary {
+                    workspaces: vec![workspace("ws-remote", "remote")],
+                    agents: vec![agent("a-remote", "ws-remote")],
+                },
+            )
+            .unwrap();
+        (model, remote_id)
     }
 
     fn mixed_supervisor_model() -> (ClientSupervisorModel, ServerId) {

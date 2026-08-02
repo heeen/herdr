@@ -20,12 +20,21 @@ use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const SWITCH_BUTTON_WIDTH: u16 = 10;
+/// The "last" button sits left of "switch". Narrow on purpose: the status row it borrows from is
+/// what tells you an agent elsewhere needs attention.
+const BACK_BUTTON_WIDTH: u16 = 6;
+/// Columns the status row must keep before the header will afford a second button at all.
+const MIN_HEADER_STATUS_WIDTH: u16 = 12;
 /// Matches the desktop sidebar's divider caption so both surfaces name the boundary identically.
 const LOCAL_REMOTE_DIVIDER_LABEL: &str = " remote ";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MobileHeaderHitAreas {
     pub menu: Rect,
+    /// The "last" button: jump straight back to the previously focused agent, for flipping between
+    /// two of them without going through the switcher. Empty when the header is too narrow to
+    /// afford it — the switcher is the one indispensable affordance, so it keeps the room.
+    pub back: Rect,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -71,7 +80,19 @@ pub(crate) fn mobile_header_hit_areas_for_rect(area: Rect) -> MobileHeaderHitAre
         area.height,
     );
 
-    MobileHeaderHitAreas { menu: switch }
+    // Only afford the back button once the status row can still say something useful without it.
+    let back = if area.width >= width + BACK_BUTTON_WIDTH + MIN_HEADER_STATUS_WIDTH {
+        Rect::new(
+            switch.x.saturating_sub(BACK_BUTTON_WIDTH),
+            area.y,
+            BACK_BUTTON_WIDTH,
+            area.height,
+        )
+    } else {
+        Rect::default()
+    };
+
+    MobileHeaderHitAreas { menu: switch, back }
 }
 
 pub(crate) fn mobile_switcher_areas(app: &AppState) -> MobileSwitcherAreas {
@@ -262,10 +283,17 @@ pub(crate) fn render_mobile_header(
     fill_rect(frame, area, Style::default().bg(p.panel_bg));
 
     let switch = app.view.mobile_menu_hit_area;
-    let status_w = switch.x.saturating_sub(area.x).saturating_sub(1);
+    let back = app.view.mobile_back_hit_area;
+    // The status row runs up to whichever button is leftmost, so it shrinks by exactly the columns
+    // the back button took (and not at all on a header too narrow to have one).
+    let buttons_x = if back.width > 0 { back.x } else { switch.x };
+    let status_w = buttons_x.saturating_sub(area.x).saturating_sub(1);
     let status = Rect::new(area.x, area.y, status_w, area.height);
 
     render_header_status(app, terminal_runtimes, frame, status);
+    if back.width > 0 {
+        render_back_button(app, frame, back);
+    }
     render_switch_button(app, frame, switch);
 }
 
@@ -431,6 +459,39 @@ fn mobile_tab_status(ws: &crate::workspace::Workspace) -> String {
     } else {
         format!("tab {tab_label} · {}/{}", ws.active_tab + 1, ws.tabs.len())
     }
+}
+
+/// The "last" button: one tap back to the previously focused agent. Styled as a quieter sibling of
+/// "switch" (same surface, no badge) because it is a shortcut, not the primary way around.
+fn render_back_button(app: &AppState, frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let p = &app.palette;
+    fill_rect(frame, area, Style::default().bg(p.surface0));
+    for y in area.y..area.y + area.height {
+        frame.buffer_mut()[(area.x, y)]
+            .set_symbol("│")
+            .set_style(Style::default().fg(p.surface_dim).bg(p.surface0));
+    }
+    let label_y = if area.height > 1 { area.y + 1 } else { area.y };
+    let style = if app.view.mobile_back_available {
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(p.overlay0)
+            .bg(p.surface0)
+            .add_modifier(Modifier::DIM)
+    };
+    frame.render_widget(
+        Paragraph::new("last")
+            .style(style)
+            .alignment(Alignment::Center),
+        Rect::new(area.x + 1, label_y, area.width.saturating_sub(1), 1),
+    );
 }
 
 fn render_switch_button(app: &AppState, frame: &mut Frame, area: Rect) {

@@ -1201,6 +1201,18 @@ impl AppState {
             if !matches!(self.mode, Mode::Terminal | Mode::Resize) {
                 return MobileMouseResult::Ignored;
             }
+            // The "last" button flips straight back to the previously focused pane without opening
+            // the switcher — quick back-and-forth is the whole point of it. It resolves through the
+            // SAME `previous_pane_focus` the `last_pane` keybind uses, so the button and the
+            // binding can never disagree about where "back" is.
+            if rect_contains(self.view.mobile_back_hit_area, mouse.column, mouse.row) {
+                return match self.mobile_back_target() {
+                    Some((ws_idx, pane_id)) => {
+                        MobileMouseResult::Action(MouseAction::FocusPane { ws_idx, pane_id })
+                    }
+                    None => MobileMouseResult::Consumed,
+                };
+            }
             if rect_contains(self.view.mobile_menu_hit_area, mouse.column, mouse.row) {
                 self.mobile_switcher_scroll = 0;
                 self.mode = Mode::Navigate;
@@ -1253,6 +1265,17 @@ impl AppState {
         }
 
         MobileMouseResult::Consumed
+    }
+
+    /// Where the mobile header's "last" button goes, or `None` when there is no previous focus or
+    /// it points at the pane already showing (nothing to flip to).
+    fn mobile_back_target(&self) -> Option<(usize, crate::layout::PaneId)> {
+        let target = self.previous_pane_focus.as_ref()?;
+        if self.current_pane_focus_target().as_ref() == Some(target) {
+            return None;
+        }
+        let (ws_idx, _tab_idx) = self.pane_focus_target_indices(target)?;
+        Some((ws_idx, target.pane_id))
     }
 
     fn scroll_mobile_switcher_at(&mut self, _col: u16, _row: u16, delta: i16) {

@@ -267,6 +267,8 @@ pub(crate) fn compute_embedded_content_view_with_cell_size(
         terminal_area,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
+        mobile_back_hit_area: Rect::default(),
+        mobile_back_available: false,
         toast_hit_area,
         pane_infos,
         split_borders,
@@ -427,6 +429,8 @@ fn compute_view_internal(
         terminal_area,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
+        mobile_back_hit_area: Rect::default(),
+        mobile_back_available: false,
         toast_hit_area,
         pane_infos,
         split_borders,
@@ -492,6 +496,10 @@ fn compute_mobile_view(
         terminal_area,
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
+        mobile_back_hit_area: header_hits.back,
+        // The monolithic host's back button rides the pane focus history the `last_pane` keybind
+        // already maintains, so the button and the binding always agree on where "back" is.
+        mobile_back_available: app.previous_pane_focus.is_some(),
         toast_hit_area,
         pane_infos,
         split_borders,

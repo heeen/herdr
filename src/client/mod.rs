@@ -1518,18 +1518,26 @@ fn dispatch_composited_mouse_input(
     // popup the sidebar's "menu" button opens. The launcher is still reachable from the switcher's
     // own menu section, exactly as on the server-rendered mobile layout.
     if mouse.row < origin.1 {
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && compositor
-                .mobile_menu_rect(host_size.0, host_size.1)
-                .is_some_and(|menu| {
-                    mouse.column >= menu.x
-                        && mouse.column < menu.x.saturating_add(menu.width)
-                        && mouse.row >= menu.y
-                        && mouse.row < menu.y.saturating_add(menu.height)
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let hit = |rect: Option<ratatui::layout::Rect>| {
+                rect.is_some_and(|r| {
+                    mouse.column >= r.x
+                        && mouse.column < r.x.saturating_add(r.width)
+                        && mouse.row >= r.y
+                        && mouse.row < r.y.saturating_add(r.height)
                 })
-        {
-            compositor.open_mobile_switcher();
-            return ClientInputDispatch::Redraw;
+            };
+            if hit(compositor.mobile_menu_rect(host_size.0, host_size.1)) {
+                compositor.open_mobile_switcher();
+                return ClientInputDispatch::Redraw;
+            }
+            // "last" flips back to the agent focus just left, without opening the switcher.
+            if hit(compositor.mobile_back_rect(host_size.0, host_size.1)) {
+                if let Some((server_id, agent_id)) = compositor.mobile_back_route(model) {
+                    return focus_agent_from_client(compositor, model, server_id, agent_id);
+                }
+                return ClientInputDispatch::Consumed;
+            }
         }
         return ClientInputDispatch::Consumed;
     }
@@ -1538,6 +1546,29 @@ fn dispatch_composited_mouse_input(
     }
 
     translate_content_mouse_input(data, mouse, origin)
+}
+
+/// Focus an agent on any host, recording where focus was leaving from so the mobile header's
+/// "last" button can flip back to it. Every client-driven agent focus goes through here, which is
+/// what keeps that history complete — a focus that bypassed it would make "last" point at a stale
+/// agent the user never actually left.
+fn focus_agent_from_client(
+    compositor: &mut compositor::ClientCompositor,
+    model: &mut supervisor::ClientSupervisorModel,
+    server_id: supervisor::ServerId,
+    agent_id: String,
+) -> ClientInputDispatch {
+    compositor.note_focus_leaving(model, Some((&server_id, &agent_id)));
+    let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
+    model
+        .focus_agent_route(&server_id, &agent_id)
+        .api_request("client:agent-focus")
+        .map(|request| ClientInputDispatch::ApiRequest {
+            server_id,
+            refresh,
+            request: Box::new(request),
+        })
+        .unwrap_or(ClientInputDispatch::Redraw)
 }
 
 /// Mouse handling for the open mobile switcher. The panel is modal and full-screen, so every event
@@ -1603,16 +1634,7 @@ fn dispatch_mobile_switcher_mouse(
             agent_id,
         } => {
             compositor.close_mobile_switcher();
-            let refresh = focus_refresh_policy(model.active_server_id(), &server_id);
-            model
-                .focus_agent_route(&server_id, &agent_id)
-                .api_request("client:agent-focus")
-                .map(|request| ClientInputDispatch::ApiRequest {
-                    server_id,
-                    refresh,
-                    request: Box::new(request),
-                })
-                .unwrap_or(ClientInputDispatch::Redraw)
+            focus_agent_from_client(compositor, model, server_id, agent_id)
         }
         compositor::MobileSwitcherHit::NewWorkspace => {
             compositor.close_mobile_switcher();
@@ -8486,6 +8508,76 @@ mod tests {
         assert!(
             model.client_menu().is_none(),
             "the launcher popup must not be what the switch button opens"
+        );
+    }
+
+    /// End to end: tapping "last" in the header focuses the agent just left, without the switcher
+    /// ever opening. This is the whole feature — the compositor tests cover the routing, this
+    /// covers that a real press reaches it.
+    #[test]
+    fn mobile_back_button_focuses_the_previously_focused_agent() {
+        let (mut model, remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::with_mobile_threshold(26, 64);
+        let host = (50u16, 24u16);
+        let local = supervisor::ServerId::main();
+
+        // The shared fixture has no local agent; give it one so there are two to flip between.
+        model
+            .set_summary(
+                &local,
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "main-herdr".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![supervisor::AgentSummary {
+                        agent_id: "main-agent".into(),
+                        workspace_id: "main-herdr".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                        pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
+                    }],
+                },
+            )
+            .unwrap();
+
+        // Go local -> remote, so "back" is the local agent.
+        compositor.note_focus_leaving(&model, Some((&local, "main-agent")));
+        model.focus_agent_route(&local, "main-agent");
+        compositor.note_focus_leaving(&model, Some((&remote_id, "remote-agent")));
+        model.focus_agent_route(&remote_id, "remote-agent");
+
+        let back = compositor
+            .mobile_back_rect(host.0, host.1)
+            .expect("the header has room for the back button");
+        let dispatch = dispatch_composited_mouse_input(
+            Vec::new(),
+            &mut compositor,
+            &mut model,
+            host,
+            &MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: back.x + 1,
+                row: back.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        match dispatch {
+            ClientInputDispatch::ApiRequest { server_id, .. } => {
+                assert_eq!(server_id, local, "back must focus on the host that owns it");
+            }
+            other => panic!("back must fire a focus request, got {other:?}"),
+        }
+        assert!(
+            !compositor.mobile_switcher_open(),
+            "back is a shortcut past the switcher, not a way into it"
         );
     }
 

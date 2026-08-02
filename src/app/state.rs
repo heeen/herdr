@@ -963,6 +963,11 @@ pub struct ViewState {
     pub terminal_area: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
+    /// The "last agent" button left of "switch". Zero-sized when the header is too narrow for it.
+    pub mobile_back_hit_area: Rect,
+    /// Whether that button has somewhere to go. Rendered dim and inert when there is no previous
+    /// focus yet, so it never looks live while doing nothing.
+    pub mobile_back_available: bool,
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
@@ -2559,6 +2564,8 @@ impl AppState {
                 terminal_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
+                mobile_back_hit_area: Rect::default(),
+                mobile_back_available: false,
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
