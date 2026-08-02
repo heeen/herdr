@@ -312,6 +312,35 @@ mod tests {
         app
     }
 
+    #[test]
+    fn agent_focus_accepts_the_terminal_id_agent_list_reports() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        // A detected agent with NO manual name — what an unnamed agent pane looks like, and the
+        // only identifier `agent.list` gives for it is this terminal id.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+
+        let response = app.handle_agent_focus(
+            "req".into(),
+            AgentTarget {
+                target: terminal_id.to_string(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected the focused agent, got {response}");
+        };
+        assert_eq!(agent.terminal_id, terminal_id.to_string());
+    }
+
     #[tokio::test]
     async fn agent_prompt_sends_text_then_delays_enter() {
         let mut app = app_with_agent();
