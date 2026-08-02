@@ -1261,7 +1261,7 @@ fn dispatch_composited_mouse_input(
     // The mobile switcher covers the whole host, so — like the menus above — it owns every event
     // while it is open, ahead of the sidebar handlers (which on a mobile host would be hit-testing
     // a sidebar that is not even rendered).
-    if compositor.mobile_switcher_open() {
+    if compositor.mobile_switcher_visible(host_size.0) {
         return dispatch_mobile_switcher_mouse(compositor, model, host_size, mouse);
     }
 
@@ -5688,6 +5688,9 @@ async fn run_client_loop(
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.host_size = (new_cols, new_rows);
                 state.cell_size_px = (cell_width_px, cell_height_px);
+                if let Some(compositor) = state.compositor.as_mut() {
+                    compositor.note_host_resized(new_cols);
+                }
                 state.reported_size = state
                     .compositor
                     .as_ref()
@@ -8504,10 +8507,53 @@ mod tests {
             dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, host, &click);
 
         assert!(matches!(dispatch, ClientInputDispatch::Redraw));
-        assert!(compositor.mobile_switcher_open());
+        assert!(compositor.mobile_switcher_visible(host.0));
         assert!(
             model.client_menu().is_none(),
             "the launcher popup must not be what the switch button opens"
+        );
+    }
+
+    /// Widening past the mobile threshold with the switcher open must not leave an invisible modal
+    /// behind: the desktop layout paints a sidebar instead of the panel, so if input still routed
+    /// to the switcher it would swallow every click on a screen that shows no switcher at all — and
+    /// with the panel gone there is no close button to escape with.
+    #[test]
+    fn widening_out_of_mobile_does_not_leave_an_invisible_switcher_capturing_clicks() {
+        let (mut model, _remote_id) = mixed_remote_model();
+        let mut compositor = compositor::ClientCompositor::with_mobile_threshold(26, 64);
+        let narrow = (50u16, 24u16);
+        let wide = (120u16, 24u16);
+
+        compositor.open_mobile_switcher();
+        assert!(compositor.mobile_switcher_visible(narrow.0));
+
+        // The panel is not painted on a desktop-width host...
+        assert!(
+            !compositor.mobile_switcher_visible(wide.0),
+            "a desktop-width host paints a sidebar, never the switcher"
+        );
+
+        // ...so a click there must reach the normal desktop handling, not the switcher. A press in
+        // the content region forwards to the pane; the switcher would have consumed it.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+        let dispatch =
+            dispatch_composited_mouse_input(Vec::new(), &mut compositor, &mut model, wide, &click);
+        assert!(
+            matches!(dispatch, ClientInputDispatch::Forward(_)),
+            "a content click on a wide host must reach the pane, got {dispatch:?}"
+        );
+
+        // The resize itself clears the state, so narrowing again does not reopen it unasked.
+        compositor.note_host_resized(wide.0);
+        assert!(
+            !compositor.mobile_switcher_visible(narrow.0),
+            "the switcher must not spring back open on a later narrow resize"
         );
     }
 
@@ -8576,7 +8622,7 @@ mod tests {
             other => panic!("back must fire a focus request, got {other:?}"),
         }
         assert!(
-            !compositor.mobile_switcher_open(),
+            !compositor.mobile_switcher_visible(host.0),
             "back is a shortcut past the switcher, not a way into it"
         );
     }
@@ -8607,7 +8653,7 @@ mod tests {
             matches!(dispatch, ClientInputDispatch::Consumed),
             "a press under the panel must not reach the pane, got {dispatch:?}"
         );
-        assert!(compositor.mobile_switcher_open());
+        assert!(compositor.mobile_switcher_visible(host.0));
 
         let close = compositor
             .mobile_switcher_close_rect(&model, host.0, host.1)
@@ -8620,7 +8666,7 @@ mod tests {
             &press(close.x, close.y),
         );
         assert!(matches!(dispatch, ClientInputDispatch::Redraw));
-        assert!(!compositor.mobile_switcher_open());
+        assert!(!compositor.mobile_switcher_visible(host.0));
     }
 
     #[test]

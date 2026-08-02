@@ -1671,10 +1671,22 @@ impl ClientCompositor {
             .then(|| (server_id.clone(), agent_id.clone()))
     }
 
-    /// Whether the mobile switcher panel is open. It covers the whole host, so every render and
-    /// input path treats it as modal.
-    pub(crate) fn mobile_switcher_open(&self) -> bool {
-        self.mobile_switcher_open
+    /// Whether the mobile switcher panel is SHOWING, which is the only question a caller should
+    /// ask. It covers the whole host, so render and input both treat it as modal — and they must
+    /// agree, or the panel swallows every click while painting nothing. Taking the host width here
+    /// is what makes that agreement structural: you cannot ask "is it open" without also answering
+    /// "is this host still narrow enough to draw it".
+    pub(crate) fn mobile_switcher_visible(&self, host_width: u16) -> bool {
+        self.mobile_switcher_open && self.is_mobile(host_width)
+    }
+
+    /// Drop state that only makes sense on the layout the host just left. Widening past the mobile
+    /// threshold swaps the header for a sidebar, and a switcher left open behind it has no
+    /// affordance to close it — so the resize closes it.
+    pub(crate) fn note_host_resized(&mut self, host_width: u16) {
+        if self.mobile_switcher_open && !self.is_mobile(host_width) {
+            self.close_mobile_switcher();
+        }
     }
 
     /// Open the switcher from the header's "switch" button. Always starts at the top: the panel
@@ -2730,10 +2742,10 @@ impl ClientSidebarSnapshot {
             host_banner_server_ids,
             agent_routes,
             collapsed_detail_agent_routes,
-            // Only meaningful on a mobile-width host; a desktop host never renders the panel, so the
-            // flag staying set across a resize back to mobile is intentional (the panel reopens
-            // where the user left it, like every other overlay).
-            mobile_switcher_open: compositor.mobile_switcher_open,
+            // Gated on width, not just the flag: a desktop-width host paints a sidebar instead, and
+            // a panel that renders on one predicate while input routes on another is exactly how it
+            // ends up invisible and still swallowing every click.
+            mobile_switcher_open: compositor.mobile_switcher_visible(host_width),
             // item 1: clone the overlay state out of the model into ui-owned carriers (pure read).
             // The closure maps these into ui view structs before rendering.
             add_remote_form: model.add_remote_form().cloned(),
