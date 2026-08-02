@@ -1716,15 +1716,32 @@ pub(crate) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         return;
     }
 
-    for (visible_idx, ws) in app.workspaces.iter().enumerate() {
+    // Follow the SAME order the expanded sidebar lays out. Iterating storage order here meant the
+    // rail's row N and the expanded list's row N could name different spaces under worktree
+    // grouping, and the rail's 1-based number disagreed with the 1-9 keys (which read the visual
+    // order). Sorting would have widened that gap; this closes it.
+    for (visible_idx, ws_idx) in workspace_list_entries_expanded(app)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+            _ => None,
+        })
+        .enumerate()
+    {
+        let Some(ws) = app.workspaces.get(ws_idx) else {
+            continue;
+        };
         let y = ws_area.y + visible_idx as u16;
         if y >= ws_area.y + ws_area.height {
             break;
         }
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
         let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
-        let is_selected = visible_idx == app.selected && is_navigating;
-        let is_active = Some(visible_idx) == app.active;
+        // Compare the STORAGE index: `selected`/`active` name a workspace, not a row position.
+        // Using the row position silently highlighted the wrong space whenever the rendered order
+        // differed from storage order (worktree grouping already did that; sorting does too).
+        let is_selected = ws_idx == app.selected && is_navigating;
+        let is_active = Some(ws_idx) == app.active;
         let row_style = if is_selected {
             Style::default().bg(p.surface0)
         } else if is_active {

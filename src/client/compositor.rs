@@ -3583,11 +3583,21 @@ fn collapsed_hit_test(
     }
 
     // Workspace-glance rows (mirrors the server's `collapsed_workspace_at_row`): one row per
-    // workspace, `idx == y - ws_area.y`, resolved through `workspace_routes` exactly like the
-    // expanded card path (disabled → no hit, Some(id) → Workspace, None → new-workspace dest).
+    // workspace, resolved through `workspace_routes` exactly like the expanded card path
+    // (disabled → no hit, Some(id) → Workspace, None → new-workspace dest). The row index maps
+    // through the shared VISUAL order first — indexing `workspace_routes` by the raw row meant a
+    // click resolved to a different space than the one drawn whenever render order differed from
+    // storage order, which worktree grouping already caused and sorting now does too.
     if ws_area != Rect::default() && y >= ws_area.y && y < ws_area.y + ws_area.height {
-        let idx = (y - ws_area.y) as usize;
-        if let Some(route) = snapshot.workspace_routes.get(idx) {
+        let row_idx = (y - ws_area.y) as usize;
+        let ws_idx = crate::ui::workspace_list_entries_expanded(&snapshot.app)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                _ => None,
+            })
+            .nth(row_idx);
+        if let Some(route) = ws_idx.and_then(|ws_idx| snapshot.workspace_routes.get(ws_idx)) {
             if route.disabled {
                 return None;
             }
@@ -8189,7 +8199,9 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (mut model, remote_id) = mixed_supervisor_model();
         let mut compositor = ClientCompositor::new(26);
-        let host = (100u16, 16u16);
+        // Tall enough that the (now taller) host menu can shift down without being clamped
+        // to the screen bottom — this test is about the drag offset, not the clamp.
+        let host = (100u16, 24u16);
         // a cursor-anchored host context menu, anchored well inside the screen so it can move freely.
         model.open_host_context_menu(remote_id, "x".into(), 10, 4);
 

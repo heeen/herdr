@@ -327,8 +327,17 @@ impl AppState {
             return None;
         }
 
-        let idx = (row - ws_area.y) as usize;
-        (idx < self.workspaces.len()).then_some(idx)
+        // The rail renders in the shared visual order, so resolve a row through that same order
+        // rather than indexing storage directly — otherwise a click lands on a different space
+        // than the one drawn there.
+        let row_idx = (row - ws_area.y) as usize;
+        crate::ui::workspace_list_entries_expanded(self)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                _ => None,
+            })
+            .nth(row_idx)
     }
 
     pub(super) fn collapsed_agent_detail_target_at(
@@ -644,6 +653,42 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    /// The collapsed rail renders in the shared visual order, so a click must resolve through that
+    /// same order. Indexing storage directly meant a click landed on a different space than the one
+    /// drawn whenever the two differed — which worktree grouping already caused, and sorting does
+    /// for every space.
+    #[test]
+    fn collapsed_rail_hit_test_follows_the_rendered_order() {
+        use crate::app::state::SpaceSort;
+        let mut app = crate::app::state::AppState::test_new();
+        for name in ["delta", "alpha", "charlie"] {
+            let mut ws = crate::workspace::Workspace::test_new(name);
+            ws.custom_name = Some(name.to_string());
+            app.workspaces.push(ws);
+        }
+        app.sidebar_collapsed = true;
+        app.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 4, 20);
+        app.space_sort = SpaceSort::Alphabetical;
+
+        let rendered: Vec<usize> = crate::ui::workspace_list_entries_expanded(&app)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, vec![1, 2, 0], "alpha, charlie, delta");
+
+        let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(app.view.sidebar_rect);
+        for (row_idx, expected) in rendered.iter().enumerate() {
+            assert_eq!(
+                app.collapsed_workspace_at_row(ws_area.y + row_idx as u16),
+                Some(*expected),
+                "row {row_idx} must resolve to the space painted there"
+            );
+        }
+    }
+
     use std::fs;
 
     use crossterm::event::{MouseButton, MouseEventKind};

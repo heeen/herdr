@@ -394,6 +394,15 @@ enum ClientInputDispatch {
         enabled: bool,
     },
     // #61: persist a remote's per-remote auto-update flag off the UI loop against ServerId::main().
+    SetRemoteStyle {
+        remote_id: String,
+        bg: Option<String>,
+        fg: Option<String>,
+        bullet: Option<String>,
+        /// Reopen the host menu here afterwards: its rows are baked at open time, so without this
+        /// the label would still show the previous preset and a second click would repeat the step.
+        anchor: (u16, u16),
+    },
     SetRemoteAutoUpdate {
         remote_id: String,
         auto_update: bool,
@@ -516,6 +525,19 @@ fn dispatch_for_client_menu_outcome(
         } => ClientInputDispatch::SetRemoteAutoUpdate {
             remote_id,
             auto_update,
+        },
+        supervisor::ClientMenuOutcome::HostSetStyle {
+            remote_id,
+            bg,
+            fg,
+            bullet,
+            anchor,
+        } => ClientInputDispatch::SetRemoteStyle {
+            remote_id,
+            bg,
+            fg,
+            bullet,
+            anchor,
         },
         supervisor::ClientMenuOutcome::HostDisconnect(server_id) => {
             ClientInputDispatch::DisconnectRemote { server_id }
@@ -3517,11 +3539,22 @@ fn api_client_error_is_timeout(err: &crate::api::client::ApiClientError) -> bool
 
 /// item 3 (Area 5): the kind of registry mutation a manage request performs. Carried back in
 /// `RemoteManageRequestFinished` so the handler can branch teardown vs. reconnect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteManageAction {
-    SetEnabled { enabled: bool },
+    SetEnabled {
+        enabled: bool,
+    },
     // #61: persist the per-remote auto-update flag (no connection side-effect — unlike SetEnabled).
-    SetAutoUpdate { auto_update: bool },
+    SetAutoUpdate {
+        auto_update: bool,
+    },
+    /// Per-host row styling. Like SetAutoUpdate it has no connection side-effect — the client just
+    /// re-reads the registry and repaints.
+    SetStyle {
+        bg: Option<String>,
+        fg: Option<String>,
+        bullet: Option<String>,
+    },
     Delete,
 }
 
@@ -3544,6 +3577,14 @@ fn remote_manage_request(
                     auto_update,
                 },
             )
+        }
+        RemoteManageAction::SetStyle { bg, fg, bullet } => {
+            crate::api::schema::Method::RemoteSetStyle(crate::api::schema::RemoteSetStyleParams {
+                remote_id: remote_id.to_string(),
+                bg,
+                fg,
+                bullet,
+            })
         }
         RemoteManageAction::Delete => {
             crate::api::schema::Method::RemoteRemove(crate::api::schema::RemoteRemoveParams {
@@ -3571,7 +3612,7 @@ fn spawn_client_remote_manage_request(
 ) {
     let main_id = supervisor::ServerId::main();
     let target = api_target_for_supervisor_server(model, &main_id, ssh_bridges);
-    let request = remote_manage_request(action, &remote_id);
+    let request = remote_manage_request(action.clone(), &remote_id);
     let event_tx = event_tx.clone();
     std::thread::spawn(move || {
         let started_at = Instant::now();
@@ -4291,6 +4332,13 @@ fn apply_remote_manage_request_finished(
     }
 
     match action {
+        // Registry-only, exactly like SetAutoUpdate: refresh so the new style reaches the render
+        // snapshot, with no connection side-effect.
+        RemoteManageAction::SetStyle { .. } => {
+            if let Some(model) = &mut state.supervisor_model {
+                model.clear_remote_manage_pending(remote_id);
+            }
+        }
         RemoteManageAction::SetEnabled { enabled: true } => {
             if let Some(model) = &mut state.supervisor_model {
                 refresh_client_supervisor_summaries(
@@ -5443,6 +5491,35 @@ async fn run_client_loop(
                                     remote_id,
                                     &state.ssh_bridges,
                                     &event_tx,
+                                );
+                                state.request_recompose();
+                                render_cached_composited_frame(&mut state);
+                                continue;
+                            }
+                            ClientInputDispatch::SetRemoteStyle {
+                                remote_id,
+                                bg,
+                                fg,
+                                bullet,
+                                anchor,
+                            } => {
+                                let server_id = supervisor::ServerId::secondary(remote_id.as_str());
+                                let display_name =
+                                    model.server_display_name(&server_id).unwrap_or_default();
+                                spawn_client_remote_manage_request(
+                                    model,
+                                    RemoteManageAction::SetStyle { bg, fg, bullet },
+                                    remote_id,
+                                    &state.ssh_bridges,
+                                    &event_tx,
+                                );
+                                // Reopen the menu in place so its labels reflect the new preset —
+                                // the rows were baked when it opened.
+                                model.open_host_context_menu(
+                                    server_id,
+                                    display_name,
+                                    anchor.0,
+                                    anchor.1,
                                 );
                                 state.request_recompose();
                                 render_cached_composited_frame(&mut state);

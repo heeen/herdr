@@ -320,9 +320,26 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
 
+# Space list ordering: "manual" (hand-arranged, drag to reorder), "alphabetical", "status"
+# (attention first) or "recent" (last focused first). Sorting applies within each host group,
+# or across every host when group_spaces_by_host is off. Dragging is only offered in "manual".
+# space_sort = "manual"
+
+# Group spaces under their host. Off gives one flat list, where each row's host is shown by its
+# color and bullet instead of by a banner above a block.
+# group_spaces_by_host = true
+
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
 # accent = "cyan"
+
+[ui.sidebar.host]
+# Row styling for the LOCAL host. Remote hosts carry their own, set from the host context menu
+# and stored per remote. Colors accept hex, rgb(r,g,b) or a named color; the bullet must be a
+# single character one column wide.
+# local_bg = "#1e1e2e"
+# local_fg = "#cdd6f4"
+# local_bullet = "●"
 
 [ui.sidebar.spaces]
 # Optional per-item color presets: default, muted, accent, cool, warm.

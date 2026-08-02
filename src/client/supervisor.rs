@@ -289,6 +289,13 @@ pub(crate) enum ClientMenuAction {
     HostToggleAutoUpdate {
         auto_update: bool,
     },
+    /// Step this host's row styling to the next preset. Carries the NEXT values, baked when the
+    /// menu opened, so activating a row is a pure dispatch with no state to re-read.
+    HostCycleStyle {
+        bg: Option<String>,
+        fg: Option<String>,
+        bullet: Option<String>,
+    },
 }
 
 /// #47: the typed outcome of activating a [`ClientMenu`] row, mapped by the client loop into a
@@ -316,6 +323,16 @@ pub(crate) enum ClientMenuOutcome {
     HostToggleAutoUpdate {
         remote_id: String,
         auto_update: bool,
+    },
+    HostSetStyle {
+        remote_id: String,
+        bg: Option<String>,
+        fg: Option<String>,
+        bullet: Option<String>,
+        /// Where the host menu was anchored, so it can be reopened in place. Menu items are baked
+        /// at open time, so without reopening the label would still show the previous preset and
+        /// a second click would repeat the same step.
+        anchor: (u16, u16),
     },
     /// The "open worktree…" picker opened in its loading state: the loop must fetch this
     /// workspace's `worktree.list` off the UI thread and fill the picker via
@@ -1722,6 +1739,22 @@ impl ClientSupervisorModel {
                     })
                     .unwrap_or(ClientMenuOutcome::Redraw)
             }
+            ClientMenuAction::HostCycleStyle { bg, fg, bullet } => {
+                let anchor = self
+                    .client_menu()
+                    .map(|menu| (menu.anchor_col, menu.anchor_row))
+                    .unwrap_or((0, 0));
+                self.close_client_overlay();
+                host_server_id
+                    .map(|id| ClientMenuOutcome::HostSetStyle {
+                        remote_id: id.registry_id().to_string(),
+                        bg,
+                        fg,
+                        bullet,
+                        anchor,
+                    })
+                    .unwrap_or(ClientMenuOutcome::Redraw)
+            }
         }
     }
 
@@ -2287,7 +2320,7 @@ impl ClientSupervisorModel {
         anchor_col: u16,
         anchor_row: u16,
     ) {
-        let (disabled, connected, remote_version, remote_protocol, auto_update) = self
+        let (disabled, connected, remote_version, remote_protocol, auto_update, style) = self
             .server(&server_id)
             .map(|server| {
                 (
@@ -2296,9 +2329,14 @@ impl ClientSupervisorModel {
                     server.remote_version.clone(),
                     server.remote_protocol,
                     server.auto_update,
+                    (
+                        server.style_bg.clone(),
+                        server.style_fg.clone(),
+                        server.style_bullet.clone(),
+                    ),
                 )
             })
-            .unwrap_or((false, false, None, None, false));
+            .unwrap_or((false, false, None, None, false, (None, None, None)));
         let (version_label, is_mismatch) =
             host_version_readout(remote_version.as_deref(), remote_protocol);
         let items = vec![
@@ -2355,6 +2393,27 @@ impl ClientSupervisorModel {
                 selectable: true,
                 action: ClientMenuAction::HostToggleAutoUpdate {
                     auto_update: !auto_update,
+                },
+            },
+            // Row styling. Presets rather than free-form input: what makes hosts distinguishable
+            // at a glance is a small set of clearly different colours, and a preset ring needs no
+            // new overlay, hit-test or text entry. Hand-edit session.json for an exact hex.
+            ClientMenuItem {
+                label: format!("color · {}", host_color_preset_label(style.0.as_deref())),
+                selectable: true,
+                action: ClientMenuAction::HostCycleStyle {
+                    bg: next_host_color_preset(style.0.as_deref()),
+                    fg: style.1.clone(),
+                    bullet: style.2.clone(),
+                },
+            },
+            ClientMenuItem {
+                label: format!("bullet · {}", style.2.as_deref().unwrap_or("default")),
+                selectable: true,
+                action: ClientMenuAction::HostCycleStyle {
+                    bg: style.0.clone(),
+                    fg: style.1.clone(),
+                    bullet: next_host_bullet_preset(style.2.as_deref()),
                 },
             },
         ];
@@ -3472,6 +3531,59 @@ fn unavailable_reason(connection_state: &ConnectionState) -> &'static str {
 fn trimmed_optional(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The background presets a host cycles through, as `(label, value)`. `None` is "no tint", so the
+/// ring always has a way back to the default look.
+const HOST_COLOR_PRESETS: [(&str, &str); 6] = [
+    ("plum", "#2a1f3d"),
+    ("moss", "#1f3d2a"),
+    ("slate", "#1f2a3d"),
+    ("ember", "#3d2a1f"),
+    ("teal", "#1f3d3d"),
+    ("wine", "#3d1f2a"),
+];
+
+/// Bullets a host cycles through. Every one is a single column wide, which the row layouts require.
+const HOST_BULLET_PRESETS: [&str; 6] = ["●", "◆", "▪", "■", "▸", "★"];
+
+fn host_color_preset_label(current: Option<&str>) -> &'static str {
+    match current {
+        None => "default",
+        Some(value) => HOST_COLOR_PRESETS
+            .iter()
+            .find(|(_, preset)| *preset == value)
+            .map(|(label, _)| *label)
+            // A hand-edited hex is not in the ring; say so rather than mislabel it.
+            .unwrap_or("custom"),
+    }
+}
+
+fn next_host_color_preset(current: Option<&str>) -> Option<String> {
+    let position = current.and_then(|value| {
+        HOST_COLOR_PRESETS
+            .iter()
+            .position(|(_, preset)| *preset == value)
+    });
+    match position {
+        None => Some(HOST_COLOR_PRESETS[0].1.to_string()),
+        Some(idx) if idx + 1 < HOST_COLOR_PRESETS.len() => {
+            Some(HOST_COLOR_PRESETS[idx + 1].1.to_string())
+        }
+        // Past the last preset the ring returns to "no tint".
+        Some(_) => None,
+    }
+}
+
+fn next_host_bullet_preset(current: Option<&str>) -> Option<String> {
+    let position = current.and_then(|value| HOST_BULLET_PRESETS.iter().position(|p| *p == value));
+    match position {
+        None => Some(HOST_BULLET_PRESETS[0].to_string()),
+        Some(idx) if idx + 1 < HOST_BULLET_PRESETS.len() => {
+            Some(HOST_BULLET_PRESETS[idx + 1].to_string())
+        }
+        Some(_) => None,
+    }
 }
 
 /// #44: format the host context-menu version-readout label and whether the remote's wire protocol
@@ -6957,6 +7069,51 @@ mod tests {
 
     // ----- #43: host context menu ---------------------------------------------------------------
 
+    /// The style rings must cycle forward and return to "no override", so a host can always be put
+    /// back to the default look without hand-editing session.json.
+    #[test]
+    fn host_style_presets_cycle_and_return_to_default() {
+        // colours: default -> first preset -> ... -> last -> default
+        let mut current = next_host_color_preset(None);
+        assert_eq!(current.as_deref(), Some(HOST_COLOR_PRESETS[0].1));
+        for _ in 1..HOST_COLOR_PRESETS.len() {
+            current = next_host_color_preset(current.as_deref());
+            assert!(current.is_some());
+        }
+        assert_eq!(
+            next_host_color_preset(current.as_deref()),
+            None,
+            "past the last preset the ring returns to no tint"
+        );
+
+        // A hand-edited hex is off the ring: label it honestly, and stepping restarts the ring.
+        assert_eq!(host_color_preset_label(Some("#123456")), "custom");
+        assert_eq!(host_color_preset_label(None), "default");
+        assert_eq!(
+            host_color_preset_label(Some(HOST_COLOR_PRESETS[0].1)),
+            HOST_COLOR_PRESETS[0].0
+        );
+
+        let mut bullet = next_host_bullet_preset(None);
+        assert_eq!(bullet.as_deref(), Some(HOST_BULLET_PRESETS[0]));
+        for _ in 1..HOST_BULLET_PRESETS.len() {
+            bullet = next_host_bullet_preset(bullet.as_deref());
+        }
+        assert_eq!(next_host_bullet_preset(bullet.as_deref()), None);
+
+        // Every bullet in the ring must survive the width validation the registry enforces.
+        for preset in HOST_BULLET_PRESETS {
+            assert!(
+                crate::remote_registry::single_width_bullet(preset).is_some(),
+                "preset {preset:?} must be a single-width bullet"
+            );
+        }
+        // ...and every colour must parse, or cycling would write a value the registry rejects.
+        for (_, colour) in HOST_COLOR_PRESETS {
+            assert!(crate::config::parse_color_checked(colour).is_some());
+        }
+    }
+
     #[test]
     fn open_host_context_menu_captures_host_and_labels() {
         // A connected, enabled host: items are add/disable/disconnect.
@@ -6993,7 +7150,9 @@ mod tests {
                 "disable",
                 "disconnect",
                 "update",
-                "enable auto-update"
+                "enable auto-update",
+                "color · default",
+                "bullet · default"
             ]
         );
 
@@ -7014,7 +7173,9 @@ mod tests {
                 "enable",
                 "reconnect",
                 "update",
-                "enable auto-update"
+                "enable auto-update",
+                "color · default",
+                "bullet · default"
             ]
         );
     }
@@ -7119,11 +7280,15 @@ mod tests {
         model.handle_client_menu_key(press(KeyCode::Down));
         model.handle_client_menu_key(press(KeyCode::Down));
         assert_eq!(model.client_menu().unwrap().selected, 5);
+        // Down stops at the last row — now the bullet preset, after the two style rows.
         model.handle_client_menu_key(press(KeyCode::Down));
-        assert_eq!(model.client_menu().unwrap().selected, 5);
+        model.handle_client_menu_key(press(KeyCode::Down));
+        assert_eq!(model.client_menu().unwrap().selected, 7);
+        model.handle_client_menu_key(press(KeyCode::Down));
+        assert_eq!(model.client_menu().unwrap().selected, 7);
         // k moves back up.
         model.handle_client_menu_key(press(KeyCode::Char('k')));
-        assert_eq!(model.client_menu().unwrap().selected, 4);
+        assert_eq!(model.client_menu().unwrap().selected, 6);
 
         // Esc dismisses.
         model.handle_client_menu_key(press(KeyCode::Esc));
