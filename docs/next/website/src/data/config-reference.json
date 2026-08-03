@@ -658,6 +658,12 @@
           "description": "Draw borders around split panes."
         },
         {
+          "key": "ui.pane_scrollbars",
+          "type": "boolean",
+          "default": "true",
+          "description": "Draw interactive scrollbars beside terminal panes. Disable to reclaim the scrollbar column and keep it out of terminal-native selections."
+        },
+        {
           "key": "ui.pane_gaps",
           "type": "boolean",
           "default": "true",
@@ -674,6 +680,16 @@
           "type": "boolean",
           "default": "false",
           "description": "Hide the tab row when the workspace has one tab."
+        },
+        {
+          "key": "ui.tab_bar_position",
+          "type": "enum",
+          "default": "\"top\"",
+          "description": "Place the desktop tab row above or below the terminal panes.",
+          "values": [
+            "top",
+            "bottom"
+          ]
         },
         {
           "key": "ui.agent_panel_sort",
@@ -714,6 +730,12 @@
           "type": "list of field lines",
           "default": "[[{ field = \"agent_status\" }, { field = \"pane_name\" }, { field = \"tab_name\" }, { field = \"space_name\" }], [{ field = \"status\" }, { field = \"time\" }, { field = \"custom_status\" }, { field = \"right_alignment\" }, { field = \"agent_name\" }]]",
           "description": "Expanded Agent sidebar layout, as lines of { field, show, color, order } tables."
+        },
+        {
+          "key": "ui.sidebar.spaces.row_gap",
+          "type": "integer",
+          "default": "0",
+          "description": "Blank terminal rows between worktree groups and unrelated top-level Spaces. Worktree parents and their indented children remain packed."
         },
         {
           "key": "ui.sidebar.host.gradient",
