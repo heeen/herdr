@@ -4,7 +4,11 @@ use std::{
     os::fd::RawFd,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
 };
 
 pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
@@ -940,6 +944,47 @@ fn read_clipboard_image_with_spawned_command(command: Command) -> Option<Vec<u8>
     )
 }
 
+/// Worst-case time to wait for a clipboard *read* helper (wl-paste/xclip/xsel) before
+/// force-killing it.
+///
+/// These tools block indefinitely when no clipboard owner ever offers a selection — no
+/// compositor clipboard manager running, or the owning app exited mid-handshake — and the read
+/// below is a blocking read on the child's stdout, so the caller hangs with it.
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Force-kills the watched process after [`CLIPBOARD_COMMAND_TIMEOUT`] unless dropped first.
+///
+/// Killing the child closes its stdout, so the blocking read unblocks with EOF and the normal
+/// error path runs — the caller sees `None` instead of never returning.
+///
+/// Deliberately not used on the write path: `wl-copy`/`xclip` legitimately stay resident there to
+/// keep serving the copied selection to other apps, so a watchdog would cut the clipboard short.
+struct ClipboardWatchdog {
+    done: Arc<AtomicBool>,
+}
+
+impl ClipboardWatchdog {
+    fn arm(pid: u32) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(CLIPBOARD_COMMAND_TIMEOUT);
+            if !watchdog_done.load(Ordering::Acquire) {
+                // SAFETY: `kill` on a pid we spawned. A reaped pid yields ESRCH, which we ignore;
+                // the reap itself happens in the caller, after this guard is dropped.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for ClipboardWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
 fn read_clipboard_image_with_spawned_command_max(
     mut command: Command,
     max_bytes: usize,
@@ -950,6 +995,7 @@ fn read_clipboard_image_with_spawned_command_max(
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let _watchdog = ClipboardWatchdog::arm(child.id());
     let stdout = child.stdout.take()?;
 
     let read = match read_limited_reader(stdout, max_bytes) {
@@ -1040,6 +1086,7 @@ fn read_clipboard_text_with_command(command: &ClipboardCommand) -> Option<String
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let _watchdog = ClipboardWatchdog::arm(child.id());
 
     let stdout = child.stdout.take()?;
     let read = match read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES) {
@@ -1933,6 +1980,38 @@ mod tests {
         };
 
         assert_eq!(read_clipboard_text_with_command(&command), None);
+    }
+
+    #[test]
+    fn read_clipboard_text_with_command_times_out_on_a_hanging_process() {
+        // wl-paste blocks forever when nothing ever offers a selection. Without the watchdog the
+        // blocking stdout read never returns and the caller hangs with it.
+        let command = ClipboardCommand {
+            program: "sleep",
+            args: &["30"],
+        };
+
+        let start = std::time::Instant::now();
+        assert_eq!(read_clipboard_text_with_command(&command), None);
+        assert!(
+            start.elapsed() < CLIPBOARD_COMMAND_TIMEOUT + Duration::from_secs(1),
+            "watchdog should have killed the hanging process well before the full sleep, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn read_clipboard_image_with_spawned_command_times_out_on_a_hanging_process() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+
+        let start = std::time::Instant::now();
+        assert_eq!(read_clipboard_image_with_spawned_command(command), None);
+        assert!(
+            start.elapsed() < CLIPBOARD_COMMAND_TIMEOUT + Duration::from_secs(1),
+            "watchdog should have killed the hanging process well before the full sleep, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
