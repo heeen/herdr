@@ -71,6 +71,8 @@ impl ClientContextMenuOverlay {
                         },
                         Action::ToggleRightClickPassthrough,
                     ),
+                    item("Copy", Action::Copy),
+                    item("Paste", Action::Paste),
                     item("Close pane", Action::ClosePane),
                 ]);
                 items
@@ -373,6 +375,28 @@ impl ClientShellState {
         action: ClientContextMenuAction,
         outcome: &mut ClientShellInput,
     ) {
+        self.apply_pane_context_menu_action_with(
+            pane_id,
+            workspace_id,
+            source_pane_id,
+            right_click_passthrough,
+            action,
+            outcome,
+            crate::platform::read_clipboard_text,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the caller above; the extra arg is the seam
+    pub(super) fn apply_pane_context_menu_action_with(
+        &mut self,
+        pane_id: String,
+        workspace_id: String,
+        source_pane_id: Option<String>,
+        right_click_passthrough: bool,
+        action: ClientContextMenuAction,
+        outcome: &mut ClientShellInput,
+        read_clipboard_text: impl FnOnce() -> Option<String>,
+    ) {
         use crate::api::schema::{
             Method, PaneInputSetParams, PaneRenameParams, PaneRightClickTarget, PaneSplitParams,
             PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams, SplitDirection,
@@ -456,6 +480,20 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
+            // Reuses the same selection-read request the mouse copy path uses, so it honours
+            // whatever `ui.copy_on_select` targets and is a no-op when nothing is selected.
+            ClientContextMenuAction::Copy => self.request_selection_copy(outcome, false),
+            ClientContextMenuAction::Paste => {
+                if let Some(text) = read_clipboard_text() {
+                    if !text.is_empty() {
+                        super::push_target_event(
+                            ClientInputTarget::Pane(pane_id),
+                            ClientPaneInputEvent::Paste(text),
+                            outcome,
+                        );
+                    }
+                }
+            }
             ClientContextMenuAction::ClosePane => {
                 self.push_endpoint_method(Method::PaneClose(PaneTarget { pane_id }), outcome)
             }
