@@ -75,6 +75,25 @@ impl App {
         &self,
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
+        // A terminal id, like `resolve_terminal_target` accepts. `AgentInfo` leads with the
+        // agent's terminal id and its `name` is optional, so the terminal id is the only stable
+        // per-pane handle an `agent.list` consumer holds — the client sidebar uses it as the agent
+        // id for every row it renders. Without this branch `agent focus <terminal id>` fails with
+        // "not found" for any agent that has no manual name, so those sidebar rows never focus.
+        //
+        // Still filtered by `target_is_agent`, so a plain terminal remains a terminal-only target.
+        let terminal_matches: Vec<_> = self
+            .terminal_targets()
+            .into_iter()
+            .filter(|candidate| candidate.terminal_id == target)
+            .collect();
+        if let Some(resolved) = self
+            .single_terminal_match(target, terminal_matches)?
+            .filter(|resolved| self.target_is_agent(resolved))
+        {
+            return Ok(resolved);
+        }
+
         if let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(target) {
             if let Some(resolved) = self
                 .terminal_target_for_pane(ws_idx, pane_id)
