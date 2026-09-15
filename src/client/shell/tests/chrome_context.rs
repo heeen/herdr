@@ -378,6 +378,94 @@ fn context_menus_capture_stable_targets_and_route_actions() {
 }
 
 #[test]
+fn pane_context_menu_paste_sends_clipboard_text_to_the_clicked_pane() {
+    // The clipboard read is injected so the test does not depend on a system clipboard, and so it
+    // can assert the text reaches the pane that was right-clicked rather than the focused one.
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("shell frame");
+
+    let mut outcome = ClientShellInput::default();
+    state.apply_pane_context_menu_action_with(
+        "pane_1".to_string(),
+        "ws_1".to_string(),
+        None,
+        false,
+        ClientContextMenuAction::Paste,
+        &mut outcome,
+        || Some("pasted text".to_string()),
+    );
+
+    let [crate::protocol::ClientMessage::ClientShellPaneInput { pane_id, events }] =
+        &outcome.requests[..]
+    else {
+        panic!("paste should send pane input, got {:?}", outcome.requests);
+    };
+    assert_eq!(pane_id, "pane_1");
+    assert_eq!(
+        events,
+        &vec![crate::protocol::ClientPaneInputEvent::Paste(
+            "pasted text".to_string()
+        )]
+    );
+}
+
+#[test]
+fn pane_context_menu_paste_is_a_no_op_without_clipboard_text() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("shell frame");
+
+    for clipboard in [None, Some(String::new())] {
+        let mut outcome = ClientShellInput::default();
+        state.apply_pane_context_menu_action_with(
+            "pane_1".to_string(),
+            "ws_1".to_string(),
+            None,
+            false,
+            ClientContextMenuAction::Paste,
+            &mut outcome,
+            || clipboard.clone(),
+        );
+        assert!(
+            outcome.requests.is_empty(),
+            "an empty clipboard must not send a paste: {:?}",
+            outcome.requests
+        );
+    }
+}
+
+#[test]
+fn pane_context_menu_offers_copy_and_paste() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("shell frame");
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("pane context menu");
+    };
+    let actions: Vec<_> = menu.items().iter().map(|item| item.action).collect();
+    assert!(
+        actions.contains(&ClientContextMenuAction::Copy),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&ClientContextMenuAction::Paste),
+        "{actions:?}"
+    );
+}
+
+#[test]
 fn global_menu_opens_from_sidebar_and_routes_client_actions() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
