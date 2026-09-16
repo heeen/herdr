@@ -934,6 +934,65 @@ impl<'de> Deserialize<'de> for PaneBordersConfig {
     }
 }
 
+/// Where a finished mouse selection is copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyOnSelectConfig {
+    Off,
+    #[default]
+    Clipboard,
+    Primary,
+}
+
+impl CopyOnSelectConfig {
+    pub fn target(self) -> Option<crate::platform::SelectionTarget> {
+        match self {
+            Self::Off => None,
+            Self::Clipboard => Some(crate::platform::SelectionTarget::Clipboard),
+            Self::Primary => Some(crate::platform::SelectionTarget::Primary),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self.target().is_some()
+    }
+}
+
+impl<'de> Deserialize<'de> for CopyOnSelectConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CopyOnSelectVisitor;
+
+        impl<'de> de::Visitor<'de> for CopyOnSelectVisitor {
+            type Value = CopyOnSelectConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("\"off\", \"clipboard\", \"primary\", or a legacy boolean")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    CopyOnSelectConfig::Clipboard
+                } else {
+                    CopyOnSelectConfig::Off
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "off" => Ok(CopyOnSelectConfig::Off),
+                    "clipboard" => Ok(CopyOnSelectConfig::Clipboard),
+                    "primary" => Ok(CopyOnSelectConfig::Primary),
+                    other => Err(E::invalid_value(de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(CopyOnSelectVisitor)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -950,8 +1009,8 @@ pub struct UiConfig {
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
-    /// Copy text selected with the mouse. Default: true.
-    pub copy_on_select: bool,
+    /// Where text selected with the mouse is copied. Default: clipboard.
+    pub copy_on_select: CopyOnSelectConfig,
     /// Host cursor policy. Default: auto.
     pub host_cursor: HostCursorModeConfig,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
@@ -1202,7 +1261,7 @@ impl Default for UiConfig {
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
-            copy_on_select: true,
+            copy_on_select: CopyOnSelectConfig::Clipboard,
             host_cursor: HostCursorModeConfig::Auto,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
@@ -1743,16 +1802,25 @@ mouse_capture = false
     }
 
     #[test]
-    fn copy_on_select_default_on_and_parse() {
+    fn copy_on_select_defaults_to_clipboard_and_parses() {
         let default_config = Config::default();
-        assert!(default_config.ui.copy_on_select);
+        assert_eq!(
+            default_config.ui.copy_on_select,
+            CopyOnSelectConfig::Clipboard
+        );
 
-        let toml = r#"
-[ui]
-copy_on_select = false
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.copy_on_select);
+        for (value, expected) in [
+            ("\"off\"", CopyOnSelectConfig::Off),
+            ("\"clipboard\"", CopyOnSelectConfig::Clipboard),
+            ("\"primary\"", CopyOnSelectConfig::Primary),
+            ("false", CopyOnSelectConfig::Off),
+            ("true", CopyOnSelectConfig::Clipboard),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[ui]\ncopy_on_select = {value}\n")).unwrap();
+            assert_eq!(config.ui.copy_on_select, expected, "{value}");
+        }
+        assert!(toml::from_str::<Config>("[ui]\ncopy_on_select = \"secondary\"\n").is_err());
     }
 
     #[test]

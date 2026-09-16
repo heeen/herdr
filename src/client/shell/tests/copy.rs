@@ -209,7 +209,7 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
     assert!(repaint);
     assert!(matches!(
         &actions[..],
-        [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"LIV"
+        [ClientShellAction::ClipboardWrite { target: crate::platform::SelectionTarget::Clipboard, bytes }] if bytes == b"LIV"
     ));
     assert_eq!(
         state
@@ -224,7 +224,7 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
 fn clipboard_feedback_is_client_local_and_respects_config() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     let now = std::time::Instant::now();
-    assert!(state.show_copy_feedback(now));
+    assert!(state.show_copy_feedback(crate::platform::SelectionTarget::Clipboard, now));
     assert_eq!(
         state
             .copy_feedback
@@ -240,7 +240,7 @@ fn clipboard_feedback_is_client_local_and_respects_config() {
     state.config.clipboard_toast_enabled = false;
     state.copy_feedback = None;
     state.copy_feedback_deadline = None;
-    assert!(!state.show_copy_feedback(now));
+    assert!(!state.show_copy_feedback(crate::platform::SelectionTarget::Clipboard, now));
     assert!(state.copy_feedback.is_none());
     assert!(state.copy_feedback_deadline.is_none());
 }
@@ -248,7 +248,7 @@ fn clipboard_feedback_is_client_local_and_respects_config() {
 #[test]
 fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelectConfig::Off;
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("composed frame");
@@ -344,7 +344,9 @@ fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() 
             text: "yIV".into(),
         }),
     );
-    assert!(matches!(&actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"yIV"));
+    assert!(
+        matches!(&actions[..], [ClientShellAction::ClipboardWrite { target: crate::platform::SelectionTarget::Clipboard, bytes }] if bytes == b"yIV")
+    );
 }
 
 #[test]
@@ -405,7 +407,7 @@ fn selection_edge_drag_requests_scroll_and_timer_continues_it() {
 #[test]
 fn keyboard_copy_mode_owns_cursor_selection_copy_and_scroll_restore() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelectConfig::Off;
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
     pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
@@ -1805,7 +1807,7 @@ fn navigator_owns_search_mouse_selection_and_stable_target_focus() {
 #[test]
 fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelectConfig::Off;
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
     pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
@@ -1938,7 +1940,7 @@ fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
 #[test]
 fn retained_selection_copy_suppresses_key_repeats() {
     let mut config = Config::default();
-    config.ui.copy_on_select = false;
+    config.ui.copy_on_select = crate::config::CopyOnSelectConfig::Off;
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
@@ -2307,4 +2309,71 @@ fn copy_mode_repeat_during_projection_gap_stays_active() {
             Some(19)
         );
     }
+}
+
+/// Selections outlive pane output, so an explicit menu copy reads the live range like Ctrl+C
+/// instead of being refused for the revision the selection was made against.
+#[test]
+fn context_menu_copy_reads_the_live_selection() {
+    let mut config = Config::default();
+    config.ui.copy_on_select = crate::config::CopyOnSelectConfig::Off;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    state.set_pane_surface(pane_surface.clone());
+    state.compose(106, 20).expect("shell frame");
+    let inner = state.hits.panes[0].inner_rect;
+    let mouse = |kind, column| {
+        RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row: inner.y,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        inner.x,
+    )]);
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        inner.x + 2,
+    )]);
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        inner.x + 2,
+    )]);
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_visible));
+
+    pane_surface.surface_revision += 1;
+    pane_surface.panes[0].content_revision += 2;
+    state.set_pane_surface(pane_surface);
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        inner.x + 1,
+    )]);
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("pane context menu");
+    };
+    let index = menu
+        .items()
+        .iter()
+        .position(|item| item.action == ClientContextMenuAction::Copy)
+        .expect("the pane menu offers Copy");
+
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(index, &mut outcome);
+    assert!(
+        outcome.actions.iter().any(|action| matches!(
+            action,
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
+                    if params.content_revision.is_none())
+        )),
+        "{:?}",
+        outcome.actions
+    );
 }

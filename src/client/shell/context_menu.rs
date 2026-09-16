@@ -480,9 +480,13 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
-            // Reuses the same selection-read request the mouse copy path uses, so it honours
-            // whatever `ui.copy_on_select` targets and is a no-op when nothing is selected.
-            ClientContextMenuAction::Copy => self.request_selection_copy(outcome, false),
+            // An explicit copy always targets the clipboard; `ui.copy_on_select` only governs the
+            // automatic copy. A no-op when nothing is selected.
+            ClientContextMenuAction::Copy => self.request_selection_copy(
+                crate::platform::SelectionTarget::Clipboard,
+                outcome,
+                true,
+            ),
             ClientContextMenuAction::Paste => {
                 if let Some(text) = read_clipboard_text() {
                     if !text.is_empty() {

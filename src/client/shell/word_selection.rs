@@ -146,8 +146,8 @@ impl ClientShellState {
                 selection.finish();
             }
             self.word_selection_gesture = None;
-            if self.config.copy_on_select {
-                self.request_selection_copy(outcome, false);
+            if let Some(target) = self.config.copy_on_select.target() {
+                self.request_selection_copy(target, outcome, false);
                 if dragged {
                     self.selection = None;
                 } else {

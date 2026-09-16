@@ -1914,7 +1914,10 @@ async fn run_client_loop(
                             let (width, height) = state.reported_size;
                             let frame = state.shell.as_mut().and_then(|shell| {
                                 shell
-                                    .show_copy_feedback(std::time::Instant::now())
+                                    .show_copy_feedback(
+                                        crate::platform::SelectionTarget::Clipboard,
+                                        std::time::Instant::now(),
+                                    )
                                     .then(|| shell.compose(width, height))
                                     .flatten()
                             });

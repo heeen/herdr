@@ -261,6 +261,19 @@ pub struct ClipboardCommand {
     pub args: &'static [&'static str],
 }
 
+/// Which system selection a copy writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionTarget {
+    Clipboard,
+    /// The X11/Wayland selection that middle-click pastes.
+    Primary,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn write_primary_selection(_bytes: &[u8]) -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardImage {
     pub bytes: Vec<u8>,

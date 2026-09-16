@@ -907,9 +907,14 @@
         },
         {
           "key": "ui.copy_on_select",
-          "type": "boolean",
-          "default": "true",
-          "description": "Automatically copy text selected by mouse drag or double-click. When disabled, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection."
+          "type": "enum",
+          "default": "clipboard",
+          "description": "Where text selected by mouse drag or double-click is copied automatically. \"primary\" writes the X11/Wayland primary selection that middle-click pastes. When off, Ctrl+C or a host-forwarded Cmd+C copies the retained selection to the clipboard and clears it. true and false are accepted as clipboard and off.",
+          "values": [
+            "off",
+            "clipboard",
+            "primary"
+          ]
         },
         {
           "key": "ui.host_cursor",

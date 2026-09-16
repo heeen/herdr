@@ -29,7 +29,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
     pub(super) toast_position: crate::config::ToastHerdrPosition,
-    pub(super) copy_on_select: bool,
+    pub(super) copy_on_select: crate::config::CopyOnSelectConfig,
     pub(super) clipboard_toast_enabled: bool,
     pub(super) clipboard_toast_position: crate::config::ToastClipboardPosition,
     pub(super) theme_name: String,
@@ -246,7 +246,10 @@ pub(crate) enum ClientShellAction {
         boot_id: String,
         request: Box<crate::api::schema::Request>,
     },
-    ClipboardWrite(Vec<u8>),
+    ClipboardWrite {
+        target: crate::platform::SelectionTarget,
+        bytes: Vec<u8>,
+    },
     OpenSafeWebUrl(String),
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
@@ -641,7 +644,9 @@ pub(super) enum PendingEndpointKind {
     WorktreeRemove {
         forced: bool,
     },
-    SelectionCopy,
+    SelectionCopy {
+        target: crate::platform::SelectionTarget,
+    },
     PaneScroll {
         pane_id: String,
         serial: u64,
@@ -1796,12 +1801,20 @@ impl ClientShellState {
         }
     }
 
-    pub(crate) fn show_copy_feedback(&mut self, now: std::time::Instant) -> bool {
+    pub(crate) fn show_copy_feedback(
+        &mut self,
+        target: crate::platform::SelectionTarget,
+        now: std::time::Instant,
+    ) -> bool {
         if !self.config.clipboard_toast_enabled {
             return false;
         }
+        let message = match target {
+            crate::platform::SelectionTarget::Clipboard => "copied to clipboard",
+            crate::platform::SelectionTarget::Primary => "copied to primary selection",
+        };
         self.copy_feedback = Some(crate::app::state::CopyFeedback {
-            message: "copied to clipboard".to_owned(),
+            message: message.to_owned(),
         });
         self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
         true

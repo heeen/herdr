@@ -15,7 +15,7 @@
 use ratatui::layout::Rect;
 use std::{ffi::OsStr, io::Write};
 
-use crate::{layout::PaneId, pane::ScrollMetrics};
+use crate::{layout::PaneId, pane::ScrollMetrics, platform::SelectionTarget};
 
 /// Current phase of a selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,10 +296,14 @@ fn clamp_to_pane(screen_col: u16, screen_row: u16, pane_inner: Rect) -> (u16, u1
     (clamped_row - pane_inner.y, clamped_col - pane_inner.x)
 }
 
-fn osc52_sequence(bytes: &[u8]) -> String {
+fn osc52_sequence(target: SelectionTarget, bytes: &[u8]) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!("\x1b]52;c;{encoded}\x07")
+    let selection = match target {
+        SelectionTarget::Clipboard => 'c',
+        SelectionTarget::Primary => 'p',
+    };
+    format!("\x1b]52;{selection};{encoded}\x07")
 }
 
 fn contains_wsl_marker(value: &str) -> bool {
@@ -352,18 +356,23 @@ fn should_prefer_osc52() -> bool {
     )
 }
 
-/// Write clipboard bytes to the system clipboard via native platform tools or OSC 52.
+/// Write bytes to a system selection via native platform tools or OSC 52.
 ///
-/// OSC 52 format: `ESC ] 52 ; c ; <base64> BEL`
+/// OSC 52 format: `ESC ] 52 ; c ; <base64> BEL`, with `p` in place of `c` for PRIMARY.
 ///
 /// Some terminals still only honor BEL-terminated OSC 52 writes, so herdr
 /// emits BEL here even though ST works in newer emulators.
-pub fn write_osc52_bytes(bytes: &[u8]) {
-    if !should_prefer_osc52() && crate::platform::write_clipboard(bytes) {
+pub fn write_osc52_bytes(target: SelectionTarget, bytes: &[u8]) {
+    if !should_prefer_osc52()
+        && match target {
+            SelectionTarget::Clipboard => crate::platform::write_clipboard(bytes),
+            SelectionTarget::Primary => crate::platform::write_primary_selection(bytes),
+        }
+    {
         return;
     }
 
-    let sequence = osc52_sequence(bytes);
+    let sequence = osc52_sequence(target, bytes);
     let _ = std::io::stdout().write_all(sequence.as_bytes());
     let _ = std::io::stdout().flush();
 }
@@ -415,7 +424,14 @@ mod tests {
 
     #[test]
     fn osc52_sequence_uses_bel_terminator() {
-        assert_eq!(osc52_sequence(b"hello"), "\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(
+            osc52_sequence(SelectionTarget::Clipboard, b"hello"),
+            "\x1b]52;c;aGVsbG8=\x07"
+        );
+        assert_eq!(
+            osc52_sequence(SelectionTarget::Primary, b"hello"),
+            "\x1b]52;p;aGVsbG8=\x07"
+        );
     }
 
     #[test]

@@ -338,7 +338,7 @@ fn client_double_click_selects_word_and_copies_only_after_release() {
             );
             let copied = word_row_reply(&mut state, &word_read_id(&actions), "bravo");
             assert!(
-                matches!(&copied[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"bravo")
+                matches!(&copied[..], [ClientShellAction::ClipboardWrite { target: crate::platform::SelectionTarget::Clipboard, bytes }] if bytes == b"bravo")
             );
             assert!(state.tick_copy_feedback(state.selection_highlight_clear_deadline.unwrap()));
             assert!(state.selection.is_none());
@@ -355,7 +355,11 @@ fn client_double_click_selects_word_and_copies_only_after_release() {
 
 fn word_drag_state(copy_on_select: bool) -> ClientShellState {
     let mut config = Config::default();
-    config.ui.copy_on_select = copy_on_select;
+    config.ui.copy_on_select = if copy_on_select {
+        crate::config::CopyOnSelectConfig::Clipboard
+    } else {
+        crate::config::CopyOnSelectConfig::Off
+    };
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
@@ -505,7 +509,7 @@ fn double_click_drag_waits_for_latest_row_before_copying() {
             "bravo charlie\ndelta echo foxtrot\ngolf hotel",
         );
         assert!(
-            matches!(&copied[..], [ClientShellAction::ClipboardWrite(bytes)]
+            matches!(&copied[..], [ClientShellAction::ClipboardWrite { target: crate::platform::SelectionTarget::Clipboard, bytes }]
             if bytes == b"bravo charlie\ndelta echo foxtrot\ngolf hotel")
         );
     }
@@ -1158,4 +1162,42 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
         })]);
     assert!(outside.repaint);
     assert!(state.overlay.is_none());
+}
+
+#[test]
+fn copy_on_select_primary_writes_the_drag_selection_to_primary() {
+    let mut config = Config::default();
+    config.ui.copy_on_select = crate::config::CopyOnSelectConfig::Primary;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("pane frame");
+    let pane = state.hits.panes[0].clone();
+    let mut mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: pane.inner_rect.x,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    };
+    state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+    mouse.column += 2;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    mouse.kind = MouseEventKind::Up(MouseButton::Left);
+    let release = state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+
+    let copied = word_row_reply(&mut state, &word_read_id(&release.actions), "abc");
+
+    assert!(matches!(
+        &copied[..],
+        [ClientShellAction::ClipboardWrite { target: crate::platform::SelectionTarget::Primary, bytes }]
+            if bytes == b"abc"
+    ));
+    assert_eq!(
+        state
+            .copy_feedback
+            .as_ref()
+            .map(|feedback| feedback.message.as_str()),
+        Some("copied to primary selection")
+    );
 }
