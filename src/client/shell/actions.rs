@@ -268,7 +268,12 @@ impl ClientShellState {
         }
     }
 
-    pub(super) fn request_selection_copy(&mut self, outcome: &mut ClientShellInput, live: bool) {
+    pub(super) fn request_selection_copy(
+        &mut self,
+        target: crate::platform::SelectionTarget,
+        outcome: &mut ClientShellInput,
+        live: bool,
+    ) {
         let Some(selection) = self.selection.as_ref() else {
             return;
         };
@@ -297,7 +302,7 @@ impl ClientShellState {
                     content_revision,
                 },
             ),
-            PendingEndpointKind::SelectionCopy,
+            PendingEndpointKind::SelectionCopy { target },
             outcome,
         );
     }
@@ -633,14 +638,17 @@ impl ClientShellState {
                 let repaint = self.complete_pane_scroll(pane_id, serial, result, &mut outcome);
                 return (repaint, outcome.actions);
             }
-            PendingEndpointKind::SelectionCopy => {
+            PendingEndpointKind::SelectionCopy { target } => {
                 return match result {
                     Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. })
                         if !text.is_empty() =>
                     {
                         (
                             false,
-                            vec![ClientShellAction::ClipboardWrite(text.into_bytes())],
+                            vec![ClientShellAction::ClipboardWrite {
+                                target,
+                                bytes: text.into_bytes(),
+                            }],
                         )
                     }
                     Ok(crate::api::schema::ResponseResult::PaneSelection { .. }) => {

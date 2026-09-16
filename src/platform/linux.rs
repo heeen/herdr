@@ -9,7 +9,9 @@ use std::{
 
 pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
 
-use super::{ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess, Signal};
+use super::{
+    ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess, SelectionTarget, Signal,
+};
 
 mod clipboard;
 
@@ -853,13 +855,18 @@ pub fn process_exists(pid: u32) -> bool {
 }
 
 pub fn write_clipboard(bytes: &[u8]) -> bool {
+    write_selection(SelectionTarget::Clipboard, bytes)
+}
+
+pub fn write_primary_selection(bytes: &[u8]) -> bool {
+    write_selection(SelectionTarget::Primary, bytes)
+}
+
+fn write_selection(target: SelectionTarget, bytes: &[u8]) -> bool {
     let deadline = std::time::Instant::now() + clipboard::TIMEOUT;
-    for command in clipboard_commands() {
-        if run_clipboard_command_until(&command, bytes, deadline) {
-            return true;
-        }
-    }
-    false
+    clipboard_commands(target)
+        .iter()
+        .any(|command| run_clipboard_command_until(command, bytes, deadline))
 }
 
 pub fn read_clipboard_text() -> Option<String> {
@@ -1047,24 +1054,35 @@ fn read_clipboard_image_with_spawned_command_max(
     )
 }
 
-fn clipboard_commands() -> Vec<ClipboardCommand> {
+// The display variables are the only reliable way to find the right seat. Guessing a socket under
+// $XDG_RUNTIME_DIR is per user, not per seat, so it can reach another seat's selection.
+fn clipboard_commands(target: SelectionTarget) -> Vec<ClipboardCommand> {
     let mut commands = Vec::new();
 
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         commands.push(ClipboardCommand {
             program: "wl-copy",
-            args: &["--type", "text/plain;charset=utf-8"],
+            args: match target {
+                SelectionTarget::Clipboard => &["--type", "text/plain;charset=utf-8"],
+                SelectionTarget::Primary => &["--primary", "--type", "text/plain;charset=utf-8"],
+            },
         });
     }
 
     if std::env::var_os("DISPLAY").is_some() {
         commands.push(ClipboardCommand {
             program: "xclip",
-            args: &["-selection", "clipboard", "-in"],
+            args: match target {
+                SelectionTarget::Clipboard => &["-selection", "clipboard", "-in"],
+                SelectionTarget::Primary => &["-selection", "primary", "-in"],
+            },
         });
         commands.push(ClipboardCommand {
             program: "xsel",
-            args: &["--clipboard", "--input"],
+            args: match target {
+                SelectionTarget::Clipboard => &["--clipboard", "--input"],
+                SelectionTarget::Primary => &["--primary", "--input"],
+            },
         });
     }
 
@@ -1688,7 +1706,7 @@ mod tests {
             std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
             std::env::remove_var("DISPLAY");
         }
-        let commands = clipboard_commands();
+        let commands = clipboard_commands(SelectionTarget::Clipboard);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].program, "wl-copy");
     }
@@ -1955,7 +1973,7 @@ mod tests {
             std::env::remove_var("WAYLAND_DISPLAY");
             std::env::set_var("DISPLAY", ":0");
         }
-        let commands = clipboard_commands();
+        let commands = clipboard_commands(SelectionTarget::Clipboard);
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "xclip");
         assert_eq!(commands[1].program, "xsel");
@@ -1974,6 +1992,38 @@ mod tests {
         assert_eq!(commands[1].program, "wl-paste");
         assert_eq!(commands[2].program, "xclip");
         assert_eq!(commands[3].program, "xsel");
+    }
+
+    #[test]
+    fn primary_selection_commands_target_primary_on_every_backend() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let write = clipboard_commands(SelectionTarget::Primary);
+
+        assert_eq!(
+            write
+                .iter()
+                .map(|command| (command.program, command.args))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "wl-copy",
+                    &["--primary", "--type", "text/plain;charset=utf-8"][..]
+                ),
+                ("xclip", &["-selection", "primary", "-in"][..]),
+                ("xsel", &["--primary", "--input"][..]),
+            ]
+        );
+        for command in clipboard_commands(SelectionTarget::Clipboard) {
+            assert!(
+                !command.args.iter().any(|arg| arg.contains("primary")),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
