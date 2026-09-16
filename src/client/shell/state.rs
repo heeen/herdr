@@ -921,6 +921,8 @@ pub(crate) struct ClientShellState {
     pub(super) pane_scroll_targets: HashMap<String, usize>,
     pub(super) copy_feedback: Option<crate::app::state::CopyFeedback>,
     pub(super) copy_feedback_deadline: Option<std::time::Instant>,
+    /// Swappable so tests do not read the developer's real selection.
+    pub(super) read_primary_selection: fn() -> crate::platform::PrimarySelectionRead,
     pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
     pub(super) popup_pending: bool,
@@ -1086,6 +1088,7 @@ impl ClientShellState {
             pane_scroll_targets: HashMap::new(),
             copy_feedback: None,
             copy_feedback_deadline: None,
+            read_primary_selection: crate::platform::read_primary_selection_text,
             host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
             popup_pending: false,
@@ -1817,6 +1820,19 @@ impl ClientShellState {
             message: message.to_owned(),
         });
         self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
+        true
+    }
+
+    /// Shown when middle-click cannot reach the seat, e.g. herdr running over ssh, where the host
+    /// terminal can still paste its own selection because Shift bypasses mouse reporting.
+    pub(super) fn show_primary_paste_hint(&mut self, now: std::time::Instant) -> bool {
+        if !self.config.clipboard_toast_enabled {
+            return false;
+        }
+        self.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "to paste your primary selection, use shift+middle-click".to_owned(),
+        });
+        self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(4));
         true
     }
 

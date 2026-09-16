@@ -138,6 +138,26 @@ impl ClientShellState {
         repaint
     }
 
+    /// Middle-click pastes PRIMARY into a pane whose program has not claimed the mouse, as xterm
+    /// does. The read happens here in the client because only the client knows which seat the user
+    /// is sitting at; a server can have clients from several seats attached.
+    fn paste_primary_selection(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
+        match (self.read_primary_selection)() {
+            crate::platform::PrimarySelectionRead::Text(text) if !text.is_empty() => {
+                super::push_target_event(
+                    ClientInputTarget::Pane(pane_id),
+                    ClientPaneInputEvent::Paste(text),
+                    outcome,
+                );
+            }
+            crate::platform::PrimarySelectionRead::NoDisplay => {
+                outcome.repaint |= self.show_primary_paste_hint(std::time::Instant::now());
+            }
+            crate::platform::PrimarySelectionRead::Text(_)
+            | crate::platform::PrimarySelectionRead::Nothing => {}
+        }
+    }
+
     pub(super) fn stop_selection_autoscroll(&mut self) {
         self.selection_autoscroll = None;
         self.selection_autoscroll_deadline = None;
@@ -2254,17 +2274,21 @@ impl ClientShellState {
                     .hits
                     .panes
                     .iter()
-                    .find(|hit| super::contains(hit.inner_rect, point) && hit.mouse_reporting)
+                    .find(|hit| super::contains(hit.inner_rect, point))
                     .cloned()
                 {
-                    self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
-                    self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
-                        last_position: self.pane_mouse_position(&hit, mouse),
-                        hit,
-                        button: MouseButton::Middle,
-                        stripped_modifiers: crossterm::event::KeyModifiers::empty(),
-                        last_event: mouse,
-                    });
+                    if hit.mouse_reporting {
+                        self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                        self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            last_position: self.pane_mouse_position(&hit, mouse),
+                            hit,
+                            button: MouseButton::Middle,
+                            stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                            last_event: mouse,
+                        });
+                    } else {
+                        self.paste_primary_selection(hit.pane_id, outcome);
+                    }
                 }
             }
             MouseEventKind::Up(MouseButton::Left | MouseButton::Middle)

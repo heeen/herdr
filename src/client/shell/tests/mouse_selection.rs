@@ -1164,6 +1164,94 @@ fn context_menu_keyboard_and_outside_click_are_client_owned() {
     assert!(state.overlay.is_none());
 }
 
+fn middle_click_state(mouse_reporting: bool) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].mouse_reporting = mouse_reporting;
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    state
+}
+
+fn middle_click(state: &mut ClientShellState) -> ClientShellInput {
+    let pane = state.hits.panes[0].clone();
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Middle),
+        column: pane.inner_rect.x + 1,
+        row: pane.inner_rect.y + 1,
+        modifiers: KeyModifiers::empty(),
+    })])
+}
+
+#[test]
+fn middle_click_pastes_the_primary_selection_into_a_pane_without_mouse_reporting() {
+    let mut state = middle_click_state(false);
+    state.read_primary_selection =
+        || crate::platform::PrimarySelectionRead::Text("selected words".into());
+
+    let outcome = middle_click(&mut state);
+
+    assert!(matches!(
+        &outcome.requests[..],
+        [ClientMessage::ClientShellPaneInput { pane_id, events }]
+            if pane_id == "pane_1"
+                && matches!(&events[..], [ClientPaneInputEvent::Paste(text)] if text == "selected words")
+    ));
+    assert!(state.copy_feedback.is_none());
+}
+
+#[test]
+fn middle_click_leaves_a_mouse_reporting_pane_its_own_click() {
+    let mut state = middle_click_state(true);
+    state.read_primary_selection = || panic!("a pane that owns the mouse must not trigger a read");
+
+    let outcome = middle_click(&mut state);
+
+    assert!(matches!(
+        &outcome.requests[..],
+        [ClientMessage::ClientShellPaneInput { events, .. }]
+            if matches!(&events[..], [ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Middle),
+                ..
+            }])
+    ));
+}
+
+#[test]
+fn middle_click_without_a_display_points_at_the_host_terminal_paste() {
+    let mut state = middle_click_state(false);
+    state.read_primary_selection = || crate::platform::PrimarySelectionRead::NoDisplay;
+
+    let outcome = middle_click(&mut state);
+
+    assert!(outcome.requests.is_empty());
+    assert!(outcome.repaint);
+    assert!(state
+        .copy_feedback
+        .as_ref()
+        .is_some_and(|feedback| feedback.message.contains("shift+middle-click")));
+}
+
+#[test]
+fn middle_click_with_an_empty_selection_does_nothing() {
+    for read in [
+        (|| crate::platform::PrimarySelectionRead::Nothing) as fn() -> _,
+        || crate::platform::PrimarySelectionRead::Text(String::new()),
+    ] {
+        let mut state = middle_click_state(false);
+        state.read_primary_selection = read;
+
+        let outcome = middle_click(&mut state);
+
+        assert!(outcome.requests.is_empty());
+        assert!(
+            state.copy_feedback.is_none(),
+            "the hint is only for a missing display"
+        );
+    }
+}
+
 #[test]
 fn copy_on_select_primary_writes_the_drag_selection_to_primary() {
     let mut config = Config::default();

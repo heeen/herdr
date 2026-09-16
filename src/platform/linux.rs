@@ -15,7 +15,7 @@ pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, SelectionTarget, Signal,
+    LimitedRead, PrimarySelectionRead, SelectionTarget, Signal,
 };
 
 pub(crate) use super::unix_common::{
@@ -796,12 +796,20 @@ fn write_selection(target: SelectionTarget, bytes: &[u8]) -> bool {
 }
 
 pub fn read_clipboard_text() -> Option<String> {
-    for command in read_clipboard_text_commands() {
-        if let Some(text) = read_clipboard_text_with_command(&command) {
-            return Some(text);
-        }
+    read_clipboard_text_commands(SelectionTarget::Clipboard)
+        .iter()
+        .find_map(read_clipboard_text_with_command)
+}
+
+pub fn read_primary_selection_text() -> PrimarySelectionRead {
+    let commands = read_clipboard_text_commands(SelectionTarget::Primary);
+    if commands.is_empty() {
+        return PrimarySelectionRead::NoDisplay;
     }
-    None
+    commands
+        .iter()
+        .find_map(read_clipboard_text_with_command)
+        .map_or(PrimarySelectionRead::Nothing, PrimarySelectionRead::Text)
 }
 
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
@@ -1064,28 +1072,44 @@ fn clipboard_commands(target: SelectionTarget) -> Vec<ClipboardCommand> {
     commands
 }
 
-fn read_clipboard_text_commands() -> Vec<ClipboardCommand> {
+fn read_clipboard_text_commands(target: SelectionTarget) -> Vec<ClipboardCommand> {
     let mut commands = Vec::new();
 
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let (utf8, plain): (&'static [&'static str], &'static [&'static str]) = match target {
+            SelectionTarget::Clipboard => (
+                &["--type", "text/plain;charset=utf-8"],
+                &["--type", "text/plain"],
+            ),
+            SelectionTarget::Primary => (
+                &["--primary", "--type", "text/plain;charset=utf-8"],
+                &["--primary", "--type", "text/plain"],
+            ),
+        };
         commands.push(ClipboardCommand {
             program: "wl-paste",
-            args: &["--type", "text/plain;charset=utf-8"],
+            args: utf8,
         });
         commands.push(ClipboardCommand {
             program: "wl-paste",
-            args: &["--type", "text/plain"],
+            args: plain,
         });
     }
 
     if std::env::var_os("DISPLAY").is_some() {
         commands.push(ClipboardCommand {
             program: "xclip",
-            args: &["-selection", "clipboard", "-out"],
+            args: match target {
+                SelectionTarget::Clipboard => &["-selection", "clipboard", "-out"],
+                SelectionTarget::Primary => &["-selection", "primary", "-out"],
+            },
         });
         commands.push(ClipboardCommand {
             program: "xsel",
-            args: &["--clipboard", "--output"],
+            args: match target {
+                SelectionTarget::Clipboard => &["--clipboard", "--output"],
+                SelectionTarget::Primary => &["--primary", "--output"],
+            },
         });
     }
 
@@ -1968,7 +1992,7 @@ mod tests {
             std::env::set_var("DISPLAY", ":0");
         }
 
-        let commands = read_clipboard_text_commands();
+        let commands = read_clipboard_text_commands(SelectionTarget::Clipboard);
         assert_eq!(commands[0].program, "wl-paste");
         assert_eq!(commands[1].program, "wl-paste");
         assert_eq!(commands[2].program, "xclip");
@@ -1984,6 +2008,7 @@ mod tests {
         }
 
         let write = clipboard_commands(SelectionTarget::Primary);
+        let read = read_clipboard_text_commands(SelectionTarget::Primary);
 
         assert_eq!(
             write
@@ -1999,12 +2024,43 @@ mod tests {
                 ("xsel", &["--primary", "--input"][..]),
             ]
         );
-        for command in clipboard_commands(SelectionTarget::Clipboard) {
+        assert_eq!(
+            read.iter()
+                .map(|command| (command.program, command.args))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "wl-paste",
+                    &["--primary", "--type", "text/plain;charset=utf-8"][..]
+                ),
+                ("wl-paste", &["--primary", "--type", "text/plain"][..]),
+                ("xclip", &["-selection", "primary", "-out"][..]),
+                ("xsel", &["--primary", "--output"][..]),
+            ]
+        );
+        for command in clipboard_commands(SelectionTarget::Clipboard)
+            .iter()
+            .chain(&read_clipboard_text_commands(SelectionTarget::Clipboard))
+        {
             assert!(
                 !command.args.iter().any(|arg| arg.contains("primary")),
                 "{command:?}"
             );
         }
+    }
+
+    #[test]
+    fn primary_selection_read_without_a_display_reports_it() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            std::env::remove_var("DISPLAY");
+        }
+
+        assert_eq!(
+            read_primary_selection_text(),
+            PrimarySelectionRead::NoDisplay
+        );
     }
 
     #[test]

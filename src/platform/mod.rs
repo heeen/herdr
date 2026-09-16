@@ -269,9 +269,24 @@ pub enum SelectionTarget {
     Primary,
 }
 
+/// What reading the X11/Wayland PRIMARY selection produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimarySelectionRead {
+    Text(String),
+    /// The selection is empty or unreadable, or the platform has no primary selection.
+    Nothing,
+    /// This process has no display session to read from, e.g. herdr running over ssh.
+    NoDisplay,
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn write_primary_selection(_bytes: &[u8]) -> bool {
     false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_primary_selection_text() -> PrimarySelectionRead {
+    PrimarySelectionRead::Nothing
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
