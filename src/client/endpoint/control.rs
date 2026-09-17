@@ -8,6 +8,11 @@ pub(crate) struct DecodedAgentViewProjection {
 
 pub(crate) enum EndpointControlMessage {
     HealthPong,
+    ClipboardWrite {
+        target: crate::platform::SelectionTarget,
+        /// Base64-encoded text.
+        data: String,
+    },
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
@@ -52,6 +57,22 @@ pub(crate) fn decode_endpoint_control(
                 view,
             },
         ));
+    }
+    if kind == crate::protocol::endpoint::CLIPBOARD_WRITE_KIND {
+        // A write this client cannot place (malformed, or a selection added later) is dropped
+        // rather than guessed onto the clipboard.
+        let Ok(write): Result<crate::protocol::endpoint::EndpointClipboardWrite, _> =
+            serde_json::from_str(data)
+        else {
+            return Ok(EndpointControlMessage::Ignored);
+        };
+        let Some(target) = write.target.selection() else {
+            return Ok(EndpointControlMessage::Ignored);
+        };
+        return Ok(EndpointControlMessage::ClipboardWrite {
+            target,
+            data: write.data,
+        });
     }
     if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
         let snapshot = serde_json::from_str(data)
@@ -160,6 +181,47 @@ mod tests {
                 "not json"
             )
             .unwrap(),
+            EndpointControlMessage::Ignored
+        ));
+    }
+
+    #[test]
+    fn clipboard_writes_decode_their_selection_and_drop_unknown_ones() {
+        let decode = |target| {
+            let write = crate::protocol::endpoint::EndpointClipboardWrite {
+                data: "aGk=".into(),
+                target,
+                pane_id: None,
+                agent: None,
+            };
+            let crate::protocol::ServerMessage::EndpointControl { kind, data } =
+                crate::protocol::endpoint::clipboard_write_message(&write).unwrap()
+            else {
+                panic!("clipboard write control");
+            };
+            decode_endpoint_control(&kind, &data).unwrap()
+        };
+        assert!(matches!(
+            decode(crate::protocol::endpoint::EndpointClipboardTarget::Primary),
+            EndpointControlMessage::ClipboardWrite {
+                target: crate::platform::SelectionTarget::Primary,
+                ref data,
+            } if data == "aGk="
+        ));
+        assert!(matches!(
+            decode(crate::protocol::endpoint::EndpointClipboardTarget::Clipboard),
+            EndpointControlMessage::ClipboardWrite {
+                target: crate::platform::SelectionTarget::Clipboard,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(crate::protocol::endpoint::EndpointClipboardTarget::Unknown),
+            EndpointControlMessage::Ignored
+        ));
+        assert!(matches!(
+            decode_endpoint_control(crate::protocol::endpoint::CLIPBOARD_WRITE_KIND, "not json")
+                .unwrap(),
             EndpointControlMessage::Ignored
         ));
     }

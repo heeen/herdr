@@ -179,6 +179,7 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite {
+        pane_id: PaneId,
         write: crate::ghostty::ClipboardWrite,
     },
     /// A pane child reported its shell current directory through terminal

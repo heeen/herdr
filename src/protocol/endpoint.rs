@@ -38,6 +38,8 @@ pub struct EndpointAgentCompletions {
     pub revision: u64,
     pub completions: std::collections::BTreeMap<String, u64>,
 }
+pub const CLIPBOARD_WRITE_CAPABILITY: &str = "clipboard_write";
+pub const CLIPBOARD_WRITE_KIND: &str = "endpoint.clipboard.write.v1";
 
 fn default_true() -> bool {
     true
@@ -64,6 +66,10 @@ pub struct EndpointClientHello {
     /// Accept the optional scroll-aware patch encoding on this connection.
     #[serde(default)]
     pub surface_scroll: bool,
+    /// Receive pane clipboard writes as `CLIPBOARD_WRITE_KIND`, which names the addressed
+    /// selection, instead of `ServerMessage::Clipboard`.
+    #[serde(default)]
+    pub clipboard_write: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -88,6 +94,49 @@ pub struct EndpointAgentViewProjection {
     pub revision: u64,
     #[serde(default)]
     pub view: Option<serde_json::Value>,
+}
+
+/// A clipboard write from a pane's program, for clients that negotiated `clipboard_write`.
+/// `ServerMessage::Clipboard` cannot name a selection, so it only ever carries clipboard writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointClipboardWrite {
+    /// Base64-encoded text, as in `ServerMessage::Clipboard`.
+    pub data: String,
+    pub target: EndpointClipboardTarget,
+    /// Public id of the pane whose program wrote, when it belongs to a workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// Canonical id of the agent detected in that pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointClipboardTarget {
+    Clipboard,
+    Primary,
+    #[serde(other)]
+    Unknown,
+}
+
+impl EndpointClipboardTarget {
+    pub fn selection(self) -> Option<crate::platform::SelectionTarget> {
+        match self {
+            Self::Clipboard => Some(crate::platform::SelectionTarget::Clipboard),
+            Self::Primary => Some(crate::platform::SelectionTarget::Primary),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl From<crate::ghostty::ClipboardTarget> for EndpointClipboardTarget {
+    fn from(target: crate::ghostty::ClipboardTarget) -> Self {
+        match target {
+            crate::ghostty::ClipboardTarget::Clipboard => Self::Clipboard,
+            crate::ghostty::ClipboardTarget::Primary => Self::Primary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +187,15 @@ pub fn agent_view_projection_message(
     })
 }
 
+pub fn clipboard_write_message(
+    write: &EndpointClipboardWrite,
+) -> serde_json::Result<ServerMessage> {
+    Ok(ServerMessage::EndpointControl {
+        kind: CLIPBOARD_WRITE_KIND.into(),
+        data: serde_json::to_string(write)?,
+    })
+}
+
 impl EndpointClientHello {
     pub fn supports_required_codecs(&self) -> bool {
         self.snapshot_codecs
@@ -174,6 +232,7 @@ impl EndpointServerWelcome {
                 HEALTH_CHECK_CAPABILITY.into(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
+                CLIPBOARD_WRITE_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -215,6 +274,7 @@ mod tests {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -364,11 +424,40 @@ mod tests {
         value.as_object_mut().unwrap().remove("surface_reuse");
         value.as_object_mut().unwrap().remove("surface_delta");
         value.as_object_mut().unwrap().remove("surface_scroll");
+        value.as_object_mut().unwrap().remove("clipboard_write");
         let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
         assert!(decoded.surface_active);
         assert!(!decoded.surface_reuse);
         assert!(!decoded.surface_delta);
         assert!(!decoded.surface_scroll);
+        assert!(!decoded.clipboard_write);
+    }
+
+    #[test]
+    fn clipboard_write_round_trips_and_tolerates_future_targets_and_fields() {
+        let write = EndpointClipboardWrite {
+            data: "aGk=".into(),
+            target: EndpointClipboardTarget::Primary,
+            pane_id: Some("w1:p2".into()),
+            agent: Some("claude".into()),
+        };
+        let ServerMessage::EndpointControl { kind, data } =
+            clipboard_write_message(&write).unwrap()
+        else {
+            panic!("clipboard writes travel as endpoint controls");
+        };
+        assert_eq!(kind, CLIPBOARD_WRITE_KIND);
+        assert_eq!(
+            serde_json::from_str::<EndpointClipboardWrite>(&data).unwrap(),
+            write
+        );
+
+        let future: EndpointClipboardWrite =
+            serde_json::from_str(r#"{"data":"aGk=","target":"secondary","mime":"text/html"}"#)
+                .unwrap();
+        assert_eq!(future.target, EndpointClipboardTarget::Unknown);
+        assert_eq!(future.target.selection(), None);
+        assert_eq!((future.pane_id, future.agent), (None, None));
     }
 
     #[test]
@@ -385,6 +474,7 @@ mod tests {
                 HEALTH_CHECK_CAPABILITY.to_string(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
+                CLIPBOARD_WRITE_CAPABILITY.to_string(),
             ]
         );
     }

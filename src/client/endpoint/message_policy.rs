@@ -25,8 +25,14 @@ pub(crate) fn accepts_endpoint_message(
     endpoint_active
         || matches!(
             message,
-            ServerMessage::EndpointControl { .. }
-                | ServerMessage::SemanticNotification(_)
+            ServerMessage::EndpointControl { kind, .. }
+                // A clipboard write is a host effect like `ServerMessage::Clipboard`: only the
+                // endpoint the user is looking at may place text on their selections.
+                if kind != crate::protocol::endpoint::CLIPBOARD_WRITE_KIND
+        )
+        || matches!(
+            message,
+            ServerMessage::SemanticNotification(_)
                 | ServerMessage::ServerShutdown { .. }
                 | ServerMessage::ClientShellSnapshot(_)
                 | ServerMessage::Welcome { .. }
@@ -66,6 +72,22 @@ mod tests {
             &ServerMessage::Clipboard {
                 data: "text".into()
             }
+        ));
+        let clipboard_write = ServerMessage::EndpointControl {
+            kind: crate::protocol::endpoint::CLIPBOARD_WRITE_KIND.into(),
+            data: "{}".into(),
+        };
+        assert!(!accepts_endpoint_message(
+            false,
+            false,
+            false,
+            &clipboard_write
+        ));
+        assert!(accepts_endpoint_message(
+            true,
+            false,
+            false,
+            &clipboard_write
         ));
         assert!(!accepts_endpoint_message(
             false,
