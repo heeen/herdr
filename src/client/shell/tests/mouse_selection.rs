@@ -1357,7 +1357,7 @@ fn copy_on_select_primary_writes_the_drag_selection_to_primary() {
         "feedback must wait for selection dispatch"
     );
     assert!(state.show_copy_feedback(
-        crate::platform::SelectionTarget::Primary,
+        &[crate::platform::SelectionTarget::Primary],
         std::time::Instant::now()
     ));
     assert_eq!(
