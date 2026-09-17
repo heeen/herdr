@@ -722,6 +722,7 @@ async fn client_shell_attach_seeds_workspace() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 6,
             surface_cols: 80,
             surface_rows: 23,
@@ -765,6 +766,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_reuse: false,
         surface_delta: false,
         surface_scroll: false,
+        clipboard_write: false,
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -814,6 +816,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id,
             surface_cols: 80,
             surface_rows: 23,
@@ -933,6 +936,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 77,
             surface_cols: 80,
             surface_rows: 23,
@@ -1036,6 +1040,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -1204,6 +1209,7 @@ fn connect_test_shell(
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id,
             surface_cols,
             surface_rows,
@@ -1809,6 +1815,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 13,
             surface_cols: 80,
             surface_rows: 23,
@@ -1834,6 +1841,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 14,
             surface_cols: 80,
             surface_rows: 23,
@@ -2754,6 +2762,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 9,
             surface_cols: 80,
             surface_rows: 23,
@@ -3001,6 +3010,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            clipboard_write: false,
             client_id: 12,
             surface_cols: 80,
             surface_rows: 23,
@@ -6640,6 +6650,7 @@ fn clipboard_write_targets_foreground_client_only() {
 
 fn test_clipboard_write(target: crate::ghostty::ClipboardTarget) -> AppEvent {
     AppEvent::ClipboardWrite {
+        pane_id: crate::layout::PaneId::from_raw(1),
         write: crate::ghostty::ClipboardWrite {
             target,
             content: b"test".to_vec(),
@@ -6675,6 +6686,65 @@ fn primary_clipboard_write_is_not_sent_as_a_legacy_clipboard_message() {
             .is_err(),
         "the legacy message has no selection field, so a primary write must not land on the clipboard"
     );
+}
+
+#[test]
+fn negotiated_client_receives_the_selection_source_pane_and_agent_of_a_clipboard_write() {
+    let mut server = test_headless_server();
+    server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+    server.app.state.ensure_test_terminals();
+    let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Claude);
+    let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+    let mut connection = ClientConnection::new(
+        (80, 24),
+        crate::kitty_graphics::HostCellSize::default(),
+        1,
+        RenderEncoding::SemanticFrame,
+        Some(foreground_tx),
+    );
+    connection.shell_clipboard_write = true;
+    server.clients.insert(1, connection);
+    server.foreground_client_id = Some(1);
+
+    let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
+        pane_id,
+        write: crate::ghostty::ClipboardWrite {
+            target: crate::ghostty::ClipboardTarget::Primary,
+            content: b"test".to_vec(),
+        },
+    });
+
+    assert!(!changed);
+    let ServerMessage::EndpointControl { kind, data } = read_server_message(
+        foreground_control_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("foreground clipboard write"),
+    ) else {
+        panic!("a negotiated client receives the clipboard write as an endpoint control");
+    };
+    assert_eq!(kind, crate::protocol::endpoint::CLIPBOARD_WRITE_KIND);
+    let write: crate::protocol::endpoint::EndpointClipboardWrite =
+        serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        write,
+        crate::protocol::endpoint::EndpointClipboardWrite {
+            data: "dGVzdA==".into(),
+            target: crate::protocol::endpoint::EndpointClipboardTarget::Primary,
+            pane_id: server.app.public_pane_id(0, pane_id),
+            agent: Some("claude".into()),
+        }
+    );
+    assert!(write.pane_id.is_some());
 }
 
 #[test]

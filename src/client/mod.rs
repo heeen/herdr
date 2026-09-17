@@ -41,9 +41,9 @@ mod terminal_setup;
 mod timer;
 mod transport;
 
+use clipboard_forwarding::apply_pane_clipboard_write;
 #[cfg(test)]
 use clipboard_forwarding::decode_clipboard_payload;
-use clipboard_forwarding::forward_clipboard;
 #[cfg(test)]
 use config_reload::reload_local_client_config;
 use config_reload::{apply_reload, init_logging};
@@ -1910,22 +1910,11 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::Clipboard { data } => {
-                        if forward_clipboard(&data) {
-                            let (width, height) = state.reported_size;
-                            let frame = state.shell.as_mut().and_then(|shell| {
-                                shell
-                                    .show_copy_feedback(
-                                        crate::platform::SelectionTarget::Clipboard,
-                                        std::time::Instant::now(),
-                                    )
-                                    .then(|| shell.compose(width, height))
-                                    .flatten()
-                            });
-                            if let Some(frame) = frame {
-                                state.present_frame(frame);
-                            }
-                        }
-                        let _ = io::stdout().flush();
+                        apply_pane_clipboard_write(
+                            &mut state,
+                            crate::platform::SelectionTarget::Clipboard,
+                            &data,
+                        );
                     }
                     ServerMessage::WindowTitle { title } => {
                         let _ = crate::terminal_effects::write_window_title(
@@ -2020,6 +2009,13 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::ClipboardWrite {
+                                target,
+                                data,
+                            }) => {
+                                apply_pane_clipboard_write(&mut state, target, &data);
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,
                             )) => {

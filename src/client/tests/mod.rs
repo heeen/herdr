@@ -971,6 +971,10 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
 fn forward_clipboard_uses_local_clipboard_path() {
     let _guard = env_lock().lock().unwrap();
     let _ssh = EnvVarGuard::set("SSH_CONNECTION", "1 2 3 4");
-    assert!(forward_clipboard("dGVzdA=="));
-    assert!(!forward_clipboard("not base64"));
+    let target = crate::platform::SelectionTarget::Clipboard;
+    assert!(clipboard_forwarding::forward_clipboard(target, "dGVzdA=="));
+    assert!(!clipboard_forwarding::forward_clipboard(
+        target,
+        "not base64"
+    ));
 }
