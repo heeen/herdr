@@ -224,7 +224,7 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
 fn clipboard_feedback_is_client_local_and_respects_config() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     let now = std::time::Instant::now();
-    assert!(state.show_copy_feedback(crate::platform::SelectionTarget::Clipboard, now));
+    assert!(state.show_copy_feedback(&[crate::platform::SelectionTarget::Clipboard], now));
     assert_eq!(
         state
             .copy_feedback
@@ -240,7 +240,7 @@ fn clipboard_feedback_is_client_local_and_respects_config() {
     state.config.clipboard_toast_enabled = false;
     state.copy_feedback = None;
     state.copy_feedback_deadline = None;
-    assert!(!state.show_copy_feedback(crate::platform::SelectionTarget::Clipboard, now));
+    assert!(!state.show_copy_feedback(&[crate::platform::SelectionTarget::Clipboard], now));
     assert!(state.copy_feedback.is_none());
     assert!(state.copy_feedback_deadline.is_none());
 }

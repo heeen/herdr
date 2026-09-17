@@ -214,6 +214,7 @@ fn run_client_with_mode(
         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
     let mut loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
+        clipboard_config: loaded_config.config.ui.clipboard,
         mouse_scroll_lines,
         redraw_on_focus_gained,
         host_cursor,
@@ -467,6 +468,7 @@ async fn run_client_loop(
         reported_size: (cols, rows),
         reported_cell_size: (initial_cell_width_px, initial_cell_height_px),
         sound_config: config.sound_config,
+        clipboard_config: config.clipboard_config,
         kitty_graphics_enabled: config.kitty_graphics_enabled,
         pixel_geometry_enabled: config.pixel_geometry_enabled,
         pixel_geometry_exact: initial_pixel_geometry_exact,
@@ -1984,9 +1986,12 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::Clipboard { data } => {
+                        // A legacy server sends no selection or agent, so this is a clipboard
+                        // write from an unknown pane.
                         apply_pane_clipboard_write(
                             &mut state,
                             crate::platform::SelectionTarget::Clipboard,
+                            None,
                             &data,
                         );
                     }
@@ -2085,9 +2090,15 @@ async fn run_client_loop(
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
                             Ok(endpoint::EndpointControlMessage::ClipboardWrite {
                                 target,
+                                agent,
                                 data,
                             }) => {
-                                apply_pane_clipboard_write(&mut state, target, &data);
+                                apply_pane_clipboard_write(
+                                    &mut state,
+                                    target,
+                                    agent.as_deref(),
+                                    &data,
+                                );
                                 continue;
                             }
                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
