@@ -1060,6 +1060,12 @@
           ]
         },
         {
+          "key": "ui.clipboard.agents",
+          "type": "table of clipboard routes",
+          "default": "{}",
+          "description": "Where clipboard writes from an agent's pane are placed, keyed by strict canonical agent id: \"clipboard\", \"primary\", or \"both\". Agents without an entry keep the selection the program addressed in its OSC 52 write."
+        },
+        {
           "key": "ui.sidebar.agents.row_gap",
           "type": "integer",
           "default": "0",

@@ -1806,15 +1806,18 @@ impl ClientShellState {
 
     pub(crate) fn show_copy_feedback(
         &mut self,
-        target: crate::platform::SelectionTarget,
+        targets: &[crate::platform::SelectionTarget],
         now: std::time::Instant,
     ) -> bool {
         if !self.config.clipboard_toast_enabled {
             return false;
         }
-        let message = match target {
-            crate::platform::SelectionTarget::Clipboard => "copied to clipboard",
-            crate::platform::SelectionTarget::Primary => "copied to primary selection",
+        let clipboard = targets.contains(&crate::platform::SelectionTarget::Clipboard);
+        let primary = targets.contains(&crate::platform::SelectionTarget::Primary);
+        let message = match (clipboard, primary) {
+            (true, true) => "copied to clipboard and primary selection",
+            (false, true) => "copied to primary selection",
+            _ => "copied to clipboard",
         };
         self.copy_feedback = Some(crate::app::state::CopyFeedback {
             message: message.to_owned(),

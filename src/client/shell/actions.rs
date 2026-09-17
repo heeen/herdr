@@ -637,7 +637,7 @@ impl ClientShellState {
                     Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. })
                         if !text.is_empty() =>
                     {
-                        let repaint = self.show_copy_feedback(target, std::time::Instant::now());
+                        let repaint = self.show_copy_feedback(&[target], std::time::Instant::now());
                         (
                             repaint,
                             vec![ClientShellAction::ClipboardWrite {

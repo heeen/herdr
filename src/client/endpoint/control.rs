@@ -10,6 +10,8 @@ pub(crate) enum EndpointControlMessage {
     HealthPong,
     ClipboardWrite {
         target: crate::platform::SelectionTarget,
+        /// Canonical id of the agent detected in the pane that wrote.
+        agent: Option<String>,
         /// Base64-encoded text.
         data: String,
     },
@@ -71,6 +73,7 @@ pub(crate) fn decode_endpoint_control(
         };
         return Ok(EndpointControlMessage::ClipboardWrite {
             target,
+            agent: write.agent,
             data: write.data,
         });
     }
@@ -205,6 +208,7 @@ mod tests {
             decode(crate::protocol::endpoint::EndpointClipboardTarget::Primary),
             EndpointControlMessage::ClipboardWrite {
                 target: crate::platform::SelectionTarget::Primary,
+                agent: None,
                 ref data,
             } if data == "aGk="
         ));

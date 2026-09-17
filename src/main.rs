@@ -260,6 +260,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # or Cmd+C when the host forwards it, copies and clears it.
 # copy_on_select = "clipboard"
 
+# Where clipboard writes from an agent's pane go: "clipboard", "primary", or "both".
+# Without an entry, a pane program's write keeps the selection it addressed.
+# Claude Code always writes the clipboard, and writes the primary selection itself only when
+# it has a display and is not running over ssh.
+# [ui.clipboard.agents]
+# claude = "both"
+
 # Host cursor policy: "auto", "native", or "drawn".
 # "auto" draws Herdr's own cursor on native Windows builds and WSL to avoid ConPTY cursor flicker, and uses the native terminal cursor elsewhere.
 # "native" always uses the outer terminal cursor. "drawn" always draws Herdr's cursor as terminal cell content.

@@ -694,12 +694,13 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     ));
     std::fs::write(
         &path,
-        "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\nmouse_capture = false\n",
+        "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\nmouse_capture = false\n\n[ui.clipboard.agents]\nclaude = \"both\"\n",
     )
     .unwrap();
     let path_string = path.to_string_lossy().to_string();
     let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
     let mut sound_config = crate::config::SoundConfig::default();
+    let mut clipboard_config = crate::config::ClipboardConfig::default();
     let mut redraw_on_focus_gained = true;
     let mut draw_host_cursor = false;
     let mut remote_image_paste_key = None;
@@ -707,6 +708,7 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
 
     reload_local_client_config(
         &mut sound_config,
+        &mut clipboard_config,
         &mut redraw_on_focus_gained,
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
@@ -716,6 +718,13 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     assert!(!redraw_on_focus_gained);
     assert!(draw_host_cursor);
     assert!(!mouse_capture);
+    assert_eq!(
+        clipboard_config.targets_for(crate::platform::SelectionTarget::Clipboard, Some("claude")),
+        [
+            crate::platform::SelectionTarget::Clipboard,
+            crate::platform::SelectionTarget::Primary
+        ]
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -734,6 +743,7 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
     let path_string = path.to_string_lossy().to_string();
     let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
     let mut sound_config = crate::config::SoundConfig::default();
+    let mut clipboard_config = crate::config::ClipboardConfig::default();
     let mut redraw_on_focus_gained = false;
     let mut draw_host_cursor = true;
     let mut remote_image_paste_key = None;
@@ -741,6 +751,7 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
 
     reload_local_client_config(
         &mut sound_config,
+        &mut clipboard_config,
         &mut redraw_on_focus_gained,
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
