@@ -685,10 +685,10 @@ mod tests {
             " ",
         );
         app.handle_tab_bar_status_tasks(std::time::Instant::now());
-        for _ in 0..50 {
-            if descendant_started.exists() {
-                break;
-            }
+        // Status commands run as a login shell that sources the user's profile, so startup
+        // time is outside the test's control and grows under parallel-suite load.
+        let startup_deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+        while !descendant_started.exists() && tokio::time::Instant::now() < startup_deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
