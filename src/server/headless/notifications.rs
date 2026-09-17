@@ -19,6 +19,59 @@ impl HeadlessServer {
             .unwrap_or(crate::detect::AgentState::Unknown)
     }
 
+    /// Clipboard writes are client-local side effects. Forward them only to the foreground
+    /// client instead of broadcasting to every attached client.
+    fn forward_clipboard_write(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        write: &crate::ghostty::ClipboardWrite,
+    ) {
+        let Some(client_id) = self.foreground_client_id else {
+            return;
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(write.content.as_slice());
+        let negotiated = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.shell_clipboard_write);
+        let message = if negotiated {
+            let (public_pane_id, agent) = self
+                .app
+                .find_pane(pane_id)
+                .map(|(ws_idx, pane)| {
+                    let agent = self
+                        .app
+                        .state
+                        .terminals
+                        .get(&pane.attached_terminal_id)
+                        .and_then(|terminal| terminal.effective_agent_label())
+                        .map(str::to_owned);
+                    (self.app.public_pane_id(ws_idx, pane_id), agent)
+                })
+                .unzip();
+            let write = crate::protocol::endpoint::EndpointClipboardWrite {
+                data,
+                target: write.target.into(),
+                pane_id: public_pane_id.flatten(),
+                agent: agent.flatten(),
+            };
+            match crate::protocol::endpoint::clipboard_write_message(&write) {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!(err = %err, "failed to encode clipboard write");
+                    return;
+                }
+            }
+        } else if write.target == crate::ghostty::ClipboardTarget::Clipboard {
+            ServerMessage::Clipboard { data }
+        } else {
+            // `ServerMessage::Clipboard` cannot name a selection, so a client that did not
+            // negotiate `clipboard_write` only ever receives clipboard writes.
+            return;
+        };
+        self.send_to_client(client_id, message);
+    }
+
     fn forward_semantic_agent_notification(
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
@@ -331,16 +384,8 @@ impl HeadlessServer {
                 }
                 false
             }
-            AppEvent::ClipboardWrite { write, .. } => {
-                // Clipboard writes are client-local side effects. Forward them only to
-                // the foreground client instead of broadcasting to every attached client.
-                // `ServerMessage::Clipboard` cannot name a selection, so a legacy client only
-                // ever receives clipboard writes, exactly as before primary writes were kept.
-                if write.target == crate::ghostty::ClipboardTarget::Clipboard {
-                    let data =
-                        base64::engine::general_purpose::STANDARD.encode(write.content.as_slice());
-                    self.send_to_foreground_client(ServerMessage::Clipboard { data });
-                }
+            AppEvent::ClipboardWrite { pane_id, write } => {
+                self.forward_clipboard_write(*pane_id, write);
                 false
             }
             AppEvent::StateChanged { pane_id, agent, .. } => {
