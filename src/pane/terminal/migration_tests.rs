@@ -13,7 +13,7 @@ struct Harness {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Effects {
     replies: Vec<u8>,
-    clipboard: Vec<Vec<u8>>,
+    clipboard: Vec<crate::ghostty::ClipboardWrite>,
     bells: u32,
     cwd: Vec<std::path::PathBuf>,
 }
