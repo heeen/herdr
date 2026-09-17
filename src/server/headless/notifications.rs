@@ -331,11 +331,16 @@ impl HeadlessServer {
                 }
                 false
             }
-            AppEvent::ClipboardWrite { content } => {
+            AppEvent::ClipboardWrite { write, .. } => {
                 // Clipboard writes are client-local side effects. Forward them only to
                 // the foreground client instead of broadcasting to every attached client.
-                let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
-                self.send_to_foreground_client(ServerMessage::Clipboard { data });
+                // `ServerMessage::Clipboard` cannot name a selection, so a legacy client only
+                // ever receives clipboard writes, exactly as before primary writes were kept.
+                if write.target == crate::ghostty::ClipboardTarget::Clipboard {
+                    let data =
+                        base64::engine::general_purpose::STANDARD.encode(write.content.as_slice());
+                    self.send_to_foreground_client(ServerMessage::Clipboard { data });
+                }
                 false
             }
             AppEvent::StateChanged { pane_id, agent, .. } => {
