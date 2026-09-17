@@ -6617,9 +6617,9 @@ fn clipboard_write_targets_foreground_client_only() {
     server.foreground_client_id = Some(2);
     server.sync_foreground_client_state();
 
-    let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
-        content: b"test".to_vec(),
-    });
+    let changed = server.handle_internal_event_with_forwarding(test_clipboard_write(
+        crate::ghostty::ClipboardTarget::Clipboard,
+    ));
 
     assert!(!changed);
     match read_server_message(
@@ -6638,14 +6638,53 @@ fn clipboard_write_targets_foreground_client_only() {
     );
 }
 
+fn test_clipboard_write(target: crate::ghostty::ClipboardTarget) -> AppEvent {
+    AppEvent::ClipboardWrite {
+        write: crate::ghostty::ClipboardWrite {
+            target,
+            content: b"test".to_vec(),
+        },
+    }
+}
+
+#[test]
+fn primary_clipboard_write_is_not_sent_as_a_legacy_clipboard_message() {
+    let mut server = test_headless_server();
+    let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_tx),
+        ),
+    );
+    server.foreground_client_id = Some(1);
+    server.sync_foreground_client_state();
+
+    let changed = server.handle_internal_event_with_forwarding(test_clipboard_write(
+        crate::ghostty::ClipboardTarget::Primary,
+    ));
+
+    assert!(!changed);
+    assert!(
+        foreground_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "the legacy message has no selection field, so a primary write must not land on the clipboard"
+    );
+}
+
 #[test]
 fn clipboard_write_without_foreground_client_does_not_change_visual_state() {
     let mut server = test_headless_server();
     server.foreground_client_id = None;
 
-    let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
-        content: b"test".to_vec(),
-    });
+    let changed = server.handle_internal_event_with_forwarding(test_clipboard_write(
+        crate::ghostty::ClipboardTarget::Clipboard,
+    ));
 
     assert!(!changed);
 }
@@ -6669,9 +6708,9 @@ fn clipboard_write_failed_foreground_send_removes_client_without_visual_change()
     );
     server.foreground_client_id = Some(1);
 
-    let changed = server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
-        content: b"test".to_vec(),
-    });
+    let changed = server.handle_internal_event_with_forwarding(test_clipboard_write(
+        crate::ghostty::ClipboardTarget::Clipboard,
+    ));
 
     assert!(!changed);
     assert!(

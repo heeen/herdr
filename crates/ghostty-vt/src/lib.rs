@@ -497,12 +497,27 @@ type WritePtyCallback = dyn FnMut(&[u8]) + Send;
 
 const MAX_CLIPBOARD_BYTES: usize = 192 * 1024;
 
+/// The system selection an OSC 52 write addresses: `c` is the clipboard, `p` and `s` are the
+/// primary selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    Primary,
+}
+
+/// Text the running program asked to place on a system selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardWrite {
+    pub target: ClipboardTarget,
+    pub content: Vec<u8>,
+}
+
 #[derive(Default)]
 struct TerminalCallbackState {
     write_pty: Option<Box<WritePtyCallback>>,
     bell_count: u16,
     pwd_changes: Vec<Vec<u8>>,
-    clipboard_writes: Vec<Vec<u8>>,
+    clipboard_writes: Vec<ClipboardWrite>,
     size_report: ffi::GhosttySizeReportSize,
     color_scheme: Option<ColorScheme>,
 }
@@ -615,9 +630,16 @@ unsafe fn capture_clipboard_write(
     }
     // SAFETY: the size check covers every field accessed below.
     let request = unsafe { &*write };
-    if request.location != ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD {
-        return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
-    }
+    let target = match request.location {
+        ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD => {
+            ClipboardTarget::Clipboard
+        }
+        ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_SELECTION
+        | ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_PRIMARY => {
+            ClipboardTarget::Primary
+        }
+        _ => return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED,
+    };
 
     // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
     let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
@@ -655,7 +677,10 @@ unsafe fn capture_clipboard_write(
     if bytes.len() > MAX_CLIPBOARD_BYTES {
         return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA;
     }
-    state.clipboard_writes.push(bytes.to_vec());
+    state.clipboard_writes.push(ClipboardWrite {
+        target,
+        content: bytes.to_vec(),
+    });
     ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
 }
 
@@ -1157,7 +1182,7 @@ impl Terminal {
         mem::take(&mut self.callback_state.pwd_changes)
     }
 
-    pub fn take_clipboard_writes(&mut self) -> Vec<Vec<u8>> {
+    pub fn take_clipboard_writes(&mut self) -> Vec<ClipboardWrite> {
         mem::take(&mut self.callback_state.clipboard_writes)
     }
 
@@ -4513,8 +4538,11 @@ mod tests {
                     .unwrap();
                 terminal.write(&bytes[..split]);
                 terminal.write(&bytes[split..]);
-                assert_eq!(terminal.take_clipboard_writes(), vec![b"a\0b".to_vec()]);
-                terminal.write(b"\x1b]52;c;?\x07\x1b]52;p;YQBi\x07");
+                assert_eq!(
+                    terminal.take_clipboard_writes(),
+                    vec![clipboard_write(ClipboardTarget::Clipboard, b"a\0b")]
+                );
+                terminal.write(b"\x1b]52;c;?\x07\x1b]52;p;?\x07");
                 assert!(terminal.take_clipboard_writes().is_empty());
                 assert!(replies.lock().unwrap().is_empty());
             }
@@ -4736,6 +4764,20 @@ mod tests {
         contents: &[ffi::GhosttyClipboardContent],
         size: usize,
     ) -> ffi::GhosttyClipboardWriteResult {
+        invoke_clipboard_callback_at(
+            terminal,
+            ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+            contents,
+            size,
+        )
+    }
+
+    fn invoke_clipboard_callback_at(
+        terminal: &mut Terminal,
+        location: ffi::GhosttyClipboardLocation,
+        contents: &[ffi::GhosttyClipboardContent],
+        size: usize,
+    ) -> ffi::GhosttyClipboardWriteResult {
         unsafe extern "C" fn reply(
             request: *const ffi::GhosttyClipboardWrite,
             response: *const ffi::GhosttyClipboardWriteReply,
@@ -4754,7 +4796,7 @@ mod tests {
         );
         let request = ffi::GhosttyClipboardWrite {
             size,
-            location: ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+            location,
             contents: contents.as_ptr(),
             contents_len: contents.len(),
             ctx: (&mut response as *mut (ffi::GhosttyClipboardWriteResult, bool, usize)).cast(),
@@ -4814,6 +4856,15 @@ mod tests {
             invoke_clipboard_callback(&mut terminal, &[text], full_size - 1),
             invalid
         );
+        assert_eq!(
+            invoke_clipboard_callback_at(
+                &mut terminal,
+                ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_MAX_VALUE,
+                &[text],
+                full_size
+            ),
+            unsupported
+        );
         assert!(terminal.take_clipboard_writes().is_empty());
     }
 
@@ -4823,16 +4874,46 @@ mod tests {
         terminal.write(b"\x1b]52;c;aGVs");
         assert!(terminal.take_clipboard_writes().is_empty());
         terminal.write(b"bG8=\x07");
-        assert_eq!(terminal.take_clipboard_writes(), vec![b"hello".to_vec()]);
+        assert_eq!(
+            terminal.take_clipboard_writes(),
+            vec![clipboard_write(ClipboardTarget::Clipboard, b"hello")]
+        );
 
         terminal.write(b"\x1b]52;c;d29ybGQ=\x1b\\");
-        assert_eq!(terminal.take_clipboard_writes(), vec![b"world".to_vec()]);
+        assert_eq!(
+            terminal.take_clipboard_writes(),
+            vec![clipboard_write(ClipboardTarget::Clipboard, b"world")]
+        );
 
         terminal.write(b"\x1b]52;c;?\x07");
         assert!(terminal.take_clipboard_writes().is_empty());
 
         terminal.write(b"\x1b]52;c;\x07");
         assert!(terminal.take_clipboard_writes().is_empty());
+    }
+
+    #[test]
+    fn osc52_writes_keep_the_selection_the_program_addressed() {
+        let mut terminal = Terminal::new(10, 5, 0).unwrap();
+        // "aGk=" is base64 for "hi". xterm's `s` (select) and `p` both mean the primary selection;
+        // `c` and the cut-buffer digits fall back to the clipboard, as libghostty maps them.
+        terminal.write(b"\x1b]52;p;aGk=\x07\x1b]52;s;aGk=\x07\x1b]52;c;aGk=\x07\x1b]52;0;aGk=\x07");
+        assert_eq!(
+            terminal.take_clipboard_writes(),
+            vec![
+                clipboard_write(ClipboardTarget::Primary, b"hi"),
+                clipboard_write(ClipboardTarget::Primary, b"hi"),
+                clipboard_write(ClipboardTarget::Clipboard, b"hi"),
+                clipboard_write(ClipboardTarget::Clipboard, b"hi"),
+            ]
+        );
+    }
+
+    fn clipboard_write(target: ClipboardTarget, content: &[u8]) -> ClipboardWrite {
+        ClipboardWrite {
+            target,
+            content: content.to_vec(),
+        }
     }
 
     #[test]

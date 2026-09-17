@@ -2467,8 +2467,8 @@ impl PaneRuntime {
                 if let Some(cwd) = result.reported_cwd.clone() {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &read_events);
                 }
-                for content in result.clipboard_writes {
-                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
+                for write in result.clipboard_writes {
+                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { write }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -2671,8 +2671,8 @@ impl PaneRuntime {
                 if let Some(cwd) = result.reported_cwd.clone() {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &events);
                 }
-                for content in result.clipboard_writes {
-                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
+                for write in result.clipboard_writes {
+                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { write }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,

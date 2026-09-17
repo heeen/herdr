@@ -167,7 +167,7 @@ pub(crate) struct ProcessBytesResult {
     pub render_delay: Option<Duration>,
     pub terminal_title_changed: bool,
     pub terminal_bells: u16,
-    pub clipboard_writes: Vec<Vec<u8>>,
+    pub clipboard_writes: Vec<crate::ghostty::ClipboardWrite>,
     pub reported_cwd: Option<std::path::PathBuf>,
     pub terminal_responses: Vec<Bytes>,
 }
@@ -4188,7 +4188,13 @@ mod tests {
         assert!(result.request_render);
         assert_eq!(result.render_delay, None);
         assert_eq!(result.terminal_bells, 0);
-        assert_eq!(result.clipboard_writes, vec![b"clipboard".to_vec()]);
+        assert_eq!(
+            result.clipboard_writes,
+            vec![crate::ghostty::ClipboardWrite {
+                target: crate::ghostty::ClipboardTarget::Clipboard,
+                content: b"clipboard".to_vec(),
+            }]
+        );
         assert_eq!(result.reported_cwd, None);
         assert!(result.terminal_responses.is_empty());
     }
