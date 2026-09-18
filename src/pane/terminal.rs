@@ -547,7 +547,7 @@ impl PaneTerminal {
         self.ghostty.collect_dirty_patch(area_width, area_height)
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+    pub fn visible_hyperlinks(&self, area: Rect) -> VisibleHyperlinks {
         self.ghostty.visible_hyperlinks(area)
     }
 
@@ -2319,7 +2319,7 @@ impl GhosttyPaneTerminal {
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+    pub fn visible_hyperlinks(&self, area: Rect) -> VisibleHyperlinks {
         self.core
             .lock()
             .ok()
@@ -2580,7 +2580,19 @@ fn cursor_state_from_render_state(
     })
 }
 
-type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
+/// One cell of a hyperlink as it will be drawn.
+///
+/// `symbol` must equal what the renderer writes into that cell: the frame table drops any entry
+/// whose symbol disagrees, which would punch a hole in the middle of a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleHyperlink {
+    pub position: (u16, u16),
+    pub symbol: String,
+    /// Shared because one wrapped url covers hundreds of cells, once per pane per frame.
+    pub uri: std::sync::Arc<str>,
+}
+
+pub type VisibleHyperlinks = Vec<VisibleHyperlink>;
 
 fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, area_height: u16) {
     if render_state.rows().is_ok_and(|rows| area_height >= rows) && render_state.clean().is_ok() {
@@ -2786,7 +2798,11 @@ fn ghostty_visible_hyperlinks(
         while x < area.width && cells.next() {
             if cells.has_hyperlink()? {
                 if let Some(uri) = terminal.viewport_hyperlink_uri(x, y.into())? {
-                    links.push(((area.x + x, area.y + y), ghostty_cell_symbol(&cells)?, uri));
+                    links.push(VisibleHyperlink {
+                        position: (area.x + x, area.y + y),
+                        symbol: ghostty_cell_symbol(&cells)?,
+                        uri: uri.into(),
+                    });
                 }
             }
             x += 1;

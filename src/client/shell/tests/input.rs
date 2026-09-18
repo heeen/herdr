@@ -636,7 +636,11 @@ fn styled_client_composition_preserves_pane_hyperlinks() {
     pane_surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(
         &linked,
         None,
-        &[((0, 0), "L".into(), "https://example.test".into())],
+        &[crate::pane::VisibleHyperlink {
+            position: (0, 0),
+            symbol: "L".into(),
+            uri: "https://example.test".into(),
+        }],
     );
     state.set_pane_surface(pane_surface);
     let mut selection =

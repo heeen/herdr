@@ -136,7 +136,7 @@ pub(crate) fn tab_surface_hyperlinks(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: TabSurfaceView<'_>,
-) -> Vec<((u16, u16), String, String)> {
+) -> crate::pane::VisibleHyperlinks {
     let Some(ws_idx) = surface.target.map(|target| target.workspace_index) else {
         return Vec::new();
     };
@@ -282,7 +282,7 @@ mod tests {
         let links = tab_surface_hyperlinks(&app, &TerminalRuntimeRegistry::new(), surface_view);
         assert!(links
             .iter()
-            .any(|(_, symbol, link)| { symbol == "L" && link == uri }));
+            .any(|link| { link.symbol == "L" && link.uri.as_ref() == uri }));
         assert!(tab_surface_cursor(&app, &TerminalRuntimeRegistry::new(), surface_view,).is_some());
     }
 }

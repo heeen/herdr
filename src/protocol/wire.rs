@@ -798,7 +798,7 @@ impl FrameData {
     pub fn from_ratatui_buffer_with_hyperlinks(
         buffer: &ratatui::buffer::Buffer,
         cursor: Option<CursorState>,
-        hyperlinks: &[((u16, u16), String, String)],
+        hyperlinks: &[crate::pane::VisibleHyperlink],
     ) -> Self {
         let area = buffer.area;
         let width = area.width;
@@ -807,8 +807,8 @@ impl FrameData {
         let mut hyperlink_uris = Vec::<String>::new();
         let mut hyperlink_indices = HashMap::<&str, u32>::new();
         let mut hyperlink_by_position = HashMap::<(u16, u16), (&str, &str)>::new();
-        for ((x, y), symbol, uri) in hyperlinks {
-            hyperlink_by_position.insert((*x, *y), (symbol.as_str(), uri.as_str()));
+        for link in hyperlinks {
+            hyperlink_by_position.insert(link.position, (link.symbol.as_str(), link.uri.as_ref()));
         }
         let mut cells = Vec::with_capacity((width as usize) * (height as usize));
         for row in 0..height {
@@ -858,7 +858,11 @@ impl FrameData {
                     let uri = self.hyperlinks.get(cell.hyperlink? as usize)?;
                     let x = u16::try_from(index % usize::from(width)).ok()?;
                     let y = u16::try_from(index / usize::from(width)).ok()?;
-                    Some(((x, y), cell.symbol.clone(), uri.clone()))
+                    Some(crate::pane::VisibleHyperlink {
+                        position: (x, y),
+                        symbol: cell.symbol.clone(),
+                        uri: uri.as_str().into(),
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -3424,7 +3428,11 @@ mod tests {
         let with_links = FrameData::from_ratatui_buffer_with_hyperlinks(
             &buffer,
             None,
-            &[((1, 0), "i".to_owned(), "https://example.com".to_owned())],
+            &[crate::pane::VisibleHyperlink {
+                position: (1, 0),
+                symbol: "i".to_owned(),
+                uri: "https://example.com".into(),
+            }],
         );
         assert_eq!(with_links.cells[1].hyperlink, Some(0));
         assert_eq!(
