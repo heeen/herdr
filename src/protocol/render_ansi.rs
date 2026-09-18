@@ -22,6 +22,7 @@
 //! - `CSI ? 2026 h/l` — begin/end synchronized output
 //! - `CSI Ps SP q` — DECSCUSR cursor shape
 //! - `ESC ] 52 ; c ; <base64> BEL` — OSC 52 clipboard write
+//! - `ESC ] 8 ; id=<id> ; <uri> ST` — OSC 8 hyperlink
 //!
 //! The goal is minimal output: skip unchanged cells, batch adjacent changes,
 //! and minimize cursor movement.
@@ -925,6 +926,23 @@ fn sanitized_cell_hyperlink_uri<'a>(
     sanitized_hyperlinks.get(index)?.as_deref()
 }
 
+/// Groups the pieces of one hyperlink for the outer terminal.
+///
+/// A link is closed and reopened whenever an unlinked cell interrupts it, which pane borders and
+/// the sidebar do on every row of a wrapped URL. Without an `id`, OSC 8 only joins cells that are
+/// contiguous, so each row would be its own link. The id is derived from the URI so it stays the
+/// same across frames and across panes: a frame's hyperlink index is rebuilt per frame and per
+/// composited surface, and an id that changed under a repaint would split the link again.
+///
+/// Two separate occurrences of one URL therefore share an id and highlight together on hover.
+fn hyperlink_id(uri: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn write_hyperlink_if_changed(
     writer: &mut impl Write,
     active: &mut Option<String>,
@@ -940,7 +958,11 @@ fn write_hyperlink_if_changed(
     }
     *active = requested;
     if let Some(uri) = active.as_deref() {
-        let _ = write!(writer, "\x1b]8;;{uri}\x1b\\");
+        let _ = write!(
+            writer,
+            "\x1b]8;id=herdr-{:016x};{uri}\x1b\\",
+            hyperlink_id(uri)
+        );
     }
 }
 
@@ -1180,7 +1202,10 @@ mod tests {
         write_all_cells(&mut output, &frame);
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "\x1b[1;1H\x1b[0;39;49ma\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\c\x1b[0;31;49md\x1b[0;39;49me\x1b[0m"
+            format!(
+                "\x1b[1;1H\x1b[0;39;49ma\x1b]8;id=herdr-{:016x};https://example.com\x1b\\b\x1b]8;;\x1b\\c\x1b[0;31;49md\x1b[0;39;49me\x1b[0m",
+                hyperlink_id("https://example.com")
+            )
         );
     }
 
@@ -1625,9 +1650,48 @@ mod tests {
         blit_frame_to(&mut output, &frame, None);
 
         let output_str = String::from_utf8(output).unwrap();
-        assert!(output_str.contains("\x1b]8;;https://example.com\x1b\\L"));
+        assert!(output_str.contains(&format!(
+            "\x1b]8;id=herdr-{:016x};https://example.com\x1b\\L",
+            hyperlink_id("https://example.com")
+        )));
         assert!(output_str.contains('i'));
         assert!(output_str.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn hyperlink_segments_split_by_unlinked_cells_share_one_id() {
+        // A wrapped URL reaches the outer terminal as one linked run per row, with the pane border
+        // and whatever sits beside the pane in between. The id is what joins them back together.
+        let mut frame = make_frame(
+            3,
+            2,
+            vec![
+                linked_cell("h", 0),
+                make_cell("|", 0, 0, 0),
+                linked_cell("t", 0),
+                linked_cell("t", 1),
+                make_cell("|", 0, 0, 0),
+                linked_cell("p", 1),
+            ],
+        );
+        frame.hyperlinks.push("https://example.com/one".to_owned());
+        frame.hyperlinks.push("https://example.com/two".to_owned());
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let output_str = String::from_utf8(output).unwrap();
+
+        let opens = output_str.match_indices("\x1b]8;id=").count();
+        assert_eq!(opens, 4, "each interrupted segment reopens its link");
+        let first = format!("id=herdr-{:016x};", hyperlink_id("https://example.com/one"));
+        let second = format!("id=herdr-{:016x};", hyperlink_id("https://example.com/two"));
+        assert_eq!(
+            output_str.matches(first.as_str()).count(),
+            2,
+            "both segments of one url carry the same id"
+        );
+        assert_eq!(output_str.matches(second.as_str()).count(), 2);
+        assert_ne!(first, second, "different urls must not share an id");
     }
 
     #[test]
@@ -1641,7 +1705,14 @@ mod tests {
         blit_frame_to(&mut output, &frame, None);
 
         let output_str = String::from_utf8(output).unwrap();
-        assert!(output_str.contains("\x1b]8;;https://example.com\x1b\\L"));
+        assert!(output_str.contains(&format!(
+            "\x1b]8;id=herdr-{:016x};https://example.com\x1b\\L",
+            hyperlink_id("https://example.com")
+        )));
+        assert!(
+            !output_str.contains('\x07'),
+            "the sanitized uri is what the id is derived from"
+        );
     }
 
     #[test]
