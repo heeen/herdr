@@ -42,7 +42,7 @@ use self::agent_detection::{
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 #[cfg(unix)]
-pub use self::terminal::{InputState, VisibleHyperlink, VisibleHyperlinks};
+pub use self::terminal::{InputState, LinkScanOptions, VisibleHyperlink, VisibleHyperlinks};
 pub(crate) use self::terminal::{
     TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
     TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
@@ -3466,8 +3466,12 @@ impl PaneRuntime {
         (self.content_seq() == revision).then_some(snapshot)
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> crate::pane::VisibleHyperlinks {
-        self.terminal.visible_hyperlinks(area)
+    pub fn visible_hyperlinks(
+        &self,
+        area: Rect,
+        options: crate::pane::LinkScanOptions,
+    ) -> crate::pane::VisibleHyperlinks {
+        self.terminal.visible_hyperlinks(area, options)
     }
 
     pub(crate) fn link_regions_at(

@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::layout::PaneId;
 use crate::protocol::CellData;
 
+mod link_scan;
 #[cfg(test)]
 mod migration_tests;
 #[cfg(windows)]
@@ -547,8 +548,8 @@ impl PaneTerminal {
         self.ghostty.collect_dirty_patch(area_width, area_height)
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> VisibleHyperlinks {
-        self.ghostty.visible_hyperlinks(area)
+    pub fn visible_hyperlinks(&self, area: Rect, options: LinkScanOptions) -> VisibleHyperlinks {
+        self.ghostty.visible_hyperlinks(area, options)
     }
 
     pub(crate) fn link_regions_at(
@@ -2319,11 +2320,11 @@ impl GhosttyPaneTerminal {
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> VisibleHyperlinks {
+    pub fn visible_hyperlinks(&self, area: Rect, options: LinkScanOptions) -> VisibleHyperlinks {
         self.core
             .lock()
             .ok()
-            .and_then(|mut core| ghostty_visible_hyperlinks(&mut core, area).ok())
+            .and_then(|mut core| ghostty_visible_hyperlinks(&mut core, area, options).ok())
             .unwrap_or_default()
     }
 
@@ -2594,6 +2595,13 @@ pub struct VisibleHyperlink {
 
 pub type VisibleHyperlinks = Vec<VisibleHyperlink>;
 
+/// What counts as a hyperlink when collecting a pane's visible links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkScanOptions {
+    /// Also report urls the program only printed as text, so the outer terminal can click them.
+    pub detect_plain_urls: bool,
+}
+
 fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, area_height: u16) {
     if render_state.rows().is_ok_and(|rows| area_height >= rows) && render_state.clean().is_ok() {
         return;
@@ -2780,6 +2788,7 @@ fn ghostty_collect_dirty_patch(
 fn ghostty_visible_hyperlinks(
     core: &mut GhosttyPaneCore,
     area: Rect,
+    options: LinkScanOptions,
 ) -> Result<VisibleHyperlinks, crate::ghostty::Error> {
     let GhosttyPaneCore {
         terminal,
@@ -2790,13 +2799,31 @@ fn ghostty_visible_hyperlinks(
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
+    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+    let mut scan = options.detect_plain_urls.then(|| {
+        link_scan::ViewportScan::with_capacity(usize::from(area.width) * usize::from(area.height))
+    });
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol_scratch = String::new();
+    let mut first_row_continues_above = false;
+    let mut last_row_continues_below = false;
     let mut links = Vec::new();
     let mut y = 0u16;
     while y < area.height && rows.next() {
+        let mut row_soft_wrapped = false;
+        if scan.is_some() {
+            let (soft_wrapped, wrap_continuation) = rows.wrap_state()?;
+            if y == 0 {
+                first_row_continues_above = wrap_continuation;
+            }
+            row_soft_wrapped = soft_wrapped;
+            last_row_continues_below = soft_wrapped;
+        }
         let mut cells = rows.populate_cells(&mut row_cells)?;
         let mut x = 0u16;
         while x < area.width && cells.next() {
-            if cells.has_hyperlink()? {
+            let basic = cells.basic_data()?;
+            if basic.has_hyperlink {
                 if let Some(uri) = terminal.viewport_hyperlink_uri(x, y.into())? {
                     links.push(VisibleHyperlink {
                         position: (area.x + x, area.y + y),
@@ -2805,11 +2832,115 @@ fn ghostty_visible_hyperlinks(
                     });
                 }
             }
+            if let Some(scan) = scan.as_mut() {
+                // A spacer head is blank padding at a wrap point; giving it text would break the
+                // url in two. The spacer tail is covered by its wide cell instead.
+                if !matches!(
+                    basic.wide,
+                    crate::ghostty::CellWide::SpacerHead | crate::ghostty::CellWide::SpacerTail
+                ) {
+                    let symbol = ghostty_buffer_symbol_into(
+                        &cells,
+                        basic.wide,
+                        hide_kitty_placeholders,
+                        &mut grapheme_bytes,
+                        &mut symbol_scratch,
+                    )?;
+                    scan.push_cell(
+                        symbol,
+                        link_scan::ScanCell {
+                            x: area.x + x,
+                            y: area.y + y,
+                            wide: basic.wide == crate::ghostty::CellWide::Wide,
+                            program_linked: basic.has_hyperlink,
+                        },
+                    );
+                }
+            }
             x += 1;
+        }
+        if let Some(scan) = scan.as_mut().filter(|_| !row_soft_wrapped) {
+            scan.push_line_break();
         }
         y += 1;
     }
+
+    if let Some(mut scan) = scan {
+        // A url that starts above the viewport or runs past its bottom is still one logical line;
+        // those rows complete the address without being clickable themselves. They are read before
+        // the scheme check, because the scheme itself may be one of the rows that is off-screen.
+        if first_row_continues_above || last_row_continues_below {
+            let viewport_top = terminal.scrollbar()?.offset;
+            if first_row_continues_above {
+                let above = ghostty_offscreen_wrapped_text(terminal, viewport_top, false)?;
+                scan.prepend_offscreen(&above);
+            }
+            if last_row_continues_below {
+                let below =
+                    ghostty_offscreen_wrapped_text(terminal, viewport_top + usize::from(y), true)?;
+                scan.push_offscreen(&below);
+            }
+        }
+        let mut text_cells = Vec::new();
+        links.extend(
+            scan.detected_links(&mut text_cells)
+                .into_iter()
+                .map(|link| VisibleHyperlink {
+                    position: (link.x, link.y),
+                    symbol: link.symbol,
+                    uri: link.uri,
+                }),
+        );
+    }
     Ok(links)
+}
+
+/// Text of the rows continuing a logical line past the viewport edge.
+///
+/// `below` walks forward from `boundary`, otherwise backward from it. Bounded the same way link
+/// resolution bounds its own word selection, so both agree on where a very long line is cut off.
+fn ghostty_offscreen_wrapped_text(
+    terminal: &crate::ghostty::Terminal,
+    boundary: usize,
+    below: bool,
+) -> Result<String, crate::ghostty::Error> {
+    const MAX_OFFSCREEN_CELLS: usize = 8192;
+
+    let cols = usize::from(terminal.cols()?).max(1);
+    let max_rows = MAX_OFFSCREEN_CELLS / cols;
+    let (start, end) = if below {
+        (boundary, boundary.saturating_add(max_rows))
+    } else {
+        (boundary.saturating_sub(max_rows), boundary)
+    };
+    let rows = terminal.screen_text_rows_range(start, end)?;
+    let mut text = String::new();
+    if below {
+        for row in rows.iter() {
+            text.push_str(&ghostty_screen_row_text(row));
+            if !row.soft_wrapped {
+                break;
+            }
+        }
+    } else {
+        // Walk back to the first row of the logical line, then read forward from there.
+        let first = rows
+            .iter()
+            .rposition(|row| !row.wrap_continuation)
+            .unwrap_or(0);
+        for row in &rows[first..] {
+            text.push_str(&ghostty_screen_row_text(row));
+        }
+    }
+    Ok(text)
+}
+
+fn ghostty_screen_row_text(row: &crate::ghostty::ScreenTextRow) -> String {
+    row.cells
+        .iter()
+        .filter(|cell| cell.wide != crate::ghostty::CellWide::SpacerTail)
+        .map(|cell| terminal_cell_text(&cell.graphemes))
+        .collect()
 }
 
 fn ghostty_visible_text(core: &mut GhosttyPaneCore) -> Result<String, crate::ghostty::Error> {
@@ -7260,6 +7391,187 @@ mod tests {
             vec![Bytes::from_static(b"\x1b]12;rgb:fdfd/f6f6/e3e3\x1b\\")]
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    fn detected_links(pane: &GhosttyPaneTerminal, width: u16, height: u16) -> VisibleHyperlinks {
+        pane.visible_hyperlinks(
+            Rect::new(0, 0, width, height),
+            LinkScanOptions {
+                detect_plain_urls: true,
+            },
+        )
+    }
+
+    #[test]
+    fn a_wrapped_url_is_detected_across_the_rows_it_covers() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        // Twenty columns, so this url occupies the tail of one row and the head of the next.
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"see https://example.com/deep/path here",
+            &tx,
+        );
+
+        let links = detected_links(&pane, 20, 4);
+
+        assert!(!links.is_empty(), "the wrapped url should be detected");
+        assert!(
+            links
+                .iter()
+                .all(|link| link.uri.as_ref() == "https://example.com/deep/path"),
+            "every cell carries the whole url, not the part on its own row: {links:?}"
+        );
+        let rows: std::collections::BTreeSet<u16> =
+            links.iter().map(|link| link.position.1).collect();
+        assert_eq!(
+            rows,
+            [0, 1].into_iter().collect(),
+            "the link covers both rows of the wrap"
+        );
+    }
+
+    #[test]
+    fn detected_links_agree_with_what_ctrl_click_would_open() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 4, 1024).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        // A wrapped url, a url with punctuation around it, and plain words in between.
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"go https://example.com/deep/path now (https://b.test/x). end",
+            &tx,
+        );
+
+        let links = detected_links(&pane, 20, 4);
+
+        for y in 0..4u16 {
+            for x in 0..20u16 {
+                let clickable = pane
+                    .link_target_at(x, y)
+                    .and_then(crate::app::actions::url_from_link_target);
+                let detected = links
+                    .iter()
+                    .find(|link| link.position == (x, y))
+                    .map(|link| link.uri.to_string());
+                assert_eq!(
+                    detected, clickable,
+                    "cell ({x}, {y}) must offer the outer terminal exactly what ctrl+click opens"
+                );
+            }
+        }
+        assert!(
+            links
+                .iter()
+                .any(|link| link.uri.as_ref() == "https://example.com/deep/path"),
+            "the fixture should contain a wrapped url"
+        );
+    }
+
+    #[test]
+    fn a_url_starting_above_the_viewport_keeps_its_whole_address() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 2, 1024).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        // Three rows' worth of url in a two-row viewport, so its start scrolls off the top.
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"https://example.com/abcdefghijklmnopqrstuvwxyz0123456789",
+            &tx,
+        );
+
+        let links = detected_links(&pane, 20, 2);
+
+        assert!(!links.is_empty());
+        assert!(
+            links.iter().all(|link| link.uri.as_ref()
+                == "https://example.com/abcdefghijklmnopqrstuvwxyz0123456789"),
+            "a visible tail must still carry the address that starts off-screen: {links:?}"
+        );
+        for link in &links {
+            let clickable = pane
+                .link_target_at(link.position.0, link.position.1)
+                .and_then(crate::app::actions::url_from_link_target);
+            assert_eq!(clickable.as_deref(), Some(link.uri.as_ref()));
+        }
+    }
+
+    #[test]
+    fn detection_is_off_unless_asked_for() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(40, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"https://example.com/plain", &tx);
+
+        assert!(pane
+            .visible_hyperlinks(Rect::new(0, 0, 40, 4), LinkScanOptions::default())
+            .is_empty());
+        assert!(!detected_links(&pane, 40, 4).is_empty());
+    }
+
+    #[test]
+    fn a_program_supplied_link_is_not_replaced_by_detection() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(40, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        // The visible text is a url of its own; the program points it somewhere else.
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]8;;https://real.test/target\x1b\\https://shown.test/text\x1b]8;;\x1b\\",
+            &tx,
+        );
+
+        let links = detected_links(&pane, 40, 4);
+
+        assert!(
+            links
+                .iter()
+                .all(|link| link.uri.as_ref() == "https://real.test/target"),
+            "detection must not override the program's own link: {links:?}"
+        );
+    }
+
+    #[test]
+    fn detected_symbols_match_what_the_renderer_draws() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(24, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        // Wide characters and a combining mark inside the path, plus a wrap.
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            "https://example.com/\u{8def}\u{5f91}/e\u{0301}nd/more".as_bytes(),
+            &tx,
+        );
+
+        let links = detected_links(&pane, 24, 4);
+        // The frame buffer, not the backend's, is what the frame table compares against.
+        let backend = ratatui::backend::TestBackend::new(24, 4);
+        let mut host = ratatui::Terminal::new(backend).unwrap();
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 24, 4));
+        host.draw(|frame| {
+            pane.render(frame, Rect::new(0, 0, 24, 4), false);
+            buffer = frame.buffer_mut().clone();
+        })
+        .unwrap();
+
+        assert!(!links.is_empty());
+        for link in &links {
+            let cell = buffer
+                .cell((link.position.0, link.position.1))
+                .expect("cell inside the rendered area");
+            assert_eq!(
+                link.symbol,
+                cell.symbol(),
+                "entry at {:?} would be dropped by the frame table",
+                link.position
+            );
+        }
     }
 
     #[test]
