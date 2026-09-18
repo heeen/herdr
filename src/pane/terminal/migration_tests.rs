@@ -102,9 +102,12 @@ impl Harness {
             geometry: (self.width, self.height),
             cells: self.full_cells(),
             text_rows,
-            links: self
-                .pane
-                .visible_hyperlinks(Rect::new(0, 0, self.width, self.height)),
+            links: self.pane.visible_hyperlinks(
+                Rect::new(0, 0, self.width, self.height),
+                super::LinkScanOptions {
+                    detect_plain_urls: true,
+                },
+            ),
             cursor: self.cursor().unwrap(),
             input: self.pane.input_state().unwrap(),
             visible: self.pane.visible_text(),
