@@ -59,6 +59,7 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod url_scan;
 mod workspace;
 mod worktree;
 
