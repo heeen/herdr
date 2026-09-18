@@ -44,9 +44,9 @@ use self::agent_detection::{
 use self::background_agent::{AgentJobStatus, AgentJobTracker};
 #[cfg(test)]
 pub(crate) use self::terminal::test_encode_key_for_app;
-#[cfg(unix)]
-pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
+#[cfg(unix)]
+pub use self::terminal::{InputState, VisibleHyperlink, VisibleHyperlinks};
 pub(crate) use self::terminal::{
     TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
     TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
@@ -3621,7 +3621,7 @@ impl PaneRuntime {
         (self.content_seq() == revision).then_some(snapshot)
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+    pub fn visible_hyperlinks(&self, area: Rect) -> crate::pane::VisibleHyperlinks {
         self.terminal.visible_hyperlinks(area)
     }
 
