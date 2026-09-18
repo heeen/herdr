@@ -3255,7 +3255,8 @@ impl<'a> RowIter<'a> {
         Ok(dirty)
     }
 
-    #[cfg(windows)]
+    /// `(soft_wrapped, wrap_continuation)` for the current row: whether the line continues on the
+    /// next row, and whether this row continues the previous one.
     pub fn wrap_state(&self) -> Result<(bool, bool), Error> {
         let mut row = 0;
         // SAFETY: row output matches requested row data type.
@@ -4939,5 +4940,30 @@ mod tests {
         assert!(basic.has_styling);
         assert_eq!(basic.style.fg_color, Some(CellColor::Palette(1)));
         assert!(!basic.has_hyperlink);
+    }
+
+    #[test]
+    fn render_rows_report_where_a_wrapped_line_continues() {
+        // Eight columns, so the twelve characters occupy two rows of one logical line.
+        let mut terminal = Terminal::new(8, 3, 100).unwrap();
+        terminal.write(b"abcdefghijkl");
+
+        let mut render_state = RenderState::new().unwrap();
+        render_state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = render_state
+            .populate_row_iterator(&mut row_iterator)
+            .unwrap();
+
+        let mut wrap_states = Vec::new();
+        while rows.next() {
+            wrap_states.push(rows.wrap_state().unwrap());
+        }
+
+        assert_eq!(
+            wrap_states,
+            [(true, false), (false, true), (false, false)],
+            "the first row continues onto the second, which is a continuation"
+        );
     }
 }
