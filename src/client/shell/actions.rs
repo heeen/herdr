@@ -707,7 +707,7 @@ impl ClientShellState {
                     Ok(crate::api::schema::ResponseResult::PaneLinkActivated {
                         url: Some(url),
                         handled: false,
-                    }) if crate::app::actions::safe_web_url(&url).is_some() && replay.is_some() => {
+                    }) if crate::url_scan::safe_web_url(&url).is_some() && replay.is_some() => {
                         self.url_click_consumes_until_up = completed_before_release;
                         (false, vec![ClientShellAction::OpenSafeWebUrl(url)])
                     }
