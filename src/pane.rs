@@ -3471,7 +3471,13 @@ impl PaneRuntime {
         area: Rect,
         options: crate::pane::LinkScanOptions,
     ) -> crate::pane::VisibleHyperlinks {
-        self.terminal.visible_hyperlinks(area, options)
+        // An odd revision means a write is in flight, so the scan cannot be cached against it.
+        let revision = self.content_seq();
+        self.terminal.visible_hyperlinks(
+            area,
+            options,
+            revision.is_multiple_of(2).then_some(revision),
+        )
     }
 
     pub(crate) fn link_regions_at(

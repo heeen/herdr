@@ -192,6 +192,22 @@ pub(crate) struct GhosttyPaneTerminal {
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
 }
 
+/// What a cached hyperlink scan was computed from. Any difference means a fresh walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkCacheKey {
+    content_revision: u64,
+    area: (u16, u16, u16, u16),
+    /// Scrolling moves the viewport without changing content, so the revision alone is not enough.
+    viewport_top: usize,
+    detect_plain_urls: bool,
+    hide_kitty_placeholders: bool,
+}
+
+struct LinkCache {
+    key: LinkCacheKey,
+    links: VisibleHyperlinks,
+}
+
 pub(crate) struct GhosttyPaneCore {
     #[cfg(test)]
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
@@ -215,6 +231,7 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    link_cache: Option<LinkCache>,
 }
 
 pub(crate) struct PaneTerminal {
@@ -548,8 +565,14 @@ impl PaneTerminal {
         self.ghostty.collect_dirty_patch(area_width, area_height)
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect, options: LinkScanOptions) -> VisibleHyperlinks {
-        self.ghostty.visible_hyperlinks(area, options)
+    pub fn visible_hyperlinks(
+        &self,
+        area: Rect,
+        options: LinkScanOptions,
+        content_revision: Option<u64>,
+    ) -> VisibleHyperlinks {
+        self.ghostty
+            .visible_hyperlinks(area, options, content_revision)
     }
 
     pub(crate) fn link_regions_at(
@@ -1196,6 +1219,7 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                link_cache: None,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -2320,11 +2344,18 @@ impl GhosttyPaneTerminal {
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
     }
 
-    pub fn visible_hyperlinks(&self, area: Rect, options: LinkScanOptions) -> VisibleHyperlinks {
+    pub fn visible_hyperlinks(
+        &self,
+        area: Rect,
+        options: LinkScanOptions,
+        content_revision: Option<u64>,
+    ) -> VisibleHyperlinks {
         self.core
             .lock()
             .ok()
-            .and_then(|mut core| ghostty_visible_hyperlinks(&mut core, area, options).ok())
+            .and_then(|mut core| {
+                ghostty_visible_hyperlinks(&mut core, area, options, content_revision).ok()
+            })
             .unwrap_or_default()
     }
 
@@ -2789,17 +2820,39 @@ fn ghostty_visible_hyperlinks(
     core: &mut GhosttyPaneCore,
     area: Rect,
     options: LinkScanOptions,
+    content_revision: Option<u64>,
 ) -> Result<VisibleHyperlinks, crate::ghostty::Error> {
+    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+    let cache_key = content_revision.map(|content_revision| LinkCacheKey {
+        content_revision,
+        area: (area.x, area.y, area.width, area.height),
+        viewport_top: 0,
+        detect_plain_urls: options.detect_plain_urls,
+        hide_kitty_placeholders,
+    });
     let GhosttyPaneCore {
         terminal,
         render_state,
+        link_cache,
         ..
     } = core;
+    let cache_key = match cache_key {
+        Some(key) => Some(LinkCacheKey {
+            viewport_top: terminal.scrollbar()?.offset,
+            ..key
+        }),
+        None => None,
+    };
+    if let Some(cached) = link_cache
+        .as_ref()
+        .filter(|cached| Some(cached.key) == cache_key)
+    {
+        return Ok(cached.links.clone());
+    }
     render_state.update(terminal)?;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
-    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
     let mut scan = options.detect_plain_urls.then(|| {
         link_scan::ViewportScan::with_capacity(usize::from(area.width) * usize::from(area.height))
     });
@@ -2891,6 +2944,12 @@ fn ghostty_visible_hyperlinks(
                     uri: link.uri,
                 }),
         );
+    }
+    if let Some(key) = cache_key {
+        *link_cache = Some(LinkCache {
+            key,
+            links: links.clone(),
+        });
     }
     Ok(links)
 }
@@ -7399,6 +7458,7 @@ mod tests {
             LinkScanOptions {
                 detect_plain_urls: true,
             },
+            None,
         )
     }
 
@@ -7501,6 +7561,64 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_is_reused_until_the_content_or_viewport_moves() {
+        let (tx, _rx) = mpsc::channel(4);
+        // Tall enough that the second line does not scroll the viewport, which would be a
+        // legitimate miss on its own.
+        let terminal = crate::ghostty::Terminal::new(20, 6, 1024).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"https://a.test/one\r\n", &tx);
+        let area = Rect::new(0, 0, 20, 6);
+        let options = LinkScanOptions {
+            detect_plain_urls: true,
+        };
+
+        let first = pane.visible_hyperlinks(area, options, Some(2));
+        assert!(!first.is_empty());
+
+        // Same revision: the second call answers from the cache, even though the pane has since
+        // been given content that the cache deliberately does not see.
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"https://b.test/two\r\n", &tx);
+        assert_eq!(pane.visible_hyperlinks(area, options, Some(2)), first);
+
+        // A new revision, a different area, or no revision at all all re-walk.
+        let rescanned = pane.visible_hyperlinks(area, options, Some(4));
+        assert_ne!(rescanned, first);
+        assert_eq!(pane.visible_hyperlinks(area, options, None), rescanned);
+        assert!(
+            pane.visible_hyperlinks(Rect::new(0, 0, 20, 1), options, Some(4))
+                .len()
+                < rescanned.len()
+        );
+    }
+
+    #[test]
+    fn scrolling_invalidates_a_cached_scan() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 2, 1024).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"https://a.test/one\r\nplain\r\nhttps://b.test/two\r\n",
+            &tx,
+        );
+        let area = Rect::new(0, 0, 20, 2);
+        let options = LinkScanOptions {
+            detect_plain_urls: true,
+        };
+
+        let bottom = pane.visible_hyperlinks(area, options, Some(2));
+        pane.scroll_up(2);
+        let scrolled = pane.visible_hyperlinks(area, options, Some(2));
+
+        assert_ne!(
+            bottom, scrolled,
+            "scrolling moves the viewport without changing content, so the key must include it"
+        );
+    }
+
+    #[test]
     fn detection_is_off_unless_asked_for() {
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(40, 4, 100).unwrap();
@@ -7508,7 +7626,7 @@ mod tests {
         pane.process_pty_bytes(PaneId::from_raw(1), 0, b"https://example.com/plain", &tx);
 
         assert!(pane
-            .visible_hyperlinks(Rect::new(0, 0, 40, 4), LinkScanOptions::default())
+            .visible_hyperlinks(Rect::new(0, 0, 40, 4), LinkScanOptions::default(), None)
             .is_empty());
         assert!(!detected_links(&pane, 40, 4).is_empty());
     }
