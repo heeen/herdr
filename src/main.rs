@@ -309,6 +309,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to reclaim the scrollbar column and keep it out of terminal-native selections.
 # pane_scrollbars = true
 
+# Offer urls printed in pane output to the outer terminal as clickable hyperlinks.
+# Detection matches what Ctrl+click opens, including urls wrapped across rows.
+# Set false to leave pane output untouched and rely on the terminal's own url matching.
+# detect_urls = true
+
 # Keep split panes visually separated instead of sharing divider borders.
 # pane_gaps = true
 

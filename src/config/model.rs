@@ -1035,6 +1035,8 @@ pub struct UiConfig {
     pub pane_outer_borders: bool,
     /// Draw interactive scrollbars beside terminal panes. Default: true.
     pub pane_scrollbars: bool,
+    /// Offer urls printed in pane output to the outer terminal as hyperlinks. Default: true.
+    pub detect_urls: bool,
     /// Keep split panes visually separated instead of sharing divider borders. Default: true.
     pub pane_gaps: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
@@ -1274,6 +1276,7 @@ impl Default for UiConfig {
             pane_borders: PaneBordersConfig::Auto,
             pane_outer_borders: true,
             pane_scrollbars: true,
+            detect_urls: true,
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
@@ -1802,6 +1805,14 @@ mouse_capture = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.mouse_capture);
+    }
+
+    #[test]
+    fn detect_urls_defaults_on_and_parses() {
+        assert!(Config::default().ui.detect_urls);
+
+        let config: Config = toml::from_str("[ui]\ndetect_urls = false\n").unwrap();
+        assert!(!config.ui.detect_urls);
     }
 
     #[test]

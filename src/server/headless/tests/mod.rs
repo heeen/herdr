@@ -6599,6 +6599,36 @@ fn terminal_bell_targets_foreground_client_only() {
 }
 
 #[test]
+fn a_patch_carrying_a_url_falls_back_to_a_full_surface() {
+    // Hyperlinks are collected only when the whole surface is rendered, so a url arriving in an
+    // incremental patch has to force one. This is the cost the feature accepts.
+    fn patch_of(text: &str) -> crate::pane::TerminalDirtyPatch {
+        let buffer = ratatui::buffer::Buffer::with_lines([text]);
+        crate::pane::TerminalDirtyPatch {
+            rows: vec![(
+                0,
+                buffer
+                    .content()
+                    .iter()
+                    .map(crate::protocol::CellData::from_ratatui_cell)
+                    .collect(),
+            )],
+        }
+    }
+
+    assert!(
+        crate::server::headless::retained_surface::patch_may_contain_url(&patch_of(
+            "see https://example.com/x"
+        ))
+    );
+    assert!(
+        !crate::server::headless::retained_surface::patch_may_contain_url(&patch_of(
+            "nothing to link here"
+        ))
+    );
+}
+
+#[test]
 fn clipboard_write_targets_foreground_client_only() {
     let mut server = test_headless_server();
     let (background_tx, background_control_rx, _background_rx) = test_client_writer();

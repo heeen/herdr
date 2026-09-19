@@ -987,6 +987,12 @@
           "description": "Draw interactive scrollbars beside terminal panes. Disable to reclaim the scrollbar column and keep it out of terminal-native selections."
         },
         {
+          "key": "ui.detect_urls",
+          "type": "boolean",
+          "default": "true",
+          "description": "Offer urls printed in pane output to the outer terminal as OSC 8 hyperlinks, matching what Ctrl+click opens, including urls wrapped across rows. The machine owning the pane decides, so a remote machine follows its own config."
+        },
+        {
           "key": "ui.pane_gaps",
           "type": "boolean",
           "default": "true",

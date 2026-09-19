@@ -716,8 +716,12 @@ impl HeadlessServer {
                         render_started,
                     );
                     let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks =
-                        runtime.visible_hyperlinks(area, crate::pane::LinkScanOptions::default());
+                    let hyperlinks = runtime.visible_hyperlinks(
+                        area,
+                        crate::pane::LinkScanOptions {
+                            detect_plain_urls: self.app.state.detect_urls,
+                        },
+                    );
                     crate::render_prof::duration_since(
                         "full_render.visible_hyperlinks",
                         hyperlinks_started,

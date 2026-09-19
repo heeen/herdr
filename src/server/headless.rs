@@ -79,7 +79,7 @@ mod lifecycle;
 mod native_graphics;
 mod notifications;
 mod render;
-mod retained_surface;
+pub(crate) mod retained_surface;
 mod surface_interest;
 
 // Producers can refill even a bounded channel while it is being drained.

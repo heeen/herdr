@@ -510,8 +510,12 @@ fn render_popup_surface(
     let content_area = Rect::new(0, 0, geometry.inner.width, geometry.inner.height);
     let (buffer, cursor) =
         crate::server::render_stream::render_terminal_virtual(runtime, content_area);
-    let hyperlinks =
-        runtime.visible_hyperlinks(content_area, crate::pane::LinkScanOptions::default());
+    let hyperlinks = runtime.visible_hyperlinks(
+        content_area,
+        crate::pane::LinkScanOptions {
+            detect_plain_urls: app.state.detect_urls,
+        },
+    );
     let title = app
         .state
         .terminals
