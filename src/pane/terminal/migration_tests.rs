@@ -107,6 +107,8 @@ impl Harness {
                 super::LinkScanOptions {
                     detect_plain_urls: true,
                 },
+                // Uncached, so a byte-split permutation cannot be answered from an earlier one.
+                None,
             ),
             cursor: self.cursor().unwrap(),
             input: self.pane.input_state().unwrap(),
