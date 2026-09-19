@@ -313,6 +313,8 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 `ui.pane_borders` accepts `"auto"` (the default, borders only for split panes), `"always"` (also frame a single pane), or `"off"`. A single-pane frame requires `ui.pane_outer_borders = true`, because all its edges are outer edges. Existing boolean values remain valid: `true` means `"auto"` and `false` means `"off"`.
 
+Herdr offers urls printed in pane output to your terminal as OSC 8 hyperlinks, so a url that wraps across rows stays clickable even though each row also holds pane borders and the sidebar. Detection matches what `Ctrl+click` opens. Set `ui.detect_urls = false` to leave pane output untouched and rely on your terminal's own url matching. The machine that owns the pane decides, so a remote machine follows its own config.
+
 Programs in panes copy through OSC 52, which names the selection to write: `c` for the clipboard and `p` for the primary selection. Herdr honors that selection. To place one agent's writes somewhere else, key `ui.clipboard.agents` by canonical agent id with `"clipboard"`, `"primary"`, or `"both"`:
 
 ```toml

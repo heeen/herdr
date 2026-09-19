@@ -148,10 +148,12 @@ pub(crate) fn tab_surface_hyperlinks(
     for info in surface.pane_infos {
         if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         {
-            links.extend(
-                runtime
-                    .visible_hyperlinks(info.inner_rect, crate::pane::LinkScanOptions::default()),
-            );
+            links.extend(runtime.visible_hyperlinks(
+                info.inner_rect,
+                crate::pane::LinkScanOptions {
+                    detect_plain_urls: app.detect_urls,
+                },
+            ));
         }
     }
     links
