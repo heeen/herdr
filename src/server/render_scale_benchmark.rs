@@ -126,6 +126,23 @@ fn history() -> String {
     (0..2_000).map(|line| format!("line-{line}\r\n")).collect()
 }
 
+/// Output with a url on every twentieth line, long enough to wrap, so url detection has work to do.
+fn history_with_links() -> String {
+    (0..2_000)
+        .map(|line| {
+            if line % 20 == 0 {
+                format!("see https://example.com/build/{line}/artifacts/output/log\r\n")
+            } else {
+                format!("line-{line}\r\n")
+            }
+        })
+        .collect()
+}
+
+fn active_panes_with_links(pane_count: usize) -> Vec<Workspace> {
+    active_panes_from(pane_count, &history_with_links())
+}
+
 fn runtime(history: &str) -> TerminalRuntime {
     TerminalRuntime::test_with_scrollback_bytes(COLS, ROWS, 1024 * 1024, history.as_bytes())
 }
@@ -143,7 +160,11 @@ fn workspaces(workspace_count: usize) -> Vec<Workspace> {
 }
 
 fn active_panes(pane_count: usize) -> Vec<Workspace> {
-    let history = history();
+    active_panes_from(pane_count, &history())
+}
+
+fn active_panes_from(pane_count: usize, history: &str) -> Vec<Workspace> {
+    let history = history.to_owned();
     let mut workspace = Workspace::test_new("bench");
     let root_pane = workspace.tabs[0].root_pane;
     workspace.insert_test_runtime(root_pane, runtime(&history));
@@ -218,6 +239,29 @@ fn print_stage(
             stats.median_us as f64 / baseline.median_us.max(1) as f64,
             stats.p95_us as f64 / baseline.p95_us.max(1) as f64,
         );
+    }
+}
+
+/// What url detection costs the server's pane surface, with and without urls on screen.
+fn print_link_detection_profiles() {
+    println!("url detection (active panes)");
+    println!("       count  detect  median_us  p95_us  max_us");
+    for count in CARDINALITIES {
+        for (detect, build) in [
+            (false, active_panes as fn(usize) -> Vec<Workspace>),
+            (true, active_panes as fn(usize) -> Vec<Workspace>),
+            (true, active_panes_with_links as fn(usize) -> Vec<Workspace>),
+        ] {
+            let mut config = Config::default();
+            config.ui.detect_urls = detect;
+            let mut pipeline = RenderPipeline::with_config(build(count), &config);
+            pipeline.app.state.detect_urls = detect;
+            let stats = profile_pipeline(pipeline).server;
+            println!(
+                "  {count:>10}  {detect:>6}  {:>9}  {:>6}  {:>6}",
+                stats.median_us, stats.p95_us, stats.max_us
+            );
+        }
     }
 }
 
@@ -585,6 +629,8 @@ async fn render_scale_profile() {
     print_snapshot_encoding_profiles("background workspaces", workspaces);
     print_profiles("active panes (one workspace)", active_panes);
     print_snapshot_encoding_profiles("active panes", active_panes);
+    print_profiles("active panes with urls in output", active_panes_with_links);
+    print_link_detection_profiles();
     print_token_rule_profiles();
     print_surface_reuse_profiles();
     print_surface_damage_profiles();
