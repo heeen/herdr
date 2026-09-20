@@ -1087,7 +1087,8 @@ fn retained_surface_patch_updates_only_pane_cells_without_recomposing_chrome() {
         cursor: None,
     };
 
-    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) = state.apply_pane_surface_patch(patch)
+    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) =
+        state.apply_pane_surface_patch(patch, None)
     else {
         panic!("expected fast retained patch");
     };
@@ -1138,7 +1139,7 @@ fn retained_surface_patch_recomposes_client_owned_mode_and_diagnostic_rows() {
         };
 
         assert!(matches!(
-            state.apply_pane_surface_patch(patch),
+            state.apply_pane_surface_patch(patch, None),
             ClientPaneSurfacePatchOutcome::Applied(None)
         ));
     }
@@ -1193,7 +1194,8 @@ fn retained_surface_patch_updates_scrollbar_cells_and_pane_hit_metadata() {
         cursor: None,
     };
 
-    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) = state.apply_pane_surface_patch(patch)
+    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) =
+        state.apply_pane_surface_patch(patch, None)
     else {
         panic!("expected fast retained patch");
     };
@@ -1230,15 +1232,18 @@ fn retained_surface_patch_rejects_stale_base_without_mutating_surface() {
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     let before = state.pane_surface.clone();
-    let outcome = state.apply_pane_surface_patch(crate::protocol::PaneSurfacePatch {
-        boot_id: "boot-1".into(),
-        projection_revision: 1,
-        base_surface_revision: 0,
-        surface_revision: 2,
-        rows: Vec::new(),
-        panes: Vec::new(),
-        cursor: None,
-    });
+    let outcome = state.apply_pane_surface_patch(
+        crate::protocol::PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            base_surface_revision: 0,
+            surface_revision: 2,
+            rows: Vec::new(),
+            panes: Vec::new(),
+            cursor: None,
+        },
+        None,
+    );
     assert!(matches!(outcome, ClientPaneSurfacePatchOutcome::Rejected));
     assert_eq!(state.pane_surface, before);
 }
