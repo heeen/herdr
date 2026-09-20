@@ -651,7 +651,7 @@ async fn dirty_scroll_collection_profile() {
             format!("{:010}{:010}\r\n", line.wrapping_mul(2_654_435_761), line).as_bytes(),
         );
         let started = Instant::now();
-        let snapshot = black_box(runtime.collect_dirty_patch_snapshot(WIDTH, HEIGHT));
+        let snapshot = black_box(runtime.collect_dirty_patch_snapshot(WIDTH, HEIGHT, None));
         if line as usize >= WARMUP_COUNT {
             samples.push(started.elapsed());
         }

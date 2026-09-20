@@ -52,14 +52,46 @@ pub use self::{
     terminal::{ScrollMetrics, TerminalCursorState},
 };
 
+/// Asks a dirty-patch collection to also report the pane's links.
+///
+/// The links have to come from the same lock and revision as the cells, or a patch could carry a
+/// link that belongs to terminal state the cells do not show.
+pub(crate) struct LinkRequest {
+    pub area: Rect,
+    pub options: LinkScanOptions,
+    /// Collect even when the patch itself shows no sign of links: the baseline already has some,
+    /// or output below a pinned viewport may have extended one.
+    pub force: bool,
+}
+
 pub(crate) struct TerminalDirtyPatchSnapshot {
     pub patch: TerminalDirtyPatchOutcome,
+    /// The pane's links at `content_revision`, when they were asked for and could matter.
+    // Read by the retained planner in the commit that plans linked patches.
+    #[allow(dead_code)]
+    pub links: Option<VisibleHyperlinks>,
     pub content_revision: u64,
     pub scroll_metrics: Option<ScrollMetrics>,
     pub mouse_reporting: bool,
     pub sgr_pixel_mouse: bool,
     pub alternate_screen_active: bool,
     pub graphics_may_have_placements: bool,
+}
+
+/// Whether a patch can leave the pane's links alone.
+///
+/// A link only changes with the rows around it: either the dirty rows themselves hold one, are
+/// about to hold one, or wrap into a neighbour whose link now reaches further.
+fn link_collection_matters(request: &LinkRequest, patch: &TerminalDirtyPatchOutcome) -> bool {
+    if request.force {
+        return true;
+    }
+    let TerminalDirtyPatchOutcome::Patch(patch) = patch else {
+        return false;
+    };
+    patch.program_links
+        || (request.options.detect_plain_urls
+            && (patch.may_contain_url() || patch.touches_soft_wrap))
 }
 
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3438,6 +3470,7 @@ impl PaneRuntime {
         &self,
         area_width: u16,
         area_height: u16,
+        links: Option<LinkRequest>,
     ) -> Option<TerminalDirtyPatchSnapshot> {
         // PTY/resize writers announce changes before locking the terminal core.
         // Exclude them until rows and metadata have been paired with their revision.
@@ -3453,8 +3486,15 @@ impl PaneRuntime {
         if matches!(patch, TerminalDirtyPatchOutcome::Fallback) {
             return None;
         }
+        let links = links
+            .filter(|request| link_collection_matters(request, &patch))
+            .map(|request| {
+                self.terminal
+                    .visible_hyperlinks(request.area, request.options, Some(revision))
+            });
         let snapshot = TerminalDirtyPatchSnapshot {
             patch,
+            links,
             content_revision: revision,
             scroll_metrics: self.scroll_metrics(),
             mouse_reporting: self.mouse_reporting_enabled(),
@@ -3896,7 +3936,7 @@ mod tests {
         let before = runtime.content_seq();
         runtime.scroll_up(1);
         runtime.clear_screen().unwrap();
-        let snapshot = runtime.collect_dirty_patch_snapshot(10, 5).unwrap();
+        let snapshot = runtime.collect_dirty_patch_snapshot(10, 5, None).unwrap();
         assert!(snapshot.content_revision > before);
         assert!(!matches!(snapshot.patch, TerminalDirtyPatchOutcome::Clean));
         let metrics = runtime.scroll_metrics().unwrap();
@@ -3938,11 +3978,11 @@ mod tests {
     async fn dirty_patch_snapshot_keeps_clean_metadata_and_terminal_fallback() {
         let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
         runtime
-            .collect_dirty_patch_snapshot(20, 4)
+            .collect_dirty_patch_snapshot(20, 4, None)
             .expect("initial snapshot");
         runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1016h");
         let snapshot = runtime
-            .collect_dirty_patch_snapshot(20, 4)
+            .collect_dirty_patch_snapshot(20, 4, None)
             .expect("mode snapshot");
         assert!(matches!(snapshot.patch, TerminalDirtyPatchOutcome::Clean));
         assert_eq!(snapshot.content_revision, runtime.content_seq());
@@ -3954,13 +3994,95 @@ mod tests {
         // A program link is reported rather than refused, and the lock is released either way.
         runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
         let snapshot = runtime
-            .collect_dirty_patch_snapshot(20, 4)
+            .collect_dirty_patch_snapshot(20, 4, None)
             .expect("link snapshot");
         let TerminalDirtyPatchOutcome::Patch(patch) = snapshot.patch else {
             panic!("expected a patch over the linked row");
         };
         assert!(patch.program_links);
         assert!(runtime.content_write_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dirty_patch_snapshot_collects_links_only_when_they_can_have_changed() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        let request = |force| LinkRequest {
+            area: Rect::new(0, 0, 20, 4),
+            options: LinkScanOptions {
+                detect_plain_urls: true,
+            },
+            force,
+        };
+        runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .expect("initial snapshot");
+
+        // Plain output cannot introduce or move a link.
+        runtime.test_process_pty_bytes(b"plain\r\n");
+        let plain = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .expect("plain snapshot");
+        assert!(plain.links.is_none());
+
+        // Nothing changed at all, but the caller knows the baseline already holds links.
+        let forced = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(true)))
+            .expect("forced snapshot");
+        assert!(forced.links.is_some());
+
+        // A url short enough not to wrap, so this exercises the scheme test on its own.
+        runtime.test_process_pty_bytes(b"https://a.io/x\r\n");
+        let detected = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .expect("url snapshot");
+        let links = detected.links.expect("a url in new output collects links");
+        assert!(links
+            .iter()
+            .any(|link| link.uri.as_ref() == "https://a.io/x"));
+        assert_eq!(detected.content_revision, runtime.content_seq());
+
+        // A program link is collected even with detection off.
+        runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com/b\x1b\\x\x1b]8;;\x1b\\");
+        let program = runtime
+            .collect_dirty_patch_snapshot(
+                20,
+                4,
+                Some(LinkRequest {
+                    area: Rect::new(0, 0, 20, 4),
+                    options: LinkScanOptions::default(),
+                    force: false,
+                }),
+            )
+            .expect("program link snapshot");
+        assert!(program
+            .links
+            .expect("a program link collects links")
+            .iter()
+            .any(|link| link.uri.as_ref() == "https://example.com/b"));
+
+        // Text on the far side of a wrap: the row it lands on carries no scheme of its own, and
+        // the row holding the scheme is already wrapped, so it stays clean.
+        runtime.test_process_pty_bytes(b"\r\nhttps://example.com/a");
+        runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .expect("url prefix snapshot");
+        runtime.test_process_pty_bytes(b"bcd");
+        let wrapped = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .expect("wrapped snapshot");
+        assert!(wrapped
+            .links
+            .expect("text extending a wrapped url collects links")
+            .iter()
+            .any(|link| link.uri.as_ref() == "https://example.com/abcd"));
+
+        // And a caller that never asks gets nothing.
+        runtime.test_process_pty_bytes(b"see https://example.com/c\r\n");
+        assert!(runtime
+            .collect_dirty_patch_snapshot(20, 4, None)
+            .expect("unasked snapshot")
+            .links
+            .is_none());
     }
 
     #[tokio::test]
@@ -3972,11 +4094,11 @@ mod tests {
             b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix",
         );
         runtime
-            .collect_dirty_patch_snapshot(20, 4)
+            .collect_dirty_patch_snapshot(20, 4, None)
             .expect("live snapshot");
         runtime.scroll_up(1);
         let scrolled = runtime
-            .collect_dirty_patch_snapshot(20, 4)
+            .collect_dirty_patch_snapshot(20, 4, None)
             .expect("scrolled snapshot");
         assert_eq!(
             scrolled.scroll_metrics.expect("metrics").offset_from_bottom,
@@ -3985,7 +4107,7 @@ mod tests {
         runtime.scroll_reset();
         runtime.resize(5, 24, 0, 0);
         let resized = runtime
-            .collect_dirty_patch_snapshot(24, 5)
+            .collect_dirty_patch_snapshot(24, 5, None)
             .expect("resized snapshot");
         let metrics = resized.scroll_metrics.expect("resized metrics");
         assert_eq!(metrics.offset_from_bottom, 0);
