@@ -7,7 +7,6 @@
 //! operations. Client-owned shells negotiate the independent stable endpoint
 //! contract in [`super::endpoint`].
 
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -804,28 +803,16 @@ impl FrameData {
         let width = area.width;
         let height = area.height;
 
-        let mut hyperlink_uris = Vec::<String>::new();
-        let mut hyperlink_indices = HashMap::<&str, u32>::new();
-        let mut hyperlink_by_position = HashMap::<(u16, u16), (&str, &str)>::new();
-        for link in hyperlinks {
-            hyperlink_by_position.insert(link.position, (link.symbol.as_str(), link.uri.as_ref()));
-        }
+        let placements = super::hyperlink_table::resolve_placements(hyperlinks);
+        let mut table = super::hyperlink_table::HyperlinkTable::default();
         let mut cells = Vec::with_capacity((width as usize) * (height as usize));
         for row in 0..height {
             for col in 0..width {
                 let cell = buffer.cell((col, row)).expect("cell within bounds");
-                let hyperlink = hyperlink_by_position
+                let hyperlink = placements
                     .get(&(col, row))
-                    .and_then(|(symbol, uri)| {
-                        if *symbol != cell.symbol() {
-                            return None;
-                        }
-                        Some(*hyperlink_indices.entry(*uri).or_insert_with(|| {
-                            let index = hyperlink_uris.len() as u32;
-                            hyperlink_uris.push((*uri).to_owned());
-                            index
-                        }))
-                    });
+                    .filter(|(symbol, _)| *symbol == cell.symbol())
+                    .map(|(_, uri)| table.intern(uri));
                 let mut cell = CellData::from_ratatui_cell(cell);
                 cell.hyperlink = hyperlink;
                 cells.push(cell);
@@ -837,7 +824,7 @@ impl FrameData {
             width,
             height,
             cursor,
-            hyperlinks: hyperlink_uris,
+            hyperlinks: table.into_uris(),
             graphics: Vec::new(),
         }
     }
@@ -3449,6 +3436,43 @@ mod tests {
         assert_eq!(restored.cell((1, 0)).unwrap().symbol(), "i");
         assert_eq!(restored.cell((2, 0)).unwrap().symbol(), "!");
         assert_eq!(restored.cell((2, 0)).unwrap().fg, Color::Rgb(255, 128, 0));
+    }
+
+    #[test]
+    fn frame_link_table_follows_placement_and_first_appearance_rules() {
+        // Two rows, and links that exercise every rule: duplicate uris, a symbol that disagrees
+        // with the drawn cell, and a later entry for the same position replacing an earlier one.
+        let buffer = ratatui::buffer::Buffer::with_lines(["abcd", "efgh"]);
+        let link = |x, y, symbol: &str, uri: &str| crate::pane::VisibleHyperlink {
+            position: (x, y),
+            symbol: symbol.to_owned(),
+            uri: uri.into(),
+        };
+        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+            &buffer,
+            None,
+            &[
+                link(2, 0, "c", "https://b.test"),
+                link(0, 1, "e", "https://a.test"),
+                link(3, 1, "h", "https://b.test"),
+                // Drawn "d", so this entry is dropped.
+                link(3, 0, "x", "https://dropped.test"),
+                // Replaced by the later entry for the same cell.
+                link(1, 1, "f", "https://replaced.test"),
+                link(1, 1, "f", "https://c.test"),
+            ],
+        );
+
+        let links: Vec<Option<u32>> = frame.cells.iter().map(|cell| cell.hyperlink).collect();
+        assert_eq!(
+            links,
+            [None, None, Some(0), None, Some(1), Some(2), None, Some(0)],
+            "indices follow first appearance row by row, and duplicates share one"
+        );
+        assert_eq!(
+            frame.hyperlinks,
+            ["https://b.test", "https://a.test", "https://c.test"]
+        );
     }
 
     #[test]
