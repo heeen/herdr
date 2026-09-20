@@ -382,15 +382,31 @@ fn sparse_dirty_patches_preserve_coordinates_and_clipped_rows() {
 }
 
 #[test]
-fn dirty_patch_fallback_keeps_previously_collected_rows_dirty() {
+fn dirty_patch_over_a_program_link_collects_and_clears_its_rows() {
+    // A program link used to make the walk refuse the whole patch, leaving its rows dirty for the
+    // full render that followed. It now reports the link and collects as usual.
     let mut terminal = Harness::new(8, 6);
     terminal.write(b"\x1b[2;3H");
     terminal.pane.collect_dirty_patch(8, 6);
     terminal.write(b"\x1b[2;3HX\x1b[5;4H\x1b]8;;https://example.test\x1b\\Y\x1b]8;;\x1b\\");
-    assert!(matches!(
-        terminal.pane.collect_dirty_patch(8, 6),
-        TerminalDirtyPatchOutcome::Fallback
-    ));
+
+    let patch = match terminal.pane.collect_dirty_patch(8, 6) {
+        TerminalDirtyPatchOutcome::Patch(patch) => patch,
+        outcome => panic!("expected a patch, got {outcome:?}"),
+    };
+    assert!(patch.program_links);
+    assert_eq!(
+        patch.rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+        vec![1, 4]
+    );
+    assert!(
+        patch
+            .rows
+            .iter()
+            .all(|(_, cells)| cells.iter().all(|cell| cell.hyperlink.is_none())),
+        "patch cells carry no link index; the planner assigns links"
+    );
+
     let core = terminal.pane.ghostty.core.lock().unwrap();
     let mut iterator = crate::ghostty::RowIterator::new().unwrap();
     let mut rows = core
@@ -405,7 +421,7 @@ fn dirty_patch_fallback_keeps_previously_collected_rows_dirty() {
         }
         y += 1;
     }
-    assert_eq!(dirty, vec![1, 4]);
+    assert!(dirty.is_empty(), "collected rows are cleared: {dirty:?}");
 }
 
 #[test]
