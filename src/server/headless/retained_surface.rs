@@ -5,29 +5,6 @@ fn rect_fits_frame(rect: protocol::SurfaceRect, frame: &FrameData) -> bool {
         && rect.y.saturating_add(rect.height) <= frame.height
 }
 
-/// Whether a patch's new text could contain a url.
-///
-/// Hyperlinks are collected only when the whole surface is rendered, so a url that arrives in an
-/// incremental patch would stay unlinked until something else forced a full render.
-pub(super) fn patch_may_contain_url(patch: &crate::pane::TerminalDirtyPatch) -> bool {
-    const SCHEME: &[u8] = b"http";
-
-    patch.rows.iter().any(|(_, cells)| {
-        let mut matched = 0;
-        for ch in cells.iter().flat_map(|cell| cell.symbol.bytes()) {
-            matched = if ch == SCHEME[matched] {
-                matched + 1
-            } else {
-                usize::from(ch == SCHEME[0])
-            };
-            if matched == SCHEME.len() {
-                return true;
-            }
-        }
-        false
-    })
-}
-
 fn patch_intersects_hyperlinks(
     frame: &FrameData,
     area: protocol::SurfaceRect,
@@ -367,7 +344,11 @@ impl HeadlessServer {
             let patch = match snapshot.patch {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained_surface.pane_clean");
-                    crate::pane::TerminalDirtyPatch { rows: Vec::new() }
+                    crate::pane::TerminalDirtyPatch {
+                        rows: Vec::new(),
+                        program_links: false,
+                        touches_soft_wrap: false,
+                    }
                 }
                 crate::pane::TerminalDirtyPatchOutcome::Patch(patch) => patch,
                 crate::pane::TerminalDirtyPatchOutcome::Fallback => {
@@ -411,14 +392,16 @@ impl HeadlessServer {
                 if pane.alternate_screen_active != collected_pane.alternate_screen_active {
                     fallback!("alternate_screen_geometry");
                 }
-                if patch_intersects_hyperlinks(
-                    &surface.frame,
-                    pane.inner_rect,
-                    &collected_pane.patch,
-                ) {
+                if collected_pane.patch.program_links
+                    || patch_intersects_hyperlinks(
+                        &surface.frame,
+                        pane.inner_rect,
+                        &collected_pane.patch,
+                    )
+                {
                     fallback!("hyperlink");
                 }
-                if self.app.state.detect_urls && patch_may_contain_url(&collected_pane.patch) {
+                if self.app.state.detect_urls && collected_pane.patch.may_contain_url() {
                     fallback!("detected_link");
                 }
                 refresh_graphics |= collected_pane.graphics_may_have_placements;
@@ -665,6 +648,8 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell(" "), cell("x"), cell("y"), cell(" ")])],
+            program_links: false,
+            touches_soft_wrap: false,
         };
 
         let rows = changed_rows(
@@ -702,6 +687,8 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell("x"), cell("z"), cell("q")])],
+            program_links: false,
+            touches_soft_wrap: false,
         };
 
         let rows = changed_rows(
@@ -738,6 +725,8 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell(" "); 4]), (1, vec![cell(" "); 4])],
+            program_links: false,
+            touches_soft_wrap: false,
         };
 
         let rows = changed_rows(
