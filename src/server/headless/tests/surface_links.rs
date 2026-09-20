@@ -446,3 +446,31 @@ async fn a_clean_row_follows_a_url_it_gains_and_loses() {
     assert!(render.try_recv().is_err(), "nothing left for a full render");
     shutdown_test_runtimes(&mut server);
 }
+
+/// Turning url detection off has to take the links off the screen, not leave them until the pane
+/// happens to produce output again.
+#[tokio::test]
+async fn turning_url_detection_off_unlinks_a_pane_that_is_not_producing_output() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_linked_test_shell(&mut server, 7);
+    write_shared_test_pane(&mut server, pane_id, b"\rsee https://example.com/x\r\n");
+    server.render_and_stream();
+    let mut shell = ShellSurface::new(&recv_pane_surface(&render, "baseline"));
+    assert!(!frame_links(&shell.frame).is_empty(), "the url is linked");
+
+    server.app.state.detect_urls = false;
+    server.render_and_stream();
+    apply_pending(&mut shell, &render);
+
+    assert!(
+        frame_links(&shell.frame).is_empty(),
+        "a full render after the reload drops the detected links"
+    );
+    assert_same_frame(
+        &shell.frame,
+        &server_surface(&server, 7).frame,
+        "client vs server",
+    );
+    shutdown_test_runtimes(&mut server);
+}
