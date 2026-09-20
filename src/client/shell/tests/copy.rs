@@ -291,19 +291,22 @@ fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() 
     let mut cell = updated.frame.cells[0].clone();
     cell.symbol = "y".into();
     assert!(matches!(
-        state.apply_pane_surface_patch(crate::protocol::PaneSurfacePatch {
-            boot_id: updated.boot_id,
-            projection_revision: updated.projection_revision,
-            base_surface_revision: updated.surface_revision,
-            surface_revision: updated.surface_revision + 1,
-            panes: updated.panes,
-            rows: vec![crate::protocol::PaneSurfacePatchRow {
-                x: 0,
-                y: 0,
-                cells: vec![cell]
-            }],
-            cursor: updated.frame.cursor,
-        }),
+        state.apply_pane_surface_patch(
+            crate::protocol::PaneSurfacePatch {
+                boot_id: updated.boot_id,
+                projection_revision: updated.projection_revision,
+                base_surface_revision: updated.surface_revision,
+                surface_revision: updated.surface_revision + 1,
+                panes: updated.panes,
+                rows: vec![crate::protocol::PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![cell]
+                }],
+                cursor: updated.frame.cursor,
+            },
+            None
+        ),
         super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
     ));
     assert!(state
