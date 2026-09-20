@@ -53,7 +53,7 @@ async fn public_pane_move_focus_follows_the_moved_pane() {
     server.app.terminal_runtimes.insert(terminal_id, runtime);
     let source_id = server.app.public_pane_id(0, source).unwrap();
     let destination_id = server.app.public_workspace_id(1);
-    let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23);
+    let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23, false);
     let initial = client_shell_snapshot(&control_rx);
 
     let moved = public_move(
@@ -143,8 +143,8 @@ async fn public_pane_move_focus_handles_source_removal_and_unchanged_server_targ
             }
         };
         let target_before = server.default_shell_target();
-        let (_first_control, _first_render) = connect_test_shell(&mut server, 9, 80, 23);
-        let (_second_control, _second_render) = connect_test_shell(&mut server, 10, 80, 23);
+        let (_first_control, _first_render) = connect_test_shell(&mut server, 9, 80, 23, false);
+        let (_second_control, _second_render) = connect_test_shell(&mut server, 10, 80, 23, false);
         assert!(server.focus_shell_client_on_tab(9, &first_tab));
         assert!(server.focus_shell_client_on_tab(10, &first_tab));
         let moved = public_move(
@@ -183,8 +183,8 @@ async fn public_pane_move_without_effective_focus_preserves_client_views() {
         let source_id = server.app.public_pane_id(0, source).unwrap();
         let remaining_tab = server.app.public_tab_id(0, 1).unwrap();
         let destination_tab = server.app.public_tab_id(1, 0).unwrap();
-        let (_control, _render) = connect_test_shell(&mut server, 9, 80, 23);
-        let (_source_control, _source_render) = connect_test_shell(&mut server, 10, 80, 23);
+        let (_control, _render) = connect_test_shell(&mut server, 9, 80, 23, false);
+        let (_source_control, _source_render) = connect_test_shell(&mut server, 10, 80, 23, false);
         // Keep a valid view distinct from the server default in every case.
         assert!(server.focus_shell_client_on_tab(9, &remaining_tab));
         let location_before = server.clients[&9].shell_location.clone();

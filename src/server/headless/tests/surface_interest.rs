@@ -67,6 +67,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id,
             surface_cols: 101,
@@ -264,7 +265,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
 async fn background_surface_activation_preserves_focused_viewer_geometry() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
-    let (focused_control, _) = connect_test_shell(&mut server, 7, 68, 17);
+    let (focused_control, _) = connect_test_shell(&mut server, 7, 68, 17, false);
     let _ = focused_control.recv().expect("focused client snapshot");
     assert!(server.handle_server_event(ServerEvent::ClientShellFocus {
         client_id: 7,
@@ -284,6 +285,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 8,
             surface_cols: 100,
@@ -356,7 +358,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
 async fn focused_surface_reassertion_reclaims_tab_geometry() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
-    let (focused_control, _) = connect_test_shell(&mut server, 8, 100, 35);
+    let (focused_control, _) = connect_test_shell(&mut server, 8, 100, 35, false);
     let _ = focused_control.recv().expect("focused client snapshot");
     assert!(server.handle_server_event(ServerEvent::ClientShellFocus {
         client_id: 8,
@@ -364,7 +366,7 @@ async fn focused_surface_reassertion_reclaims_tab_geometry() {
     }));
     let shared_tab_id = server.shell_tab_id_for_client(8).expect("focused tab");
 
-    let (other_control, _) = connect_test_shell(&mut server, 7, 68, 17);
+    let (other_control, _) = connect_test_shell(&mut server, 7, 68, 17, false);
     let _ = other_control.recv().expect("other client snapshot");
     assert!(server.claim_shell_tab_geometry(7, false));
     assert_eq!(
@@ -399,6 +401,7 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id,
             surface_cols: 80,
@@ -517,6 +520,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: source_client_id,
             surface_cols: 80,
@@ -542,6 +546,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: target_client_id,
             surface_cols: 80,
