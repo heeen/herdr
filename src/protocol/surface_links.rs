@@ -9,10 +9,6 @@
 //! the new table by URI. That keeps the result identical to what a full render would have sent,
 //! which is what lets the server, the client and the surface-reuse baseline stay in step.
 
-// The server planner and the client shell start using these in the commits that follow; the
-// encoding is landed on its own so its own tests stand before anything depends on it.
-#![allow(dead_code)]
-
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 

@@ -12,6 +12,8 @@ mod retained_links_tests;
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
+#[path = "surface_links.rs"]
+mod surface_links_tests;
 #[path = "surface_scroll.rs"]
 mod surface_scroll_tests;
 
@@ -731,6 +733,7 @@ async fn client_shell_attach_seeds_workspace() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 6,
             surface_cols: 80,
@@ -776,6 +779,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_delta: false,
         surface_scroll: false,
         clipboard_write: false,
+        surface_links: false,
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -825,6 +829,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id,
             surface_cols: 80,
@@ -945,6 +950,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 77,
             surface_cols: 80,
@@ -1049,6 +1055,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 7,
             surface_cols: 80,
@@ -1208,6 +1215,7 @@ fn connect_test_shell(
     client_id: u64,
     surface_cols: u16,
     surface_rows: u16,
+    surface_links: bool,
 ) -> (
     std::sync::mpsc::Receiver<Vec<u8>>,
     std::sync::mpsc::Receiver<Vec<u8>>,
@@ -1218,6 +1226,7 @@ fn connect_test_shell(
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links,
             clipboard_write: false,
             client_id,
             surface_cols,
@@ -1242,7 +1251,18 @@ fn connect_matching_test_shell(
     std::sync::mpsc::Receiver<Vec<u8>>,
     std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
-    connect_test_shell(server, client_id, 80, 23)
+    connect_test_shell(server, client_id, 80, 23, false)
+}
+
+/// A shell that negotiated patches carrying their own link table.
+fn connect_linked_test_shell(
+    server: &mut HeadlessServer,
+    client_id: u64,
+) -> (
+    std::sync::mpsc::Receiver<Vec<u8>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    connect_test_shell(server, client_id, 80, 23, true)
 }
 
 fn write_shared_test_pane(
@@ -1487,7 +1507,7 @@ async fn retained_snapshot_survives_a_writer_waiting_for_the_terminal_core() {
 async fn first_shell_surface_resizes_a_pane_that_entered_alternate_screen() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
-    let (_control, render) = connect_test_shell(&mut server, 7, 80, 23);
+    let (_control, render) = connect_test_shell(&mut server, 7, 80, 23, false);
     let initial_size = server.app.state.workspaces[0].test_runtimes[&pane_id].current_size();
 
     write_shared_test_pane(&mut server, pane_id, b"\x1b[?1049hALT");
@@ -1506,8 +1526,8 @@ async fn first_shell_surface_resizes_a_pane_that_entered_alternate_screen() {
 async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_collection() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
-    let (large_control, large_render) = connect_test_shell(&mut server, 7, 80, 23);
-    let (small_control, small_render) = connect_test_shell(&mut server, 8, 68, 17);
+    let (large_control, large_render) = connect_test_shell(&mut server, 7, 80, 23, false);
+    let (small_control, small_render) = connect_test_shell(&mut server, 8, 68, 17, false);
     let _ = large_control.recv().expect("large snapshot");
     let _ = small_control.recv().expect("small snapshot");
     server.render_and_stream();
@@ -1844,6 +1864,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 13,
             surface_cols: 80,
@@ -1870,6 +1891,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 14,
             surface_cols: 80,
@@ -1913,8 +1935,8 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
     let first_tab_id = tab_ids[0].clone();
     let second_tab_id = tab_ids[second_tab].clone();
 
-    let (first_control, _first_render) = connect_test_shell(&mut server, 7, 100, 30);
-    let (second_control, _second_render) = connect_test_shell(&mut server, 8, 80, 24);
+    let (first_control, _first_render) = connect_test_shell(&mut server, 7, 100, 30, false);
+    let (second_control, _second_render) = connect_test_shell(&mut server, 8, 80, 24, false);
     let first_initial = client_shell_snapshot(&first_control);
     let second_initial = client_shell_snapshot(&second_control);
     assert_eq!(
@@ -2348,7 +2370,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
     server.app.state.mode = crate::app::Mode::Terminal;
     let tab_id = server.app.public_tab_id(0, 0).expect("tab id");
 
-    let (control, _) = connect_test_shell(&mut server, 65, 100, 30);
+    let (control, _) = connect_test_shell(&mut server, 65, 100, 30, false);
     let _ = control.recv().expect("snapshot");
     let before = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
     let (respond_to, _response_rx) = std::sync::mpsc::channel();
@@ -2397,7 +2419,7 @@ async fn public_close_reapplies_controller_geometry() {
     server.app.state.mode = crate::app::Mode::Terminal;
     let second_pane_id = server.app.public_pane_id(0, second_pane).unwrap();
 
-    let (control, _) = connect_test_shell(&mut server, 66, 100, 30);
+    let (control, _) = connect_test_shell(&mut server, 66, 100, 30, false);
     let _ = control.recv().expect("snapshot");
     let shrunk = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
     assert!(shrunk.0 < 30);
@@ -2449,8 +2471,8 @@ async fn geometry_reapply_replaces_a_controller_that_left_the_tab() {
     let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
     let third_tab_id = server.app.public_tab_id(0, third_tab).unwrap();
 
-    let (first_control, _) = connect_test_shell(&mut server, 67, 100, 30);
-    let (second_control, _) = connect_test_shell(&mut server, 68, 70, 20);
+    let (first_control, _) = connect_test_shell(&mut server, 67, 100, 30, false);
+    let (second_control, _) = connect_test_shell(&mut server, 68, 70, 20, false);
     let _ = first_control.recv().expect("first snapshot");
     let _ = second_control.recv().expect("second snapshot");
 
@@ -2507,7 +2529,7 @@ async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     let initial_second_size =
         server.app.state.workspaces[0].test_runtimes[&second_pane].current_size();
 
-    let (first_control, first_render) = connect_test_shell(&mut server, 21, 100, 30);
+    let (first_control, first_render) = connect_test_shell(&mut server, 21, 100, 30, false);
     let _ = first_control.recv().expect("first snapshot");
     let first_size = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
     let singleton_second_size =
@@ -2515,7 +2537,7 @@ async fn client_shell_tabs_render_accept_input_and_resize_independently() {
     assert_ne!(singleton_second_size, initial_second_size);
     assert_eq!(singleton_second_size, first_size);
 
-    let (second_control, second_render) = connect_test_shell(&mut server, 22, 70, 20);
+    let (second_control, second_render) = connect_test_shell(&mut server, 22, 70, 20, false);
     let _ = second_control.recv().expect("second snapshot");
 
     assert!(server.focus_shell_client_on_tab(22, &second_tab_id));
@@ -2645,8 +2667,8 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
     let first_tab_id = server.app.public_tab_id(0, 0).unwrap();
     let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
 
-    let (first_control, _) = connect_test_shell(&mut server, 41, 100, 30);
-    let (second_control, _) = connect_test_shell(&mut server, 42, 80, 24);
+    let (first_control, _) = connect_test_shell(&mut server, 41, 100, 30, false);
+    let (second_control, _) = connect_test_shell(&mut server, 42, 80, 24, false);
     let _ = first_control.recv().expect("first snapshot");
     let _ = second_control.recv().expect("second snapshot");
     assert!(server.focus_shell_client_on_tab(41, &second_tab_id));
@@ -2711,7 +2733,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
     let first_pane_id = server.app.public_pane_id(0, first_pane).unwrap();
     let second_tab_id = server.app.public_tab_id(1, 0).unwrap();
 
-    let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23);
+    let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23, false);
     let _ = client_shell_snapshot(&control_rx);
     assert!(server.focus_shell_client_on_tab(9, &second_tab_id));
     assert!(server.claim_shell_tab_geometry(9, false));
@@ -2791,6 +2813,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 9,
             surface_cols: 80,
@@ -3039,6 +3062,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_links: false,
             clipboard_write: false,
             client_id: 12,
             surface_cols: 80,
@@ -5160,8 +5184,8 @@ async fn pane_death_reconciles_each_client_view_and_focus() {
         .public_tab_id(0, second_tab)
         .expect("second tab id");
 
-    let (first_control, _) = connect_test_shell(&mut server, 71, 100, 30);
-    let (second_control, _) = connect_test_shell(&mut server, 72, 70, 20);
+    let (first_control, _) = connect_test_shell(&mut server, 71, 100, 30, false);
+    let (second_control, _) = connect_test_shell(&mut server, 72, 70, 20, false);
     let _ = first_control.recv().expect("first snapshot");
     let _ = second_control.recv().expect("second snapshot");
     assert!(server.focus_shell_client_on_tab(72, &second_tab_id));
@@ -5232,7 +5256,7 @@ async fn pane_death_reapplies_controller_geometry() {
     server.app.state.selected = 0;
     server.app.state.mode = crate::app::Mode::Terminal;
 
-    let (control, _) = connect_test_shell(&mut server, 73, 185, 46);
+    let (control, _) = connect_test_shell(&mut server, 73, 185, 46, false);
     let _ = control.recv().expect("snapshot");
     let shrunk = server.app.state.workspaces[0].test_runtimes[&first_pane].current_size();
     assert!(shrunk.0 < 46);
@@ -6493,6 +6517,7 @@ async fn client_shell_requests_host_pixels_for_an_unfocused_pixel_pane() {
             surface_delta: false,
             surface_scroll: false,
             clipboard_write: false,
+            surface_links: false,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -7131,8 +7156,7 @@ fn a_patch_carrying_a_url_falls_back_to_a_full_surface() {
                     .map(crate::protocol::CellData::from_ratatui_cell)
                     .collect(),
             )],
-            program_links: false,
-            touches_soft_wrap: false,
+            ..Default::default()
         }
     }
 
