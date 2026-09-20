@@ -26,9 +26,11 @@ pub(crate) fn accepts_endpoint_message(
         || matches!(
             message,
             ServerMessage::EndpointControl { kind, .. }
-                // A clipboard write is a host effect like `ServerMessage::Clipboard`: only the
-                // endpoint the user is looking at may place text on their selections.
+                // A clipboard write is a host effect like `ServerMessage::Clipboard`, and a linked
+                // patch updates the surface the user is looking at: neither may arrive from an
+                // endpoint in the background.
                 if kind != crate::protocol::endpoint::CLIPBOARD_WRITE_KIND
+                    && kind != crate::protocol::surface_links::MESSAGE_KIND
         )
         || matches!(
             message,
@@ -89,6 +91,17 @@ mod tests {
             false,
             &clipboard_write
         ));
+        let linked_patch = ServerMessage::EndpointControl {
+            kind: crate::protocol::surface_links::MESSAGE_KIND.into(),
+            data: "{}".into(),
+        };
+        assert!(!accepts_endpoint_message(
+            false,
+            false,
+            false,
+            &linked_patch
+        ));
+        assert!(accepts_endpoint_message(true, false, false, &linked_patch));
         assert!(!accepts_endpoint_message(
             false,
             false,

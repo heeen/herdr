@@ -70,6 +70,10 @@ pub struct EndpointClientHello {
     /// selection, instead of `ServerMessage::Clipboard`.
     #[serde(default)]
     pub clipboard_write: bool,
+    /// Accept incremental pane patches that carry hyperlinks, so a linked row does not cost a
+    /// whole surface.
+    #[serde(default)]
+    pub surface_links: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -233,6 +237,7 @@ impl EndpointServerWelcome {
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
                 CLIPBOARD_WRITE_CAPABILITY.into(),
+                super::surface_links::CAPABILITY.into(),
             ],
             error: None,
         }
@@ -275,6 +280,7 @@ mod tests {
             surface_delta: false,
             surface_scroll: false,
             clipboard_write: false,
+            surface_links: false,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -425,12 +431,14 @@ mod tests {
         value.as_object_mut().unwrap().remove("surface_delta");
         value.as_object_mut().unwrap().remove("surface_scroll");
         value.as_object_mut().unwrap().remove("clipboard_write");
+        value.as_object_mut().unwrap().remove("surface_links");
         let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
         assert!(decoded.surface_active);
         assert!(!decoded.surface_reuse);
         assert!(!decoded.surface_delta);
         assert!(!decoded.surface_scroll);
         assert!(!decoded.clipboard_write);
+        assert!(!decoded.surface_links);
     }
 
     #[test]
@@ -475,6 +483,7 @@ mod tests {
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
                 CLIPBOARD_WRITE_CAPABILITY.to_string(),
+                super::super::surface_links::CAPABILITY.to_string(),
             ]
         );
     }
