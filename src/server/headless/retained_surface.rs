@@ -338,7 +338,7 @@ impl HeadlessServer {
             ) else {
                 fallback!("runtime_missing");
             };
-            let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height) else {
+            let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height, None) else {
                 fallback!("terminal_snapshot");
             };
             let patch = match snapshot.patch {
