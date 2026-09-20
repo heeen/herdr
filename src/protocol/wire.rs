@@ -740,6 +740,19 @@ impl CellData {
             hyperlink: None,
         }
     }
+
+    /// An unstyled cell, optionally pointing into a link table.
+    #[cfg(test)]
+    pub(crate) fn test_linked(symbol: &str, hyperlink: Option<u32>) -> Self {
+        Self {
+            symbol: symbol.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink,
+        }
+    }
 }
 
 /// Cursor shape encoded as a DECSCUSR parameter.
@@ -764,7 +777,7 @@ pub struct CursorState {
 }
 
 /// A rendered frame to be displayed by the client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameData {
     /// Cells in row-major order. Length must equal `width * height`.
     pub cells: Vec<CellData>,
