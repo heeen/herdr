@@ -427,8 +427,10 @@ impl TerminalRuntime {
         &self,
         area_width: u16,
         area_height: u16,
+        links: Option<crate::pane::LinkRequest>,
     ) -> Option<crate::pane::TerminalDirtyPatchSnapshot> {
-        self.0.collect_dirty_patch_snapshot(area_width, area_height)
+        self.0
+            .collect_dirty_patch_snapshot(area_width, area_height, links)
     }
 
     pub fn visible_hyperlinks(
