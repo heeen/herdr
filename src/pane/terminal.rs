@@ -106,9 +106,36 @@ pub struct TerminalCursorState {
     pub shape: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TerminalDirtyPatch {
     pub rows: Vec<(u16, Vec<CellData>)>,
+    /// A dirty cell carries the program's own OSC 8 link.
+    pub program_links: bool,
+    /// A dirty row wraps into or continues from its neighbour, so a link may reach rows this
+    /// patch never visited.
+    pub touches_soft_wrap: bool,
+}
+
+impl TerminalDirtyPatch {
+    /// Whether the new text could hold a url, using the same scheme test the scanner uses.
+    pub(crate) fn may_contain_url(&self) -> bool {
+        const SCHEME: &[u8] = b"http";
+
+        self.rows.iter().any(|(_, cells)| {
+            let mut matched = 0;
+            for byte in cells.iter().flat_map(|cell| cell.symbol.bytes()) {
+                matched = if byte == SCHEME[matched] {
+                    matched + 1
+                } else {
+                    usize::from(byte == SCHEME[0])
+                };
+                if matched == SCHEME.len() {
+                    return true;
+                }
+            }
+            false
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2729,9 +2756,17 @@ fn ghostty_collect_dirty_patch(
     let mut symbol_scratch = String::new();
     let mut patch_rows = Vec::new();
     let blank = blank_cell_data(default_fg, default_bg);
+    let mut program_links = false;
+    let mut touches_soft_wrap = false;
     while let Some(y) = rows.next_dirty() {
         if y >= area_height {
             break;
+        }
+        match rows.wrap_state() {
+            Ok((soft_wrapped, wrap_continuation)) => {
+                touches_soft_wrap |= soft_wrapped || wrap_continuation;
+            }
+            Err(_) => fallback!("wrap_state_error"),
         }
         match rows.selection() {
             Ok(None) => {}
@@ -2756,9 +2791,7 @@ fn ghostty_collect_dirty_patch(
             let Ok(basic) = cells.basic_data() else {
                 fallback!("basic_data_error");
             };
-            if basic.has_hyperlink {
-                fallback!("hyperlink_present");
-            }
+            program_links |= basic.has_hyperlink;
             let style = ghostty_cell_style(
                 &cells,
                 &basic,
@@ -2812,7 +2845,9 @@ fn ghostty_collect_dirty_patch(
     }
 
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
-        rows: patch_rows
+        rows: patch_rows,
+        program_links,
+        touches_soft_wrap,
     }));
 }
 
@@ -3865,6 +3900,29 @@ mod tests {
 
     fn rgb(r: u8, g: u8, b: u8) -> crate::ghostty::RgbColor {
         crate::ghostty::RgbColor { r, g, b }
+    }
+
+    #[test]
+    fn a_dirty_patch_reports_whether_it_touches_a_soft_wrap() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut wrapped = crate::ghostty::Terminal::new(8, 3, 200).unwrap();
+        wrapped.write(b"0123456789");
+        let wrapped = PaneTerminal::new(GhosttyPaneTerminal::new(wrapped, tx.clone()).unwrap());
+
+        let mut hard = crate::ghostty::Terminal::new(8, 3, 200).unwrap();
+        hard.write(b"0123\r\n456");
+        let hard = PaneTerminal::new(GhosttyPaneTerminal::new(hard, tx).unwrap());
+
+        let soft_wrap = |pane: &PaneTerminal| match pane.collect_dirty_patch(8, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch.touches_soft_wrap,
+            outcome => panic!("expected a patch, got {outcome:?}"),
+        };
+
+        assert!(
+            soft_wrap(&wrapped),
+            "ten characters over eight columns wrap"
+        );
+        assert!(!soft_wrap(&hard));
     }
 
     #[test]

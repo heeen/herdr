@@ -3951,8 +3951,15 @@ mod tests {
         assert!(snapshot.sgr_pixel_mouse);
         assert!(!snapshot.alternate_screen_active);
 
+        // A program link is reported rather than refused, and the lock is released either way.
         runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
-        assert!(runtime.collect_dirty_patch_snapshot(20, 4).is_none());
+        let snapshot = runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("link snapshot");
+        let TerminalDirtyPatchOutcome::Patch(patch) = snapshot.patch else {
+            panic!("expected a patch over the linked row");
+        };
+        assert!(patch.program_links);
         assert!(runtime.content_write_lock.try_lock().is_ok());
     }
 

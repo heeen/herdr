@@ -1662,6 +1662,26 @@ async fn retained_patches_only_reach_shells_viewing_the_dirty_tab() {
 }
 
 #[tokio::test]
+async fn a_program_link_in_new_output_falls_back_to_a_full_surface() {
+    // The dirty walk reports program links instead of refusing them, so the planner is what keeps
+    // a client that cannot receive links in a patch on full surfaces.
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let _ = recv_pane_surface(&render, "baseline");
+
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\r\x1b]8;;https://example.com/link\x1b\\linked\x1b]8;;\x1b\\",
+    );
+
+    assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
     let mut server = test_headless_server();
     let pane_id = install_shared_view_test_runtime(&mut server);
@@ -6615,19 +6635,13 @@ fn a_patch_carrying_a_url_falls_back_to_a_full_surface() {
                     .map(crate::protocol::CellData::from_ratatui_cell)
                     .collect(),
             )],
+            program_links: false,
+            touches_soft_wrap: false,
         }
     }
 
-    assert!(
-        crate::server::headless::retained_surface::patch_may_contain_url(&patch_of(
-            "see https://example.com/x"
-        ))
-    );
-    assert!(
-        !crate::server::headless::retained_surface::patch_may_contain_url(&patch_of(
-            "nothing to link here"
-        ))
-    );
+    assert!(patch_of("see https://example.com/x").may_contain_url());
+    assert!(!patch_of("nothing to link here").may_contain_url());
 }
 
 #[test]
