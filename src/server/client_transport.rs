@@ -1482,6 +1482,7 @@ mod tests {
             surface_delta: false,
             surface_scroll: false,
             clipboard_write: false,
+            surface_links: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
