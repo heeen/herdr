@@ -88,86 +88,72 @@ pub(crate) fn apply(
     rows: &[PaneSurfacePatchRow],
     hyperlinks: Vec<String>,
 ) -> Result<(), &'static str> {
-    let width = usize::from(frame.width);
-    let mut covered = vec![false; frame.cells.len()];
+    let FrameData {
+        width,
+        height,
+        cells: frame_cells,
+        hyperlinks: frame_hyperlinks,
+        ..
+    } = frame;
+    let (width, height) = (usize::from(*width), *height);
+    let mut covered = vec![false; frame_cells.len()];
     for row in rows {
-        if row.y >= frame.height || usize::from(row.x) + row.cells.len() > width {
+        if row.y >= height || usize::from(row.x) + row.cells.len() > width {
             return Err("linked patch row leaves the frame");
+        }
+        if row
+            .cells
+            .iter()
+            .any(|cell| cell.hyperlink.is_some() && uri_at(&hyperlinks, cell.hyperlink).is_none())
+        {
+            return Err("linked patch cell points outside its table");
         }
         let start = usize::from(row.y) * width + usize::from(row.x);
-        let end = start + row.cells.len();
-        if end > frame.cells.len() {
-            return Err("linked patch row leaves the frame");
-        }
-        for (offset, cell) in row.cells.iter().enumerate() {
-            if cell.hyperlink.is_some_and(|index| {
-                usize::try_from(index).unwrap_or(usize::MAX) >= hyperlinks.len()
-            }) {
-                return Err("linked patch cell points outside its table");
-            }
-            covered[start + offset] = true;
-        }
+        covered[start..start + row.cells.len()].fill(true);
     }
 
     // Cells the patch does not rewrite keep their uri, so their index has to be translated.
-    let mut remap = vec![None; frame.hyperlinks.len()];
-    for (old, uri) in frame.hyperlinks.iter().enumerate() {
-        remap[old] = hyperlinks
-            .iter()
-            .position(|candidate| candidate == uri)
-            .and_then(|index| u32::try_from(index).ok());
-    }
-    for (index, cell) in frame.cells.iter().enumerate() {
-        if covered[index] {
-            continue;
-        }
-        let Some(link) = cell.hyperlink else {
-            continue;
-        };
-        let missing = remap
-            .get(usize::try_from(link).unwrap_or(usize::MAX))
-            .copied()
-            .flatten()
-            .is_none();
-        if missing {
-            return Err("linked patch drops a uri that surviving cells still use");
-        }
+    let remap = frame_hyperlinks
+        .iter()
+        .map(|uri| {
+            hyperlinks
+                .iter()
+                .position(|candidate| candidate == uri)
+                .and_then(|index| u32::try_from(index).ok())
+        })
+        .collect::<Vec<_>>();
+    let translate = |link: Option<u32>| remap.get(usize::try_from(link?).ok()?).copied().flatten();
+    let stranded = frame_cells.iter().zip(&covered).any(|(cell, covered)| {
+        !covered && cell.hyperlink.is_some() && translate(cell.hyperlink).is_none()
+    });
+    if stranded {
+        return Err("linked patch drops a uri that surviving cells still use");
     }
 
-    for (index, cell) in frame.cells.iter_mut().enumerate() {
-        if covered[index] {
-            continue;
-        }
-        if let Some(link) = cell.hyperlink {
-            cell.hyperlink = remap
-                .get(usize::try_from(link).unwrap_or(usize::MAX))
-                .copied()
-                .flatten();
-        }
+    for (cell, _) in frame_cells
+        .iter_mut()
+        .zip(&covered)
+        .filter(|(_, covered)| !**covered)
+    {
+        cell.hyperlink = translate(cell.hyperlink);
     }
     for row in rows {
         let start = usize::from(row.y) * width + usize::from(row.x);
-        frame.cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
+        frame_cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
     }
-    frame.hyperlinks = hyperlinks;
+    *frame_hyperlinks = hyperlinks;
     Ok(())
+}
+
+/// The uri a link index stands for in `table`, if it points inside it.
+pub(crate) fn uri_at(table: &[String], index: Option<u32>) -> Option<&str> {
+    table.get(usize::try_from(index?).ok()?).map(String::as_str)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::CellData;
-
-    fn cell(symbol: &str, hyperlink: Option<u32>) -> CellData {
-        CellData {
-            symbol: symbol.to_owned(),
-            fg: 0,
-            bg: 0,
-            modifier: 0,
-            skip: false,
-            hyperlink,
-        }
-    }
 
     fn frame(cells: Vec<CellData>, hyperlinks: Vec<String>) -> FrameData {
         FrameData {
@@ -197,7 +183,7 @@ mod tests {
         let sent = patch(vec![PaneSurfacePatchRow {
             x: 1,
             y: 0,
-            cells: vec![cell("a", Some(1))],
+            cells: vec![CellData::test_linked("a", Some(1))],
         }]);
         let table = vec!["https://a.test".to_owned(), "https://b.test".to_owned()];
 
@@ -246,7 +232,11 @@ mod tests {
     fn applying_a_patch_reindexes_the_cells_it_does_not_cover() {
         // "a" is being overwritten, so the surviving "b" cell has to follow its uri to index 0.
         let mut target = frame(
-            vec![cell("x", Some(0)), cell("y", Some(0)), cell("z", Some(1))],
+            vec![
+                CellData::test_linked("x", Some(0)),
+                CellData::test_linked("y", Some(0)),
+                CellData::test_linked("z", Some(1)),
+            ],
             vec!["https://a.test".to_owned(), "https://b.test".to_owned()],
         );
 
@@ -255,7 +245,10 @@ mod tests {
             &[PaneSurfacePatchRow {
                 x: 0,
                 y: 0,
-                cells: vec![cell("p", None), cell("q", None)],
+                cells: vec![
+                    CellData::test_linked("p", None),
+                    CellData::test_linked("q", None),
+                ],
             }],
             vec!["https://b.test".to_owned()],
         )
@@ -283,7 +276,10 @@ mod tests {
     #[test]
     fn a_patch_that_would_strand_a_surviving_link_is_rejected_whole() {
         let original = frame(
-            vec![cell("x", Some(0)), cell("z", Some(1))],
+            vec![
+                CellData::test_linked("x", Some(0)),
+                CellData::test_linked("z", Some(1)),
+            ],
             vec!["https://a.test".to_owned(), "https://b.test".to_owned()],
         );
         let mut target = original.clone();
@@ -294,7 +290,7 @@ mod tests {
             &[PaneSurfacePatchRow {
                 x: 0,
                 y: 0,
-                cells: vec![cell("p", Some(0))],
+                cells: vec![CellData::test_linked("p", Some(0))],
             }],
             vec!["https://a.test".to_owned()],
         )
@@ -306,7 +302,7 @@ mod tests {
 
     #[test]
     fn a_patch_cell_outside_its_table_or_frame_is_rejected() {
-        let original = frame(vec![cell("x", None)], Vec::new());
+        let original = frame(vec![CellData::test_linked("x", None)], Vec::new());
 
         let mut target = original.clone();
         assert!(apply(
@@ -314,7 +310,7 @@ mod tests {
             &[PaneSurfacePatchRow {
                 x: 0,
                 y: 0,
-                cells: vec![cell("p", Some(0))],
+                cells: vec![CellData::test_linked("p", Some(0))],
             }],
             Vec::new(),
         )
@@ -327,7 +323,7 @@ mod tests {
             &[PaneSurfacePatchRow {
                 x: 0,
                 y: 3,
-                cells: vec![cell("p", None)],
+                cells: vec![CellData::test_linked("p", None)],
             }],
             Vec::new(),
         )
