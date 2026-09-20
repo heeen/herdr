@@ -761,15 +761,18 @@ fn pane_content_updates_preserve_live_ranges_until_geometry_or_screen_changes() 
         .unwrap()
         .offset_from_bottom = 2;
     assert!(matches!(
-        state.apply_pane_surface_patch(crate::protocol::PaneSurfacePatch {
-            boot_id: scrolled.boot_id,
-            projection_revision: scrolled.projection_revision,
-            base_surface_revision: 3,
-            surface_revision: 4,
-            panes: scrolled.panes,
-            rows: vec![],
-            cursor: scrolled.frame.cursor,
-        }),
+        state.apply_pane_surface_patch(
+            crate::protocol::PaneSurfacePatch {
+                boot_id: scrolled.boot_id,
+                projection_revision: scrolled.projection_revision,
+                base_surface_revision: 3,
+                surface_revision: 4,
+                panes: scrolled.panes,
+                rows: vec![],
+                cursor: scrolled.frame.cursor,
+            },
+            None
+        ),
         super::super::surface_patch::ClientPaneSurfacePatchOutcome::Applied(_)
     ));
     assert!(state.selection.as_ref().unwrap().is_in_progress());

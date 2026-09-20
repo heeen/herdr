@@ -202,8 +202,7 @@ pub(super) fn do_handshake(
             surface_delta: true,
             surface_scroll: true,
             clipboard_write: true,
-            // Flipped on once the client can present linked patches.
-            surface_links: false,
+            surface_links: true,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],

@@ -210,7 +210,7 @@ fn ctrl_hover_content_patch_removes_all_old_underlines() {
         cursor: None,
     };
     assert!(matches!(
-        state.apply_pane_surface_patch(patch),
+        state.apply_pane_surface_patch(patch, None),
         ClientPaneSurfacePatchOutcome::Applied(None)
     ));
     assert!(state.link_hover.is_none());
@@ -258,7 +258,7 @@ fn ctrl_hover_preserves_fast_patches_for_other_panes() {
         cursor: None,
     };
     assert!(matches!(
-        state.apply_pane_surface_patch(patch),
+        state.apply_pane_surface_patch(patch, None),
         ClientPaneSurfacePatchOutcome::Applied(Some(_))
     ));
     assert!(!state.link_hover.as_ref().unwrap().regions.is_empty());
@@ -406,5 +406,67 @@ fn ctrl_hover_groups_contiguous_same_destination_cells_without_server_query() {
     assert_eq!(
         (regions[0].row, regions[0].start_col, regions[0].end_col),
         (0, 1, 2)
+    );
+}
+
+/// A linked patch has to leave the composed frame where a fresh compose would have left it,
+/// including the table the outer terminal resolves its OSC 8 links through.
+#[test]
+fn a_linked_patch_composes_the_frame_a_full_compose_would() {
+    let mut state = hover_state();
+    state.compose(106, 20).unwrap();
+
+    let mut pane = state.pane_surface.as_ref().unwrap().panes[0].clone();
+    pane.content_revision = 2;
+    let mut linked = state.pane_surface.as_ref().unwrap().frame.cells[0].clone();
+    linked.hyperlink = Some(0);
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![linked],
+        }],
+        panes: vec![pane],
+        cursor: None,
+    };
+    let table = vec!["https://patched.test".to_owned()];
+
+    let outcome = state.apply_pane_surface_patch(patch, Some(table.clone()));
+    let ClientPaneSurfacePatchOutcome::Applied(composed) = outcome else {
+        panic!("a linked patch applies");
+    };
+    let composed = composed.expect("the fast path carries the patch to the encoder");
+    assert_eq!(
+        composed.hyperlinks.as_deref(),
+        Some(table.as_slice()),
+        "the composed patch carries the table its cells index"
+    );
+
+    let surface = state.pane_surface.as_ref().unwrap();
+    assert_eq!(surface.frame.hyperlinks, table);
+    assert_eq!(surface.frame.cells[0].hyperlink, Some(0));
+
+    // The composed frame the fast path skipped must equal the one a full compose produces.
+    let full = state.compose(106, 20).unwrap();
+    assert_eq!(full.hyperlinks, table, "the composed table is the pane's");
+    let index = full
+        .cells
+        .iter()
+        .position(|cell| cell.hyperlink.is_some())
+        .expect("the composed frame carries the link");
+    assert_eq!(
+        (
+            index % usize::from(full.width),
+            index / usize::from(full.width)
+        ),
+        (
+            usize::from(state.hits.panes[0].inner_rect.x),
+            usize::from(state.hits.panes[0].inner_rect.y)
+        ),
+        "the link lands where the pane was blitted"
     );
 }

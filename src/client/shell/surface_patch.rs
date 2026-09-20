@@ -3,6 +3,8 @@ use super::*;
 pub(crate) struct ClientComposedSurfacePatch {
     pub(crate) rows: Vec<crate::protocol::PaneSurfacePatchRow>,
     pub(crate) cursor: Option<crate::protocol::CursorState>,
+    /// The composed frame's link table once the patch is applied, when the patch renumbers it.
+    pub(crate) hyperlinks: Option<Vec<String>>,
 }
 
 pub(crate) enum ClientPaneSurfacePatchOutcome {
@@ -33,10 +35,20 @@ fn apply_row(row: &crate::protocol::PaneSurfacePatchRow, frame: &mut FrameData) 
 fn apply_patch_to_surface(
     surface: &mut crate::protocol::PaneSurfaceFrame,
     patch: &crate::protocol::PaneSurfacePatch,
+    hyperlinks: Option<Vec<String>>,
 ) -> bool {
-    for row in &patch.rows {
-        if !apply_row(row, &mut surface.frame) {
+    if let Some(hyperlinks) = hyperlinks {
+        if let Err(error) =
+            crate::protocol::surface_links::apply(&mut surface.frame, &patch.rows, hyperlinks)
+        {
+            tracing::debug!(%error, "linked pane surface patch does not fit the surface");
             return false;
+        }
+    } else {
+        for row in &patch.rows {
+            if !apply_row(row, &mut surface.frame) {
+                return false;
+            }
         }
     }
     for updated in &patch.panes {
@@ -109,6 +121,7 @@ impl ClientShellState {
     pub(crate) fn apply_pane_surface_patch(
         &mut self,
         patch: crate::protocol::PaneSurfacePatch,
+        hyperlinks: Option<Vec<String>>,
     ) -> ClientPaneSurfacePatchOutcome {
         let Some(current) = self.pane_surface.as_ref() else {
             return ClientPaneSurfacePatchOutcome::Rejected;
@@ -177,6 +190,7 @@ impl ClientShellState {
             self.layout(cols, rows).pane_surface
         });
         let composed_patch = fast_path_area.map(|area| ClientComposedSurfacePatch {
+            hyperlinks: hyperlinks.clone(),
             rows: patch
                 .rows
                 .iter()
@@ -200,7 +214,7 @@ impl ClientShellState {
             let applied = self
                 .pane_surface
                 .as_mut()
-                .is_some_and(|surface| apply_patch_to_surface(surface, &patch));
+                .is_some_and(|surface| apply_patch_to_surface(surface, &patch, hyperlinks.clone()));
             if !applied {
                 return ClientPaneSurfacePatchOutcome::Rejected;
             }
@@ -247,7 +261,7 @@ impl ClientShellState {
             self.reconcile_input_source();
         } else {
             let mut next = current.clone();
-            if !apply_patch_to_surface(&mut next, &patch) {
+            if !apply_patch_to_surface(&mut next, &patch, hyperlinks) {
                 return ClientPaneSurfacePatchOutcome::Rejected;
             }
             self.set_pane_surface(next);

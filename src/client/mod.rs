@@ -1427,7 +1427,26 @@ async fn run_client_loop(
                 {
                     continue;
                 }
-                match *message {
+                // A patch that brings its own link table is the same patch, so it is unwrapped
+                // here and travels the one patch path with its table beside it.
+                let (message, patch_hyperlinks) = match *message {
+                    ServerMessage::EndpointControl { kind, data }
+                        if kind == protocol::surface_links::MESSAGE_KIND =>
+                    {
+                        match protocol::surface_links::decode(&data) {
+                            Ok((patch, hyperlinks)) => {
+                                (ServerMessage::PaneSurfacePatch(patch), Some(hyperlinks))
+                            }
+                            Err(error) => {
+                                warn!(%error, "ignoring malformed linked pane surface patch");
+                                state.request_repaint();
+                                continue;
+                            }
+                        }
+                    }
+                    message => (message, None),
+                };
+                match message {
                     ServerMessage::ClientShellSnapshot(_) => {
                         let message = "server sent an unnegotiated binary endpoint snapshot";
                         if federated || !endpoint_id.is_local() {
@@ -1495,7 +1514,7 @@ async fn run_client_loop(
                         let outcome = state
                             .shell
                             .as_mut()
-                            .map(|shell| shell.apply_pane_surface_patch(patch));
+                            .map(|shell| shell.apply_pane_surface_patch(patch, patch_hyperlinks));
                         crate::render_prof::duration_since(
                             "client_surface_patch.apply",
                             apply_started,

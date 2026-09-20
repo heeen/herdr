@@ -32,6 +32,7 @@ use std::io::Write;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::protocol::surface_links::uri_at;
 use crate::protocol::{
     underline_style_from_modifier, CellData, CursorState, FrameData, PaneSurfacePatchRow,
 };
@@ -138,11 +139,13 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
+    /// Encodes a patch, resolving its cells against `hyperlinks` when it brings its own table.
     pub(crate) fn encode_patch(
         &self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<CursorState>,
         suppress_visible_cursor: bool,
+        hyperlinks: Option<&[String]>,
     ) -> Option<EncodedBlit> {
         let frame = self.last_frame.as_ref()?;
         if rows.iter().any(|row| !patch_row_fits(frame, row)) || patch_rows_overlap(rows) {
@@ -167,6 +170,7 @@ impl BlitEncoder {
         blit_patch_to(
             &mut bytes,
             frame,
+            hyperlinks.unwrap_or(&frame.hyperlinks),
             rows,
             cursor,
             &mut next_last_visible_cursor,
@@ -186,9 +190,22 @@ impl BlitEncoder {
         &self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<&CursorState>,
+        hyperlinks: Option<&[String]>,
     ) -> Option<Vec<PaneSurfacePatchRow>> {
         let frame = self.last_frame.as_ref()?;
         let mut rows = rows.to_vec();
+        // A cell taken from the old frame carries an old index, which the patch's table renumbers.
+        let borrowed = |cell: &CellData| {
+            let mut cell = cell.clone();
+            if let Some(hyperlinks) = hyperlinks {
+                cell.hyperlink = uri_at(&frame.hyperlinks, cell.hyperlink)
+                    .and_then(|uri| hyperlinks.iter().position(|candidate| candidate == uri))
+                    .and_then(|index| u32::try_from(index).ok());
+            }
+            cell.modifier ^= REVERSED_MODIFIER;
+            cell
+        };
+
         let previous = frame
             .cursor
             .as_ref()
@@ -200,8 +217,7 @@ impl BlitEncoder {
 
         if let Some((x, y)) = previous.filter(|position| Some(*position) != next) {
             if patch_cell_mut(&mut rows, x, y).is_none() {
-                let mut cell = frame.cells.get(frame_cell_index(frame, x, y)?)?.clone();
-                cell.modifier ^= REVERSED_MODIFIER;
+                let cell = borrowed(frame.cells.get(frame_cell_index(frame, x, y)?)?);
                 rows.push(PaneSurfacePatchRow {
                     x,
                     y,
@@ -213,8 +229,7 @@ impl BlitEncoder {
             if let Some(cell) = patch_cell_mut(&mut rows, x, y) {
                 cell.modifier ^= REVERSED_MODIFIER;
             } else if previous != next {
-                let mut cell = frame.cells.get(frame_cell_index(frame, x, y)?)?.clone();
-                cell.modifier ^= REVERSED_MODIFIER;
+                let cell = borrowed(frame.cells.get(frame_cell_index(frame, x, y)?)?);
                 rows.push(PaneSurfacePatchRow {
                     x,
                     y,
@@ -225,22 +240,36 @@ impl BlitEncoder {
         Some(rows)
     }
 
+    /// Advances the baseline to the patch that was just written.
+    ///
+    /// A patch bringing its own table is applied through the shared rules, so the baseline ends up
+    /// where a full compose would have put it. Refusing here leaves the baseline untouched and the
+    /// caller composes a full frame instead.
     pub(crate) fn commit_patch(
         &mut self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<CursorState>,
         encoded: EncodedBlit,
+        hyperlinks: Option<Vec<String>>,
     ) -> bool {
         let Some(frame) = self.last_frame.as_mut() else {
             return false;
         };
-        for row in rows {
-            let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
-            let end = start + row.cells.len();
-            let Some(target) = frame.cells.get_mut(start..end) else {
+        if let Some(hyperlinks) = hyperlinks {
+            if let Err(error) = crate::protocol::surface_links::apply(frame, rows, hyperlinks) {
+                crate::render_prof::event("client_surface_patch.fallback.link_table");
+                tracing::debug!(%error, "composed patch does not fit the presented frame");
                 return false;
-            };
-            target.clone_from_slice(&row.cells);
+            }
+        } else {
+            for row in rows {
+                let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
+                let end = start + row.cells.len();
+                let Some(target) = frame.cells.get_mut(start..end) else {
+                    return false;
+                };
+                target.clone_from_slice(&row.cells);
+            }
         }
         frame.cursor = cursor;
         self.last_visible_cursor = encoded.next_last_visible_cursor;
@@ -291,8 +320,8 @@ fn compute_prof_blit_stats(
         };
     }
 
-    let sanitized_hyperlinks = sanitized_frame_hyperlinks(frame);
-    let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
+    let sanitized = sanitized_hyperlinks(&frame.hyperlinks);
+    let prev_sanitized = sanitized_hyperlinks(&prev.hyperlinks);
     let mut stats = ProfBlitStats {
         scanned_cells: frame.cells.len() as u64,
         changed_cells: 0,
@@ -307,12 +336,8 @@ fn compute_prof_blit_stats(
             let cell = &frame.cells[idx];
             let prev_cell = &prev.cells[idx];
             let changed = !cell.skip
-                && (!cells_visually_equal(
-                    &sanitized_hyperlinks,
-                    cell,
-                    &prev_sanitized_hyperlinks,
-                    prev_cell,
-                ) || invalidated > 0)
+                && (!cells_visually_equal(&sanitized, cell, &prev_sanitized, prev_cell)
+                    || invalidated > 0)
                 && to_skip == 0;
             if changed {
                 stats.changed_cells += 1;
@@ -478,20 +503,6 @@ fn build_sgr(fg: u32, bg: u32, modifier: u16) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Cell comparison
-// ---------------------------------------------------------------------------
-
-/// Checks if two cells are visually identical.
-fn cells_equal(a: &CellData, b: &CellData) -> bool {
-    a.symbol == b.symbol
-        && a.fg == b.fg
-        && a.bg == b.bg
-        && a.modifier == b.modifier
-        && a.hyperlink == b.hyperlink
-    // Skip flag is only for ratatui internal use, not visual.
-}
-
-// ---------------------------------------------------------------------------
 // Blitting
 // ---------------------------------------------------------------------------
 
@@ -584,23 +595,19 @@ fn patch_row_fits(frame: &FrameData, row: &PaneSurfacePatchRow) -> bool {
     let Ok(len) = u16::try_from(row.cells.len()) else {
         return false;
     };
-    if row.y >= frame.height
-        || row.x.saturating_add(len) > frame.width
-        || row.cells.iter().any(|cell| cell.hyperlink.is_some())
-    {
+    if row.y >= frame.height || row.x.saturating_add(len) > frame.width {
         return false;
     }
     let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
-    let end = start + row.cells.len();
-    frame
-        .cells
-        .get(start..end)
-        .is_some_and(|cells| cells.iter().all(|cell| cell.hyperlink.is_none()))
+    start
+        .checked_add(row.cells.len())
+        .is_some_and(|end| end <= frame.cells.len())
 }
 
 fn blit_patch_to(
     mut writer: impl Write,
     frame: &FrameData,
+    hyperlinks: &[String],
     rows: &[PaneSurfacePatchRow],
     cursor: Option<CursorState>,
     last_visible_cursor: &mut Option<(u16, u16)>,
@@ -612,6 +619,10 @@ fn blit_patch_to(
     let mut last_sgr = String::new();
     let mut last_style = None;
     let mut active_hyperlink = None;
+    // A patch may renumber the table, so cells are compared by uri exactly as a full diff
+    // compares them.
+    let sanitized = sanitized_hyperlinks(hyperlinks);
+    let previous_sanitized = sanitized_hyperlinks(&frame.hyperlinks);
     for row in rows {
         let mut invalidated = 0usize;
         let mut to_skip = 0usize;
@@ -620,7 +631,11 @@ fn blit_patch_to(
             let col = row.x + offset as u16;
             let idx = usize::from(row.y) * usize::from(frame.width) + usize::from(col);
             let prev_cell = &frame.cells[idx];
-            if !cell.skip && (!cells_equal(cell, prev_cell) || invalidated > 0) && to_skip == 0 {
+            if !cell.skip
+                && (!cells_visually_equal(&sanitized, cell, &previous_sanitized, prev_cell)
+                    || invalidated > 0)
+                && to_skip == 0
+            {
                 let cursor_position =
                     (next_inline_col != Some(col) || invalidated > 0).then_some((col, row.y));
                 write_cell(
@@ -630,7 +645,7 @@ fn blit_patch_to(
                     &mut last_sgr,
                     &mut last_style,
                     &mut active_hyperlink,
-                    frame,
+                    hyperlinks,
                 );
                 next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
                     .then_some(col.saturating_add(1));
@@ -882,7 +897,7 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
                 &mut last_sgr,
                 &mut last_style,
                 &mut active_hyperlink,
-                frame,
+                &frame.hyperlinks,
             );
             let width = cell_width(cell);
             next_inline_col =
@@ -897,11 +912,6 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let _ = writer.write_all(b"\x1b[0m");
 }
 
-fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a str> {
-    let index = cell.hyperlink? as usize;
-    frame.hyperlinks.get(index).map(String::as_str)
-}
-
 fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
     let sanitized: String = uri
         .chars()
@@ -910,9 +920,8 @@ fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn sanitized_frame_hyperlinks(frame: &FrameData) -> Vec<Option<String>> {
-    frame
-        .hyperlinks
+fn sanitized_hyperlinks(hyperlinks: &[String]) -> Vec<Option<String>> {
+    hyperlinks
         .iter()
         .map(|uri| sanitized_hyperlink_uri(uri))
         .collect()
@@ -979,7 +988,7 @@ fn write_cell(
     last_sgr: &mut String,
     last_style: &mut Option<(u32, u32, u16)>,
     active_hyperlink: &mut Option<String>,
-    frame: &FrameData,
+    hyperlinks: &[String],
 ) {
     if cell.skip {
         return;
@@ -999,7 +1008,7 @@ fn write_cell(
         *last_style = Some(style);
     }
 
-    write_hyperlink_if_changed(writer, active_hyperlink, cell_hyperlink_uri(frame, cell));
+    write_hyperlink_if_changed(writer, active_hyperlink, uri_at(hyperlinks, cell.hyperlink));
     let _ = writer.write_all(cell.symbol.as_bytes());
 }
 
@@ -1023,8 +1032,8 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
     let mut last_sgr = String::new(); // Track last SGR to avoid redundant style changes.
     let mut last_style = None;
     let mut active_hyperlink = None;
-    let sanitized_hyperlinks = sanitized_frame_hyperlinks(frame);
-    let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
+    let sanitized = sanitized_hyperlinks(&frame.hyperlinks);
+    let prev_sanitized = sanitized_hyperlinks(&prev.hyperlinks);
 
     for row in 0..frame.height {
         let mut invalidated = 0usize;
@@ -1039,12 +1048,8 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
             let prev_cell = &prev.cells[idx];
 
             if !cell.skip
-                && (!cells_visually_equal(
-                    &sanitized_hyperlinks,
-                    cell,
-                    &prev_sanitized_hyperlinks,
-                    prev_cell,
-                ) || invalidated > 0)
+                && (!cells_visually_equal(&sanitized, cell, &prev_sanitized, prev_cell)
+                    || invalidated > 0)
                 && to_skip == 0
             {
                 let cursor_position =
@@ -1056,7 +1061,7 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
                     &mut last_sgr,
                     &mut last_style,
                     &mut active_hyperlink,
-                    frame,
+                    &frame.hyperlinks,
                 );
                 next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
                     .then_some(col.saturating_add(1));
@@ -1222,24 +1227,27 @@ mod tests {
     }
 
     #[test]
-    fn cells_equal_identical() {
+    fn cells_are_visually_equal_only_when_symbol_style_and_uri_agree() {
+        let links = [Some("https://a.test".to_owned())];
+        let other = [Some("https://b.test".to_owned())];
         let a = make_cell("A", 2, 1, 0);
-        let b = make_cell("A", 2, 1, 0);
-        assert!(cells_equal(&a, &b));
-    }
-
-    #[test]
-    fn cells_equal_different_symbol() {
-        let a = make_cell("A", 2, 1, 0);
-        let b = make_cell("B", 2, 1, 0);
-        assert!(!cells_equal(&a, &b));
-    }
-
-    #[test]
-    fn cells_equal_different_color() {
-        let a = make_cell("A", 2, 1, 0);
-        let b = make_cell("A", 3, 1, 0);
-        assert!(!cells_equal(&a, &b));
+        assert!(cells_visually_equal(&links, &a, &links, &a.clone()));
+        assert!(!cells_visually_equal(
+            &links,
+            &a,
+            &links,
+            &make_cell("B", 2, 1, 0)
+        ));
+        assert!(!cells_visually_equal(
+            &links,
+            &a,
+            &links,
+            &make_cell("A", 3, 1, 0)
+        ));
+        assert!(
+            !cells_visually_equal(&links, &linked_cell("A", 0), &other, &linked_cell("A", 0)),
+            "the same index means a different uri in another table"
+        );
     }
 
     #[test]
@@ -1906,11 +1914,164 @@ mod tests {
 
         let full_diff = encoder.encode(&expected, false);
         let patch = encoder
-            .encode_patch(&rows, cursor.clone(), false)
+            .encode_patch(&rows, cursor.clone(), false, None)
             .expect("valid retained patch");
         assert_eq!(patch.bytes, full_diff.bytes);
-        assert!(encoder.commit_patch(&rows, cursor, patch));
+        assert!(encoder.commit_patch(&rows, cursor, patch, None));
         assert!(encoder.is_current(&expected));
+    }
+
+    /// A linked patch has to write exactly the bytes a full diff would, for every way a table can
+    /// move under it, or the outer terminal and the baseline drift apart.
+    #[test]
+    fn retained_linked_patch_matches_full_diff() {
+        let a = "https://a.test".to_owned();
+        let b = "https://b.test".to_owned();
+        let wide = "https://wide.test".to_owned();
+        struct Case {
+            name: &'static str,
+            cells: Vec<CellData>,
+            hyperlinks: Vec<String>,
+            rows: Vec<PaneSurfacePatchRow>,
+            table: Vec<String>,
+        }
+        let cases = vec![
+            Case {
+                name: "a link appears",
+                cells: vec![make_cell("x", 0, 0, 0), make_cell("y", 0, 0, 0)],
+                hyperlinks: Vec::new(),
+                rows: vec![PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![linked_cell("x", 0)],
+                }],
+                table: vec![a.clone()],
+            },
+            Case {
+                name: "a link goes away",
+                cells: vec![linked_cell("x", 0), make_cell("y", 0, 0, 0)],
+                hyperlinks: vec![a.clone()],
+                rows: vec![PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![make_cell("x", 0, 0, 0)],
+                }],
+                table: Vec::new(),
+            },
+            Case {
+                name: "the table is renumbered around a cell the patch does not cover",
+                cells: vec![linked_cell("x", 0), linked_cell("y", 1)],
+                hyperlinks: vec![b.clone(), a.clone()],
+                rows: vec![PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![linked_cell("x", 1)],
+                }],
+                table: vec![a.clone(), b.clone()],
+            },
+            Case {
+                name: "the same symbol points somewhere else",
+                cells: vec![linked_cell("x", 0), make_cell("y", 0, 0, 0)],
+                hyperlinks: vec![a.clone()],
+                rows: vec![PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![linked_cell("x", 0)],
+                }],
+                table: vec![b.clone()],
+            },
+            Case {
+                name: "a wide character inside a link",
+                cells: vec![make_cell("a", 0, 0, 0), make_skip_cell("", 0, 0, 0)],
+                hyperlinks: Vec::new(),
+                rows: vec![PaneSurfacePatchRow {
+                    x: 0,
+                    y: 0,
+                    cells: vec![linked_cell("路", 0), {
+                        let mut spacer = linked_cell("", 0);
+                        spacer.skip = true;
+                        spacer
+                    }],
+                }],
+                table: vec![wide.clone()],
+            },
+        ];
+
+        for Case {
+            name,
+            cells,
+            hyperlinks,
+            rows,
+            table,
+        } in cases
+        {
+            let mut previous = make_frame(2, 1, cells);
+            previous.hyperlinks = hyperlinks;
+            let mut encoder = BlitEncoder::new();
+            let initial = encoder.encode(&previous, false);
+            encoder.commit(previous.clone(), initial);
+
+            let mut expected = previous.clone();
+            crate::protocol::surface_links::apply(&mut expected, &rows, table.clone())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+
+            let full_diff = encoder.encode(&expected, false);
+            let patch = encoder
+                .encode_patch(&rows, None, false, Some(&table))
+                .unwrap_or_else(|| panic!("{name}: patch refused"));
+            assert_eq!(
+                String::from_utf8_lossy(&patch.bytes),
+                String::from_utf8_lossy(&full_diff.bytes),
+                "{name}"
+            );
+            assert!(
+                encoder.commit_patch(&rows, None, patch, Some(table)),
+                "{name}"
+            );
+            assert!(encoder.is_current(&expected), "{name}: baseline");
+        }
+    }
+
+    /// The cell the drawn cursor borrows from the old frame keeps its uri, not its old index.
+    #[test]
+    fn a_borrowed_cursor_cell_follows_its_uri_into_the_new_table() {
+        let a = "https://a.test".to_owned();
+        let b = "https://b.test".to_owned();
+        let mut previous = make_frame(2, 1, vec![linked_cell("x", 1), make_cell("y", 0, 0, 0)]);
+        previous.hyperlinks = vec![b.clone(), a.clone()];
+        previous.cursor = Some(CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+            shape: 2,
+        });
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&previous, false);
+        encoder.commit(previous, initial);
+
+        // The patch drops b.test, so a.test moves to index 0 and the cursor cell has to follow it.
+        let rows = vec![PaneSurfacePatchRow {
+            x: 1,
+            y: 0,
+            cells: vec![make_cell("z", 0, 0, 0)],
+        }];
+        let table = vec![a];
+        let cursor = Some(CursorState {
+            x: 1,
+            y: 0,
+            visible: true,
+            shape: 2,
+        });
+
+        let drawn = encoder
+            .patch_rows_with_drawn_cursor(&rows, cursor.as_ref(), Some(&table))
+            .expect("drawn cursor rows");
+
+        let borrowed = drawn
+            .iter()
+            .find(|row| row.x == 0)
+            .expect("the cell under the old cursor is repainted");
+        assert_eq!(borrowed.cells[0].hyperlink, Some(0), "renumbered by uri");
     }
 
     #[test]
@@ -1938,7 +2099,7 @@ mod tests {
 
         let full_diff = encoder.encode(&expected, false);
         let patch = encoder
-            .encode_patch(&rows, None, false)
+            .encode_patch(&rows, None, false, None)
             .expect("valid retained patch");
         assert_eq!(patch.bytes, full_diff.bytes);
     }
@@ -1970,10 +2131,10 @@ mod tests {
             },
         ];
 
-        assert!(encoder.encode_patch(&rows, None, false).is_none());
+        assert!(encoder.encode_patch(&rows, None, false, None).is_none());
         let mut reversed = rows.clone();
         reversed.reverse();
-        assert!(encoder.encode_patch(&reversed, None, false).is_none());
+        assert!(encoder.encode_patch(&reversed, None, false, None).is_none());
 
         // Input order need not match screen order; touching runs are disjoint.
         let disjoint = vec![
@@ -1984,7 +2145,7 @@ mod tests {
             },
             rows[0].clone(),
         ];
-        assert!(encoder.encode_patch(&disjoint, None, false).is_some());
+        assert!(encoder.encode_patch(&disjoint, None, false, None).is_some());
     }
 
     #[test]
@@ -2003,9 +2164,11 @@ mod tests {
             frame.cursor = cursor.clone();
             let initial = encoder.encode(&frame, false);
             encoder.commit(frame.clone(), initial);
-            let encoded = encoder.encode_patch(&[], cursor.clone(), false).unwrap();
+            let encoded = encoder
+                .encode_patch(&[], cursor.clone(), false, None)
+                .unwrap();
             assert!(encoded.bytes.is_empty());
-            assert!(encoder.commit_patch(&[], cursor, encoded));
+            assert!(encoder.commit_patch(&[], cursor, encoded, None));
             assert!(encoder.is_current(&frame));
         }
         for cursor in [
@@ -2023,10 +2186,10 @@ mod tests {
             },
         ] {
             let encoded = encoder
-                .encode_patch(&[], Some(cursor.clone()), false)
+                .encode_patch(&[], Some(cursor.clone()), false, None)
                 .unwrap();
             assert!(String::from_utf8_lossy(&encoded.bytes).contains("\x1b[1;3H"));
-            assert!(encoder.commit_patch(&[], Some(cursor), encoded));
+            assert!(encoder.commit_patch(&[], Some(cursor), encoded, None));
         }
         // Switching to a client-drawn cursor must still hide the visible host cursor.
         let encoded = encoder
@@ -2034,6 +2197,7 @@ mod tests {
                 &[],
                 encoder.last_frame.as_ref().unwrap().cursor.clone(),
                 true,
+                None,
             )
             .unwrap();
         assert!(String::from_utf8_lossy(&encoded.bytes).contains("\x1b[?25l"));
@@ -2077,7 +2241,7 @@ mod tests {
             shape: 0,
         });
         let drawn_rows = encoder
-            .patch_rows_with_drawn_cursor(&rows, cursor.as_ref())
+            .patch_rows_with_drawn_cursor(&rows, cursor.as_ref(), None)
             .expect("drawn cursor patch rows");
         let mut expected = previous;
         expected.cells[0..3].clone_from_slice(&rows[0].cells);
@@ -2086,10 +2250,10 @@ mod tests {
 
         let full_diff = encoder.encode_with_suppressed_visible_cursor(&expected, false);
         let patch = encoder
-            .encode_patch(&drawn_rows, cursor.clone(), true)
+            .encode_patch(&drawn_rows, cursor.clone(), true, None)
             .expect("valid drawn cursor patch");
         assert_eq!(patch.bytes, full_diff.bytes);
-        assert!(encoder.commit_patch(&drawn_rows, cursor, patch));
+        assert!(encoder.commit_patch(&drawn_rows, cursor, patch, None));
         assert!(encoder.is_current(&expected));
     }
 

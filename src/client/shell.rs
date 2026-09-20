@@ -246,8 +246,10 @@ fn panel_contrast_fg(palette: &Palette) -> ratatui::style::Color {
 fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
     let copy_width = source.width.min(area.width);
     let copy_height = source.height.min(area.height);
-    let hyperlink_base = target.hyperlinks.len() as u32;
-    target.hyperlinks.extend(source.hyperlinks.iter().cloned());
+    // Chrome carries no links of its own, so the composed table is the pane's table as it is,
+    // which is what lets a linked patch hand the pane's table straight to the encoder.
+    debug_assert!(target.hyperlinks.is_empty(), "chrome must not place links");
+    target.hyperlinks.clone_from(&source.hyperlinks);
 
     for row in 0..copy_height {
         for col in 0..copy_width {
@@ -262,9 +264,9 @@ fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
                 continue;
             };
             *target_cell = source_cell.clone();
-            target_cell.hyperlink = source_cell.hyperlink.and_then(|index| {
-                ((index as usize) < source.hyperlinks.len()).then_some(hyperlink_base + index)
-            });
+            target_cell.hyperlink = source_cell
+                .hyperlink
+                .filter(|index| (*index as usize) < source.hyperlinks.len());
         }
     }
 
