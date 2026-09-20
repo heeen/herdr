@@ -59,16 +59,14 @@ pub use self::{
 pub(crate) struct LinkRequest {
     pub area: Rect,
     pub options: LinkScanOptions,
-    /// Collect even when the patch itself shows no sign of links: the baseline already has some,
-    /// or output below a pinned viewport may have extended one.
-    pub force: bool,
+    /// Pane rows already carrying a link. A patch that rewrites one may move or remove it, which
+    /// the patch itself gives no sign of.
+    pub linked_rows: Vec<u16>,
 }
 
 pub(crate) struct TerminalDirtyPatchSnapshot {
     pub patch: TerminalDirtyPatchOutcome,
     /// The pane's links at `content_revision`, when they were asked for and could matter.
-    // Read by the retained planner in the commit that plans linked patches.
-    #[allow(dead_code)]
     pub links: Option<VisibleHyperlinks>,
     pub content_revision: u64,
     pub scroll_metrics: Option<ScrollMetrics>,
@@ -81,15 +79,17 @@ pub(crate) struct TerminalDirtyPatchSnapshot {
 /// Whether a patch can leave the pane's links alone.
 ///
 /// A link only changes with the rows around it: either the dirty rows themselves hold one, are
-/// about to hold one, or wrap into a neighbour whose link now reaches further.
+/// about to hold one, or wrap into a neighbour whose link now reaches further. Everything else
+/// leaves the pane's links exactly where the last render put them.
 fn link_collection_matters(request: &LinkRequest, patch: &TerminalDirtyPatchOutcome) -> bool {
-    if request.force {
-        return true;
-    }
     let TerminalDirtyPatchOutcome::Patch(patch) = patch else {
         return false;
     };
     patch.program_links
+        || patch
+            .rows
+            .iter()
+            .any(|(y, _)| request.linked_rows.contains(y))
         || (request.options.detect_plain_urls
             && (patch.may_contain_url() || patch.touches_soft_wrap))
 }
@@ -4006,34 +4006,35 @@ mod tests {
     #[tokio::test]
     async fn dirty_patch_snapshot_collects_links_only_when_they_can_have_changed() {
         let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
-        let request = |force| LinkRequest {
+        let request = |linked_rows: &[u16]| LinkRequest {
             area: Rect::new(0, 0, 20, 4),
             options: LinkScanOptions {
                 detect_plain_urls: true,
             },
-            force,
+            linked_rows: linked_rows.to_vec(),
         };
         runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
             .expect("initial snapshot");
 
         // Plain output cannot introduce or move a link.
         runtime.test_process_pty_bytes(b"plain\r\n");
         let plain = runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
             .expect("plain snapshot");
         assert!(plain.links.is_none());
 
-        // Nothing changed at all, but the caller knows the baseline already holds links.
-        let forced = runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(true)))
-            .expect("forced snapshot");
-        assert!(forced.links.is_some());
+        // The same output over a row the caller says already carries a link, which it may remove.
+        runtime.test_process_pty_bytes(b"plain\r\n");
+        let over_a_link = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[0, 1, 2, 3])))
+            .expect("relinked snapshot");
+        assert!(over_a_link.links.is_some());
 
         // A url short enough not to wrap, so this exercises the scheme test on its own.
         runtime.test_process_pty_bytes(b"https://a.io/x\r\n");
         let detected = runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
             .expect("url snapshot");
         let links = detected.links.expect("a url in new output collects links");
         assert!(links
@@ -4050,7 +4051,7 @@ mod tests {
                 Some(LinkRequest {
                     area: Rect::new(0, 0, 20, 4),
                     options: LinkScanOptions::default(),
-                    force: false,
+                    linked_rows: Vec::new(),
                 }),
             )
             .expect("program link snapshot");
@@ -4064,11 +4065,11 @@ mod tests {
         // the row holding the scheme is already wrapped, so it stays clean.
         runtime.test_process_pty_bytes(b"\r\nhttps://example.com/a");
         runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
             .expect("url prefix snapshot");
         runtime.test_process_pty_bytes(b"bcd");
         let wrapped = runtime
-            .collect_dirty_patch_snapshot(20, 4, Some(request(false)))
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
             .expect("wrapped snapshot");
         assert!(wrapped
             .links
@@ -4083,6 +4084,52 @@ mod tests {
             .expect("unasked snapshot")
             .links
             .is_none());
+    }
+
+    /// Erasing the rest of a wrapping row unjoins it from the row below without writing a cell
+    /// of that row. The walk still reports the row below dirty, because its wrap state changed,
+    /// which is what lets the gate rely on dirty rows alone: recollecting for the whole viewport
+    /// then leaves the row below unlinked.
+    #[tokio::test]
+    async fn erasing_a_wrapping_row_relinks_the_row_it_no_longer_wraps_into() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        let request = |linked_rows: &[u16]| LinkRequest {
+            area: Rect::new(0, 0, 20, 4),
+            options: LinkScanOptions {
+                detect_plain_urls: true,
+            },
+            linked_rows: linked_rows.to_vec(),
+        };
+        runtime.test_process_pty_bytes(b"https://example.com/abcdef");
+        let joined = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[])))
+            .expect("wrapped snapshot");
+        let joined = joined.links.expect("the wrapped url is collected");
+        assert!(joined.iter().any(|link| link.position.1 == 1));
+        assert!(joined
+            .iter()
+            .all(|link| link.uri.as_ref() == "https://example.com/abcdef"));
+
+        runtime.test_process_pty_bytes(b"\x1b[1;20H\x1b[K");
+        let split = runtime
+            .collect_dirty_patch_snapshot(20, 4, Some(request(&[0, 1])))
+            .expect("erased snapshot");
+        let TerminalDirtyPatchOutcome::Patch(patch) = &split.patch else {
+            panic!("erasing produces a patch");
+        };
+        assert_eq!(
+            patch.rows.iter().map(|(y, _)| *y).collect::<Vec<_>>(),
+            [0, 1],
+            "unjoining the rows dirties the one below as well"
+        );
+        let links = split.links.expect("a row that held a link was rewritten");
+        assert!(
+            links.iter().all(|link| link.position.1 == 0),
+            "the row below is no longer part of the url: {links:?}"
+        );
+        assert!(links
+            .iter()
+            .all(|link| link.uri.as_ref() == "https://example.com"));
     }
 
     #[tokio::test]

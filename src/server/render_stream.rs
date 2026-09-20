@@ -21,6 +21,7 @@ pub(crate) enum ClientRenderState {
         surface_delta: bool,
         surface_scroll: bool,
         recompute_pending: bool,
+        surface_links: bool,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi {
@@ -40,6 +41,7 @@ impl ClientRenderState {
                 surface_delta: false,
                 surface_scroll: false,
                 recompute_pending: false,
+                surface_links: false,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
@@ -85,6 +87,22 @@ impl ClientRenderState {
             self,
             Self::Semantic {
                 recompute_pending: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn enable_surface_links(&mut self, enabled: bool) {
+        if let Self::Semantic { surface_links, .. } = self {
+            *surface_links = enabled;
+        }
+    }
+
+    pub(crate) fn surface_links(&self) -> bool {
+        matches!(
+            self,
+            Self::Semantic {
+                surface_links: true,
                 ..
             }
         )
@@ -241,14 +259,20 @@ impl ClientRenderState {
         })
     }
 
+    /// Prepares a patch, with the link table its surface has once applied when it renumbers one.
+    ///
+    /// Only a client that negotiated the capability can take a table; everything else plans a
+    /// full surface instead.
     pub(crate) fn prepare_pane_surface_patch(
         &self,
         mut patch: PaneSurfacePatch,
+        hyperlinks: Option<Vec<String>>,
     ) -> Option<PreparedRender> {
         let Self::Semantic {
             last_surface,
             surface_revision,
             surface_scroll,
+            surface_links,
             ..
         } = self
         else {
@@ -264,20 +288,33 @@ impl ClientRenderState {
         {
             return None;
         }
-        let next_revision = surface_revision.saturating_add(1);
-        patch.surface_revision = next_revision;
-        let scrolled = (*surface_scroll)
-            .then(|| crate::protocol::surface_scroll::message(last, &patch))
-            .flatten();
-        Some(match scrolled {
-            Some(message) => PreparedRender::SemanticPatch {
-                message,
-                encoded: Some(Box::new(patch)),
-            },
-            None => PreparedRender::SemanticPatch {
-                message: ServerMessage::PaneSurfacePatch(patch),
-                encoded: None,
-            },
+        patch.surface_revision = surface_revision.saturating_add(1);
+        let Some(hyperlinks) = hyperlinks else {
+            let scrolled = (*surface_scroll)
+                .then(|| crate::protocol::surface_scroll::message(last, &patch))
+                .flatten();
+            return Some(match scrolled {
+                Some(message) => PreparedRender::SemanticPatch {
+                    message,
+                    encoded: Some(Box::new(patch)),
+                },
+                None => PreparedRender::SemanticPatch {
+                    message: ServerMessage::PaneSurfacePatch(patch),
+                    encoded: None,
+                },
+            });
+        };
+        if !surface_links {
+            return None;
+        }
+        let message = crate::protocol::surface_links::message(&patch, &hyperlinks)
+            .map_err(|error| tracing::warn!(%error, "failed to encode linked pane surface patch"))
+            .ok()
+            .flatten()?;
+        Some(PreparedRender::SemanticLinkPatch {
+            message,
+            patch,
+            hyperlinks,
         })
     }
 
@@ -304,18 +341,39 @@ impl ClientRenderState {
                     surface_revision,
                     ..
                 },
-                PreparedRender::SemanticPatch { message, encoded },
+                prepared @ (PreparedRender::SemanticPatch { .. }
+                | PreparedRender::SemanticLinkPatch { .. }),
             ) => {
-                let patch = match (encoded, message) {
-                    (Some(patch), _) => *patch,
-                    (None, ServerMessage::PaneSurfacePatch(patch)) => patch,
-                    (None, _) => unreachable!("a plain semantic patch carries its pane patch"),
+                let (patch, hyperlinks) = match prepared {
+                    PreparedRender::SemanticPatch {
+                        encoded: Some(patch),
+                        ..
+                    } => (*patch, None),
+                    PreparedRender::SemanticPatch {
+                        message: ServerMessage::PaneSurfacePatch(patch),
+                        encoded: None,
+                    } => (patch, None),
+                    PreparedRender::SemanticLinkPatch {
+                        patch, hyperlinks, ..
+                    } => (patch, Some(hyperlinks)),
+                    _ => return,
                 };
                 let surface = last_surface
                     .as_deref_mut()
                     .expect("prepared patch baseline");
-                apply_pane_surface_patch(surface, &patch);
-                *surface_revision = patch.surface_revision;
+                match apply_pane_surface_patch(surface, &patch, hyperlinks) {
+                    Ok(()) => *surface_revision = patch.surface_revision,
+                    Err(error) => {
+                        // Planning validated these rows against this baseline, so reaching here
+                        // means the two disagree. Drop the baseline rather than keep describing a
+                        // screen the client was never sent.
+                        tracing::warn!(
+                            %error,
+                            "linked patch did not fit the baseline it was planned against"
+                        );
+                        *last_surface = None;
+                    }
+                }
             }
             (
                 Self::TerminalAnsi {
@@ -339,14 +397,27 @@ impl ClientRenderState {
 }
 
 // Planning validates all rows and pane IDs before any send. The server does not yield
-// between planning and commit, so applying the accepted patch cannot fail partway through.
-pub(super) fn apply_pane_surface_patch(surface: &mut PaneSurfaceFrame, patch: &PaneSurfacePatch) {
+// between planning and commit, so applying the accepted patch cannot fail partway through;
+// a patch that brings its own table is the one exception, and it is refused whole.
+pub(super) fn apply_pane_surface_patch(
+    surface: &mut PaneSurfaceFrame,
+    patch: &PaneSurfacePatch,
+    hyperlinks: Option<Vec<String>>,
+) -> Result<(), &'static str> {
     debug_assert_eq!(surface.boot_id, patch.boot_id);
     debug_assert_eq!(surface.projection_revision, patch.projection_revision);
     debug_assert_eq!(surface.surface_revision, patch.base_surface_revision);
-    for row in &patch.rows {
-        let start = usize::from(row.y) * usize::from(surface.frame.width) + usize::from(row.x);
-        surface.frame.cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
+    match hyperlinks {
+        Some(hyperlinks) => {
+            crate::protocol::surface_links::apply(&mut surface.frame, &patch.rows, hyperlinks)?
+        }
+        None => {
+            for row in &patch.rows {
+                let start =
+                    usize::from(row.y) * usize::from(surface.frame.width) + usize::from(row.x);
+                surface.frame.cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
+            }
+        }
     }
     for updated in &patch.panes {
         let pane = surface
@@ -358,6 +429,7 @@ pub(super) fn apply_pane_surface_patch(surface: &mut PaneSurfaceFrame, patch: &P
     }
     surface.frame.cursor.clone_from(&patch.cursor);
     surface.surface_revision = patch.surface_revision;
+    Ok(())
 }
 
 fn insert_graphics_before_sync_end(encoded: &mut Vec<u8>, graphics: &[u8]) {
@@ -384,6 +456,13 @@ pub(crate) enum PreparedRender {
         /// The pane patch a compact `message` encodes; `None` when `message` is that patch.
         encoded: Option<Box<PaneSurfacePatch>>,
     },
+    /// A patch carrying its own link table, kept beside the message so the baseline can be
+    /// advanced exactly the way the client advances its own.
+    SemanticLinkPatch {
+        message: ServerMessage,
+        patch: PaneSurfacePatch,
+        hyperlinks: Vec<String>,
+    },
     TerminalAnsi {
         message: ServerMessage,
         frame: FrameData,
@@ -396,6 +475,7 @@ impl PreparedRender {
         match self {
             Self::Semantic { message, .. }
             | Self::SemanticPatch { message, .. }
+            | Self::SemanticLinkPatch { message, .. }
             | Self::TerminalAnsi { message, .. } => message,
         }
     }
@@ -412,7 +492,9 @@ impl PreparedRender {
                 queued_graphics_assets,
                 ..
             } => Some((&committed_surface.graphics, queued_graphics_assets)),
-            Self::SemanticPatch { .. } | Self::TerminalAnsi { .. } => None,
+            Self::SemanticPatch { .. }
+            | Self::SemanticLinkPatch { .. }
+            | Self::TerminalAnsi { .. } => None,
         }
     }
 
@@ -638,6 +720,56 @@ mod tests {
         }
     }
 
+    /// Planning cannot produce such a patch, so this is the safety net: a baseline that could
+    /// not take a linked patch is dropped rather than left describing a screen the client does
+    /// not have, and the planner sends a whole surface next.
+    #[test]
+    fn a_linked_patch_the_baseline_cannot_take_drops_the_baseline() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        state.enable_surface_links(true);
+        let mut surface = popup_surface("popup");
+        surface.popup = None;
+        surface.frame = FrameData {
+            width: 2,
+            height: 1,
+            cells: vec![
+                crate::protocol::CellData::test_linked("x", Some(0)),
+                crate::protocol::CellData::test_linked("y", Some(0)),
+            ],
+            cursor: None,
+            hyperlinks: vec!["https://a.test".to_owned()],
+            graphics: Vec::new(),
+        };
+        let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+        state.commit_sent_frame(initial);
+
+        // The second cell still needs a.test, which the table drops.
+        let prepared = state
+            .prepare_pane_surface_patch(
+                PaneSurfacePatch {
+                    boot_id: surface.boot_id.clone(),
+                    projection_revision: surface.projection_revision,
+                    base_surface_revision: 1,
+                    surface_revision: 0,
+                    rows: vec![crate::protocol::PaneSurfacePatchRow {
+                        x: 0,
+                        y: 0,
+                        cells: vec![crate::protocol::CellData::test_linked("x", Some(0))],
+                    }],
+                    panes: Vec::new(),
+                    cursor: None,
+                },
+                Some(vec!["https://b.test".to_owned()]),
+            )
+            .expect("a capable client takes a linked patch");
+        state.commit_sent_frame(prepared);
+
+        assert!(
+            state.last_pane_surface().is_none(),
+            "the baseline is dropped rather than half applied"
+        );
+    }
+
     #[test]
     fn surface_delta_recompute_preserves_wire_baseline_but_epoch_reset_drops_it() {
         for enabled in [false, true] {
@@ -723,19 +855,22 @@ mod tests {
             let mut changed_cell = surface.frame.cells[0].clone();
             changed_cell.symbol = "x".into();
             let patch = state
-                .prepare_pane_surface_patch(PaneSurfacePatch {
-                    boot_id: surface.boot_id.clone(),
-                    projection_revision: surface.projection_revision,
-                    base_surface_revision: 2,
-                    surface_revision: 0,
-                    rows: vec![crate::protocol::PaneSurfacePatchRow {
-                        x: 0,
-                        y: 0,
-                        cells: vec![changed_cell.clone()],
-                    }],
-                    panes: Vec::new(),
-                    cursor: None,
-                })
+                .prepare_pane_surface_patch(
+                    PaneSurfacePatch {
+                        boot_id: surface.boot_id.clone(),
+                        projection_revision: surface.projection_revision,
+                        base_surface_revision: 2,
+                        surface_revision: 0,
+                        rows: vec![crate::protocol::PaneSurfacePatchRow {
+                            x: 0,
+                            y: 0,
+                            cells: vec![changed_cell.clone()],
+                        }],
+                        panes: Vec::new(),
+                        cursor: None,
+                    },
+                    None,
+                )
                 .unwrap();
             decoder.decode(patch.message().clone()).unwrap();
             state.commit_sent_frame(patch);

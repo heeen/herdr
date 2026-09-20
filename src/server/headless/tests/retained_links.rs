@@ -44,63 +44,66 @@ async fn render_scale_profile_retained_links() {
         LinkScenario::UrlScrolling,
         LinkScenario::UrlStaticTyping,
     ] {
-        for count in [1, 4, 15] {
-            let (mut server, client_rx, root) = retained_test_server(b"");
-            let mut pane_ids = vec![root];
-            for index in 1..count {
-                let workspace = &mut server.app.state.workspaces[0];
-                workspace.tabs[0]
-                    .layout
-                    .focus_pane(pane_ids[(index - 1) / 2]);
-                let id = workspace.test_split(if index % 2 == 0 {
-                    Direction::Vertical
-                } else {
-                    Direction::Horizontal
-                });
-                workspace.insert_test_runtime(
-                    id,
-                    crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
-                );
-                pane_ids.push(id);
-            }
-            let client = server.clients.get_mut(&1).unwrap();
-            client.mode = ClientConnectionMode::ClientShell;
-            for id in &pane_ids {
-                write_shared_test_pane(&mut server, *id, scenario.setup());
-            }
-            server.render_and_stream();
-            let _ = client_rx.try_iter().count();
-
-            let sources = pane_ids.iter().copied().collect();
-            let mut samples = Vec::new();
-            let mut retained = 0usize;
-            let mut bytes = 0usize;
-            for sample in 0..110 {
+        for surface_links in [false, true] {
+            for count in [1, 4, 15] {
+                let (mut server, client_rx, root) = retained_test_server(b"");
+                let mut pane_ids = vec![root];
+                for index in 1..count {
+                    let workspace = &mut server.app.state.workspaces[0];
+                    workspace.tabs[0]
+                        .layout
+                        .focus_pane(pane_ids[(index - 1) / 2]);
+                    let id = workspace.test_split(if index % 2 == 0 {
+                        Direction::Vertical
+                    } else {
+                        Direction::Horizontal
+                    });
+                    workspace.insert_test_runtime(
+                        id,
+                        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+                    );
+                    pane_ids.push(id);
+                }
+                let client = server.clients.get_mut(&1).unwrap();
+                client.mode = ClientConnectionMode::ClientShell;
+                client.render_state.enable_surface_links(surface_links);
                 for id in &pane_ids {
-                    write_shared_test_pane(&mut server, *id, &scenario.update(sample));
+                    write_shared_test_pane(&mut server, *id, scenario.setup());
                 }
-                // The same sequence the server runs: try the retained patch, fall back to a full
-                // render when it refuses.
-                let started = Instant::now();
-                let patched = server.render_retained_pane_surface_and_stream(&sources);
-                if !patched {
-                    server.render_and_stream();
+                server.render_and_stream();
+                let _ = client_rx.try_iter().count();
+
+                let sources = pane_ids.iter().copied().collect();
+                let mut samples = Vec::new();
+                let mut retained = 0usize;
+                let mut bytes = 0usize;
+                for sample in 0..110 {
+                    for id in &pane_ids {
+                        write_shared_test_pane(&mut server, *id, &scenario.update(sample));
+                    }
+                    // The same sequence the server runs: try the retained patch, fall back to a full
+                    // render when it refuses.
+                    let started = Instant::now();
+                    let patched = server.render_retained_pane_surface_and_stream(&sources);
+                    if !patched {
+                        server.render_and_stream();
+                    }
+                    let elapsed = started.elapsed();
+                    let sent: usize = client_rx.try_iter().map(|frame| frame.len()).sum();
+                    if sample >= 10 {
+                        samples.push(elapsed);
+                        retained += usize::from(patched);
+                        bytes += sent;
+                    }
                 }
-                let elapsed = started.elapsed();
-                let sent: usize = client_rx.try_iter().map(|frame| frame.len()).sum();
-                if sample >= 10 {
-                    samples.push(elapsed);
-                    retained += usize::from(patched);
-                    bytes += sent;
-                }
-            }
-            samples.sort_unstable();
-            println!(
-                "retained_links scenario={scenario:?} panes={count} retained={retained}/100 median_us={} p95_us={} bytes_per_update={}",
+                samples.sort_unstable();
+                println!(
+                "retained_links scenario={scenario:?} links={surface_links} panes={count} retained={retained}/100 median_us={} p95_us={} bytes_per_update={}",
                 samples[50].as_micros(),
                 samples[94].as_micros(),
                 bytes / 100,
             );
+            }
         }
     }
 }

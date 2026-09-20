@@ -1863,6 +1863,7 @@ impl HeadlessServer {
                 surface_delta,
                 surface_scroll,
                 clipboard_write,
+                surface_links,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -1913,6 +1914,7 @@ impl HeadlessServer {
                 connection
                     .render_state
                     .enable_surface_scroll(surface_scroll);
+                connection.render_state.enable_surface_links(surface_links);
                 connection.shell_clipboard_write = clipboard_write;
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {

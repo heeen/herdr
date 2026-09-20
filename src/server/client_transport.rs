@@ -420,6 +420,7 @@ pub(crate) enum ServerEvent {
         surface_delta: bool,
         surface_scroll: bool,
         clipboard_write: bool,
+        surface_links: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -789,6 +790,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_delta,
                     hello.surface_scroll,
                     hello.clipboard_write,
+                    hello.surface_links,
                 )),
             )
         }
@@ -887,6 +889,7 @@ pub(crate) fn handle_client_handshake(
         surface_delta,
         surface_scroll,
         clipboard_write,
+        surface_links,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -904,6 +907,7 @@ pub(crate) fn handle_client_handshake(
             surface_delta,
             surface_scroll,
             clipboard_write,
+            surface_links,
             writer,
         }
     } else {
@@ -2002,12 +2006,14 @@ mod tests {
                 surface_delta,
                 surface_scroll,
                 clipboard_write,
+                surface_links,
                 writer,
             } => {
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
                 assert!(!surface_scroll);
                 assert!(!clipboard_write);
+                assert!(!surface_links);
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
