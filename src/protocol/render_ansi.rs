@@ -995,6 +995,9 @@ fn write_cell(
     }
 
     if let Some(position) = cursor_position {
+        // Konsole ends an open hyperlink at a cursor jump, so the cells after it would be
+        // unlinked. Reopening with the same id keeps the pieces one link everywhere.
+        close_hyperlink(writer, active_hyperlink);
         write_cursor_position(writer, position);
     }
 
@@ -1700,6 +1703,66 @@ mod tests {
         );
         assert_eq!(output_str.matches(second.as_str()).count(), 2);
         assert_ne!(first, second, "different urls must not share an id");
+    }
+
+    #[test]
+    fn a_link_is_never_open_across_a_cursor_jump() {
+        // A patch skips the unchanged border between two rows of a wrapped url, so the rows are
+        // joined by a cursor jump alone. Konsole drops an open link at the jump, which left every
+        // row after the first unlinked.
+        let blank = || make_cell(" ", 0, 0, 0);
+        let mut frame = make_frame(
+            3,
+            2,
+            vec![blank(), blank(), blank(), blank(), blank(), blank()],
+        );
+        frame
+            .hyperlinks
+            .push("https://example.com/wrapped".to_owned());
+        let rows = [
+            PaneSurfacePatchRow {
+                x: 1,
+                y: 0,
+                cells: vec![linked_cell("h", 0), linked_cell("t", 0)],
+            },
+            PaneSurfacePatchRow {
+                x: 1,
+                y: 1,
+                cells: vec![linked_cell("t", 0), linked_cell("p", 0)],
+            },
+        ];
+
+        let mut output = Vec::new();
+        blit_patch_to(
+            &mut output,
+            &frame,
+            &frame.hyperlinks,
+            &rows,
+            None,
+            &mut None,
+            &mut 0,
+            false,
+            false,
+        );
+        let output = String::from_utf8(output).unwrap();
+
+        let open = format!(
+            "\x1b]8;id=herdr-{:016x};https://example.com/wrapped\x1b\\",
+            hyperlink_id("https://example.com/wrapped")
+        );
+        assert_eq!(
+            output.matches(open.as_str()).count(),
+            2,
+            "each row reopens the link: {output:?}"
+        );
+        let jump = output.find("\x1b[2;2H").expect("jump to the second row");
+        let last_osc8 = output[..jump]
+            .rfind("\x1b]8;")
+            .expect("link opened before the jump");
+        assert!(
+            output[last_osc8..].starts_with("\x1b]8;;\x1b\\"),
+            "the link is closed before the cursor jumps: {output:?}"
+        );
     }
 
     #[test]
