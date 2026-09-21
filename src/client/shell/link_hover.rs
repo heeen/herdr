@@ -227,33 +227,21 @@ impl ClientShellState {
         (outcome.repaint, outcome.actions)
     }
 
+    /// The uri the surface shows at a pane cell, given in the pane's own coordinates.
+    pub(super) fn link_uri_at(&self, source_rect: SurfaceRect, col: u16, row: u16) -> Option<&str> {
+        let surface = self.pane_surface.as_ref()?;
+        let index = hyperlink_index_at(surface, source_rect, col, row)?;
+        surface
+            .frame
+            .hyperlinks
+            .get(usize::try_from(index).ok()?)
+            .map(String::as_str)
+    }
+
     fn explicit_link_regions(&self, target: &LinkHoverTarget) -> Option<Vec<PaneLinkRegion>> {
         let surface = self.pane_surface.as_ref()?;
         let rect = target.source_rect;
-        let cell = |col: u16, row: u16| {
-            let x = usize::from(rect.x) + usize::from(col);
-            let y = usize::from(rect.y) + usize::from(row);
-            if x >= usize::from(surface.frame.width) || y >= usize::from(surface.frame.height) {
-                return None;
-            }
-            surface
-                .frame
-                .cells
-                .get(y * usize::from(surface.frame.width) + x)
-        };
-        let hyperlink_at = |col: u16, row: u16| {
-            let current = cell(col, row)?;
-            current.hyperlink.or_else(|| {
-                // Rendered wide-cell spacers may not carry their own OSC 8 metadata.
-                if col == 0 || !current.symbol.trim().is_empty() {
-                    return None;
-                }
-                let previous = cell(col - 1, row)?;
-                (previous.symbol.width() == 2)
-                    .then_some(previous.hyperlink)
-                    .flatten()
-            })
-        };
+        let hyperlink_at = |col: u16, row: u16| hyperlink_index_at(surface, rect, col, row);
         let hyperlink = hyperlink_at(target.col, target.row)?;
         let uri = surface.frame.hyperlinks.get(hyperlink as usize)?;
         if crate::url_scan::safe_web_url(uri).is_none() {
@@ -365,4 +353,35 @@ impl ClientShellState {
 
 fn region_contains(region: &PaneLinkRegion, col: u16, row: u16) -> bool {
     region.row == row && col >= region.start_col && col <= region.end_col
+}
+
+/// The link index a pane cell carries. A wide cell's spacer may not carry its own OSC 8 metadata,
+/// so it takes the link of the cell before it.
+fn hyperlink_index_at(
+    surface: &crate::protocol::PaneSurfaceFrame,
+    rect: SurfaceRect,
+    col: u16,
+    row: u16,
+) -> Option<u32> {
+    let cell = |col: u16, row: u16| {
+        let x = usize::from(rect.x) + usize::from(col);
+        let y = usize::from(rect.y) + usize::from(row);
+        if x >= usize::from(surface.frame.width) || y >= usize::from(surface.frame.height) {
+            return None;
+        }
+        surface
+            .frame
+            .cells
+            .get(y * usize::from(surface.frame.width) + x)
+    };
+    let current = cell(col, row)?;
+    current.hyperlink.or_else(|| {
+        if col == 0 || !current.symbol.trim().is_empty() {
+            return None;
+        }
+        let previous = cell(col - 1, row)?;
+        (previous.symbol.width() == 2)
+            .then_some(previous.hyperlink)
+            .flatten()
+    })
 }

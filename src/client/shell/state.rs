@@ -527,6 +527,7 @@ pub(super) enum ClientContextMenuAction {
     SplitDown,
     Zoom,
     ToggleRightClickPassthrough,
+    CopyLink,
     Copy,
     Paste,
     ClosePane,
@@ -551,6 +552,8 @@ pub(super) enum ClientContextMenuTarget {
         source_pane_id: Option<String>,
         has_manual_label: bool,
         right_click_passthrough: bool,
+        /// The uri under the click, when it landed on a link.
+        link: Option<String>,
     },
 }
 

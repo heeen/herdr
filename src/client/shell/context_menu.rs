@@ -50,6 +50,7 @@ impl ClientContextMenuOverlay {
                 source_pane_id,
                 has_manual_label,
                 right_click_passthrough,
+                link,
                 ..
             } => {
                 let mut items = vec![item("Rename pane", Action::RenamePane)];
@@ -71,6 +72,11 @@ impl ClientContextMenuOverlay {
                         },
                         Action::ToggleRightClickPassthrough,
                     ),
+                ]);
+                if link.is_some() {
+                    items.push(item("Copy link", Action::CopyLink));
+                }
+                items.extend([
                     item("Copy", Action::Copy),
                     item("Paste", Action::Paste),
                     item("Close pane", Action::ClosePane),
@@ -155,6 +161,27 @@ impl ClientShellState {
             .focused_pane_id
             .clone()
             .filter(|focused| focused != &pane_id);
+        // The surface already carries every link as a whole uri, wrapped or not, so the click
+        // can be resolved here without asking the server.
+        let link = self
+            .hits
+            .panes
+            .iter()
+            .find(|hit| hit.pane_id == pane_id && super::contains(hit.inner_rect, (x, y)))
+            .and_then(|hit| {
+                let surface_pane = self
+                    .pane_surface
+                    .as_ref()?
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == pane_id)?;
+                self.link_uri_at(
+                    surface_pane.inner_rect,
+                    x - hit.inner_rect.x,
+                    y - hit.inner_rect.y,
+                )
+                .map(str::to_owned)
+            });
         self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
             target: ClientContextMenuTarget::Pane {
                 pane_id,
@@ -162,6 +189,7 @@ impl ClientShellState {
                 source_pane_id,
                 has_manual_label: pane.label.is_some(),
                 right_click_passthrough: pane.right_click_passthrough,
+                link,
             },
             x,
             y,
@@ -206,12 +234,14 @@ impl ClientShellState {
                 workspace_id,
                 source_pane_id,
                 right_click_passthrough,
+                link,
                 ..
             } => self.activate_pane_context_action(
                 pane_id,
                 workspace_id,
                 source_pane_id,
                 right_click_passthrough,
+                link,
                 action,
                 outcome,
             ),
@@ -372,6 +402,7 @@ impl ClientShellState {
         workspace_id: String,
         source_pane_id: Option<String>,
         right_click_passthrough: bool,
+        link: Option<String>,
         action: ClientContextMenuAction,
         outcome: &mut ClientShellInput,
     ) {
@@ -380,6 +411,7 @@ impl ClientShellState {
             workspace_id,
             source_pane_id,
             right_click_passthrough,
+            link,
             action,
             outcome,
             crate::platform::read_clipboard_text,
@@ -393,6 +425,7 @@ impl ClientShellState {
         workspace_id: String,
         source_pane_id: Option<String>,
         right_click_passthrough: bool,
+        link: Option<String>,
         action: ClientContextMenuAction,
         outcome: &mut ClientShellInput,
         read_clipboard_text: impl FnOnce() -> Option<String>,
@@ -480,6 +513,19 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
+            // The uri was resolved when the menu opened, so this needs no round trip; like any
+            // explicit copy it targets the clipboard regardless of `ui.copy_on_select`.
+            ClientContextMenuAction::CopyLink => {
+                if let Some(link) = link {
+                    let target = crate::platform::SelectionTarget::Clipboard;
+                    outcome.repaint |=
+                        self.show_copy_feedback(&[target], std::time::Instant::now());
+                    outcome.actions.push(ClientShellAction::ClipboardWrite {
+                        target,
+                        bytes: link.into_bytes(),
+                    });
+                }
+            }
             // An explicit copy always targets the clipboard; `ui.copy_on_select` only governs the
             // automatic copy. A no-op when nothing is selected.
             ClientContextMenuAction::Copy => self.request_selection_copy(
