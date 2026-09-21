@@ -392,6 +392,7 @@ fn pane_context_menu_paste_sends_clipboard_text_to_the_clicked_pane() {
         "ws_1".to_string(),
         None,
         false,
+        None,
         ClientContextMenuAction::Paste,
         &mut outcome,
         || Some("pasted text".to_string()),
@@ -425,6 +426,7 @@ fn pane_context_menu_paste_is_a_no_op_without_clipboard_text() {
             "ws_1".to_string(),
             None,
             false,
+            None,
             ClientContextMenuAction::Paste,
             &mut outcome,
             || clipboard.clone(),
@@ -435,6 +437,63 @@ fn pane_context_menu_paste_is_a_no_op_without_clipboard_text() {
             outcome.requests
         );
     }
+}
+
+/// The surface carries every link as one uri, wrapped or not, so the menu can offer it without
+/// asking the server, and only when the click landed on one.
+#[test]
+fn pane_context_menu_offers_copy_link_only_on_a_link() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut linked = surface();
+    linked.frame.hyperlinks = vec!["https://example.com/very/long/wrapped/path".to_owned()];
+    linked.frame.cells[1].hyperlink = Some(0);
+    state.set_pane_surface(linked);
+    state.compose(106, 20).expect("shell frame");
+    let pane = state.hits.panes[0].inner_rect;
+    let right_click = |column| {
+        RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column,
+            row: pane.y,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+
+    state.handle_raw_events(vec![right_click(pane.x)]);
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("pane context menu");
+    };
+    let actions: Vec<_> = menu.items().iter().map(|item| item.action).collect();
+    assert!(
+        !actions.contains(&ClientContextMenuAction::CopyLink),
+        "no link under the click: {actions:?}"
+    );
+    state.overlay = None;
+
+    state.handle_raw_events(vec![right_click(pane.x + 1)]);
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("pane context menu");
+    };
+    let index = menu
+        .items()
+        .iter()
+        .position(|item| item.action == ClientContextMenuAction::CopyLink)
+        .expect("a link under the click offers Copy link");
+
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(index, &mut outcome);
+    assert!(
+        matches!(
+            outcome.actions.as_slice(),
+            [ClientShellAction::ClipboardWrite { target, bytes }]
+                if *target == crate::platform::SelectionTarget::Clipboard
+                    && bytes == b"https://example.com/very/long/wrapped/path"
+        ),
+        "the whole uri goes to the clipboard without a server round trip: {:?}",
+        outcome.actions
+    );
+    assert!(outcome.requests.is_empty());
 }
 
 #[test]
