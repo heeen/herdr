@@ -615,7 +615,7 @@ fn blit_patch_to(
     repeat_ime_anchor: bool,
     suppress_visible_cursor: bool,
 ) {
-    let _ = writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\");
+    let _ = writer.write_all(b"\x1b[?2026h\x1b[?25l");
     let mut last_sgr = String::new();
     let mut last_style = None;
     let mut active_hyperlink = None;
@@ -703,10 +703,8 @@ fn blit_frame_to_with_cursor_memory_and_clear_policy(
     // on terminals that render the hardware cursor at intermediate CUP positions.
     let _ = writer.write_all(b"\x1b[?25l");
 
-    // Start each frame from a known OSC 8 state. If a previous write was
-    // interrupted or the outer terminal had an active hyperlink, unlinked cells
-    // must not inherit it.
-    let _ = writer.write_all(b"\x1b]8;;\x1b\\");
+    // No OSC 8 reset here: every write closes the links it opens, and Konsole
+    // toggles on any OSC 8, so a close with nothing open swallows the next link.
 
     if full_redraw {
         if clear_before_full_redraw {
@@ -1705,6 +1703,56 @@ mod tests {
         assert_ne!(first, second, "different urls must not share an id");
     }
 
+    /// Konsole toggles link capture on every OSC 8, open or close, so a close with nothing open
+    /// makes it drop the next real link.
+    fn assert_osc8_balanced(output: &str) {
+        let mut open = false;
+        for (at, _) in output.match_indices("\x1b]8;") {
+            let closes = output[at..].starts_with("\x1b]8;;\x1b\\");
+            assert_ne!(open, !closes, "unbalanced OSC 8 at byte {at}: {output:?}");
+            open = !closes;
+        }
+        assert!(!open, "a link is left open: {output:?}");
+    }
+
+    #[test]
+    fn frames_and_patches_never_close_a_link_that_is_not_open() {
+        let blank = || make_cell(" ", 0, 0, 0);
+        let mut frame = make_frame(3, 1, vec![linked_cell("a", 0), blank(), blank()]);
+        frame.hyperlinks.push("https://example.com/a".to_owned());
+
+        for prev in [
+            None,
+            Some(&make_frame(3, 1, vec![blank(), blank(), blank()])),
+        ] {
+            let mut output = Vec::new();
+            blit_frame_to(&mut output, &frame, prev);
+            assert_osc8_balanced(&String::from_utf8(output).unwrap());
+        }
+        let mut output = Vec::new();
+        let rows = [PaneSurfacePatchRow {
+            x: 1,
+            y: 0,
+            cells: vec![make_cell("b", 0, 0, 0)],
+        }];
+        blit_patch_to(
+            &mut output,
+            &frame,
+            &frame.hyperlinks,
+            &rows,
+            None,
+            &mut None,
+            &mut 0,
+            false,
+            false,
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            !output.contains("\x1b]8;"),
+            "an unlinked patch says nothing about links: {output:?}"
+        );
+    }
+
     #[test]
     fn a_link_is_never_open_across_a_cursor_jump() {
         // A patch skips the unchanged border between two rows of a wrapped url, so the rows are
@@ -1745,6 +1793,7 @@ mod tests {
             false,
         );
         let output = String::from_utf8(output).unwrap();
+        assert_osc8_balanced(&output);
 
         let open = format!(
             "\x1b]8;id=herdr-{:016x};https://example.com/wrapped\x1b\\",
