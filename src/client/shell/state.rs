@@ -529,6 +529,7 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     CopyLink,
+    CopyPaneId,
     Copy,
     Paste,
     ClosePane,

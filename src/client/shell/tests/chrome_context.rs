@@ -497,6 +497,42 @@ fn pane_context_menu_offers_copy_link_only_on_a_link() {
 }
 
 #[test]
+fn pane_context_menu_copies_the_clicked_pane_id() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("shell frame");
+    let pane = state.hits.panes[0].inner_rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("pane context menu");
+    };
+    let index = menu
+        .items()
+        .iter()
+        .position(|item| item.action == ClientContextMenuAction::CopyPaneId)
+        .expect("the pane menu offers Copy pane ID");
+
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(index, &mut outcome);
+    assert!(
+        matches!(
+            outcome.actions.as_slice(),
+            [ClientShellAction::ClipboardWrite { target, bytes }]
+                if *target == crate::platform::SelectionTarget::Clipboard && bytes == b"pane_1"
+        ),
+        "{:?}",
+        outcome.actions
+    );
+    assert!(outcome.requests.is_empty());
+}
+
+#[test]
 fn pane_context_menu_offers_copy_and_paste() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
