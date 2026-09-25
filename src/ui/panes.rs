@@ -7,9 +7,7 @@ use ratatui::{
 };
 
 use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
-#[cfg(test)]
-use super::text::display_width;
-use super::text::truncate_end;
+use super::text::{display_width, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::AppState;
@@ -22,13 +20,13 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
 }
 
-fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
+/// Pads `label` with one space on each side, truncated to fit `width` columns.
+fn pane_border_title(label: &str, width: usize) -> Option<String> {
     let label = label.trim();
-    if label.is_empty() || pane_width <= 4 {
+    if label.is_empty() || width <= 2 {
         return None;
     }
-    let max_label_width = pane_width.saturating_sub(4) as usize;
-    Some(format!(" {} ", truncate_end(label, max_label_width)))
+    Some(format!(" {} ", truncate_end(label, width - 2)))
 }
 
 // Full view computation reaches this helper for active and background panes.
@@ -644,25 +642,17 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
-        let Some(title) = ws
-            .pane_state(info.id)
-            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
-        else {
-            continue;
-        };
         let y = info.rect.y;
         if y < area.y || y >= area.y.saturating_add(area.height) {
             continue;
         }
         let start_x = info.rect.x.saturating_add(1);
-        let end_x = info
+        let right_x = info
             .rect
             .x
             .saturating_add(info.rect.width)
-            .saturating_sub(1)
-            .min(area.x.saturating_add(area.width));
+            .saturating_sub(1);
+        let end_x = right_x.min(area.x.saturating_add(area.width));
         if start_x >= end_x {
             continue;
         }
@@ -675,6 +665,35 @@ fn render_pane_border_titles(
         if info.is_focused {
             style = style.add_modifier(Modifier::BOLD);
         }
+
+        // The span between the corners, unclipped, so titles lay out the same at the frame edge.
+        let mut title_width = usize::from(right_x - start_x);
+        let pane_number = app
+            .show_pane_ids_on_pane_borders
+            .then(|| ws.public_pane_number(info.id))
+            .flatten();
+        if let Some(pane_number) = pane_number {
+            let id = crate::workspace::public_pane_id_for_number(&ws.id, pane_number);
+            let id_title = format!(" {id} ");
+            let id_width = display_width(&id_title);
+            if id_width <= title_width {
+                let id_x = right_x - id_width as u16;
+                if id_x < end_x {
+                    buf.set_stringn(id_x, y, &id_title, usize::from(end_x - id_x), style);
+                }
+                // Keep one border cell between the two titles.
+                title_width = title_width.saturating_sub(id_width + 1);
+            }
+        }
+
+        let Some(title) = ws
+            .pane_state(info.id)
+            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
+            .and_then(|label| pane_border_title(&label, title_width))
+        else {
+            continue;
+        };
         buf.set_stringn(
             start_x,
             y,
@@ -892,28 +911,17 @@ mod tests {
     #[test]
     fn pane_border_title_trims_and_truncates() {
         assert_eq!(
-            pane_border_title(" claude ", 20, false).as_deref(),
+            pane_border_title(" claude ", 18).as_deref(),
             Some(" claude ")
         );
-        assert_eq!(
-            pane_border_title(" claude ", 20, true).as_deref(),
-            Some(" claude ")
-        );
-        assert_eq!(pane_border_title("", 20, false), None);
-        assert_eq!(
-            pane_border_title("abcdef", 8, false).as_deref(),
-            Some(" abc… ")
-        );
-        assert_eq!(
-            pane_border_title("abcdef", 8, true).as_deref(),
-            Some(" abc… ")
-        );
-        assert_eq!(pane_border_title("abcdef", 4, false), None);
+        assert_eq!(pane_border_title("", 18), None);
+        assert_eq!(pane_border_title("abcdef", 6).as_deref(), Some(" abc… "));
+        assert_eq!(pane_border_title("abcdef", 2), None);
     }
 
     #[test]
     fn pane_border_title_truncates_cjk_by_display_width() {
-        let title = pane_border_title("1 模块组织（已定）", 12, false).unwrap();
+        let title = pane_border_title("1 模块组织（已定）", 10).unwrap();
 
         assert_eq!(title, " 1 模块… ");
         assert!(display_width(title.as_str()) <= 10);
@@ -949,6 +957,56 @@ mod tests {
         assert_eq!(buffer[(4, 0)].symbol(), "模");
         assert_eq!(buffer[(5, 0)].symbol(), " ");
         assert_eq!(buffer[(6, 0)].symbol(), "块");
+    }
+
+    fn top_border_text(app: &AppState, ws: &Workspace, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3)).unwrap();
+        terminal
+            .draw(|frame| render_view_pane_borders(app, ws, &[], frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn pane_border_shows_right_aligned_pane_id_and_shortens_the_title() {
+        let width = 24;
+        let mut app = AppState::test_new();
+        app.view.terminal_area = Rect::new(0, 0, width, 3);
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        app.view.pane_infos = vec![PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, width, 3),
+            inner_rect: Rect::default(),
+            scrollbar_rect: None,
+            borders: Borders::ALL,
+            is_focused: false,
+        }];
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.set_manual_label("a long reviewer name".into());
+        app.terminals.insert(terminal_id, terminal_state);
+        let id = crate::workspace::public_pane_id_for_number(
+            &ws.id,
+            ws.public_pane_number(pane_id).unwrap(),
+        );
+
+        assert_eq!(
+            top_border_text(&app, &ws, width),
+            "┌ a long reviewer name ┐"
+        );
+
+        app.show_pane_ids_on_pane_borders = true;
+        let border = top_border_text(&app, &ws, width);
+        assert!(border.ends_with(&format!(" {id} ┐")), "{border}");
+        let title_end = border.find('…').expect("the title is truncated");
+        let id_start = border.rfind(&format!(" {id} ")).unwrap();
+        assert!(
+            border[title_end..id_start].contains('─'),
+            "a border cell separates the titles: {border}"
+        );
     }
 
     #[test]

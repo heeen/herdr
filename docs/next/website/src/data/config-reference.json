@@ -1005,6 +1005,12 @@
           "description": "Show agent labels in split pane borders when no manual pane label is set."
         },
         {
+          "key": "ui.show_pane_ids_on_pane_borders",
+          "type": "boolean",
+          "default": "false",
+          "description": "Show each pane's id right-aligned in its top border."
+        },
+        {
           "key": "ui.hide_tab_bar_when_single_tab",
           "type": "boolean",
           "default": "false",
