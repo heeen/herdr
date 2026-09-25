@@ -77,6 +77,7 @@ impl ClientContextMenuOverlay {
                     items.push(item("Copy link", Action::CopyLink));
                 }
                 items.extend([
+                    item("Copy pane ID", Action::CopyPaneId),
                     item("Copy", Action::Copy),
                     item("Paste", Action::Paste),
                     item("Close pane", Action::ClosePane),
@@ -396,6 +397,17 @@ impl ClientShellState {
         }
     }
 
+    /// Menu copies know their text when the menu opens, so they need no server round trip; like
+    /// any explicit copy they target the clipboard regardless of `ui.copy_on_select`.
+    fn copy_to_clipboard(&mut self, text: String, outcome: &mut ClientShellInput) {
+        let target = crate::platform::SelectionTarget::Clipboard;
+        outcome.repaint |= self.show_copy_feedback(&[target], std::time::Instant::now());
+        outcome.actions.push(ClientShellAction::ClipboardWrite {
+            target,
+            bytes: text.into_bytes(),
+        });
+    }
+
     fn activate_pane_context_action(
         &mut self,
         pane_id: String,
@@ -513,19 +525,12 @@ impl ClientShellState {
                 }),
                 outcome,
             ),
-            // The uri was resolved when the menu opened, so this needs no round trip; like any
-            // explicit copy it targets the clipboard regardless of `ui.copy_on_select`.
             ClientContextMenuAction::CopyLink => {
                 if let Some(link) = link {
-                    let target = crate::platform::SelectionTarget::Clipboard;
-                    outcome.repaint |=
-                        self.show_copy_feedback(&[target], std::time::Instant::now());
-                    outcome.actions.push(ClientShellAction::ClipboardWrite {
-                        target,
-                        bytes: link.into_bytes(),
-                    });
+                    self.copy_to_clipboard(link, outcome);
                 }
             }
+            ClientContextMenuAction::CopyPaneId => self.copy_to_clipboard(pane_id, outcome),
             // An explicit copy always targets the clipboard; `ui.copy_on_select` only governs the
             // automatic copy. A no-op when nothing is selected.
             ClientContextMenuAction::Copy => self.request_selection_copy(
